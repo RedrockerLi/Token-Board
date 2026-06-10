@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DeepSeek API 用量可视化</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <style>
+        /* ── Reset & Base ── */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --color-primary: #0070F3;
+            --color-primary-light: #E6F0FD;
+            --color-cyan: #00CEF3;
+            --color-bg: #F5F6FA;
+            --color-surface: #FFFFFF;
+            --color-text: #020E36;
+            --color-text-secondary: #6B7194;
+            --color-text-tertiary: #9094A2;
+            --color-border: #E8EBF0;
+            --color-success: #22C55E;
+            --color-warning: #F59E0B;
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 14px;
+            --shadow-sm: 0 1px 3px rgba(0,0,0,0.04);
+            --shadow-md: 0 2px 12px rgba(0,0,0,0.06);
+            --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif;
+            --transition: 0.2s ease;
+        }
+
+        body {
+            font-family: var(--font-family);
+            background: var(--color-bg);
+            color: var(--color-text);
+            min-height: 100vh;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* ── Header ── */
+        .header {
+            background: var(--color-surface);
+            border-bottom: 1px solid var(--color-border);
+            padding: 0 28px;
+            height: 56px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .header-logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            height: 24px;
+        }
+
+        .header-logo svg {
+            height: 24px;
+            width: auto;
+        }
+
+        .header-badge {
+            min-width: 56px;
+            height: 20px;
+            background: #000;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            color: #fff;
+            font-weight: 500;
+            padding: 0 8px;
+            user-select: none;
+        }
+
+        .header-divider {
+            width: 1px;
+            height: 20px;
+            background: var(--color-border);
+            margin: 0 4px;
+        }
+
+        .header-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--color-text);
+        }
+
+        /* ── Main Layout ── */
+        .main-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 28px 28px 60px;
+        }
+
+        /* ── Page Title Area ── */
+        .page-header {
+            margin-bottom: 24px;
+        }
+
+        .page-title {
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--color-text);
+            margin-bottom: 6px;
+        }
+
+        .page-subtitle {
+            font-size: 13px;
+            color: var(--color-text-tertiary);
+        }
+
+        /* ── Stats Cards Row ── */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-bottom: 32px;
+        }
+
+        @media (max-width: 900px) {
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 600px) {
+            .stats-grid { grid-template-columns: 1fr; }
+        }
+
+        .stat-card {
+            background: var(--color-surface);
+            border-radius: var(--radius-md);
+            padding: 20px 24px;
+            box-shadow: var(--shadow-sm);
+            border: 1px solid var(--color-border);
+            transition: box-shadow var(--transition), transform var(--transition);
+        }
+
+        .stat-card:hover {
+            box-shadow: var(--shadow-md);
+            transform: translateY(-1px);
+        }
+
+        .stat-card__label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: var(--color-text-secondary);
+            margin-bottom: 10px;
+        }
+
+        .stat-card__label .icon-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .stat-card__value {
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--color-text);
+            letter-spacing: -0.5px;
+            margin-bottom: 4px;
+        }
+
+        .stat-card__sub {
+            font-size: 12px;
+            color: var(--color-text-tertiary);
+        }
+
+        .stat-card--highlight {
+            border-left: 3px solid var(--color-primary);
+        }
+
+        .stat-card--cyan {
+            border-left: 3px solid var(--color-cyan);
+        }
+
+        /* ── Section ── */
+        .section {
+            margin-bottom: 32px;
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .section-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--color-text);
+        }
+
+        .section-subtitle {
+            font-size: 13px;
+            color: var(--color-text-tertiary);
+            margin-left: 8px;
+            font-weight: 400;
+        }
+
+        /* ── Controls ── */
+        .controls-group {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .select-styled {
+            appearance: none;
+            -webkit-appearance: none;
+            padding: 7px 32px 7px 12px;
+            font-size: 13px;
+            font-family: var(--font-family);
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-sm);
+            background: var(--color-surface);
+            color: var(--color-text);
+            cursor: pointer;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236B7194' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+            transition: border-color var(--transition);
+        }
+
+        .select-styled:hover { border-color: var(--color-primary); }
+        .select-styled:focus { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 3px rgba(0,112,243,0.1); }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 7px 16px;
+            font-size: 13px;
+            font-family: var(--font-family);
+            font-weight: 500;
+            border: 1px solid var(--color-border);
+            border-radius: var(--radius-sm);
+            background: var(--color-surface);
+            color: var(--color-text);
+            cursor: pointer;
+            transition: all var(--transition);
+            white-space: nowrap;
+        }
+
+        .btn:hover {
+            border-color: var(--color-primary);
+            color: var(--color-primary);
+        }
+
+        .btn--primary {
+            background: var(--color-primary);
+            color: #fff;
+            border-color: var(--color-primary);
+        }
+
+        .btn--primary:hover {
+            background: #0062D6;
+            border-color: #0062D6;
+            color: #fff;
+        }
+
+        .btn--sm { padding: 5px 12px; font-size: 12px; }
+
+        /* ── Chart Containers ── */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
+        @media (max-width: 900px) {
+            .charts-grid { grid-template-columns: 1fr; }
+        }
+
+        .chart-card {
+            background: var(--color-surface);
+            border-radius: var(--radius-md);
+            padding: 20px 24px;
+            box-shadow: var(--shadow-sm);
+            border: 1px solid var(--color-border);
+        }
+
+        .chart-card--wide {
+            grid-column: 1 / -1;
+        }
+
+        .chart-card__title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--color-text);
+            margin-bottom: 12px;
+        }
+
+        .chart-container {
+            width: 100%;
+            height: 320px;
+        }
+
+        .chart-container--sm {
+            height: 280px;
+        }
+
+        .chart-container--lg {
+            height: 400px;
+        }
+
+        /* ── Loading ── */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            color: var(--color-text-tertiary);
+            font-size: 14px;
+        }
+
+        .loading::after {
+            content: '';
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--color-border);
+            border-top-color: var(--color-primary);
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-left: 10px;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ── Refresh Indicator ── */
+        .last-updated {
+            font-size: 12px;
+            color: var(--color-text-tertiary);
+            text-align: center;
+            margin-top: 40px;
+            padding-bottom: 20px;
+        }
+
+        /* ── Formatters ── */
+        .number-lg {
+            font-variant-numeric: tabular-nums;
+        }
+    </style>
+</head>
+<body>
+
+
+    <!-- ── Main Content ── -->
+    <div class="main-container">
+
+        <!-- Page Title -->
+        <div class="page-header">
+            <h1 class="page-title">API 用量可视化面板</h1>
+            <p class="page-subtitle" id="pageSubtitle">所有日期均按 UTC+0 时间显示 · Token 统计跨所有可用月份</p>
+            <div class="controls-group" style="margin-top: 12px;">
+                <label style="font-size:13px;color:var(--color-text-secondary);white-space:nowrap;">用户选择</label>
+                <select class="select-styled" id="keyNameSelector">
+                    <option value="">总览 (所有用户)</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Stats Cards Row 1 -->
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card stat-card--highlight">
+                <div class="stat-card__label"><span class="icon-dot" style="background:#0070F3;"></span> 总Token使用量</div>
+                <div class="stat-card__value number-lg" id="statTotalTokens">--</div>
+                <div class="stat-card__sub">跨月份</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-card__label"><span class="icon-dot" style="background:#8B5CF6;"></span> 总请求数</div>
+                <div class="stat-card__value number-lg" id="statRequests">--</div>
+                <div class="stat-card__sub">API 调用次数</div>
+            </div>
+            <div class="stat-card stat-card--cyan">
+                <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 总消费</div>
+                <div class="stat-card__value number-lg" id="statCost">--</div>
+                <div class="stat-card__sub">CNY · 跨月份</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-card__label"><span class="icon-dot" style="background:#22C55E;"></span> 输入Token</div>
+                <div class="stat-card__value number-lg" id="statInputTokens">--</div>
+                <div class="stat-card__sub">缓存命中 + 未命中</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-card__label"><span class="icon-dot" style="background:#00CEF3;"></span> 输出Token</div>
+                <div class="stat-card__value number-lg" id="statOutputTokens">--</div>
+                <div class="stat-card__sub">模型生成的输出</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-card__label"><span class="icon-dot" style="background:#F59E0B;"></span> 缓存命中Token</div>
+                <div class="stat-card__value number-lg" id="statCacheHitTokens">--</div>
+                <div class="stat-card__sub">输入缓存命中 (节省费用)</div>
+            </div>
+        </div>
+
+        <!-- Global Overview Pie Charts -->
+        <div class="section">
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <div class="chart-card__title">模型分布 (跨月份)</div>
+                    <div class="chart-container chart-container--sm" id="chartModelPie"></div>
+                    <div class="loading" id="loadingModelPie">加载中</div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-card__title">Token 类型分布 (跨月份)</div>
+                    <div class="chart-container chart-container--sm" id="chartTypePie"></div>
+                    <div class="loading" id="loadingTypePie">加载中</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Month Selector + Refresh -->
+        <div class="section">
+            <div class="section-header">
+                <div>
+                    <span class="section-title">每月用量详情</span>
+                    <span class="section-subtitle" id="currentMonthLabel"></span>
+                </div>
+                <div class="controls-group">
+                    <select class="select-styled" id="monthSelector">
+                        <option value="">-- 选择月份 --</option>
+                    </select>
+                    <button class="btn btn--sm" onclick="refreshData()" title="重新扫描 data/ 目录">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+                        刷新数据
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Daily Chart (wide) -->
+        <div class="section">
+            <div class="chart-card chart-card--wide">
+                <div class="chart-card__title">每日 Token 使用量 &amp; 消费</div>
+                <div class="chart-container chart-container--lg" id="chartDaily"></div>
+                <div class="loading" id="loadingDaily">加载中</div>
+            </div>
+        </div>
+
+
+        <!-- Monthly Trend Chart (wide) -->
+        <div class="section">
+            <div class="chart-card chart-card--wide">
+                <div class="chart-card__title">月度 Token 使用趋势</div>
+                <div class="chart-container chart-container--lg" id="chartMonthly"></div>
+                <div class="loading" id="loadingMonthly">加载中</div>
+            </div>
+        </div>
+
+        <p class="last-updated" id="lastUpdated"></p>
+    </div>
+
+    <!-- ── Scripts ── -->
+    <script>
+    // ── Global state ──
+    let currentMonth = null; // {year, month}
+    let currentKeyName = ''; // '' = overview (all users)
+    let summaryData = null;
+
+    // ── Utility: format large numbers ──
+    function fmtNum(n) {
+        if (n == null || isNaN(n)) return '--';
+        if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + ' B';
+        if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + ' M';
+        if (n >= 10_000) return (n / 1_000).toFixed(1) + ' K';
+        return n.toLocaleString('en-US');
+    }
+
+    function fmtCost(n) {
+        if (n == null || isNaN(n)) return '--';
+        return '¥' + n.toFixed(2);
+    }
+
+    // ── ECharts common theme ──
+    const chartColors = ['#0070F3', '#00CEF3', '#22C55E', '#F59E0B', '#8B5CF6', '#EF4444', '#EC4899', '#6366F1'];
+
+    function initChart(domId) {
+        const dom = document.getElementById(domId);
+        if (!dom) return null;
+        // Dispose previous instance if any
+        const existing = echarts.getInstanceByDom(dom);
+        if (existing) existing.dispose();
+        const chart = echarts.init(dom, null, { renderer: 'svg' });
+        // Responsive resize
+        const ro = new ResizeObserver(() => chart.resize());
+        ro.observe(dom);
+        return chart;
+    }
+
+    // ── Fetch helpers ──
+    async function fetchJSON(url) {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
+        return resp.json();
+    }
+
+    // ── Helper: build query string with optional api_key_name ──
+    function buildParams(baseUrl, extraParams = {}) {
+        const url = new URL(baseUrl, window.location.origin);
+        for (const [k, v] of Object.entries(extraParams)) {
+            if (v != null) url.searchParams.set(k, v);
+        }
+        if (currentKeyName) url.searchParams.set('api_key_name', currentKeyName);
+        return url.pathname + url.search;
+    }
+
+    // ── Load summary & populate stats ──
+    async function loadSummary() {
+        const url = buildParams('/api/summary');
+        const data = await fetchJSON(url);
+        summaryData = data;
+
+        document.getElementById('statTotalTokens').textContent = fmtNum(data.total_tokens);
+        document.getElementById('statOutputTokens').textContent = fmtNum(data.total_output_tokens);
+        document.getElementById('statInputTokens').textContent = fmtNum(data.total_input_tokens);
+        document.getElementById('statCacheHitTokens').textContent = fmtNum(data.total_input_cache_hit_tokens);
+        document.getElementById('statRequests').textContent = fmtNum(data.total_requests);
+        document.getElementById('statCost').textContent = fmtCost(data.total_cost);
+
+        // Populate month selector (only on first load / refresh — preserve selection)
+        const sel = document.getElementById('monthSelector');
+        const months = data.available_months || [];
+        const prevMonthVal = sel.value;
+        sel.innerHTML = '<option value="">-- 选择月份 --</option>';
+        months.forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = `${m.year}-${m.month}`;
+            opt.textContent = `${m.year} - ${m.month}月`;
+            sel.appendChild(opt);
+        });
+
+        // Populate api_key_name selector
+        const keySel = document.getElementById('keyNameSelector');
+        const keyNames = data.api_key_names || [];
+        const prevKeyVal = keySel.value;
+        keySel.innerHTML = '<option value="">总览 (所有用户)</option>';
+        keyNames.forEach(name => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            keySel.appendChild(opt);
+        });
+        // Restore previous selection if still valid
+        if (prevKeyVal && [...keySel.options].some(o => o.value === prevKeyVal)) {
+            keySel.value = prevKeyVal;
+        } else {
+            keySel.value = '';
+            currentKeyName = '';
+        }
+
+        // Default to latest month if no prior selection
+        if (months.length > 0) {
+            const latest = months[months.length - 1];
+            if (!prevMonthVal || ![...sel.options].some(o => o.value === prevMonthVal)) {
+                sel.value = `${latest.year}-${latest.month}`;
+                currentMonth = { year: latest.year, month: latest.month };
+            } else {
+                sel.value = prevMonthVal;
+                const [y, m] = prevMonthVal.split('-').map(Number);
+                currentMonth = { year: y, month: m };
+            }
+            const label = `${currentMonth.year}-${currentMonth.month.toString().padStart(2,'0')}`;
+            document.getElementById('currentMonthLabel').textContent = `当前显示: ${label}`;
+            loadDailyChart();
+        }
+
+        // Update subtitle
+        updateSubtitle();
+
+        // Update "last updated"
+        document.getElementById('lastUpdated').textContent =
+            `数据更新时间: ${new Date().toLocaleString('zh-CN')} · 共 ${months.length} 个月数据`;
+    }
+
+    function updateSubtitle() {
+        const el = document.getElementById('pageSubtitle');
+        if (currentKeyName) {
+            el.textContent = `筛选: ${currentKeyName} · 费用按Token比例分摊 · 所有日期均按 UTC+0 时间显示`;
+        } else {
+            el.textContent = '总览 (所有用户) · 所有日期均按 UTC+0 时间显示 · Token 统计跨所有可用月份';
+        }
+    }
+
+    // ── Daily Chart ──
+    let dailyRawData = [];
+    async function loadDailyChart() {
+        const dom = document.getElementById('chartDaily');
+        const loader = document.getElementById('loadingDaily');
+        loader.style.display = 'flex';
+        dom.style.display = 'none';
+
+        if (!currentMonth) {
+            loader.style.display = 'none';
+            dom.style.display = 'block';
+            return;
+        }
+
+        try {
+            const url = buildParams('/api/daily', {year: currentMonth.year, month: currentMonth.month});
+            const data = await fetchJSON(url);
+            dailyRawData = data.days || [];
+            const chart = initChart('chartDaily');
+
+            const days = dailyRawData.map(d => d.date);
+            const outputVals = dailyRawData.map(d => d.output_tokens);
+            const inputVals = dailyRawData.map(d => d.input_tokens);
+            const costVals = dailyRawData.map(d => d.cost);
+
+            chart.setOption({
+                tooltip: {
+                    trigger: 'axis',
+                    backgroundColor: '#fff',
+                    borderColor: '#E8EBF0',
+                    textStyle: { color: '#020E36', fontSize: 13 },
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.08)',
+                    formatter: function(params) {
+                        const idx = params[0]?.dataIndex;
+                        if (idx == null) return '';
+                        const d = dailyRawData[idx];
+                        const total = d.total_tokens || 1;
+                        const pct = v => (v / total * 100).toFixed(1);
+                        let html = `<b>${d.date}</b><br/>`;
+                        html += `输出Token: <b>${fmtNum(d.output_tokens)}</b> (${pct(d.output_tokens)}%)<br/>`;
+                        html += `输入缓存命中: <b>${fmtNum(d.input_cache_hit_tokens)}</b> (${pct(d.input_cache_hit_tokens)}%)<br/>`;
+                        html += `输入缓存未命中: <b>${fmtNum(d.input_cache_miss_tokens)}</b> (${pct(d.input_cache_miss_tokens)}%)<br/>`;
+                        html += `总请求: <b>${fmtNum(d.requests)}</b><br/>`;
+                        html += `消费: <b>¥${d.cost.toFixed(2)}</b><br/>`;
+                        if (d.by_model && Object.keys(d.by_model).length > 0) {
+                            html += '<hr style="margin:4px 0;border-color:#E8EBF0"/>';
+                            html += '<div style="font-size:11px;color:#9094A2;margin-bottom:2px;">模型分布:</div>';
+                            const models = Object.entries(d.by_model)
+                                .sort((a,b) => b[1].total_tokens - a[1].total_tokens);
+                            for (const [mdl, v] of models) {
+                                html += `  ${mdl}: <b>${fmtNum(v.total_tokens)}</b> (${pct(v.total_tokens)}%)<br/>`;
+                            }
+                        }
+                        return html;
+                    },
+                },
+                legend: {
+                    data: ['输出Token', '输入Token', '消费 (CNY)'],
+                    bottom: 0,
+                    textStyle: { fontSize: 12, color: '#6B7194' },
+                },
+                grid: { left: 60, right: 60, top: 16, bottom: 40 },
+                xAxis: {
+                    type: 'category',
+                    data: days,
+                    axisLine: { lineStyle: { color: '#E8EBF0' } },
+                    axisTick: { show: false },
+                    axisLabel: { color: '#9094A2', fontSize: 11 },
+                },
+                yAxis: [
+                    {
+                        type: 'value',
+                        name: 'Tokens',
+                        nameTextStyle: { color: '#9094A2', fontSize: 11 },
+                        axisLabel: {
+                            color: '#9094A2',
+                            fontSize: 11,
+                            formatter: v => fmtNum(v),
+                        },
+                        splitLine: { lineStyle: { color: '#F0F1F5', type: 'dashed' } },
+                    },
+                    {
+                        type: 'value',
+                        name: 'CNY',
+                        nameTextStyle: { color: '#9094A2', fontSize: 11 },
+                        axisLabel: { color: '#9094A2', fontSize: 11, formatter: v => '¥' + v.toFixed(1) },
+                        splitLine: { show: false },
+                    },
+                ],
+                series: [
+                    {
+                        name: '输出Token',
+                        type: 'bar',
+                        data: outputVals,
+                        itemStyle: { color: '#0070F3', borderRadius: [4, 4, 0, 0] },
+                        barMaxWidth: 28,
+                    },
+                    {
+                        name: '输入Token',
+                        type: 'bar',
+                        data: inputVals,
+                        itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
+                        barMaxWidth: 28,
+                    },
+                    {
+                        name: '消费 (CNY)',
+                        type: 'line',
+                        yAxisIndex: 1,
+                        data: costVals,
+                        lineStyle: { color: '#EF4444', width: 2 },
+                        itemStyle: { color: '#EF4444' },
+                        symbol: 'circle',
+                        symbolSize: 6,
+                    },
+                ],
+            });
+
+            loader.style.display = 'none';
+            dom.style.display = 'block';
+        } catch (err) {
+            console.error('Failed to load daily chart:', err);
+            loader.textContent = '加载失败';
+        }
+    }
+
+    // ── Model Pie Chart ──
+    async function loadModelPie() {
+        const dom = document.getElementById('chartModelPie');
+        const loader = document.getElementById('loadingModelPie');
+        try {
+            const url = buildParams('/api/summary');
+            const data = await fetchJSON(url);
+            const breakdown = data.model_breakdown || {};
+            const pieData = Object.entries(breakdown)
+                .map(([name, d]) => ({ name, value: d.total_tokens }))
+                .filter(d => d.value > 0)
+                .sort((a, b) => b.value - a.value);
+
+            const chart = initChart('chartModelPie');
+            chart.setOption({
+                tooltip: {
+                    trigger: 'item',
+                    backgroundColor: '#fff',
+                    borderColor: '#E8EBF0',
+                    textStyle: { color: '#020E36' },
+                    formatter: p => `${p.name}<br/>Tokens: ${fmtNum(p.value)} (${p.percent}%)`,
+                },
+                legend: {
+                    orient: 'vertical',
+                    right: 10,
+                    top: 'center',
+                    textStyle: { fontSize: 12, color: '#6B7194' },
+                },
+                series: [{
+                    type: 'pie',
+                    radius: ['45%', '75%'],
+                    center: ['35%', '50%'],
+                    avoidLabelOverlap: false,
+                    itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 },
+                    label: { show: false },
+                    emphasis: {
+                        label: { show: true, fontSize: 14, fontWeight: 'bold' },
+                    },
+                    data: pieData,
+                    color: chartColors,
+                }],
+            });
+
+            loader.style.display = 'none';
+        } catch (err) {
+            console.error('Failed to load model pie:', err);
+            loader.textContent = '加载失败';
+        }
+    }
+
+    // ── Token Type Pie Chart ──
+    async function loadTypePie() {
+        const dom = document.getElementById('chartTypePie');
+        const loader = document.getElementById('loadingTypePie');
+        try {
+            const url = buildParams('/api/token_types');
+            const data = await fetchJSON(url);
+            const chart = initChart('chartTypePie');
+            chart.setOption({
+                tooltip: {
+                    trigger: 'item',
+                    backgroundColor: '#fff',
+                    borderColor: '#E8EBF0',
+                    textStyle: { color: '#020E36' },
+                    formatter: p => `${p.name}<br/>Tokens: ${fmtNum(p.value)} (${p.percent}%)`,
+                },
+                legend: {
+                    orient: 'vertical',
+                    right: 10,
+                    top: 'center',
+                    textStyle: { fontSize: 12, color: '#6B7194' },
+                },
+                series: [{
+                    type: 'pie',
+                    radius: ['45%', '75%'],
+                    center: ['35%', '50%'],
+                    avoidLabelOverlap: false,
+                    itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 },
+                    label: { show: false },
+                    emphasis: {
+                        label: { show: true, fontSize: 14, fontWeight: 'bold' },
+                    },
+                    data: data.filter(d => d.value > 0),
+                    color: ['#0070F3', '#00CEF3', '#F59E0B'],
+                }],
+            });
+
+            loader.style.display = 'none';
+        } catch (err) {
+            console.error('Failed to load type pie:', err);
+            loader.textContent = '加载失败';
+        }
+    }
+
+    // ── Monthly Trend Chart ──
+    let monthlyRawData = [];
+    async function loadMonthlyTrend() {
+        const dom = document.getElementById('chartMonthly');
+        const loader = document.getElementById('loadingMonthly');
+        try {
+            const url = buildParams('/api/monthly');
+            const data = await fetchJSON(url);
+            monthlyRawData = data;
+            const chart = initChart('chartMonthly');
+
+            const labels = data.map(d => d.label);
+            const outputVals = data.map(d => d.output_tokens);
+            const inputVals = data.map(d => d.input_tokens);
+            const costVals = data.map(d => d.cost);
+
+            chart.setOption({
+                tooltip: {
+                    trigger: 'axis',
+                    backgroundColor: '#fff',
+                    borderColor: '#E8EBF0',
+                    textStyle: { color: '#020E36', fontSize: 13 },
+                    formatter: function(params) {
+                        const idx = params[0]?.dataIndex;
+                        if (idx == null) return '';
+                        const d = monthlyRawData[idx];
+                        const total = d.total_tokens || 1;
+                        const pct = v => (v / total * 100).toFixed(1);
+                        let html = `<b>${d.label}</b><br/>`;
+                        html += `输出Token: <b>${fmtNum(d.output_tokens)}</b> (${pct(d.output_tokens)}%)<br/>`;
+                        html += `输入缓存命中: <b>${fmtNum(d.input_cache_hit_tokens)}</b> (${pct(d.input_cache_hit_tokens)}%)<br/>`;
+                        html += `输入缓存未命中: <b>${fmtNum(d.input_cache_miss_tokens)}</b> (${pct(d.input_cache_miss_tokens)}%)<br/>`;
+                        html += `总请求: <b>${fmtNum(d.requests)}</b><br/>`;
+                        html += `消费: <b>¥${d.cost.toFixed(2)}</b><br/>`;
+                        if (d.by_model && Object.keys(d.by_model).length > 0) {
+                            html += '<hr style="margin:4px 0;border-color:#E8EBF0"/>';
+                            html += '<div style="font-size:11px;color:#9094A2;margin-bottom:2px;">模型分布:</div>';
+                            const models = Object.entries(d.by_model)
+                                .sort((a,b) => b[1].total_tokens - a[1].total_tokens);
+                            for (const [mdl, v] of models) {
+                                html += `  ${mdl}: <b>${fmtNum(v.total_tokens)}</b> (${pct(v.total_tokens)}%)<br/>`;
+                            }
+                        }
+                        return html;
+                    },
+                },
+                legend: {
+                    data: ['输出Token', '输入Token', '消费 (CNY)'],
+                    bottom: 0,
+                    textStyle: { fontSize: 12, color: '#6B7194' },
+                },
+                grid: { left: 60, right: 60, top: 16, bottom: 40 },
+                xAxis: {
+                    type: 'category',
+                    data: labels,
+                    axisLine: { lineStyle: { color: '#E8EBF0' } },
+                    axisTick: { show: false },
+                    axisLabel: { color: '#9094A2', fontSize: 12 },
+                },
+                yAxis: [
+                    {
+                        type: 'value',
+                        name: 'Tokens',
+                        nameTextStyle: { color: '#9094A2', fontSize: 11 },
+                        axisLabel: {
+                            color: '#9094A2',
+                            fontSize: 11,
+                            formatter: v => fmtNum(v),
+                        },
+                        splitLine: { lineStyle: { color: '#F0F1F5', type: 'dashed' } },
+                    },
+                    {
+                        type: 'value',
+                        name: 'CNY',
+                        nameTextStyle: { color: '#9094A2', fontSize: 11 },
+                        axisLabel: { color: '#9094A2', fontSize: 11, formatter: v => '¥' + v.toFixed(1) },
+                        splitLine: { show: false },
+                    },
+                ],
+                series: [
+                    {
+                        name: '输出Token',
+                        type: 'bar',
+                        data: outputVals,
+                        itemStyle: { color: '#0070F3', borderRadius: [4, 4, 0, 0] },
+                        barMaxWidth: 40,
+                        barGap: '20%',
+                    },
+                    {
+                        name: '输入Token',
+                        type: 'bar',
+                        data: inputVals,
+                        itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
+                        barMaxWidth: 40,
+                    },
+                    {
+                        name: '消费 (CNY)',
+                        type: 'line',
+                        yAxisIndex: 1,
+                        data: costVals,
+                        lineStyle: { color: '#EF4444', width: 3 },
+                        itemStyle: { color: '#EF4444' },
+                        symbol: 'circle',
+                        symbolSize: 8,
+                    },
+                ],
+            });
+
+            loader.style.display = 'none';
+        } catch (err) {
+            console.error('Failed to load monthly trend:', err);
+            loader.textContent = '加载失败';
+        }
+    }
+
+    // ── Month selector handler ──
+    document.getElementById('monthSelector').addEventListener('change', function() {
+        const val = this.value;
+        if (!val) {
+            currentMonth = null;
+            document.getElementById('currentMonthLabel').textContent = '';
+            document.getElementById('chartDaily').style.display = 'none';
+            document.getElementById('loadingDaily').style.display = 'flex';
+            document.getElementById('loadingDaily').textContent = '请选择月份';
+            return;
+        }
+        const [y, m] = val.split('-').map(Number);
+        currentMonth = { year: y, month: m };
+        const label = `${y}-${m.toString().padStart(2, '0')}`;
+        document.getElementById('currentMonthLabel').textContent = `当前显示: ${label}`;
+        loadDailyChart();
+    });
+
+    // ── Key name selector handler ──
+    document.getElementById('keyNameSelector').addEventListener('change', function() {
+        currentKeyName = this.value;
+        // Reload all data with the new filter
+        loadSummary();
+        loadModelPie();
+        loadTypePie();
+        loadMonthlyTrend();
+        // Daily chart will reload via loadSummary -> loadDailyChart
+    });
+
+    // ── Refresh ──
+    async function refreshData() {
+        try {
+            await fetchJSON('/api/refresh');
+            await loadSummary();
+            await loadModelPie();
+            await loadTypePie();
+            await loadMonthlyTrend();
+            if (currentMonth) await loadDailyChart();
+        } catch (err) {
+            console.error('Refresh failed:', err);
+            alert('刷新失败，请检查服务器日志');
+        }
+    }
+
+    // ── Initialize ──
+    async function init() {
+        await loadSummary();
+        await loadModelPie();
+        await loadTypePie();
+        await loadMonthlyTrend();
+    }
+
+    init();
+    </script>
+</body>
+</html>
