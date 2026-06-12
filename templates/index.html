@@ -442,22 +442,36 @@
             </div>
         </div>
 
-        <!-- Daily Chart (wide) -->
+        <!-- Daily Charts - Pro & Flash -->
         <div class="section">
-            <div class="chart-card chart-card--wide">
-                <div class="chart-card__title">每日 Token 使用量 &amp; 消费</div>
-                <div class="chart-container chart-container--lg" id="chartDaily"></div>
-                <div class="loading" id="loadingDaily">加载中</div>
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <div class="chart-card__title">每日用量 - DeepSeek V4 Pro</div>
+                    <div class="chart-container chart-container--lg" id="chartDailyPro"></div>
+                    <div class="loading" id="loadingDailyPro">加载中</div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-card__title">每日用量 - DeepSeek V4 Flash</div>
+                    <div class="chart-container chart-container--lg" id="chartDailyFlash"></div>
+                    <div class="loading" id="loadingDailyFlash">加载中</div>
+                </div>
             </div>
         </div>
 
 
-        <!-- Monthly Trend Chart (wide) -->
+        <!-- Monthly Trend Charts - Pro & Flash -->
         <div class="section">
-            <div class="chart-card chart-card--wide">
-                <div class="chart-card__title">月度 Token 使用趋势</div>
-                <div class="chart-container chart-container--lg" id="chartMonthly"></div>
-                <div class="loading" id="loadingMonthly">加载中</div>
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <div class="chart-card__title">月度趋势 - DeepSeek V4 Pro</div>
+                    <div class="chart-container chart-container--lg" id="chartMonthlyPro"></div>
+                    <div class="loading" id="loadingMonthlyPro">加载中</div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-card__title">月度趋势 - DeepSeek V4 Flash</div>
+                    <div class="chart-container chart-container--lg" id="chartMonthlyFlash"></div>
+                    <div class="loading" id="loadingMonthlyFlash">加载中</div>
+                </div>
             </div>
         </div>
 
@@ -536,7 +550,8 @@
         const months = data.available_months || [];
         const prevMonthVal = sel.value;
         sel.innerHTML = '<option value="">-- 选择月份 --</option>';
-        months.forEach(m => {
+        // Show most recent months first
+        [...months].reverse().forEach(m => {
             const opt = document.createElement('option');
             opt.value = `${m.year}-${m.month}`;
             opt.textContent = `${m.year} - ${m.month}月`;
@@ -575,7 +590,7 @@
             }
             const label = `${currentMonth.year}-${currentMonth.month.toString().padStart(2,'0')}`;
             document.getElementById('currentMonthLabel').textContent = `当前显示: ${label}`;
-            loadDailyChart();
+            loadDailyCharts();
         }
 
         // Update subtitle
@@ -595,11 +610,108 @@
         }
     }
 
-    // ── Daily Chart ──
-    let dailyRawData = [];
-    async function loadDailyChart() {
-        const dom = document.getElementById('chartDaily');
-        const loader = document.getElementById('loadingDaily');
+    // ── Daily Charts (Pro + Flash) ──
+    let dailyProRawData = [];
+    let dailyFlashRawData = [];
+
+    /** Render a single time-series chart (used by both daily and monthly) */
+    function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTokens,
+                                    requests, cost, rawData, xAxisLabelRotate) {
+        const dom = document.getElementById(chartId);
+        const loader = document.getElementById(loaderId);
+        const chart = initChart(chartId);
+
+        chart.setOption({
+            tooltip: {
+                trigger: 'axis',
+                backgroundColor: '#fff',
+                borderColor: '#E8EBF0',
+                textStyle: { color: '#020E36', fontSize: 13 },
+                boxShadow: '0 4px 16px rgba(0,0,0,0.08)',
+                formatter: function(params) {
+                    const idx = params[0]?.dataIndex;
+                    if (idx == null) return '';
+                    const d = rawData[idx];
+                    const total = (d.total_tokens || 1);
+                    const pct = v => (v / total * 100).toFixed(1);
+                    let html = `<b>${d.date || d.label}</b><br/>`;
+                    html += `输出Token: <b>${fmtNum(d.output_tokens)}</b> (${pct(d.output_tokens)}%)<br/>`;
+                    html += `输入缓存命中: <b>${fmtNum(d.input_cache_hit_tokens)}</b> (${pct(d.input_cache_hit_tokens)}%)<br/>`;
+                    html += `输入缓存未命中: <b>${fmtNum(d.input_cache_miss_tokens)}</b> (${pct(d.input_cache_miss_tokens)}%)<br/>`;
+                    html += `调用次数: <b>${fmtNum(d.requests)}</b><br/>`;
+                    return html;
+                },
+            },
+            legend: {
+                data: ['输出Token', '输入Token', '调用次数'],
+                bottom: 0,
+                textStyle: { fontSize: 12, color: '#6B7194' },
+            },
+            grid: { left: 70, right: 70, top: 16, bottom: 40 },
+            xAxis: {
+                type: 'category',
+                data: labels,
+                axisLine: { lineStyle: { color: '#E8EBF0' } },
+                axisTick: { show: false },
+                axisLabel: { color: '#9094A2', fontSize: 11, rotate: xAxisLabelRotate || 0 },
+            },
+            yAxis: [
+                {
+                    type: 'value',
+                    name: 'Tokens',
+                    nameTextStyle: { color: '#9094A2', fontSize: 11 },
+                    axisLabel: {
+                        color: '#9094A2',
+                        fontSize: 11,
+                        formatter: v => fmtNum(v),
+                    },
+                    splitLine: { lineStyle: { color: '#F0F1F5', type: 'dashed' } },
+                },
+                {
+                    type: 'value',
+                    name: '次数',
+                    nameTextStyle: { color: '#9094A2', fontSize: 11 },
+                    axisLabel: { color: '#9094A2', fontSize: 11, formatter: v => fmtNum(v) },
+                    splitLine: { show: false },
+                },
+            ],
+            series: [
+                {
+                    name: '输出Token',
+                    type: 'bar',
+                    yAxisIndex: 0,
+                    data: outputTokens,
+                    itemStyle: { color: '#0070F3', borderRadius: [4, 4, 0, 0] },
+                    barMaxWidth: 28,
+                },
+                {
+                    name: '输入Token',
+                    type: 'bar',
+                    yAxisIndex: 0,
+                    data: inputTokens,
+                    itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
+                    barMaxWidth: 28,
+                },
+                {
+                    name: '调用次数',
+                    type: 'line',
+                    yAxisIndex: 1,
+                    data: requests,
+                    lineStyle: { color: '#8B5CF6', width: 2.5 },
+                    itemStyle: { color: '#8B5CF6' },
+                    symbol: 'diamond',
+                    symbolSize: 8,
+                },
+            ],
+        });
+
+        if (loader) loader.style.display = 'none';
+        dom.style.display = 'block';
+    }
+
+    async function loadDailyChartForModel(modelName, chartId, loaderId) {
+        const dom = document.getElementById(chartId);
+        const loader = document.getElementById(loaderId);
         loader.style.display = 'flex';
         dom.style.display = 'none';
 
@@ -610,114 +722,37 @@
         }
 
         try {
-            const url = buildParams('/api/daily', {year: currentMonth.year, month: currentMonth.month});
-            const data = await fetchJSON(url);
-            dailyRawData = data.days || [];
-            const chart = initChart('chartDaily');
-
-            const days = dailyRawData.map(d => d.date);
-            const outputVals = dailyRawData.map(d => d.output_tokens);
-            const inputVals = dailyRawData.map(d => d.input_tokens);
-            const costVals = dailyRawData.map(d => d.cost);
-
-            chart.setOption({
-                tooltip: {
-                    trigger: 'axis',
-                    backgroundColor: '#fff',
-                    borderColor: '#E8EBF0',
-                    textStyle: { color: '#020E36', fontSize: 13 },
-                    boxShadow: '0 4px 16px rgba(0,0,0,0.08)',
-                    formatter: function(params) {
-                        const idx = params[0]?.dataIndex;
-                        if (idx == null) return '';
-                        const d = dailyRawData[idx];
-                        const total = d.total_tokens || 1;
-                        const pct = v => (v / total * 100).toFixed(1);
-                        let html = `<b>${d.date}</b><br/>`;
-                        html += `输出Token: <b>${fmtNum(d.output_tokens)}</b> (${pct(d.output_tokens)}%)<br/>`;
-                        html += `输入缓存命中: <b>${fmtNum(d.input_cache_hit_tokens)}</b> (${pct(d.input_cache_hit_tokens)}%)<br/>`;
-                        html += `输入缓存未命中: <b>${fmtNum(d.input_cache_miss_tokens)}</b> (${pct(d.input_cache_miss_tokens)}%)<br/>`;
-                        html += `总请求: <b>${fmtNum(d.requests)}</b><br/>`;
-                        html += `消费: <b>¥${d.cost.toFixed(2)}</b><br/>`;
-                        if (d.by_model && Object.keys(d.by_model).length > 0) {
-                            html += '<hr style="margin:4px 0;border-color:#E8EBF0"/>';
-                            html += '<div style="font-size:11px;color:#9094A2;margin-bottom:2px;">模型分布:</div>';
-                            const models = Object.entries(d.by_model)
-                                .sort((a,b) => b[1].total_tokens - a[1].total_tokens);
-                            for (const [mdl, v] of models) {
-                                html += `  ${mdl}: <b>${fmtNum(v.total_tokens)}</b> (${pct(v.total_tokens)}%)<br/>`;
-                            }
-                        }
-                        return html;
-                    },
-                },
-                legend: {
-                    data: ['输出Token', '输入Token', '消费 (CNY)'],
-                    bottom: 0,
-                    textStyle: { fontSize: 12, color: '#6B7194' },
-                },
-                grid: { left: 60, right: 60, top: 16, bottom: 40 },
-                xAxis: {
-                    type: 'category',
-                    data: days,
-                    axisLine: { lineStyle: { color: '#E8EBF0' } },
-                    axisTick: { show: false },
-                    axisLabel: { color: '#9094A2', fontSize: 11 },
-                },
-                yAxis: [
-                    {
-                        type: 'value',
-                        name: 'Tokens',
-                        nameTextStyle: { color: '#9094A2', fontSize: 11 },
-                        axisLabel: {
-                            color: '#9094A2',
-                            fontSize: 11,
-                            formatter: v => fmtNum(v),
-                        },
-                        splitLine: { lineStyle: { color: '#F0F1F5', type: 'dashed' } },
-                    },
-                    {
-                        type: 'value',
-                        name: 'CNY',
-                        nameTextStyle: { color: '#9094A2', fontSize: 11 },
-                        axisLabel: { color: '#9094A2', fontSize: 11, formatter: v => '¥' + v.toFixed(1) },
-                        splitLine: { show: false },
-                    },
-                ],
-                series: [
-                    {
-                        name: '输出Token',
-                        type: 'bar',
-                        data: outputVals,
-                        itemStyle: { color: '#0070F3', borderRadius: [4, 4, 0, 0] },
-                        barMaxWidth: 28,
-                    },
-                    {
-                        name: '输入Token',
-                        type: 'bar',
-                        data: inputVals,
-                        itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
-                        barMaxWidth: 28,
-                    },
-                    {
-                        name: '消费 (CNY)',
-                        type: 'line',
-                        yAxisIndex: 1,
-                        data: costVals,
-                        lineStyle: { color: '#EF4444', width: 2 },
-                        itemStyle: { color: '#EF4444' },
-                        symbol: 'circle',
-                        symbolSize: 6,
-                    },
-                ],
+            const url = buildParams('/api/daily', {
+                year: currentMonth.year,
+                month: currentMonth.month,
+                model: modelName,
             });
+            const data = await fetchJSON(url);
+            const days = data.days || [];
 
-            loader.style.display = 'none';
-            dom.style.display = 'block';
+            // Store for reference
+            if (modelName === 'deepseek-v4-pro') dailyProRawData = days;
+            else dailyFlashRawData = days;
+
+            const labels = days.map(d => d.date);
+            const outputVals = days.map(d => d.output_tokens);
+            const inputVals = days.map(d => d.input_tokens);
+            const requestVals = days.map(d => d.requests);
+            const costVals = days.map(d => d.cost);
+
+            renderTimeSeriesChart(chartId, loaderId, labels, outputVals, inputVals,
+                                  requestVals, costVals, days, 0);
         } catch (err) {
-            console.error('Failed to load daily chart:', err);
+            console.error(`Failed to load daily chart for ${modelName}:`, err);
             loader.textContent = '加载失败';
         }
+    }
+
+    async function loadDailyCharts() {
+        await Promise.all([
+            loadDailyChartForModel('deepseek-v4-pro', 'chartDailyPro', 'loadingDailyPro'),
+            loadDailyChartForModel('deepseek-v4-flash', 'chartDailyFlash', 'loadingDailyFlash'),
+        ]);
     }
 
     // ── Model Pie Chart ──
@@ -814,119 +849,43 @@
         }
     }
 
-    // ── Monthly Trend Chart ──
-    let monthlyRawData = [];
-    async function loadMonthlyTrend() {
-        const dom = document.getElementById('chartMonthly');
-        const loader = document.getElementById('loadingMonthly');
+    // ── Monthly Trend Charts (Pro + Flash) ──
+    let monthlyProRawData = [];
+    let monthlyFlashRawData = [];
+
+    async function loadMonthlyTrendForModel(modelName, chartId, loaderId) {
+        const dom = document.getElementById(chartId);
+        const loader = document.getElementById(loaderId);
+        loader.style.display = 'flex';
+        dom.style.display = 'none';
+
         try {
-            const url = buildParams('/api/monthly');
+            const url = buildParams('/api/monthly', { model: modelName });
             const data = await fetchJSON(url);
-            monthlyRawData = data;
-            const chart = initChart('chartMonthly');
+
+            // Store for reference
+            if (modelName === 'deepseek-v4-pro') monthlyProRawData = data;
+            else monthlyFlashRawData = data;
 
             const labels = data.map(d => d.label);
             const outputVals = data.map(d => d.output_tokens);
             const inputVals = data.map(d => d.input_tokens);
+            const requestVals = data.map(d => d.requests);
             const costVals = data.map(d => d.cost);
 
-            chart.setOption({
-                tooltip: {
-                    trigger: 'axis',
-                    backgroundColor: '#fff',
-                    borderColor: '#E8EBF0',
-                    textStyle: { color: '#020E36', fontSize: 13 },
-                    formatter: function(params) {
-                        const idx = params[0]?.dataIndex;
-                        if (idx == null) return '';
-                        const d = monthlyRawData[idx];
-                        const total = d.total_tokens || 1;
-                        const pct = v => (v / total * 100).toFixed(1);
-                        let html = `<b>${d.label}</b><br/>`;
-                        html += `输出Token: <b>${fmtNum(d.output_tokens)}</b> (${pct(d.output_tokens)}%)<br/>`;
-                        html += `输入缓存命中: <b>${fmtNum(d.input_cache_hit_tokens)}</b> (${pct(d.input_cache_hit_tokens)}%)<br/>`;
-                        html += `输入缓存未命中: <b>${fmtNum(d.input_cache_miss_tokens)}</b> (${pct(d.input_cache_miss_tokens)}%)<br/>`;
-                        html += `总请求: <b>${fmtNum(d.requests)}</b><br/>`;
-                        html += `消费: <b>¥${d.cost.toFixed(2)}</b><br/>`;
-                        if (d.by_model && Object.keys(d.by_model).length > 0) {
-                            html += '<hr style="margin:4px 0;border-color:#E8EBF0"/>';
-                            html += '<div style="font-size:11px;color:#9094A2;margin-bottom:2px;">模型分布:</div>';
-                            const models = Object.entries(d.by_model)
-                                .sort((a,b) => b[1].total_tokens - a[1].total_tokens);
-                            for (const [mdl, v] of models) {
-                                html += `  ${mdl}: <b>${fmtNum(v.total_tokens)}</b> (${pct(v.total_tokens)}%)<br/>`;
-                            }
-                        }
-                        return html;
-                    },
-                },
-                legend: {
-                    data: ['输出Token', '输入Token', '消费 (CNY)'],
-                    bottom: 0,
-                    textStyle: { fontSize: 12, color: '#6B7194' },
-                },
-                grid: { left: 60, right: 60, top: 16, bottom: 40 },
-                xAxis: {
-                    type: 'category',
-                    data: labels,
-                    axisLine: { lineStyle: { color: '#E8EBF0' } },
-                    axisTick: { show: false },
-                    axisLabel: { color: '#9094A2', fontSize: 12 },
-                },
-                yAxis: [
-                    {
-                        type: 'value',
-                        name: 'Tokens',
-                        nameTextStyle: { color: '#9094A2', fontSize: 11 },
-                        axisLabel: {
-                            color: '#9094A2',
-                            fontSize: 11,
-                            formatter: v => fmtNum(v),
-                        },
-                        splitLine: { lineStyle: { color: '#F0F1F5', type: 'dashed' } },
-                    },
-                    {
-                        type: 'value',
-                        name: 'CNY',
-                        nameTextStyle: { color: '#9094A2', fontSize: 11 },
-                        axisLabel: { color: '#9094A2', fontSize: 11, formatter: v => '¥' + v.toFixed(1) },
-                        splitLine: { show: false },
-                    },
-                ],
-                series: [
-                    {
-                        name: '输出Token',
-                        type: 'bar',
-                        data: outputVals,
-                        itemStyle: { color: '#0070F3', borderRadius: [4, 4, 0, 0] },
-                        barMaxWidth: 40,
-                        barGap: '20%',
-                    },
-                    {
-                        name: '输入Token',
-                        type: 'bar',
-                        data: inputVals,
-                        itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
-                        barMaxWidth: 40,
-                    },
-                    {
-                        name: '消费 (CNY)',
-                        type: 'line',
-                        yAxisIndex: 1,
-                        data: costVals,
-                        lineStyle: { color: '#EF4444', width: 3 },
-                        itemStyle: { color: '#EF4444' },
-                        symbol: 'circle',
-                        symbolSize: 8,
-                    },
-                ],
-            });
-
-            loader.style.display = 'none';
+            renderTimeSeriesChart(chartId, loaderId, labels, outputVals, inputVals,
+                                  requestVals, costVals, data, 0);
         } catch (err) {
-            console.error('Failed to load monthly trend:', err);
+            console.error(`Failed to load monthly trend for ${modelName}:`, err);
             loader.textContent = '加载失败';
         }
+    }
+
+    async function loadMonthlyCharts() {
+        await Promise.all([
+            loadMonthlyTrendForModel('deepseek-v4-pro', 'chartMonthlyPro', 'loadingMonthlyPro'),
+            loadMonthlyTrendForModel('deepseek-v4-flash', 'chartMonthlyFlash', 'loadingMonthlyFlash'),
+        ]);
     }
 
     // ── Month selector handler ──
@@ -935,16 +894,21 @@
         if (!val) {
             currentMonth = null;
             document.getElementById('currentMonthLabel').textContent = '';
-            document.getElementById('chartDaily').style.display = 'none';
-            document.getElementById('loadingDaily').style.display = 'flex';
-            document.getElementById('loadingDaily').textContent = '请选择月份';
+            // Hide all daily charts
+            ['chartDailyPro', 'chartDailyFlash'].forEach(id => {
+                document.getElementById(id).style.display = 'none';
+            });
+            ['loadingDailyPro', 'loadingDailyFlash'].forEach(id => {
+                document.getElementById(id).style.display = 'flex';
+                document.getElementById(id).textContent = '请选择月份';
+            });
             return;
         }
         const [y, m] = val.split('-').map(Number);
         currentMonth = { year: y, month: m };
         const label = `${y}-${m.toString().padStart(2, '0')}`;
         document.getElementById('currentMonthLabel').textContent = `当前显示: ${label}`;
-        loadDailyChart();
+        loadDailyCharts();
     });
 
     // ── Key name selector handler ──
@@ -954,8 +918,8 @@
         loadSummary();
         loadModelPie();
         loadTypePie();
-        loadMonthlyTrend();
-        // Daily chart will reload via loadSummary -> loadDailyChart
+        loadMonthlyCharts();
+        if (currentMonth) loadDailyCharts();
     });
 
     // ── Refresh ──
@@ -965,8 +929,8 @@
             await loadSummary();
             await loadModelPie();
             await loadTypePie();
-            await loadMonthlyTrend();
-            if (currentMonth) await loadDailyChart();
+            await loadMonthlyCharts();
+            if (currentMonth) await loadDailyCharts();
         } catch (err) {
             console.error('Refresh failed:', err);
             alert('刷新失败，请检查服务器日志');
@@ -978,7 +942,7 @@
         await loadSummary();
         await loadModelPie();
         await loadTypePie();
-        await loadMonthlyTrend();
+        await loadMonthlyCharts();
     }
 
     init();

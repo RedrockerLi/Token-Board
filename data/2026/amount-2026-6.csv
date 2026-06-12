@@ -1,0 +1,130 @@
+﻿user_id,utc_date,model,api_key_name,api_key,type,price,amount
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,7579
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,12
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,1664
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,1328
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,output_tokens,0.000006,59250
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,request_count,,86
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.000000025,6766848
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000003,181771
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,700
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,12
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.00000002,896
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,2759
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,output_tokens,0.000002,6480
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,request_count,,12
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.00000002,56576
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-01,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000001,16784
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,64
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,1
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,10
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,output_tokens,0.000006,106551
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,request_count,,219
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.000000025,7373184
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000003,553209
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,output_tokens,0.000002,71486
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,request_count,,89
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.00000002,969344
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-02,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000001,211521
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-03,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,19317
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-03,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,15
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-03,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,61440
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-03,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,84405
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-03,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,153
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-03,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,11
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-03,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.00000002,128
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-03,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,8540
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-04,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,10192
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-04,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,10
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-04,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,2176
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-04,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,94641
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-04,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,152
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-04,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,11
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-04,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,3576
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-05,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,4696
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-05,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,5
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-05,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,11648
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-05,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,91067
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-05,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,753
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-05,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,21
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-05,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.00000002,128
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-05,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,5468
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-06,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,124
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-06,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,1
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-06,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,10
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-06,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,3
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-06,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,1
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-06,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,215
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-07,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,48984
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-07,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,37
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-07,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,503936
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-07,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,431521
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-07,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,25
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-07,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,5
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-07,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,25116
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-08,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,26119
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-08,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,24
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-08,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,250496
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-08,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,303279
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-08,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,11
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-08,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,2
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-08,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,458
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,26765
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,24
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,433408
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,251810
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,output_tokens,0.000006,1975
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,request_count,,3
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.000000025,48896
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000003,28078
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,523
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,18
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,5828
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,output_tokens,0.000002,231
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,request_count,,3
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.00000002,256
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-09,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000001,939
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,52518
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,25
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,475008
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,156937
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,output_tokens,0.000006,169459
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,request_count,,274
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.000000025,24067584
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000003,603044
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,218
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,7
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,7237
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,output_tokens,0.000002,959
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,request_count,,1
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-10,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000001,375
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,86336
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,65
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,558208
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,438165
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,output_tokens,0.000006,32418
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,request_count,,50
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.000000025,4184448
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000003,164544
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,36
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,6
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,13533
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,output_tokens,0.000002,97132
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,request_count,,108
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.00000002,4057856
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-11,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000001,238333
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000006,52445
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,request_count,,24
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_hit_tokens,0.000000025,146944
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-pro,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000003,183739
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,output_tokens,0.000006,274288
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,request_count,,295
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.000000025,38984960
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-pro,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000003,578329
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,output_tokens,0.000002,14
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,request_count,,3
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-flash,PC-cherry studio,sk-61069***********************f0a5,input_cache_miss_tokens,0.000001,3501
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,output_tokens,0.000002,132288
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,request_count,,91
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_hit_tokens,0.00000002,2764928
+63431cad-7ca9-48c9-91d0-38569e772819,2026-06-12,deepseek-v4-flash,PC-wsl,sk-13bef***********************928d,input_cache_miss_tokens,0.000001,585151

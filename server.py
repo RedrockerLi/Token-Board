@@ -334,9 +334,10 @@ def api_summary():
 def api_monthly():
     """Return per-month aggregated token and cost statistics with model breakdown.
 
-    Query params: api_key_name (optional) — filter by specific api key name
+    Query params: api_key_name (optional), model (optional)
     """
     api_key_name = request.args.get("api_key_name", "").strip() or None
+    model_filter = request.args.get("model", "").strip() or None
 
     # Aggregate amount records by month + model
     monthly_amount = defaultdict(lambda: {
@@ -346,6 +347,8 @@ def api_monthly():
     })
     for r in DATA_STORE["amount_records"]:
         if api_key_name and r.get("api_key_name", "").strip() != api_key_name:
+            continue
+        if model_filter and r.get("model", "").strip() != model_filter:
             continue
         key = (r["_source_year"], r["_source_month"])
         rtype = r.get("type", "")
@@ -373,12 +376,12 @@ def api_monthly():
         for r in all_amounts:
             uid = r.get("user_id", "")
             date = r.get("utc_date", "")
-            model = r.get("model", "unknown")
+            rmodel = r.get("model", "unknown")
             kn = r.get("api_key_name", "")
             rtype = r.get("type", "")
             amount = safe_int(r.get("amount", 0))
             if rtype in ("output_tokens", "input_cache_hit_tokens", "input_cache_miss_tokens"):
-                group_tokens[(uid, date, model)][kn] += amount
+                group_tokens[(uid, date, rmodel)][kn] += amount
 
         share = {}
         for gk, kt in group_tokens.items():
@@ -389,23 +392,27 @@ def api_monthly():
         monthly_cost = defaultdict(float)
         monthly_cost_by_model = defaultdict(lambda: defaultdict(float))
         for r in DATA_STORE["cost_records"]:
+            if model_filter and r.get("model", "").strip() != model_filter:
+                continue
             key = (r["_source_year"], r["_source_month"])
             uid = r.get("user_id", "")
             date = r.get("utc_date", "")
-            model = r.get("model", "unknown")
+            rmodel = r.get("model", "unknown")
             cost = safe_float(r.get("cost", 0))
-            fraction = share.get((uid, date, model), 0.0)
+            fraction = share.get((uid, date, rmodel), 0.0)
             monthly_cost[key] += cost * fraction
-            monthly_cost_by_model[key][model] += cost * fraction
+            monthly_cost_by_model[key][rmodel] += cost * fraction
     else:
         monthly_cost = defaultdict(float)
         monthly_cost_by_model = defaultdict(lambda: defaultdict(float))
         for r in DATA_STORE["cost_records"]:
+            if model_filter and r.get("model", "").strip() != model_filter:
+                continue
             key = (r["_source_year"], r["_source_month"])
             cost = safe_float(r.get("cost", 0))
-            model = r.get("model", "unknown")
+            rmodel = r.get("model", "unknown")
             monthly_cost[key] += cost
-            monthly_cost_by_model[key][model] += cost
+            monthly_cost_by_model[key][rmodel] += cost
 
     result = []
     for m in DATA_STORE["available_months"]:
@@ -444,11 +451,12 @@ def api_monthly():
 def api_daily():
     """Return daily token/cost breakdown for a given month.
 
-    Query params: year (int), month (int), api_key_name (optional)
+    Query params: year (int), month (int), api_key_name (optional), model (optional)
     """
     year = request.args.get("year", type=int)
     month = request.args.get("month", type=int)
     api_key_name = request.args.get("api_key_name", "").strip() or None
+    model_filter = request.args.get("model", "").strip() or None
     if not year or not month:
         return jsonify({"error": "year and month query params required"}), 400
 
@@ -464,6 +472,8 @@ def api_daily():
         if r["_source_year"] != year or r["_source_month"] != month:
             continue
         if api_key_name and r.get("api_key_name", "").strip() != api_key_name:
+            continue
+        if model_filter and r.get("model", "").strip() != model_filter:
             continue
         day = r.get("utc_date", "")
         rtype = r.get("type", "")
@@ -496,12 +506,12 @@ def api_daily():
         for r in month_amounts:
             uid = r.get("user_id", "")
             date = r.get("utc_date", "")
-            model = r.get("model", "unknown")
+            rmodel = r.get("model", "unknown")
             kn = r.get("api_key_name", "")
             rtype = r.get("type", "")
             amount = safe_int(r.get("amount", 0))
             if rtype in ("output_tokens", "input_cache_hit_tokens", "input_cache_miss_tokens"):
-                group_tokens[(uid, date, model)][kn] += amount
+                group_tokens[(uid, date, rmodel)][kn] += amount
 
         share = {}
         for gk, kt in group_tokens.items():
@@ -512,25 +522,29 @@ def api_daily():
         daily_cost = defaultdict(float)
         daily_cost_by_model = defaultdict(lambda: defaultdict(float))
         for r in month_costs:
+            if model_filter and r.get("model", "").strip() != model_filter:
+                continue
             day = r.get("utc_date", "")
             uid = r.get("user_id", "")
             date = r.get("utc_date", "")
-            model = r.get("model", "unknown")
+            rmodel = r.get("model", "unknown")
             cost = safe_float(r.get("cost", 0))
-            fraction = share.get((uid, date, model), 0.0)
+            fraction = share.get((uid, date, rmodel), 0.0)
             daily_cost[day] += cost * fraction
-            daily_cost_by_model[day][model] += cost * fraction
+            daily_cost_by_model[day][rmodel] += cost * fraction
     else:
         daily_cost = defaultdict(float)
         daily_cost_by_model = defaultdict(lambda: defaultdict(float))
         for r in DATA_STORE["cost_records"]:
             if r["_source_year"] != year or r["_source_month"] != month:
                 continue
+            if model_filter and r.get("model", "").strip() != model_filter:
+                continue
             day = r.get("utc_date", "")
             cost = safe_float(r.get("cost", 0))
-            model = r.get("model", "unknown")
+            rmodel = r.get("model", "unknown")
             daily_cost[day] += cost
-            daily_cost_by_model[day][model] += cost
+            daily_cost_by_model[day][rmodel] += cost
 
     # Build sorted daily result
     sorted_days = sorted(set(daily_tokens.keys()) | set(daily_cost.keys()))
