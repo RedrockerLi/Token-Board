@@ -6,7 +6,6 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PORT=5000
 OPEN_BROWSER=true
 [[ "$1" == "--no-browser" ]] && OPEN_BROWSER=false
 
@@ -19,22 +18,40 @@ python3 -c "import flask" 2>/dev/null || pip install -q --disable-pip-version-ch
 # ── Ensure data dir exists ──
 [ -d "$SCRIPT_DIR/data" ] || mkdir -p "$SCRIPT_DIR/data"
 
-# ── Kill existing server on port ──
-EXISTING_PID=$(lsof -ti :$PORT 2>/dev/null || true)
-[ -n "$EXISTING_PID" ] && kill "$EXISTING_PID" 2>/dev/null && sleep 1
+# ── Kill any existing server instance ──
+EXISTING_PID=$(pgrep -f "python3.*server\.py" 2>/dev/null || true)
+if [ -n "$EXISTING_PID" ]; then
+    echo "[INFO] 关闭已有服务器 (PID: $EXISTING_PID)..."
+    kill $EXISTING_PID 2>/dev/null || true
+    sleep 1
+    kill -9 $EXISTING_PID 2>/dev/null || true
+fi
 
-# ── Start ──
-echo "启动服务器..."
+# ── Find a free port (same logic as server.py's find_free_port) ──
+PORT=$(python3 -c "
+import socket
+for port in range(5000, 5100):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('0.0.0.0', port))
+            print(port)
+            break
+    except OSError:
+        continue
+")
+
+# ── Start server with the chosen port ──
+echo "[INFO] 启动服务器..."
 cd "$SCRIPT_DIR"
-python3 server.py > /dev/null 2>&1 &
+python3 server.py --port "$PORT" > /dev/null 2>&1 &
 SERVER_PID=$!
 
 # ── Wait for ready ──
-for i in $(seq 1 15); do
+for i in $(seq 1 10); do
+    sleep 1
     if curl -s "http://localhost:$PORT/api/summary" > /dev/null 2>&1; then
         break
     fi
-    sleep 1
 done
 
 if ! curl -s "http://localhost:$PORT/api/summary" > /dev/null 2>&1; then
