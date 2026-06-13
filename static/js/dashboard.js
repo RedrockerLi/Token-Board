@@ -9,22 +9,30 @@
 // ── Global state ──
 var currentMonth = null;       // { year: number, month: number }
 var currentKeyName = '';       // '' = overview (all users)
+var currentPlatform = '';      // '' = all platforms
 var summaryData = null;        // cached /api/summary response
+var modelsList = [];           // list of model names from /api/summary
 
-var dailyProRawData = [];
-var dailyFlashRawData = [];
-var monthlyProRawData = [];
-var monthlyFlashRawData = [];
+// Dynamic chart containers
+var dailyChartIds = [];
+var monthlyChartIds = [];
+var dailyModelMap = {};        // modelName -> { chartId, loaderId }
+var monthlyModelMap = {};
 
 // ── Subtitle ──
 
 function updateSubtitle() {
     var el = document.getElementById('pageSubtitle');
+    var parts = [];
+    if (currentPlatform) parts.push('平台: ' + currentPlatform);
     if (currentKeyName) {
-        el.textContent = '筛选: ' + currentKeyName + ' · 费用按Token比例分摊 · 所有日期均按 UTC+0 时间显示';
+        parts.push('筛选: ' + currentKeyName);
+        parts.push('费用按Token比例分摊');
     } else {
-        el.textContent = '总览 (所有用户) · 所有日期均按 UTC+0 时间显示 · Token 统计跨所有可用月份';
+        parts.push('总览 (所有用户)');
     }
+    parts.push('所有日期均按 UTC+0 时间显示');
+    el.textContent = parts.join(' · ');
 }
 
 // ── Selector population ──
@@ -33,7 +41,6 @@ function populateMonthSelector(months) {
     var sel = document.getElementById('monthSelector');
     var prevMonthVal = sel.value;
     sel.innerHTML = '<option value="">-- 选择月份 --</option>';
-    // Most recent first
     months.slice().reverse().forEach(function (m) {
         var opt = document.createElement('option');
         opt.value = m.year + '-' + m.month;
@@ -56,6 +63,64 @@ function populateKeyNameSelector(keyNames) {
     return prevKeyVal;
 }
 
+function populatePlatformSelector(platforms) {
+    var platSel = document.getElementById('platformSelector');
+    var prevPlatVal = platSel.value;
+    platSel.innerHTML = '<option value="">全部平台</option>';
+    platforms.forEach(function (p) {
+        var opt = document.createElement('option');
+        opt.value = p;
+        opt.textContent = p;
+        platSel.appendChild(opt);
+    });
+    return prevPlatVal;
+}
+
+// ── Dynamic chart container management ──
+
+function clearDynamicCharts() {
+    // Clear DOM containers
+    document.getElementById('dailyCharts').innerHTML = '';
+    document.getElementById('monthlyCharts').innerHTML = '';
+    dailyChartIds = [];
+    monthlyChartIds = [];
+    dailyModelMap = {};
+    monthlyModelMap = {};
+}
+
+function buildDynamicCharts(models) {
+    clearDynamicCharts();
+    modelsList = models.slice();
+
+    models.forEach(function (modelName, idx) {
+        // Daily chart
+        var dailyChartId = 'chartDaily_' + idx;
+        var dailyLoaderId = 'loadingDaily_' + idx;
+        var dailyCard = document.createElement('div');
+        dailyCard.className = 'chart-card';
+        dailyCard.innerHTML =
+            '<div class="chart-card__title">每日用量 - ' + modelName + '</div>' +
+            '<div class="chart-container chart-container--lg" id="' + dailyChartId + '"></div>' +
+            '<div class="loading" id="' + dailyLoaderId + '">加载中</div>';
+        document.getElementById('dailyCharts').appendChild(dailyCard);
+        dailyChartIds.push({ chartId: dailyChartId, loaderId: dailyLoaderId, model: modelName });
+        dailyModelMap[modelName] = { chartId: dailyChartId, loaderId: dailyLoaderId };
+
+        // Monthly chart
+        var monthlyChartId = 'chartMonthly_' + idx;
+        var monthlyLoaderId = 'loadingMonthly_' + idx;
+        var monthlyCard = document.createElement('div');
+        monthlyCard.className = 'chart-card';
+        monthlyCard.innerHTML =
+            '<div class="chart-card__title">月度趋势 - ' + modelName + '</div>' +
+            '<div class="chart-container chart-container--lg" id="' + monthlyChartId + '"></div>' +
+            '<div class="loading" id="' + monthlyLoaderId + '">加载中</div>';
+        document.getElementById('monthlyCharts').appendChild(monthlyCard);
+        monthlyChartIds.push({ chartId: monthlyChartId, loaderId: monthlyLoaderId, model: modelName });
+        monthlyModelMap[modelName] = { chartId: monthlyChartId, loaderId: monthlyLoaderId };
+    });
+}
+
 // ── Summary loader ──
 
 async function loadSummary() {
@@ -71,10 +136,22 @@ async function loadSummary() {
 
     var months = data.available_months || [];
     var keyNames = data.api_key_names || [];
+    var platforms = data.platforms || [];
+    var models = data.models || [];
 
     // Populate selectors (preserve previous selection when possible)
     var prevMonthVal = populateMonthSelector(months);
     var prevKeyVal = populateKeyNameSelector(keyNames);
+    var prevPlatVal = populatePlatformSelector(platforms);
+
+    // Restore platform selection
+    var platSel = document.getElementById('platformSelector');
+    if (prevPlatVal && Array.from(platSel.options).some(function (o) { return o.value === prevPlatVal; })) {
+        platSel.value = prevPlatVal;
+    } else {
+        platSel.value = '';
+        currentPlatform = '';
+    }
 
     // Restore key name selection
     var keySel = document.getElementById('keyNameSelector');
@@ -84,6 +161,9 @@ async function loadSummary() {
         keySel.value = '';
         currentKeyName = '';
     }
+
+    // Build dynamic charts for discovered models
+    buildDynamicCharts(models);
 
     // Restore / default month selection
     var sel = document.getElementById('monthSelector');
@@ -113,6 +193,7 @@ async function loadSummary() {
 async function loadDailyChartForModel(modelName, chartId, loaderId) {
     var dom = document.getElementById(chartId);
     var loader = document.getElementById(loaderId);
+    if (!dom || !loader) return;
     loader.style.display = 'flex';
     dom.style.display = 'none';
 
@@ -125,9 +206,6 @@ async function loadDailyChartForModel(modelName, chartId, loaderId) {
     try {
         var data = await fetchDaily(currentMonth.year, currentMonth.month, modelName);
         var days = data.days || [];
-
-        if (modelName === 'deepseek-v4-pro') dailyProRawData = days;
-        else dailyFlashRawData = days;
 
         var labels = days.map(function (d) { return d.date; });
         var outputVals = days.map(function (d) { return d.output_tokens; });
@@ -144,10 +222,10 @@ async function loadDailyChartForModel(modelName, chartId, loaderId) {
 }
 
 async function loadDailyCharts() {
-    await Promise.all([
-        loadDailyChartForModel('deepseek-v4-pro', 'chartDailyPro', 'loadingDailyPro'),
-        loadDailyChartForModel('deepseek-v4-flash', 'chartDailyFlash', 'loadingDailyFlash')
-    ]);
+    var tasks = dailyChartIds.map(function (info) {
+        return loadDailyChartForModel(info.model, info.chartId, info.loaderId);
+    });
+    await Promise.all(tasks);
 }
 
 // ── Pie charts ──
@@ -188,14 +266,12 @@ async function loadTypePie() {
 async function loadMonthlyTrendForModel(modelName, chartId, loaderId) {
     var dom = document.getElementById(chartId);
     var loader = document.getElementById(loaderId);
+    if (!dom || !loader) return;
     loader.style.display = 'flex';
     dom.style.display = 'none';
 
     try {
         var data = await fetchMonthly(modelName);
-
-        if (modelName === 'deepseek-v4-pro') monthlyProRawData = data;
-        else monthlyFlashRawData = data;
 
         var labels = data.map(function (d) { return d.label; });
         var outputVals = data.map(function (d) { return d.output_tokens; });
@@ -212,10 +288,10 @@ async function loadMonthlyTrendForModel(modelName, chartId, loaderId) {
 }
 
 async function loadMonthlyCharts() {
-    await Promise.all([
-        loadMonthlyTrendForModel('deepseek-v4-pro', 'chartMonthlyPro', 'loadingMonthlyPro'),
-        loadMonthlyTrendForModel('deepseek-v4-flash', 'chartMonthlyFlash', 'loadingMonthlyFlash')
-    ]);
+    var tasks = monthlyChartIds.map(function (info) {
+        return loadMonthlyTrendForModel(info.model, info.chartId, info.loaderId);
+    });
+    await Promise.all(tasks);
 }
 
 // ── Event handlers ──
@@ -225,12 +301,11 @@ document.getElementById('monthSelector').addEventListener('change', function () 
     if (!val) {
         currentMonth = null;
         document.getElementById('currentMonthLabel').textContent = '';
-        ['chartDailyPro', 'chartDailyFlash'].forEach(function (id) {
-            document.getElementById(id).style.display = 'none';
-        });
-        ['loadingDailyPro', 'loadingDailyFlash'].forEach(function (id) {
-            document.getElementById(id).style.display = 'flex';
-            document.getElementById(id).textContent = '请选择月份';
+        dailyChartIds.forEach(function (info) {
+            var dom = document.getElementById(info.chartId);
+            var loader = document.getElementById(info.loaderId);
+            if (dom) dom.style.display = 'none';
+            if (loader) { loader.style.display = 'flex'; loader.textContent = '请选择月份'; }
         });
         return;
     }
@@ -243,6 +318,15 @@ document.getElementById('monthSelector').addEventListener('change', function () 
 
 document.getElementById('keyNameSelector').addEventListener('change', function () {
     currentKeyName = this.value;
+    loadSummary();
+    loadModelPie();
+    loadTypePie();
+    loadMonthlyCharts();
+    if (currentMonth) loadDailyCharts();
+});
+
+document.getElementById('platformSelector').addEventListener('change', function () {
+    currentPlatform = this.value;
     loadSummary();
     loadModelPie();
     loadTypePie();

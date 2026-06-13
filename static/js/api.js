@@ -28,7 +28,7 @@ async function fetchJSON(url) {
     return resp.json();
 }
 
-/** Build a relative URL with optional extra params and the global api_key_name. */
+/** Build a relative URL with optional extra params, global api_key_name, and platform. */
 function buildParams(baseUrl, extraParams) {
     const url = new URL(baseUrl, window.location.origin);
     for (const [k, v] of Object.entries(extraParams || {})) {
@@ -36,6 +36,9 @@ function buildParams(baseUrl, extraParams) {
     }
     if (typeof currentKeyName !== 'undefined' && currentKeyName) {
         url.searchParams.set('api_key_name', currentKeyName);
+    }
+    if (typeof currentPlatform !== 'undefined' && currentPlatform) {
+        url.searchParams.set('platform', currentPlatform);
     }
     return url.pathname + url.search;
 }
@@ -56,6 +59,10 @@ async function fetchMonthly(model) {
 
 async function fetchTokenTypes() {
     return fetchJSON(buildParams('/api/token_types'));
+}
+
+async function fetchModels() {
+    return fetchJSON('/api/models');
 }
 
 async function fetchRefresh() {

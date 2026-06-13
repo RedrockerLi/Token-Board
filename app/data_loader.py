@@ -1,13 +1,14 @@
-"""CSV data loading and the DataStore singleton.
+"""Data loading and the DataStore singleton.
 
-Reads cost-*.csv and amount-*.csv files from the data/ directory recursively,
-extracting year/month from filenames and injecting source metadata into each row.
+Scans the data/ directory for platform subdirectories, dispatches CSV
+parsing to the appropriate adapter, and stores everything as IR records.
 """
 
-import csv
 import os
-import re
 from collections import defaultdict
+
+from app.adapters import get_adapter, list_platforms
+from app.ir import CostEntry, RequestUsage, TokenUsage
 
 
 def safe_int(val, default=0):
@@ -31,71 +32,90 @@ def safe_float(val, default=0.0):
 
 
 class DataStore:
-    """Holds all parsed CSV records and derived metadata.
+    """Holds all parsed IR records and derived metadata.
 
     Usage::
 
         store = DataStore("/path/to/data")
         store.load()
-        print(len(store.cost_records))
+        print(len(store.token_usages))
     """
 
     def __init__(self, data_dir):
         self.data_dir = data_dir
-        self.cost_records: list[dict] = []
-        self.amount_records: list[dict] = []
-        self.available_months: list[dict] = []   # [{"year", "month", "label"}]
+        self.token_usages: list[TokenUsage] = []
+        self.request_usages: list[RequestUsage] = []
+        self.cost_entries: list[CostEntry] = []
+        self.available_months: list[dict] = []     # [{"year", "month", "label"}]
         self.api_key_names: list[str] = []
+        self.platforms: list[str] = []             # discovered platform names
+        self.models: list[str] = []                # unique model names
 
-    # ── public API ──────────────────────────────────────────────────────────
+    # ── public API ──────────────────────────────────────────────────────
 
     def load(self):
-        """Scan data_dir recursively, parse all CSVs, rebuild internal state."""
-        cost_records = []
-        amount_records = []
-        months_set = set()
+        """Scan data_dir for platform dirs, parse all CSVs, rebuild state."""
+        token_usages: list[TokenUsage] = []
+        request_usages: list[RequestUsage] = []
+        cost_entries: list[CostEntry] = []
+        months_set: set[tuple[int, int]] = set()
+        api_key_names_set: set[str] = set()
+        models_set: set[str] = set()
 
         data_dir = self.data_dir
         if not data_dir.exists():
             print(f"[WARN] Data directory not found: {data_dir}")
-            self.cost_records = []
-            self.amount_records = []
-            self.available_months = []
-            self.api_key_names = []
+            self._commit([], [], [], [], [], [], [])
             return
 
-        for root, _dirs, files in os.walk(data_dir):
-            for fname in files:
-                if not fname.endswith(".csv"):
+        # Each immediate subdirectory of data_dir = one platform
+        platforms_found: list[str] = []
+        try:
+            for entry in sorted(data_dir.iterdir()):
+                if not entry.is_dir():
                     continue
-                parsed = self._parse_filename(fname)
-                if parsed is None:
+                platform_name = entry.name
+                adapter = get_adapter(platform_name)
+                if adapter is None:
+                    print(f"[WARN] No adapter for platform '{platform_name}', "
+                          f"skipping directory '{entry}'")
                     continue
-                csv_type, year, month = parsed
-                filepath = os.path.join(root, fname)
-                months_set.add((year, month))
+                platforms_found.append(platform_name)
 
-                try:
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
-                            cleaned = {k.strip(): v.strip() for k, v in row.items()}
-                            cleaned["_source_year"] = year
-                            cleaned["_source_month"] = month
-                            cleaned["_source_file"] = fname
-                            if csv_type == "cost":
-                                cost_records.append(cleaned)
-                            else:
-                                amount_records.append(cleaned)
-                except Exception as e:
-                    print(f"[ERROR] Failed to read {filepath}: {e}")
+                # Walk the platform directory tree for CSV files
+                for root, _dirs, files in os.walk(entry):
+                    for fname in sorted(files):
+                        if not fname.endswith(".csv"):
+                            continue
+                        filepath = os.path.join(root, fname)
 
-        # Collect unique api_key_names from amount records
-        api_key_names_set = set()
-        for r in amount_records:
-            name = r.get("api_key_name", "").strip()
-            if name:
-                api_key_names_set.add(name)
+                        tus, rus, ces, year, month = adapter.parse(filepath)
+                        if year == 0 or month == 0:
+                            continue  # filename didn't match expected pattern
+
+                        months_set.add((year, month))
+
+                        # Stamp source metadata on every record
+                        for rec in tus:
+                            rec._year = year
+                            rec._month = month
+                            api_key_names_set.add(rec.api_key_name)
+                            models_set.add(rec.model)
+                        for rec in rus:
+                            rec._year = year
+                            rec._month = month
+                            api_key_names_set.add(rec.api_key_name)
+                            models_set.add(rec.model)
+                        for rec in ces:
+                            rec._year = year
+                            rec._month = month
+
+                        token_usages.extend(tus)
+                        request_usages.extend(rus)
+                        cost_entries.extend(ces)
+
+        except OSError as e:
+            print(f"[ERROR] Failed to scan data directory: {e}")
 
         # Sort months
         sorted_months = sorted(months_set, key=lambda x: (x[0], x[1]))
@@ -104,17 +124,24 @@ class DataStore:
             for y, m in sorted_months
         ]
 
-        self.cost_records = cost_records
-        self.amount_records = amount_records
+        self._commit(
+            token_usages,
+            request_usages,
+            cost_entries,
+            available_months,
+            sorted(api_key_names_set),
+            sorted(platforms_found),
+            sorted(models_set),
+        )
+
+    # ── helpers ─────────────────────────────────────────────────────────
+
+    def _commit(self, token_usages, request_usages, cost_entries,
+                available_months, api_key_names, platforms, models):
+        self.token_usages = token_usages
+        self.request_usages = request_usages
+        self.cost_entries = cost_entries
         self.available_months = available_months
-        self.api_key_names = sorted(api_key_names_set)
-
-    # ── helpers ─────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _parse_filename(filename: str) -> tuple[str, int, int] | None:
-        """Extract (type, year, month) from 'cost-2026-5.csv'."""
-        m = re.match(r"(cost|amount)-(\d{4})-(\d{1,2})\.csv$", filename)
-        if m:
-            return m.group(1), int(m.group(2)), int(m.group(3))
-        return None
+        self.api_key_names = api_key_names
+        self.platforms = platforms
+        self.models = models

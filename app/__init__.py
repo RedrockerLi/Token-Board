@@ -1,4 +1,4 @@
-"""DeepSeek Dashboard application package."""
+"""AI API Usage Dashboard application package."""
 
 from pathlib import Path
 
@@ -16,14 +16,21 @@ def create_app():
     """
     root = Path(__file__).resolve().parent.parent  # project root
 
-    app = Flask(
+    flask_app = Flask(
         __name__,
         template_folder=str(root / "templates"),
         static_folder=str(root / "static"),
     )
-    app.config["DATA_STORE"] = DataStore(root / "data")
+    flask_app.config["DATA_STORE"] = DataStore(root / "data")
 
-    from app.routes import bp  # noqa: E402 (deferred import to avoid circularity)
-    app.register_blueprint(bp)
+    # Ensure adapters are imported so they self-register.
+    # Use __import__ to avoid binding 'app' and shadowing the local
+    # flask_app variable (import app.adapters.deepseek would override
+    # any local named 'app' with the module reference).
+    __import__("app.adapters.deepseek")
+    __import__("app.adapters.mimo")
 
-    return app
+    from app.routes import bp  # noqa: E402
+    flask_app.register_blueprint(bp)
+
+    return flask_app

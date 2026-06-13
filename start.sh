@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DeepSeek API Usage Visualization Dashboard - One-Click Start Script
+# AI API Usage Visualization Dashboard - One-Click Start Script
 # Usage: bash start.sh [--no-browser]
 # ==============================================================================
 set -e
@@ -27,7 +27,7 @@ if [ -n "$EXISTING_PID" ]; then
     kill -9 $EXISTING_PID 2>/dev/null || true
 fi
 
-# ── Find a free port (same logic as server.py's find_free_port) ──
+# ── Find a free port ──
 PORT=$(python3 -c "
 import socket
 for port in range(5000, 5100):
