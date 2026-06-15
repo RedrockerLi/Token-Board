@@ -5,17 +5,19 @@
 ## 快速开始
 
 ```bash
-# 一键启动（代理后台 + 仪表板前台）
+# 仅启动仪表板（默认）
 bash start.sh
 
-# 仅启动仪表板
-bash scripts/start-dashboard.sh
+# 启动全部（代理 + 仪表板，代理设为开机自启）
+bash start.sh --all
 
-# 代理开机自启
-bash scripts/start-proxy.sh --install
+# 不自动打开浏览器
+bash start.sh --no-browser
 ```
 
 浏览器访问仪表板，通过左侧导航栏切换功能页面。
+
+> 代理开机自启基于 systemd 用户服务。非 systemd 环境（macOS 等）请用 `bash scripts/start-proxy.sh --daemon` 后台启动。
 
 ---
 
