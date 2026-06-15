@@ -351,17 +351,23 @@ def sync(db_path: str) -> dict:
         merged_conn.commit()
         merged_conn.close()
 
-        # 7. Upload
+        # 7. Count uploaded records
+        upload_conn = sqlite3.connect(merged_path)
+        uploaded_count = upload_conn.execute("SELECT COUNT(*) FROM request_log").fetchone()[0]
+        upload_conn.close()
+
+        # 8. Upload
         _webdav_upload(config, merged_path)
 
         if has_remote:
-            msg = f"同步成功，从远端合并了 {new_count} 条新记录"
+            msg = f"同步成功 — 从远端拉取 {new_count} 条，上传 {uploaded_count} 条至云端"
         else:
-            msg = "首次同步成功，已将本地数据上传至云端"
+            msg = f"首次同步成功，已上传 {uploaded_count} 条至云端"
         return {
             "status": "ok",
             "message": msg,
             "remote_records": new_count,
+            "uploaded_records": uploaded_count,
         }
 
     except WebDAVError as e:
