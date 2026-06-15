@@ -184,10 +184,10 @@ async function triggerSync() {
 }
 
 async function openSyncConfig() {
-    // Load existing config
     try {
         const cfg = await proxyFetch('/api/proxy/sync/config');
-        document.getElementById('syncUrl').value = cfg.url || '';
+        document.getElementById('syncBaseUrl').value = cfg.base_url || '';
+        document.getElementById('syncFolder').value = cfg.folder || 'token-board-sync';
         document.getElementById('syncUsername').value = cfg.username || '';
         document.getElementById('syncPassword').value = cfg.has_password ? '••••••' : '';
     } catch (e) {
@@ -313,7 +313,9 @@ function initBillingPage() {
                     <button class="modal__close" onclick="closeModal('syncModal')">&times;</button>
                 </div>
                 <form id="syncConfigForm" onsubmit="saveSyncConfig(event)">
-                    <label>WebDAV 地址 <input name="url" id="syncUrl" required placeholder="https://dav.example.com/remote.php/dav/files/user/proxy.db"></label>
+                    <label>WebDAV 服务器地址 <input name="base_url" id="syncBaseUrl" required placeholder="https://dav.example.com/remote.php/dav/files/user"></label>
+                    <label>同步文件夹 <input name="folder" id="syncFolder" value="token-board-sync" placeholder="token-board-sync"></label>
+                    <p style="font-size:11px; color:var(--color-text-tertiary); margin-top:-8px;">数据库将以 proxy_sync.db 为名保存在此文件夹中</p>
                     <label>用户名 <input name="username" id="syncUsername" required></label>
                     <label>密码 <input name="password" id="syncPassword" type="password" placeholder="留空不变"></label>
                     <div style="display:flex; gap:8px;">

@@ -214,12 +214,13 @@ def get_sync_config():
     cfg = load_sync_config(db_path)
     if cfg:
         return jsonify({
-            "url": cfg.url,
+            "base_url": cfg.base_url,
+            "folder": cfg.folder,
             "username": cfg.username,
             "password": "••••••" if cfg.password else "",
             "has_password": bool(cfg.password),
         })
-    return jsonify({"url": "", "username": "", "password": "", "has_password": False})
+    return jsonify({"base_url": "", "folder": "token-board-sync", "username": "", "password": "", "has_password": False})
 
 
 @bp_proxy.route("/sync/config", methods=["PUT"])
@@ -227,8 +228,12 @@ def save_sync_config():
     from app.sync import SyncConfig, save_sync_config as save_cfg
 
     data = request.get_json(force=True)
-    if not data.get("url") or not data.get("username"):
-        return jsonify({"error": "url and username are required"}), 400
+    if not data.get("base_url") or not data.get("username"):
+        return jsonify({"error": "base_url and username are required"}), 400
+    if not data["base_url"].startswith(("https://", "http://")):
+        return jsonify({"error": "服务器地址必须以 https:// 或 http:// 开头"}), 400
+    if "/" not in data["base_url"][8:]:
+        return jsonify({"error": "服务器地址格式不正确，需包含主机名"}), 400
 
     db_path = current_app.config["PROXY_DB"].db_path
 
@@ -240,7 +245,12 @@ def save_sync_config():
     else:
         password = data.get("password", "")
 
-    cfg = SyncConfig(url=data["url"], username=data["username"], password=password)
+    cfg = SyncConfig(
+        base_url=data["base_url"],
+        folder=data.get("folder", "token-board-sync"),
+        username=data["username"],
+        password=password,
+    )
     save_cfg(db_path, cfg)
     return jsonify({"status": "ok"})
 
@@ -253,7 +263,8 @@ def test_sync_connection():
     db_path = current_app.config["PROXY_DB"].db_path
 
     # Build config from request (or fall back to saved config)
-    url = data.get("url")
+    base_url = data.get("base_url")
+    folder = data.get("folder", "token-board-sync")
     username = data.get("username")
     password = data.get("password", "")
 
@@ -262,10 +273,12 @@ def test_sync_connection():
         existing = load_sync_config(db_path)
         password = existing.password if existing else ""
 
-    if not url or not username:
-        return jsonify({"error": "url and username are required"}), 400
+    if not base_url or not username:
+        return jsonify({"error": "base_url and username are required"}), 400
+    if not base_url.startswith(("https://", "http://")):
+        return jsonify({"error": "服务器地址必须以 https:// 或 http:// 开头"}), 400
 
-    cfg = SyncConfig(url=url, username=username, password=password)
+    cfg = SyncConfig(base_url=base_url, folder=folder, username=username, password=password)
     err = _webdav_test(cfg)
     if err:
         return jsonify({"status": "error", "message": f"连接失败: {err}"}), 400

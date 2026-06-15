@@ -30,9 +30,14 @@ from requests.auth import HTTPBasicAuth
 @dataclass
 class SyncConfig:
     """WebDAV connection parameters."""
-    url: str          # e.g. "https://dav.example.com/remote.php/dav/files/user/proxy.db"
+    base_url: str     # e.g. "https://dav.example.com/remote.php/dav/files/user"
+    folder: str       # e.g. "token-board-sync" — subfolder to store the DB in
     username: str
     password: str
+
+    @property
+    def full_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/{self.folder.strip('/')}/proxy_sync.db"
 
 
 # ── Config persistence ────────────────────────────────────────────────────
@@ -51,7 +56,8 @@ def save_sync_config(db_path: str, config: SyncConfig):
     conn = sqlite3.connect(db_path)
     try:
         _ensure_sync_config_table(conn)
-        conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('url', ?)", (config.url,))
+        conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('url', ?)", (config.base_url,))
+        conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('folder', ?)", (config.folder,))
         conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('username', ?)", (config.username,))
         conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('password', ?)", (config.password,))
         conn.commit()
@@ -65,8 +71,31 @@ def load_sync_config(db_path: str) -> SyncConfig | None:
         _ensure_sync_config_table(conn)
         rows = dict(conn.execute("SELECT key, value FROM sync_config").fetchall())
         if rows.get("url") and rows.get("username"):
+            old_url = rows["url"]
+
+            # If the old url is just a scheme or malformed, use it as-is with a default folder
+            if old_url.count("/") < 3:
+                # Probably just a base URL like "https://dav.jianguoyun.com/dav"
+                base = old_url.rstrip("/")
+                folder = rows.get("folder", "token-board-sync")
+            else:
+                # Full path like "https://dav.jianguoyun.com/dav/folder/file.db"
+                # Strip last two segments (folder/file.db) to get base
+                parts = old_url.rstrip("/").rsplit("/", 2)
+                if len(parts) >= 3:
+                    base = parts[0]
+                    folder = parts[1] if not "." in parts[1] else rows.get("folder", "token-board-sync")
+                    # Don't lose the actual base if we stripped too much
+                    if not base.startswith("https://") and not base.startswith("http://"):
+                        base = old_url.rstrip("/")
+                        folder = rows.get("folder", "token-board-sync")
+                else:
+                    base = parts[0]
+                    folder = rows.get("folder", "token-board-sync")
+            folder = rows.get("folder", folder)  # explicit folder takes priority
             return SyncConfig(
-                url=rows["url"],
+                base_url=base,
+                folder=folder,
                 username=rows["username"],
                 password=rows.get("password", ""),
             )
@@ -81,29 +110,49 @@ class WebDAVError(Exception):
     pass
 
 
-def _webdav_download(config: SyncConfig, dest_path: str):
-    """Download a file from WebDAV to dest_path."""
+def _webdav_download(config: SyncConfig, dest_path: str) -> bool:
+    """Download remote DB. Returns True if downloaded, False if not found (first sync)."""
     resp = requests.get(
-        config.url,
+        config.full_url,
         auth=HTTPBasicAuth(config.username, config.password),
         timeout=30,
     )
-    if resp.status_code == 404:
-        # No remote DB yet — create an empty one
-        conn = sqlite3.connect(dest_path)
-        conn.close()
-        return
+    if resp.status_code in (404, 410):
+        return False  # no remote DB yet — first sync
     if not resp.ok:
         raise WebDAVError(f"Download failed: HTTP {resp.status_code}")
     with open(dest_path, "wb") as f:
         f.write(resp.content)
+    return True
+
+
+def _webdav_ensure_folder(config: SyncConfig):
+    """Ensure the target folder exists on the WebDAV server (create if needed)."""
+    folder_url = config.full_url.rsplit("/", 1)[0] + "/"
+    resp = requests.request(
+        "PROPFIND", folder_url,
+        auth=HTTPBasicAuth(config.username, config.password),
+        timeout=10,
+    )
+    if resp.status_code in (404, 410):
+        # Folder doesn't exist — create it
+        resp = requests.request(
+            "MKCOL", folder_url,
+            auth=HTTPBasicAuth(config.username, config.password),
+            timeout=10,
+        )
+        if not resp.ok and resp.status_code != 405:
+            raise WebDAVError(f"无法创建文件夹 {folder_url}: HTTP {resp.status_code}")
+    elif not resp.ok:
+        raise WebDAVError(f"无法访问文件夹 {folder_url}: HTTP {resp.status_code}")
 
 
 def _webdav_upload(config: SyncConfig, src_path: str):
     """Upload a file to WebDAV from src_path."""
+    _webdav_ensure_folder(config)
     with open(src_path, "rb") as f:
         resp = requests.put(
-            config.url,
+            config.full_url,
             data=f,
             auth=HTTPBasicAuth(config.username, config.password),
             timeout=60,
@@ -115,26 +164,43 @@ def _webdav_upload(config: SyncConfig, src_path: str):
 def _webdav_test(config: SyncConfig) -> str | None:
     """Test WebDAV connectivity. Returns None on success, error string on failure."""
     try:
-        # Try PROPFIND to check connection
+        folder_url = config.full_url.rsplit("/", 1)[0] + "/"
+
+        # 1. Try PROPFIND on the folder
         resp = requests.request(
-            "PROPFIND",
-            config.url.rsplit("/", 1)[0] + "/",  # parent directory
+            "PROPFIND", folder_url,
             auth=HTTPBasicAuth(config.username, config.password),
             timeout=10,
         )
         if resp.ok:
-            return None
-        # Some servers don't support PROPFIND, try GET on the file itself
+            return None  # folder exists, connection OK
+
+        # 2. Folder doesn't exist — try to create it with MKCOL
+        if resp.status_code in (404, 410):
+            resp = requests.request(
+                "MKCOL", folder_url,
+                auth=HTTPBasicAuth(config.username, config.password),
+                timeout=10,
+            )
+            if resp.ok or resp.status_code == 405:  # 405 = already exists (some servers)
+                return None
+            return f"无法创建文件夹: HTTP {resp.status_code} — {resp.text[:200]}"
+
+        # 3. Auth error?
+        if resp.status_code == 401 or resp.status_code == 403:
+            return f"认证失败 (HTTP {resp.status_code}) — 请检查用户名和密码。坚果云需要使用「应用密码」而非账号密码"
+
+        # 4. Other error — try simple GET on the file
         resp = requests.get(
-            config.url,
+            config.full_url,
             auth=HTTPBasicAuth(config.username, config.password),
             timeout=10,
         )
-        if resp.status_code in (200, 404):
+        if resp.status_code in (200, 404, 410):
             return None
-        return f"HTTP {resp.status_code}"
+        return f"连接失败: HTTP {resp.status_code} — {resp.text[:200]}"
     except requests.RequestException as e:
-        return str(e)
+        return f"网络错误: {e}"
 
 
 # ── Merge logic ───────────────────────────────────────────────────────────
@@ -252,51 +318,60 @@ def sync(db_path: str) -> dict:
         return {"status": "error", "message": "未配置同步服务器，请先点击齿轮图标设置"}
 
     try:
-        # 1. Download remote DB
-        _webdav_download(config, remote_path)
+        # 1. Download remote DB (skip merge if first sync)
+        has_remote = _webdav_download(config, remote_path)
+        new_count = 0
 
-        # 2. Ensure remote DB has the correct schema
-        remote_conn = sqlite3.connect(remote_path)
-        _ensure_schema(remote_conn)
-        remote_conn.close()
+        if has_remote:
+            # 2. Ensure remote DB has the correct schema
+            remote_conn = sqlite3.connect(remote_path)
+            _ensure_schema(remote_conn)
+            remote_conn.close()
 
-        # 3. Open local DB
-        local_conn = sqlite3.connect(db_path)
-        local_conn.row_factory = sqlite3.Row
+            # 3. Open local DB
+            local_conn = sqlite3.connect(db_path)
+            local_conn.row_factory = sqlite3.Row
 
-        # 4. Merge remote request_log into local (one-way: remote → local)
-        remote_conn = sqlite3.connect(remote_path)
-        remote_conn.row_factory = sqlite3.Row
-        new_count = _merge_request_log(local_conn, remote_conn)
-        remote_conn.close()
+            # 4. Merge remote request_log into local
+            remote_conn = sqlite3.connect(remote_path)
+            remote_conn.row_factory = sqlite3.Row
+            new_count = _merge_request_log(local_conn, remote_conn)
+            remote_conn.close()
 
-        # 5. Local DB stays complete — close without trimming
-        local_conn.close()
+            # 5. Close local
+            local_conn.close()
 
         # 6. Create trimmed copy for upload (30 days, usage only — no keys)
         shutil.copy(db_path, merged_path)
         merged_conn = sqlite3.connect(merged_path)
         _trim_old(merged_conn)
-        # Strip all sensitive data before uploading
         merged_conn.execute("DELETE FROM upstream_accounts")
         merged_conn.execute("DELETE FROM local_keys")
         merged_conn.execute("DELETE FROM sync_config")
         merged_conn.commit()
         merged_conn.close()
 
-        # 7. Upload trimmed copy
+        # 7. Upload
         _webdav_upload(config, merged_path)
 
+        if has_remote:
+            msg = f"同步成功，从远端合并了 {new_count} 条新记录"
+        else:
+            msg = "首次同步成功，已将本地数据上传至云端"
         return {
             "status": "ok",
-            "message": f"同步成功，从远端合并了 {new_count} 条新记录",
+            "message": msg,
             "remote_records": new_count,
         }
 
     except WebDAVError as e:
-        return {"status": "error", "message": str(e)}
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": f"WebDAV 错误: {e}"}
     except Exception as e:
-        return {"status": "error", "message": f"同步失败: {e}"}
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": f"同步失败: {type(e).__name__}: {e}"}
     finally:
         # Cleanup
         if os.path.exists(tmp_dir):
