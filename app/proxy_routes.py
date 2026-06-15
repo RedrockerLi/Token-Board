@@ -177,8 +177,7 @@ def export_data():
     if not year or not month:
         return jsonify({"error": "year and month are required"}), 400
 
-    output_dir = data.get("output_dir", "data/boardproxy")
-    result = _proxy_db().export_month(year, month, output_dir)
+    result = _proxy_db().export_to_dashboard(year, month)
 
     # Trigger dashboard data reload
     ds = current_app.config.get("DATA_STORE")
@@ -192,12 +191,31 @@ def export_data():
 
 @bp_proxy.route("/sync", methods=["POST"])
 def sync_database():
-    from app.sync import sync as do_sync
+    from app.sync import sync as do_sync, sync_dashboard
 
     db_path = current_app.config["PROXY_DB"].db_path
     result = do_sync(db_path)
 
-    # Reload dashboard data if sync brought new records
+    # Also sync dashboard database
+    import os as _os
+    dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
+    if _os.path.exists(dash_db_path):
+        try:
+            dash_result = sync_dashboard(db_path, dash_db_path)
+            if dash_result.get("status") == "error":
+                print(f"[Sync] Dashboard sync error: {dash_result.get('message')}", flush=True)
+                result["dashboard_sync"] = "失败: " + dash_result.get("message", "")
+            else:
+                result["dashboard_sync"] = dash_result.get("message", "")
+                result["dashboard_records"] = dash_result.get("dashboard_records", 0)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            result["dashboard_sync"] = f"失败: {e}"
+    else:
+        result["dashboard_sync"] = "跳过 (dashboard.db 不存在)"
+
+    # Reload dashboard data
     ds = current_app.config.get("DATA_STORE")
     if ds:
         ds.load()

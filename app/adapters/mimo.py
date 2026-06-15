@@ -14,7 +14,6 @@ TokenUsage records AND a CostEntry (plus optionally a RequestUsage).
 
 import csv
 import os
-import re
 
 from app.adapters import register_adapter
 from app.data_loader import safe_float, safe_int
@@ -27,9 +26,6 @@ class MimoAdapter:
 
     platform = "mimo"
 
-    # Matches "usage_data_2026-6.csv" or "usage_data_2026-12.csv"
-    _FILENAME_RE = re.compile(r"^usage_data_(\d{4})-(\d{1,2})\.csv$")
-
     # ── public API ──────────────────────────────────────────────────────
 
     def parse(self, filepath: str):
@@ -38,13 +34,7 @@ class MimoAdapter:
         Returns:
             (token_usages, request_usages, cost_entries, year, month)
         """
-        fname = os.path.basename(filepath)
-        m = self._FILENAME_RE.match(fname)
-        if not m:
-            return [], [], [], 0, 0
-
-        year = int(m.group(1))
-        month = int(m.group(2))
+        year, month = 0, 0
 
         token_usages: list[TokenUsage] = []
         request_usages: list[RequestUsage] = []
@@ -56,6 +46,16 @@ class MimoAdapter:
                 for row in reader:
                     row = {k.strip().lstrip('﻿'): v.strip()
                            for k, v in row.items()}
+                    # Derive year/month from first data row
+                    if year == 0:
+                        date_str = row.get("Date", "")
+                        parts = date_str.split("-")
+                        if len(parts) >= 2:
+                            try:
+                                year = int(parts[0])
+                                month = int(parts[1])
+                            except ValueError:
+                                pass
                     self._parse_row(row, token_usages, request_usages,
                                     cost_entries)
         except Exception as e:

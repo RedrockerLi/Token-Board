@@ -447,16 +447,12 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    def export_month(self, year: int, month: int, output_dir: str) -> dict:
-        """Export proxy data for a month to DeepSeek-format CSV files.
+    def export_to_dashboard(self, year: int, month: int) -> dict:
+        """Export proxy data for a month directly to dashboard.db.
 
-        Produces amount-YYYY-M.csv and cost-YYYY-M.csv in output_dir.
-        Returns {amount_path, cost_path, record_count}.
+        Returns {record_count, dashboard_records}.
         """
-        import csv
         import os
-
-        os.makedirs(output_dir, exist_ok=True)
 
         conn = self._connect()
         try:
@@ -468,7 +464,6 @@ class ProxyDatabase:
                     r.model,
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
-                    COALESCE(SUM(r.total_tokens), 0) AS total_tokens,
                     COUNT(*) AS request_count,
                     COALESCE(SUM(r.cost), 0) AS cost
                 FROM request_log r
@@ -479,61 +474,28 @@ class ProxyDatabase:
                 ORDER BY date(r.requested_at), a.name, r.model
             """, (year, month)).fetchall()
 
-            # Get pricing for price-per-token columns
-            pricing = {p["model_pattern"]: p for p in self.get_pricing()}
-
-            def _find_price(model: str, token_type: str) -> float:
-                """Match model against pricing patterns."""
-                for entry in pricing.values():
-                    pattern = entry["model_pattern"]
-                    if self._glob_match(pattern, model):
-                        if token_type == "output_tokens":
-                            return entry["output_price"]
-                        else:
-                            return entry["input_price"]
-                return 0.001  # fallback
-
-            # Write amount CSV
-            amount_path = os.path.join(output_dir, f"amount-{year}-{month}.csv")
-            with open(amount_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["user_id", "utc_date", "model", "api_key_name",
-                                 "api_key", "type", "price", "amount"])
-                for r in rows:
-                    name = r["account_name"] or "unknown"
-                    model = r["model"]
-
-                    # Output tokens
-                    if r["completion_tokens"] > 0:
-                        price = _find_price(model, "output_tokens")
-                        writer.writerow([name, r["date"], model, name, "proxy",
-                                         "output_tokens", price, r["completion_tokens"]])
-                    # Input tokens (all as cache_miss since we don't track hit/miss)
-                    if r["prompt_tokens"] > 0:
-                        price = _find_price(model, "input_cache_miss_tokens")
-                        writer.writerow([name, r["date"], model, name, "proxy",
-                                         "input_cache_miss_tokens", price, r["prompt_tokens"]])
-                    # Request count
-                    if r["request_count"] > 0:
-                        writer.writerow([name, r["date"], model, name, "proxy",
-                                         "request_count", 0, r["request_count"]])
-
-            # Write cost CSV
-            cost_path = os.path.join(output_dir, f"cost-{year}-{month}.csv")
-            with open(cost_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["user_id", "utc_date", "model", "wallet_type",
-                                 "cost", "currency"])
-                for r in rows:
-                    if r["cost"] > 0:
-                        name = r["account_name"] or "unknown"
-                        writer.writerow([name, r["date"], r["model"], "proxy",
-                                         round(r["cost"], 6), "CNY"])
+            # Write to dashboard.db
+            from app.dashboard_db import DashboardDatabase
+            dash_db_path = os.path.join(
+                os.path.dirname(self.db_path), "dashboard.db"
+            )
+            dash_db = DashboardDatabase(dash_db_path)
+            dash_count = 0
+            for r in rows:
+                name = r["account_name"] or "unknown"
+                dash_count += dash_db.upsert_proxy_data(
+                    date=r["date"],
+                    model=r["model"],
+                    account_name=name,
+                    prompt_tokens=r["prompt_tokens"],
+                    completion_tokens=r["completion_tokens"],
+                    request_count=r["request_count"],
+                    cost=r["cost"],
+                )
 
             return {
-                "amount_path": amount_path,
-                "cost_path": cost_path,
                 "record_count": len(rows),
+                "dashboard_records": dash_count,
             }
         finally:
             conn.close()

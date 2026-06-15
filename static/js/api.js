@@ -37,9 +37,6 @@ function buildParams(baseUrl, extraParams) {
     if (typeof currentKeyName !== 'undefined' && currentKeyName) {
         url.searchParams.set('api_key_name', currentKeyName);
     }
-    if (typeof currentPlatform !== 'undefined' && currentPlatform) {
-        url.searchParams.set('platform', currentPlatform);
-    }
     return url.pathname + url.search;
 }
 

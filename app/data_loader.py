@@ -11,6 +11,11 @@ from app.adapters import get_adapter, list_platforms
 from app.ir import CostEntry, RequestUsage, TokenUsage
 
 
+def _sort_models(models: set) -> list:
+    from app.dashboard_db import MODEL_ORDER
+    return sorted(models, key=lambda m: (MODEL_ORDER.get(m, 99), m.lower()))
+
+
 def safe_int(val, default=0):
     """Convert to int, treating empty string as default."""
     if val is None or str(val).strip() == "":
@@ -54,7 +59,21 @@ class DataStore:
     # ── public API ──────────────────────────────────────────────────────
 
     def load(self):
-        """Scan data_dir for platform dirs, parse all CSVs, rebuild state."""
+        """Rebuild state from dashboard.db (preferred) or CSV files (fallback)."""
+        data_dir = self.data_dir
+
+        # Try dashboard database first
+        db_path = data_dir / "dashboard.db"  # data/dashboard.db
+        if db_path.exists():
+            self._load_from_db(str(db_path))
+            return
+
+        # Fallback: scan CSV files (legacy path)
+        if not data_dir.exists():
+            print(f"[WARN] Data directory not found: {data_dir}")
+            self._commit([], [], [], [], [], [], [])
+            return
+
         token_usages: list[TokenUsage] = []
         request_usages: list[RequestUsage] = []
         cost_entries: list[CostEntry] = []
@@ -62,14 +81,7 @@ class DataStore:
         api_key_names_set: set[str] = set()
         models_set: set[str] = set()
 
-        data_dir = self.data_dir
-        if not data_dir.exists():
-            print(f"[WARN] Data directory not found: {data_dir}")
-            self._commit([], [], [], [], [], [], [])
-            return
-
         # Each immediate subdirectory of data_dir = one platform
-        platforms_found: list[str] = []
         try:
             for entry in sorted(data_dir.iterdir()):
                 if not entry.is_dir():
@@ -80,7 +92,6 @@ class DataStore:
                     print(f"[WARN] No adapter for platform '{platform_name}', "
                           f"skipping directory '{entry}'")
                     continue
-                platforms_found.append(platform_name)
 
                 # Walk the platform directory tree for CSV files
                 for root, _dirs, files in os.walk(entry):
@@ -130,11 +141,36 @@ class DataStore:
             cost_entries,
             available_months,
             sorted(api_key_names_set),
-            sorted(platforms_found),
-            sorted(models_set),
+            [],  # platforms no longer tracked
+            _sort_models(models_set),
         )
 
     # ── helpers ─────────────────────────────────────────────────────────
+
+    def _load_from_db(self, db_path: str):
+        """Load all records from the dashboard SQLite database."""
+        from app.dashboard_db import DashboardDatabase
+
+        db = DashboardDatabase(db_path)
+        (
+            token_usages,
+            request_usages,
+            cost_entries,
+            available_months,
+            api_key_names,
+            platforms,
+            models,
+        ) = db.load_to_ir()
+
+        self._commit(
+            token_usages,
+            request_usages,
+            cost_entries,
+            available_months,
+            api_key_names,
+            platforms,
+            models,
+        )
 
     def _commit(self, token_usages, request_usages, cost_entries,
                 available_months, api_key_names, platforms, models):

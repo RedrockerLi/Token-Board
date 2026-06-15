@@ -11,7 +11,6 @@
 // ── Global state ──
 var currentMonth = null;       // { year: number, month: number }
 var currentKeyName = '';       // '' = overview (all users)
-var currentPlatform = '';      // '' = all platforms
 var summaryData = null;        // cached /api/summary response
 var modelsList = [];           // list of model names from /api/summary
 var modelPlatformMap = {};     // modelName -> platform name (from /api/models)
@@ -28,7 +27,6 @@ function updateSubtitle() {
     var el = document.getElementById('pageSubtitle');
     if (!el) return;
     var parts = [];
-    if (currentPlatform) parts.push('平台: ' + currentPlatform);
     if (currentKeyName) {
         parts.push('筛选: ' + currentKeyName);
         parts.push('费用按Token比例分摊');
@@ -69,20 +67,6 @@ function populateKeyNameSelector(keyNames) {
     return prevKeyVal;
 }
 
-function populatePlatformSelector(platforms) {
-    var platSel = document.getElementById('platformSelector');
-    if (!platSel) return '';
-    var prevPlatVal = platSel.value;
-    platSel.innerHTML = '<option value="">全部平台</option>';
-    platforms.forEach(function (p) {
-        var opt = document.createElement('option');
-        opt.value = p;
-        opt.textContent = p;
-        platSel.appendChild(opt);
-    });
-    return prevPlatVal;
-}
-
 // ── Dynamic chart container management ──
 
 function clearDynamicCharts() {
@@ -96,46 +80,23 @@ function clearDynamicCharts() {
     monthlyModelMap = {};
 }
 
-function filterChartsByPlatform() {
-    var platform = currentPlatform;
-    var dailyCards = document.querySelectorAll('#dailyCharts .chart-card');
-    dailyCards.forEach(function (card) {
-        if (!platform || card.getAttribute('data-platform') === platform) {
-            card.style.display = '';
-        } else {
-            card.style.display = 'none';
-        }
-    });
-    var monthlyCards = document.querySelectorAll('#monthlyCharts .chart-card');
-    monthlyCards.forEach(function (card) {
-        if (!platform || card.getAttribute('data-platform') === platform) {
-            card.style.display = '';
-        } else {
-            card.style.display = 'none';
-        }
-    });
-}
-
 function buildDynamicCharts(models) {
     clearDynamicCharts();
     modelsList = models.slice();
 
     models.forEach(function (modelName, idx) {
-        var platform = (modelPlatformMap[modelName] || {}).platform || '';
-
         // Daily chart
         var dailyChartId = 'chartDaily_' + idx;
         var dailyLoaderId = 'loadingDaily_' + idx;
         var dailyCard = document.createElement('div');
         dailyCard.className = 'chart-card';
-        dailyCard.setAttribute('data-platform', platform);
         dailyCard.innerHTML =
             '<div class="chart-card__title">每日用量 - ' + modelName + '</div>' +
             '<div class="chart-container chart-container--lg" id="' + dailyChartId + '"></div>' +
             '<div class="loading" id="' + dailyLoaderId + '">加载中</div>';
         var dailyContainer = document.getElementById('dailyCharts');
         if (dailyContainer) dailyContainer.appendChild(dailyCard);
-        dailyChartIds.push({ chartId: dailyChartId, loaderId: dailyLoaderId, model: modelName, platform: platform });
+        dailyChartIds.push({ chartId: dailyChartId, loaderId: dailyLoaderId, model: modelName });
         dailyModelMap[modelName] = { chartId: dailyChartId, loaderId: dailyLoaderId };
 
         // Monthly chart
@@ -143,18 +104,16 @@ function buildDynamicCharts(models) {
         var monthlyLoaderId = 'loadingMonthly_' + idx;
         var monthlyCard = document.createElement('div');
         monthlyCard.className = 'chart-card';
-        monthlyCard.setAttribute('data-platform', platform);
         monthlyCard.innerHTML =
             '<div class="chart-card__title">月度趋势 - ' + modelName + '</div>' +
             '<div class="chart-container chart-container--lg" id="' + monthlyChartId + '"></div>' +
             '<div class="loading" id="' + monthlyLoaderId + '">加载中</div>';
         var monthlyContainer = document.getElementById('monthlyCharts');
         if (monthlyContainer) monthlyContainer.appendChild(monthlyCard);
-        monthlyChartIds.push({ chartId: monthlyChartId, loaderId: monthlyLoaderId, model: modelName, platform: platform });
+        monthlyChartIds.push({ chartId: monthlyChartId, loaderId: monthlyLoaderId, model: modelName });
         monthlyModelMap[modelName] = { chartId: monthlyChartId, loaderId: monthlyLoaderId };
     });
 
-    filterChartsByPlatform();
 }
 
 // ── Summary loader ──
@@ -192,17 +151,6 @@ async function loadSummary() {
 
     var prevMonthVal = populateMonthSelector(months);
     var prevKeyVal = populateKeyNameSelector(keyNames);
-    var prevPlatVal = populatePlatformSelector(platforms);
-
-    var platSel = document.getElementById('platformSelector');
-    if (platSel) {
-        if (prevPlatVal && Array.from(platSel.options).some(function (o) { return o.value === prevPlatVal; })) {
-            platSel.value = prevPlatVal;
-        } else {
-            platSel.value = '';
-            currentPlatform = '';
-        }
-    }
 
     var keySel = document.getElementById('keyNameSelector');
     if (keySel) {
@@ -393,17 +341,6 @@ function bindDashboardEvents() {
         });
     }
 
-    var platSel = document.getElementById('platformSelector');
-    if (platSel && !platSel._bound) {
-        platSel._bound = true;
-        platSel.addEventListener('change', async function () {
-            currentPlatform = this.value;
-            filterChartsByPlatform();
-            await loadSummary();
-            loadModelPie();
-            loadTypePie();
-        });
-    }
 }
 
 // ── Refresh ──

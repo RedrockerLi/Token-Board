@@ -31,7 +31,6 @@ def create_app(proxy_db_path: str | None = None):
     # Ensure adapters are imported so they self-register.
     __import__("app.adapters.deepseek")
     __import__("app.adapters.mimo")
-    __import__("app.adapters.boardproxy")
 
     from app.routes import bp  # noqa: E402
     flask_app.register_blueprint(bp)

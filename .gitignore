@@ -1,10 +1,17 @@
 .vscode
 __pycache__
 
-# Runtime database (contains secrets + live usage data)
+# CSV data files — not tracked, imported into DB on startup
+data/*.csv
+data/**/*.csv
+
+# Runtime databases
 data/proxy.db
 data/proxy.db-wal
 data/proxy.db-shm
+data/dashboard.db
+data/dashboard.db-wal
+data/dashboard.db-shm
 
 # C++ build artifacts
 proxy/build/

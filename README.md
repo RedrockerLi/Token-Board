@@ -87,7 +87,7 @@ OPENAI_API_KEY  = <在仪表板生成的本地密钥>
 
 数据来源：
 - **CSV 导入**：支持 DeepSeek、Mimo、BoardProxy 平台
-- **代理导出**：在费用报告页选择月份 → 点击「导出数据」，数据写入 `data/boardproxy/`，自动显示在仪表板中
+- **代理导出**：在费用报告页选择月份 → 点击「导出数据」，数据直接写入仪表板数据库，实时显示
 
 ### 费用报告
 
@@ -132,8 +132,7 @@ Token_Board/
 │   ├── ir.py                 #   中间表示 (IR) 数据模型
 │   ├── adapters/             #   平台适配器（CSV → IR）
 │   │   ├── deepseek.py
-│   │   ├── mimo.py
-│   │   └── boardproxy.py
+│   │   └── mimo.py
 │   ├── data_loader.py        #   数据扫描和加载
 │   ├── cost_allocator.py     #   按比例分摊费用
 │   ├── routes.py             #   仪表板 API
@@ -156,7 +155,6 @@ Token_Board/
 ├── data/                     # CSV 数据 + 代理数据库
 │   ├── deepseek/
 │   ├── mimo/
-│   ├── boardproxy/           #   代理导出 CSV
 │   └── proxy.db              #   代理 SQLite 数据库
 ├── server.py                 # 仪表板入口
 └── start.sh                  # 一键启动

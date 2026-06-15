@@ -155,7 +155,7 @@ async function exportData() {
             method: 'POST',
             body: JSON.stringify({ year, month }),
         });
-        showToast(`导出成功：${result.record_count} 条记录已写入 data/boardproxy/`);
+        showToast(`导出成功：${result.record_count} 条记录`);
         try { await fetchRefresh(); } catch (e) { /* ignore */ }
     } catch (err) {
         showToast('导出失败: ' + err.message, 'error');
@@ -315,7 +315,6 @@ function initBillingPage() {
                 <form id="syncConfigForm" onsubmit="saveSyncConfig(event)">
                     <label>WebDAV 服务器地址 <input name="base_url" id="syncBaseUrl" required placeholder="https://dav.example.com/remote.php/dav/files/user"></label>
                     <label>同步文件夹 <input name="folder" id="syncFolder" value="token-board-sync" placeholder="token-board-sync"></label>
-                    <p style="font-size:11px; color:var(--color-text-tertiary); margin-top:-8px;">数据库将以 proxy_sync.db 为名保存在此文件夹中</p>
                     <label>用户名 <input name="username" id="syncUsername" required></label>
                     <label>密码 <input name="password" id="syncPassword" type="password" placeholder="留空不变"></label>
                     <div style="display:flex; gap:8px;">

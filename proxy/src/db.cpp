@@ -64,7 +64,7 @@ void Database::create_schema() {
             name        TEXT NOT NULL UNIQUE,
             upstream_key TEXT NOT NULL,
             base_url    TEXT NOT NULL DEFAULT '',
-            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         );
 
         CREATE TABLE IF NOT EXISTS local_keys (
@@ -72,7 +72,7 @@ void Database::create_schema() {
             key_value   TEXT NOT NULL UNIQUE,
             label       TEXT,
             account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id),
-            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
             last_used_at TEXT
         );
 
@@ -88,7 +88,7 @@ void Database::create_schema() {
             is_streaming     INTEGER NOT NULL DEFAULT 0,
             status_code      INTEGER NOT NULL,
             duration_ms      INTEGER NOT NULL DEFAULT 0,
-            requested_at     TEXT NOT NULL DEFAULT (datetime('now'))
+            requested_at     TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_rl_account
@@ -145,7 +145,7 @@ void Database::prepare_statements() {
             "FROM model_pricing ORDER BY id",
             stmt_get_pricing_);
 
-    PREPARE("UPDATE local_keys SET last_used_at = datetime('now') "
+    PREPARE("UPDATE local_keys SET last_used_at = datetime('now', 'localtime') "
             "WHERE id = ?1",
             stmt_update_last_used_);
 

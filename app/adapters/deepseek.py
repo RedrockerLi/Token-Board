@@ -15,7 +15,6 @@ cost-*.csv columns:
 """
 
 import csv
-import re
 
 from app.adapters import register_adapter
 from app.data_loader import safe_float, safe_int
@@ -28,44 +27,34 @@ class DeepSeekAdapter:
 
     platform = "deepseek"
 
-    # Matches "amount-2026-5.csv" or "cost-2026-12.csv"
-    _FILENAME_RE = re.compile(r"^(amount|cost)-(\d{4})-(\d{1,2})\.csv$")
-
     # ── public API ──────────────────────────────────────────────────────
 
     def parse(self, filepath: str):
-
-        """Parse a DeepSeek CSV file into IR records.
-
-        Returns:
-            (token_usages: list[TokenUsage],
-             request_usages: list[RequestUsage],
-             cost_entries: list[CostEntry],
-             year: int,
-             month: int)
-        """
-        import os
-        fname = os.path.basename(filepath)
-        m = self._FILENAME_RE.match(fname)
-        if not m:
-            return [], [], [], 0, 0
-
-        csv_type = m.group(1)
-        year = int(m.group(2))
-        month = int(m.group(3))
-
+        """Parse a DeepSeek CSV file into IR records."""
         token_usages: list[TokenUsage] = []
         request_usages: list[RequestUsage] = []
         cost_entries: list[CostEntry] = []
+        year, month = 0, 0
 
+        # Detect CSV type from content (first column header)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     row = {k.strip().lstrip('﻿'): v.strip() for k, v in row.items()}
-                    if csv_type == "amount":
+                    # Derive year/month from first data row
+                    if year == 0:
+                        date_str = row.get("utc_date", "")
+                        parts = date_str.split("-")
+                        if len(parts) >= 2:
+                            try:
+                                year = int(parts[0])
+                                month = int(parts[1])
+                            except ValueError:
+                                pass
+                    if "type" in row:
                         self._parse_amount_row(row, token_usages, request_usages)
-                    else:  # csv_type == "cost"
+                    elif "wallet_type" in row:
                         self._parse_cost_row(row, cost_entries)
         except Exception as e:
             print(f"[ERROR] Failed to parse {filepath}: {e}")

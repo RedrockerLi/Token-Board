@@ -99,12 +99,15 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
             route_result.local_key_id, route_result.account_id,
             req_model.c_str());
 
+    // Capture model for use in streaming lambda
+    auto model_copy = req_model;
+
     if (is_stream) {
         // ── Streaming path ──────────────────────────────────────────
 
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, route_result, body, content_type](
+            [this, route_result, body, content_type, model_copy](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
 
                 std::string accumulated;
@@ -115,9 +118,18 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                     return sink.write(data, len);
                 };
 
-                auto fwd = upstream_.forward(
-                    route_result.base_url, route_result.upstream_key,
-                    "/chat/completions", body, content_type, on_chunk);
+                // Retry up to 3 times
+                UpstreamClient::ForwardResult fwd;
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    if (attempt > 0) {
+                        fprintf(stderr, "[Proxy] Retry %d/3 for streaming request\n", attempt + 1);
+                        accumulated.clear();
+                    }
+                    fwd = upstream_.forward(
+                        route_result.base_url, route_result.upstream_key,
+                        "/chat/completions", body, content_type, on_chunk);
+                    if (fwd.success) break;
+                }
 
                 // Parse usage from accumulated SSE data
                 auto usage = UsageTracker::parse_usage_from_sse(fwd.body);
@@ -129,13 +141,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                 } else {
                     fprintf(stderr, "[Proxy] Warning: could not parse usage "
                                     "from streaming response\n");
-                    // Log with zero tokens so the request is still recorded
-                    UsageTracker::UsageInfo empty_usage;
-                    empty_usage.model = "unknown";
-                    tracker_.log_request(route_result.account_id,
-                                         route_result.local_key_id,
-                                         empty_usage, true, fwd.status_code,
-                                         fwd.duration_ms);
+                    // Don't write empty records — they pollute the dashboard with "unknown" models
                 }
 
                 tracker_.mark_key_used(route_result.local_key_id);
@@ -147,9 +153,15 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
     } else {
         // ── Non-streaming path ──────────────────────────────────────
 
-        auto fwd = upstream_.forward(
-            route_result.base_url, route_result.upstream_key,
-            "/chat/completions", body, content_type, nullptr);
+        UpstreamClient::ForwardResult fwd;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0)
+                fprintf(stderr, "[Proxy] Retry %d/3 for non-streaming request\n", attempt + 1);
+            fwd = upstream_.forward(
+                route_result.base_url, route_result.upstream_key,
+                "/chat/completions", body, content_type, nullptr);
+            if (fwd.success) break;
+        }
 
         // Parse usage from JSON response
         auto usage = UsageTracker::parse_usage(fwd.body);
@@ -160,13 +172,8 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                                  fwd.duration_ms);
         } else {
             fprintf(stderr, "[Proxy] Warning: could not parse usage "
-                            "from non-streaming response\n");
-            UsageTracker::UsageInfo empty_usage;
-            empty_usage.model = "unknown";
-            tracker_.log_request(route_result.account_id,
-                                 route_result.local_key_id,
-                                 empty_usage, false, fwd.status_code,
-                                 fwd.duration_ms);
+                            "from non-streaming response, model=%s\n",
+                            req_model.c_str());
         }
 
         tracker_.mark_key_used(route_result.local_key_id);
