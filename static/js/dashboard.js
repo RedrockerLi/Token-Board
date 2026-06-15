@@ -116,7 +116,7 @@ function buildDynamicCharts(models) {
     modelsList = models.slice();
 
     models.forEach(function (modelName, idx) {
-        var platform = modelPlatformMap[modelName] || '';
+        var platform = (modelPlatformMap[modelName] || {}).platform || '';
 
         // Daily chart
         var dailyChartId = 'chartDaily_' + idx;
@@ -222,6 +222,7 @@ async function loadSummary() {
     }
 
     updateSubtitle();
+    loadMonthlyCharts();
 
     document.getElementById('lastUpdated').textContent =
         '数据更新时间: ' + new Date().toLocaleString('zh-CN') + ' · 共 ' + months.length + ' 个月数据';
@@ -355,23 +356,19 @@ document.getElementById('monthSelector').addEventListener('change', function () 
     loadDailyCharts();
 });
 
-document.getElementById('keyNameSelector').addEventListener('change', function () {
+document.getElementById('keyNameSelector').addEventListener('change', async function () {
     currentKeyName = this.value;
-    loadSummary();
+    await loadSummary();
     loadModelPie();
     loadTypePie();
-    loadMonthlyCharts();
-    if (currentMonth) loadDailyCharts();
 });
 
-document.getElementById('platformSelector').addEventListener('change', function () {
+document.getElementById('platformSelector').addEventListener('change', async function () {
     currentPlatform = this.value;
     filterChartsByPlatform();
-    loadSummary();
+    await loadSummary();
     loadModelPie();
     loadTypePie();
-    loadMonthlyCharts();
-    if (currentMonth) loadDailyCharts();
 });
 
 // ── Refresh ──
@@ -382,8 +379,6 @@ async function refreshData() {
         await loadSummary();
         await loadModelPie();
         await loadTypePie();
-        await loadMonthlyCharts();
-        if (currentMonth) await loadDailyCharts();
     } catch (err) {
         console.error('Refresh failed:', err);
         alert('刷新失败，请检查服务器日志');
@@ -396,7 +391,6 @@ async function init() {
     await loadSummary();
     await loadModelPie();
     await loadTypePie();
-    await loadMonthlyCharts();
 }
 
 init();

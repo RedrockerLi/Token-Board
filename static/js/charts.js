@@ -60,12 +60,12 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 html += '输出Token: <b>' + fmtNum(d.output_tokens) + '</b> (' + pct(d.output_tokens) + '%)<br/>';
                 html += '输入缓存命中: <b>' + fmtNum(d.input_cache_hit_tokens) + '</b> (' + pct(d.input_cache_hit_tokens) + '%)<br/>';
                 html += '输入缓存未命中: <b>' + fmtNum(d.input_cache_miss_tokens) + '</b> (' + pct(d.input_cache_miss_tokens) + '%)<br/>';
-                html += '调用次数: <b>' + fmtNum(d.requests) + '</b><br/>';
+                html += '费用: <b>' + fmtCost(d.cost) + '</b><br/>';
                 return html;
             }
         },
         legend: {
-            data: ['输出Token', '输入Token', '调用次数'],
+            data: ['输出Token', '输入Token', '费用'],
             bottom: 0,
             textStyle: { fontSize: 12, color: '#6B7194' }
         },
@@ -91,9 +91,9 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
             },
             {
                 type: 'value',
-                name: '次数',
+                name: '费用 (CNY)',
                 nameTextStyle: { color: '#9094A2', fontSize: 11 },
-                axisLabel: { color: '#9094A2', fontSize: 11, formatter: function (v) { return fmtNum(v); } },
+                axisLabel: { color: '#9094A2', fontSize: 11, formatter: function (v) { return fmtCost(v); } },
                 splitLine: { show: false }
             }
         ],
@@ -117,14 +117,14 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 barMaxWidth: 28
             },
             {
-                name: '调用次数',
+                name: '费用',
                 type: 'line',
                 yAxisIndex: 1,
-                data: requests,
-                lineStyle: { color: '#8B5CF6', width: 2.5 },
-                itemStyle: { color: '#8B5CF6' },
-                symbol: 'diamond',
-                symbolSize: 8
+                data: cost,
+                lineStyle: { color: '#EF4444', width: 2.5 },
+                itemStyle: { color: '#EF4444' },
+                symbol: 'circle',
+                symbolSize: 6
             }
         ]
     });
