@@ -68,3 +68,17 @@ async function fetchModels() {
 async function fetchRefresh() {
     return fetchJSON('/api/refresh');
 }
+
+// ── Proxy management API wrappers ──
+
+async function proxyFetchJSON(url, options = {}) {
+    const resp = await fetch(url, {
+        headers: { 'Content-Type': 'application/json', ...options.headers },
+        ...options,
+    });
+    if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${resp.status}`);
+    }
+    return resp.json();
+}

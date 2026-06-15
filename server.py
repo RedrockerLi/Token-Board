@@ -5,7 +5,7 @@ Reads cost and amount CSV files from the data/ directory (organised
 by platform) and serves a web dashboard with token usage statistics
 and ECharts visualizations.
 
-Usage: python3 server.py --port <PORT>
+Usage: python3 server.py --port <PORT> [--proxy-db <PATH>]
 """
 
 import argparse
@@ -15,9 +15,15 @@ from app import create_app
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI API Usage Dashboard Server")
     parser.add_argument("--port", type=int, required=True, help="Port to listen on")
+    parser.add_argument(
+        "--proxy-db",
+        type=str,
+        default=None,
+        help="Path to proxy SQLite database (enables proxy management UI)",
+    )
     args = parser.parse_args()
 
-    app = create_app()
+    app = create_app(proxy_db_path=args.proxy_db)
     app.config["DATA_STORE"].load()
 
     print(f" * Starting on http://0.0.0.0:{args.port}")

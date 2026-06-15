@@ -1,0 +1,274 @@
+#include "db.h"
+
+#include <cstdio>
+#include <sqlite3.h>
+
+// ── Internal helpers ────────────────────────────────────────────────────
+
+namespace {
+
+// Lightweight RAII guard that calls sqlite3_finalize unless released.
+class StmtGuard {
+public:
+    explicit StmtGuard(sqlite3_stmt *s) : stmt_(s) {}
+    ~StmtGuard() { if (stmt_) sqlite3_finalize(stmt_); }
+    sqlite3_stmt *release() { auto s = stmt_; stmt_ = nullptr; return s; }
+private:
+    sqlite3_stmt *stmt_;
+};
+
+} // anonymous namespace
+
+// ── Constructor / Destructor ─────────────────────────────────────────────
+
+Database::~Database() { close(); }
+
+// ── open ─────────────────────────────────────────────────────────────────
+
+bool Database::open(const std::string &path) {
+    int rc = sqlite3_open_v2(
+        path.c_str(), &db_,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+        nullptr);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[DB] Failed to open %s: %s\n", path.c_str(),
+                sqlite3_errmsg(db_));
+        return false;
+    }
+
+    // Performance / safety pragmas
+    sqlite3_exec(db_, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "PRAGMA foreign_keys=ON", nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "PRAGMA busy_timeout=5000", nullptr, nullptr, nullptr);
+
+    create_schema();
+    prepare_statements();
+    fprintf(stderr, "[DB] Opened %s (WAL mode)\n", path.c_str());
+    return true;
+}
+
+void Database::close() {
+    if (!db_) return;
+    finalize_statements();
+    sqlite3_close(db_);
+    db_ = nullptr;
+    fprintf(stderr, "[DB] Closed\n");
+}
+
+// ── Schema creation ──────────────────────────────────────────────────────
+
+void Database::create_schema() {
+    const char *sql = R"SQL(
+        CREATE TABLE IF NOT EXISTS upstream_accounts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL UNIQUE,
+            upstream_key TEXT NOT NULL,
+            base_url    TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS local_keys (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_value   TEXT NOT NULL UNIQUE,
+            label       TEXT,
+            account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id),
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            last_used_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS request_log (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id       INTEGER NOT NULL REFERENCES upstream_accounts(id),
+            local_key_id     INTEGER NOT NULL REFERENCES local_keys(id),
+            model            TEXT NOT NULL,
+            prompt_tokens    INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens     INTEGER NOT NULL DEFAULT 0,
+            cost             REAL NOT NULL DEFAULT 0.0,
+            is_streaming     INTEGER NOT NULL DEFAULT 0,
+            status_code      INTEGER NOT NULL,
+            duration_ms      INTEGER NOT NULL DEFAULT 0,
+            requested_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_rl_account
+            ON request_log(account_id);
+        CREATE INDEX IF NOT EXISTS idx_rl_time
+            ON request_log(requested_at);
+
+        CREATE TABLE IF NOT EXISTS model_pricing (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_pattern  TEXT NOT NULL UNIQUE,
+            input_price    REAL NOT NULL,
+            output_price   REAL NOT NULL,
+            currency       TEXT NOT NULL DEFAULT 'CNY'
+        );
+    )SQL";
+
+    char *err = nullptr;
+    int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &err);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[DB] Schema creation error: %s\n", err);
+        sqlite3_free(err);
+    }
+
+    // Pricing entries are managed by the web dashboard; no auto-seeding.
+}
+
+// ── Prepared statements ──────────────────────────────────────────────────
+
+void Database::prepare_statements() {
+    #define PREPARE(sql, stmt) \
+        do { \
+            int _rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr); \
+            if (_rc != SQLITE_OK) \
+                fprintf(stderr, "[DB] Prepare error: %s\n", sqlite3_errmsg(db_)); \
+        } while (0)
+
+    PREPARE("SELECT id, key_value, account_id, "
+            "COALESCE(label,'') FROM local_keys "
+            "WHERE key_value = ?1",
+            stmt_lookup_key_);
+
+    PREPARE("SELECT id, name, upstream_key, base_url "
+            "FROM upstream_accounts WHERE id = ?1",
+            stmt_get_account_);
+
+    PREPARE("INSERT INTO request_log "
+            "(account_id, local_key_id, model, prompt_tokens, "
+            " completion_tokens, total_tokens, cost, is_streaming, "
+            " status_code, duration_ms) "
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            stmt_insert_log_);
+
+    PREPARE("SELECT id, model_pattern, input_price, output_price "
+            "FROM model_pricing ORDER BY id",
+            stmt_get_pricing_);
+
+    PREPARE("UPDATE local_keys SET last_used_at = datetime('now') "
+            "WHERE id = ?1",
+            stmt_update_last_used_);
+
+    #undef PREPARE
+}
+
+void Database::finalize_statements() {
+    #define FINALIZE(s) do { if (s) { sqlite3_finalize(s); s = nullptr; } } while (0)
+    FINALIZE(stmt_lookup_key_);
+    FINALIZE(stmt_get_account_);
+    FINALIZE(stmt_insert_log_);
+    FINALIZE(stmt_get_pricing_);
+    FINALIZE(stmt_update_last_used_);
+    #undef FINALIZE
+}
+
+// ── lookup_local_key ─────────────────────────────────────────────────────
+
+std::optional<Database::KeyInfo> Database::lookup_local_key(
+    const std::string &key_value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_lookup_key_);
+    sqlite3_bind_text(stmt_lookup_key_, 1,
+                      key_value.c_str(), key_value.size(), SQLITE_STATIC);
+
+    std::optional<KeyInfo> result;
+    if (sqlite3_step(stmt_lookup_key_) == SQLITE_ROW) {
+        KeyInfo info;
+        info.id = sqlite3_column_int(stmt_lookup_key_, 0);
+        info.key_value = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_lookup_key_, 1));
+        info.account_id = sqlite3_column_int(stmt_lookup_key_, 2);
+        info.label = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_lookup_key_, 3));
+        result = std::move(info);
+    }
+    sqlite3_reset(stmt_lookup_key_);
+    return result;
+}
+
+// ── get_account ──────────────────────────────────────────────────────────
+
+std::optional<Database::AccountInfo> Database::get_account(int account_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_get_account_);
+    sqlite3_bind_int(stmt_get_account_, 1, account_id);
+
+    std::optional<AccountInfo> result;
+    if (sqlite3_step(stmt_get_account_) == SQLITE_ROW) {
+        AccountInfo info;
+        info.id = sqlite3_column_int(stmt_get_account_, 0);
+        info.name = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_account_, 1));
+        info.upstream_key = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_account_, 2));
+        info.base_url = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_account_, 3));
+        result = std::move(info);
+    }
+    sqlite3_reset(stmt_get_account_);
+    return result;
+}
+
+// ── log_request ──────────────────────────────────────────────────────────
+
+void Database::log_request(int account_id, int local_key_id,
+                           const std::string &model,
+                           int prompt_tokens, int completion_tokens,
+                           int total_tokens, double cost,
+                           bool is_streaming, int status_code,
+                           int duration_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_insert_log_);
+    sqlite3_bind_int(stmt_insert_log_, 1, account_id);
+    sqlite3_bind_int(stmt_insert_log_, 2, local_key_id);
+    sqlite3_bind_text(stmt_insert_log_, 3,
+                      model.c_str(), model.size(), SQLITE_STATIC);
+    sqlite3_bind_int(stmt_insert_log_, 4, prompt_tokens);
+    sqlite3_bind_int(stmt_insert_log_, 5, completion_tokens);
+    sqlite3_bind_int(stmt_insert_log_, 6, total_tokens);
+    sqlite3_bind_double(stmt_insert_log_, 7, cost);
+    sqlite3_bind_int(stmt_insert_log_, 8, is_streaming ? 1 : 0);
+    sqlite3_bind_int(stmt_insert_log_, 9, status_code);
+    sqlite3_bind_int(stmt_insert_log_, 10, duration_ms);
+
+    int rc = sqlite3_step(stmt_insert_log_);
+    if (rc != SQLITE_DONE)
+        fprintf(stderr, "[DB] log_request insert error: %s\n",
+                sqlite3_errmsg(db_));
+    sqlite3_reset(stmt_insert_log_);
+}
+
+// ── update_key_last_used ─────────────────────────────────────────────────
+
+void Database::update_key_last_used(int local_key_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_update_last_used_);
+    sqlite3_bind_int(stmt_update_last_used_, 1, local_key_id);
+    sqlite3_step(stmt_update_last_used_);
+    sqlite3_reset(stmt_update_last_used_);
+}
+
+// ── get_all_pricing ─────────────────────────────────────────────────────
+
+std::vector<Database::PricingEntry> Database::get_all_pricing() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    std::vector<PricingEntry> result;
+    sqlite3_reset(stmt_get_pricing_);
+
+    while (sqlite3_step(stmt_get_pricing_) == SQLITE_ROW) {
+        PricingEntry e;
+        e.id = sqlite3_column_int(stmt_get_pricing_, 0);
+        e.model_pattern = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_pricing_, 1));
+        e.input_price = sqlite3_column_double(stmt_get_pricing_, 2);
+        e.output_price = sqlite3_column_double(stmt_get_pricing_, 3);
+        result.push_back(e);
+    }
+    sqlite3_reset(stmt_get_pricing_);
+    return result;
+}

@@ -9,112 +9,194 @@
 </head>
 <body>
 
-    <!-- ── Main Content ── -->
-    <div class="main-container">
+<!-- ═══ Sidebar + Content Layout ═══ -->
+<div class="layout">
 
-        <!-- Page Title -->
-        <div class="page-header">
-            <h1 class="page-title">AI API 用量可视化面板</h1>
-            <p class="page-subtitle" id="pageSubtitle">所有日期均按 UTC+0 时间显示 · Token 统计跨所有可用月份</p>
-            <div class="controls-group" style="margin-top: 12px;">
-                <label style="font-size:13px;color:var(--color-text-secondary);white-space:nowrap;">平台</label>
-                <select class="select-styled" id="platformSelector">
-                    <option value="">全部平台</option>
-                </select>
-                <label style="font-size:13px;color:var(--color-text-secondary);white-space:nowrap;">用户选择</label>
-                <select class="select-styled" id="keyNameSelector">
-                    <option value="">总览 (所有用户)</option>
-                </select>
-            </div>
+    <!-- ── Sidebar ── -->
+    <aside class="sidebar" id="sidebar">
+        <button class="sidebar__toggle" id="sidebarToggle" title="收缩/展开">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><polyline points="13 9 16 12 13 15"/></svg>
+        </button>
+
+        <div class="sidebar__logo">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            <span class="sidebar__logo-text">Token Board</span>
         </div>
 
-        <!-- Stats Cards Row -->
-        <div class="stats-grid" id="statsGrid">
-            <div class="stat-card stat-card--highlight">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#0070F3;"></span> 总Token使用量</div>
-                <div class="stat-card__value number-lg" id="statTotalTokens">--</div>
-                <div class="stat-card__sub">跨月份</div>
+        <nav class="sidebar__nav">
+            <!-- Data Analysis Section -->
+            <div class="sidebar__nav-section">
+                <div class="sidebar__nav-section-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
+                    数据面板
+                </div>
+                <a class="sidebar__nav-item" href="#/dashboard">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                    用量仪表板
+                </a>
+                <a class="sidebar__nav-item" href="#/proxy/billing">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                    费用报告
+                </a>
             </div>
-            <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#8B5CF6;"></span> 总请求数</div>
-                <div class="stat-card__value number-lg" id="statRequests">--</div>
-                <div class="stat-card__sub">API 调用次数</div>
-            </div>
-            <div class="stat-card stat-card--cyan">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 总消费</div>
-                <div class="stat-card__value number-lg" id="statCost">--</div>
-                <div class="stat-card__sub">CNY · 跨月份</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#22C55E;"></span> 输入Token</div>
-                <div class="stat-card__value number-lg" id="statInputTokens">--</div>
-                <div class="stat-card__sub">缓存命中 + 未命中</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#00CEF3;"></span> 输出Token</div>
-                <div class="stat-card__value number-lg" id="statOutputTokens">--</div>
-                <div class="stat-card__sub">模型生成的输出</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#F59E0B;"></span> 缓存命中Token</div>
-                <div class="stat-card__value number-lg" id="statCacheHitTokens">--</div>
-                <div class="stat-card__sub">输入缓存命中 (节省费用)</div>
-            </div>
-        </div>
 
-        <!-- Global Overview Pie Charts -->
-        <div class="section">
-            <div class="charts-grid">
-                <div class="chart-card">
-                    <div class="chart-card__title">模型分布 (跨月份)</div>
-                    <div class="chart-container chart-container--sm" id="chartModelPie"></div>
-                    <div class="loading" id="loadingModelPie">加载中</div>
+            <!-- Proxy Management Section -->
+            <div class="sidebar__nav-section">
+                <div class="sidebar__nav-section-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                    代理管理
                 </div>
-                <div class="chart-card">
-                    <div class="chart-card__title">Token 类型分布 (跨月份)</div>
-                    <div class="chart-container chart-container--sm" id="chartTypePie"></div>
-                    <div class="loading" id="loadingTypePie">加载中</div>
-                </div>
+                <a class="sidebar__nav-item" href="#/proxy/accounts">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                    上游账户
+                </a>
+                <a class="sidebar__nav-item" href="#/proxy/keys">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7" cy="12" r="3"/><path d="M10 9v2l7 7"/><path d="M21 17l-1.5-1.5"/></svg>
+                    本地密钥
+                </a>
+                <a class="sidebar__nav-item" href="#/proxy/pricing">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 18V6"/></svg>
+                    模型定价
+                </a>
+                <a class="sidebar__nav-item" href="#/proxy/logs">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                    请求日志
+                </a>
             </div>
-        </div>
+        </nav>
 
-        <!-- Month Selector + Refresh -->
-        <div class="section">
-            <div class="section-header">
-                <div>
-                    <span class="section-title">每月用量详情</span>
-                    <span class="section-subtitle" id="currentMonthLabel"></span>
-                </div>
-                <div class="controls-group">
-                    <select class="select-styled" id="monthSelector">
-                        <option value="">-- 选择月份 --</option>
+        <div class="sidebar__footer">
+            <span class="sidebar__version">v2.0</span>
+        </div>
+    </aside>
+
+    <!-- ── Main Content Area ── -->
+    <main class="content">
+
+        <!-- ═══ Page: Dashboard (existing token board) ═══ -->
+        <div class="page-container" id="page-dashboard" style="display:none;">
+
+            <!-- Page Title -->
+            <div class="page-header">
+                <h1 class="page-title">AI API 用量可视化面板</h1>
+                <p class="page-subtitle" id="pageSubtitle">所有日期均按 UTC+0 时间显示 · Token 统计跨所有可用月份</p>
+                <div class="controls-group" style="margin-top: 12px;">
+                    <label style="font-size:13px;color:var(--color-text-secondary);white-space:nowrap;">平台</label>
+                    <select class="select-styled" id="platformSelector">
+                        <option value="">全部平台</option>
                     </select>
-                    <button class="btn btn--sm" onclick="refreshData()" title="重新扫描 data/ 目录">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
-                        刷新数据
-                    </button>
+                    <label style="font-size:13px;color:var(--color-text-secondary);white-space:nowrap;">用户选择</label>
+                    <select class="select-styled" id="keyNameSelector">
+                        <option value="">总览 (所有用户)</option>
+                    </select>
                 </div>
             </div>
-        </div>
 
-        <!-- Daily Charts (dynamic) -->
-        <div class="section">
-            <div class="charts-grid" id="dailyCharts">
+            <!-- Stats Cards Row -->
+            <div class="stats-grid" id="statsGrid">
+                <div class="stat-card stat-card--highlight">
+                    <div class="stat-card__label"><span class="icon-dot" style="background:#0070F3;"></span> 总Token使用量</div>
+                    <div class="stat-card__value number-lg" id="statTotalTokens">--</div>
+                    <div class="stat-card__sub">跨月份</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-card__label"><span class="icon-dot" style="background:#8B5CF6;"></span> 总请求数</div>
+                    <div class="stat-card__value number-lg" id="statRequests">--</div>
+                    <div class="stat-card__sub">API 调用次数</div>
+                </div>
+                <div class="stat-card stat-card--cyan">
+                    <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 总消费</div>
+                    <div class="stat-card__value number-lg" id="statCost">--</div>
+                    <div class="stat-card__sub">CNY · 跨月份</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-card__label"><span class="icon-dot" style="background:#22C55E;"></span> 输入Token</div>
+                    <div class="stat-card__value number-lg" id="statInputTokens">--</div>
+                    <div class="stat-card__sub">缓存命中 + 未命中</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-card__label"><span class="icon-dot" style="background:#00CEF3;"></span> 输出Token</div>
+                    <div class="stat-card__value number-lg" id="statOutputTokens">--</div>
+                    <div class="stat-card__sub">模型生成的输出</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-card__label"><span class="icon-dot" style="background:#F59E0B;"></span> 缓存命中Token</div>
+                    <div class="stat-card__value number-lg" id="statCacheHitTokens">--</div>
+                    <div class="stat-card__sub">输入缓存命中 (节省费用)</div>
+                </div>
             </div>
-        </div>
 
-        <!-- Monthly Trend Charts (dynamic) -->
-        <div class="section">
-            <div class="charts-grid" id="monthlyCharts">
+            <!-- Global Overview Pie Charts -->
+            <div class="section">
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <div class="chart-card__title">模型分布 (跨月份)</div>
+                        <div class="chart-container chart-container--sm" id="chartModelPie"></div>
+                        <div class="loading" id="loadingModelPie">加载中</div>
+                    </div>
+                    <div class="chart-card">
+                        <div class="chart-card__title">Token 类型分布 (跨月份)</div>
+                        <div class="chart-container chart-container--sm" id="chartTypePie"></div>
+                        <div class="loading" id="loadingTypePie">加载中</div>
+                    </div>
+                </div>
             </div>
+
+            <!-- Month Selector + Refresh -->
+            <div class="section">
+                <div class="section-header">
+                    <div>
+                        <span class="section-title">每月用量详情</span>
+                        <span class="section-subtitle" id="currentMonthLabel"></span>
+                    </div>
+                    <div class="controls-group">
+                        <select class="select-styled" id="monthSelector">
+                            <option value="">-- 选择月份 --</option>
+                        </select>
+                        <button class="btn btn--sm" onclick="refreshData()" title="重新扫描 data/ 目录">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+                            刷新数据
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Daily Charts (dynamic) -->
+            <div class="section">
+                <div class="charts-grid" id="dailyCharts"></div>
+            </div>
+
+            <!-- Monthly Trend Charts (dynamic) -->
+            <div class="section">
+                <div class="charts-grid" id="monthlyCharts"></div>
+            </div>
+
+            <p class="last-updated" id="lastUpdated"></p>
         </div>
 
-        <p class="last-updated" id="lastUpdated"></p>
-    </div>
+        <!-- ═══ Page: Billing ═══ -->
+        <div class="page-container" id="page-billing" style="display:none;"></div>
 
-    <!-- ── Scripts (load order: primitives → rendering → orchestration) ── -->
-    <script src="/static/js/api.js"></script>
-    <script src="/static/js/charts.js"></script>
-    <script src="/static/js/dashboard.js"></script>
+        <!-- ═══ Page: Accounts ═══ -->
+        <div class="page-container" id="page-proxy-accounts" style="display:none;"></div>
+
+        <!-- ═══ Page: Keys ═══ -->
+        <div class="page-container" id="page-proxy-keys" style="display:none;"></div>
+
+        <!-- ═══ Page: Pricing ═══ -->
+        <div class="page-container" id="page-proxy-pricing" style="display:none;"></div>
+
+        <!-- ═══ Page: Logs ═══ -->
+        <div class="page-container" id="page-proxy-logs" style="display:none;"></div>
+
+    </main>
+</div>
+
+<!-- ═══ Scripts ═══ -->
+<!-- Load order: primitives → router → page modules → chart rendering -->
+<script src="/static/js/api.js"></script>
+<script src="/static/js/charts.js"></script>
+<script src="/static/js/dashboard.js"></script>
+<script src="/static/js/app.js"></script>
 </body>
 </html>

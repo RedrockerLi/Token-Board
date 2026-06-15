@@ -4,6 +4,8 @@
  * Global state, data-loading functions, DOM event handlers, and initialisation.
  * Depends on: api.js (fmtNum, fmtCost, fetchJSON, buildParams, fetch* wrappers)
  *             charts.js (initChart, renderTimeSeriesChart, renderPieChart, chartColors)
+ *
+ * Exports: initDashboard() — called by the SPA router when #/dashboard is active.
  */
 
 // ── Global state ──
@@ -24,6 +26,7 @@ var monthlyModelMap = {};
 
 function updateSubtitle() {
     var el = document.getElementById('pageSubtitle');
+    if (!el) return;
     var parts = [];
     if (currentPlatform) parts.push('平台: ' + currentPlatform);
     if (currentKeyName) {
@@ -40,6 +43,7 @@ function updateSubtitle() {
 
 function populateMonthSelector(months) {
     var sel = document.getElementById('monthSelector');
+    if (!sel) return '';
     var prevMonthVal = sel.value;
     sel.innerHTML = '<option value="">-- 选择月份 --</option>';
     months.slice().reverse().forEach(function (m) {
@@ -53,6 +57,7 @@ function populateMonthSelector(months) {
 
 function populateKeyNameSelector(keyNames) {
     var keySel = document.getElementById('keyNameSelector');
+    if (!keySel) return '';
     var prevKeyVal = keySel.value;
     keySel.innerHTML = '<option value="">总览 (所有用户)</option>';
     keyNames.forEach(function (name) {
@@ -66,6 +71,7 @@ function populateKeyNameSelector(keyNames) {
 
 function populatePlatformSelector(platforms) {
     var platSel = document.getElementById('platformSelector');
+    if (!platSel) return '';
     var prevPlatVal = platSel.value;
     platSel.innerHTML = '<option value="">全部平台</option>';
     platforms.forEach(function (p) {
@@ -80,9 +86,10 @@ function populatePlatformSelector(platforms) {
 // ── Dynamic chart container management ──
 
 function clearDynamicCharts() {
-    // Clear DOM containers
-    document.getElementById('dailyCharts').innerHTML = '';
-    document.getElementById('monthlyCharts').innerHTML = '';
+    var dailyEl = document.getElementById('dailyCharts');
+    var monthlyEl = document.getElementById('monthlyCharts');
+    if (dailyEl) dailyEl.innerHTML = '';
+    if (monthlyEl) monthlyEl.innerHTML = '';
     dailyChartIds = [];
     monthlyChartIds = [];
     dailyModelMap = {};
@@ -91,7 +98,6 @@ function clearDynamicCharts() {
 
 function filterChartsByPlatform() {
     var platform = currentPlatform;
-    // Show/hide daily chart cards
     var dailyCards = document.querySelectorAll('#dailyCharts .chart-card');
     dailyCards.forEach(function (card) {
         if (!platform || card.getAttribute('data-platform') === platform) {
@@ -100,7 +106,6 @@ function filterChartsByPlatform() {
             card.style.display = 'none';
         }
     });
-    // Show/hide monthly chart cards
     var monthlyCards = document.querySelectorAll('#monthlyCharts .chart-card');
     monthlyCards.forEach(function (card) {
         if (!platform || card.getAttribute('data-platform') === platform) {
@@ -128,7 +133,8 @@ function buildDynamicCharts(models) {
             '<div class="chart-card__title">每日用量 - ' + modelName + '</div>' +
             '<div class="chart-container chart-container--lg" id="' + dailyChartId + '"></div>' +
             '<div class="loading" id="' + dailyLoaderId + '">加载中</div>';
-        document.getElementById('dailyCharts').appendChild(dailyCard);
+        var dailyContainer = document.getElementById('dailyCharts');
+        if (dailyContainer) dailyContainer.appendChild(dailyCard);
         dailyChartIds.push({ chartId: dailyChartId, loaderId: dailyLoaderId, model: modelName, platform: platform });
         dailyModelMap[modelName] = { chartId: dailyChartId, loaderId: dailyLoaderId };
 
@@ -142,12 +148,12 @@ function buildDynamicCharts(models) {
             '<div class="chart-card__title">月度趋势 - ' + modelName + '</div>' +
             '<div class="chart-container chart-container--lg" id="' + monthlyChartId + '"></div>' +
             '<div class="loading" id="' + monthlyLoaderId + '">加载中</div>';
-        document.getElementById('monthlyCharts').appendChild(monthlyCard);
+        var monthlyContainer = document.getElementById('monthlyCharts');
+        if (monthlyContainer) monthlyContainer.appendChild(monthlyCard);
         monthlyChartIds.push({ chartId: monthlyChartId, loaderId: monthlyLoaderId, model: modelName, platform: platform });
         monthlyModelMap[modelName] = { chartId: monthlyChartId, loaderId: monthlyLoaderId };
     });
 
-    // Apply current platform filter
     filterChartsByPlatform();
 }
 
@@ -157,19 +163,25 @@ async function loadSummary() {
     var data = await fetchSummary();
     summaryData = data;
 
-    document.getElementById('statTotalTokens').textContent = fmtNum(data.total_tokens);
-    document.getElementById('statOutputTokens').textContent = fmtNum(data.total_output_tokens);
-    document.getElementById('statInputTokens').textContent = fmtNum(data.total_input_tokens);
-    document.getElementById('statCacheHitTokens').textContent = fmtNum(data.total_input_cache_hit_tokens);
-    document.getElementById('statRequests').textContent = fmtNum(data.total_requests);
-    document.getElementById('statCost').textContent = fmtCost(data.total_cost);
+    var elStatTotalTokens = document.getElementById('statTotalTokens');
+    var elStatOutputTokens = document.getElementById('statOutputTokens');
+    var elStatInputTokens = document.getElementById('statInputTokens');
+    var elStatCacheHitTokens = document.getElementById('statCacheHitTokens');
+    var elStatRequests = document.getElementById('statRequests');
+    var elStatCost = document.getElementById('statCost');
+
+    if (elStatTotalTokens) elStatTotalTokens.textContent = fmtNum(data.total_tokens);
+    if (elStatOutputTokens) elStatOutputTokens.textContent = fmtNum(data.total_output_tokens);
+    if (elStatInputTokens) elStatInputTokens.textContent = fmtNum(data.total_input_tokens);
+    if (elStatCacheHitTokens) elStatCacheHitTokens.textContent = fmtNum(data.total_input_cache_hit_tokens);
+    if (elStatRequests) elStatRequests.textContent = fmtNum(data.total_requests);
+    if (elStatCost) elStatCost.textContent = fmtCost(data.total_cost);
 
     var months = data.available_months || [];
     var keyNames = data.api_key_names || [];
     var platforms = data.platforms || [];
     var models = data.models || [];
 
-    // Fetch model→platform mapping (only once, then cached)
     if (Object.keys(modelPlatformMap).length === 0) {
         try {
             modelPlatformMap = await fetchModels();
@@ -178,54 +190,59 @@ async function loadSummary() {
         }
     }
 
-    // Populate selectors (preserve previous selection when possible)
     var prevMonthVal = populateMonthSelector(months);
     var prevKeyVal = populateKeyNameSelector(keyNames);
     var prevPlatVal = populatePlatformSelector(platforms);
 
-    // Restore platform selection
     var platSel = document.getElementById('platformSelector');
-    if (prevPlatVal && Array.from(platSel.options).some(function (o) { return o.value === prevPlatVal; })) {
-        platSel.value = prevPlatVal;
-    } else {
-        platSel.value = '';
-        currentPlatform = '';
+    if (platSel) {
+        if (prevPlatVal && Array.from(platSel.options).some(function (o) { return o.value === prevPlatVal; })) {
+            platSel.value = prevPlatVal;
+        } else {
+            platSel.value = '';
+            currentPlatform = '';
+        }
     }
 
-    // Restore key name selection
     var keySel = document.getElementById('keyNameSelector');
-    if (prevKeyVal && Array.from(keySel.options).some(function (o) { return o.value === prevKeyVal; })) {
-        keySel.value = prevKeyVal;
-    } else {
-        keySel.value = '';
-        currentKeyName = '';
+    if (keySel) {
+        if (prevKeyVal && Array.from(keySel.options).some(function (o) { return o.value === prevKeyVal; })) {
+            keySel.value = prevKeyVal;
+        } else {
+            keySel.value = '';
+            currentKeyName = '';
+        }
     }
 
-    // Build dynamic charts for discovered models
     buildDynamicCharts(models);
 
-    // Restore / default month selection
     var sel = document.getElementById('monthSelector');
     if (months.length > 0) {
         var latest = months[months.length - 1];
-        if (!prevMonthVal || !Array.from(sel.options).some(function (o) { return o.value === prevMonthVal; })) {
+        if (sel && (!prevMonthVal || !Array.from(sel.options).some(function (o) { return o.value === prevMonthVal; }))) {
             sel.value = latest.year + '-' + latest.month;
             currentMonth = { year: latest.year, month: latest.month };
-        } else {
+        } else if (sel) {
             sel.value = prevMonthVal;
             var parts = prevMonthVal.split('-').map(Number);
             currentMonth = { year: parts[0], month: parts[1] };
         }
-        var label = currentMonth.year + '-' + String(currentMonth.month).padStart(2, '0');
-        document.getElementById('currentMonthLabel').textContent = '当前显示: ' + label;
+        if (currentMonth) {
+            var label = currentMonth.year + '-' + String(currentMonth.month).padStart(2, '0');
+            var labelEl = document.getElementById('currentMonthLabel');
+            if (labelEl) labelEl.textContent = '当前显示: ' + label;
+        }
         loadDailyCharts();
     }
 
     updateSubtitle();
     loadMonthlyCharts();
 
-    document.getElementById('lastUpdated').textContent =
-        '数据更新时间: ' + new Date().toLocaleString('zh-CN') + ' · 共 ' + months.length + ' 个月数据';
+    var lastUpdatedEl = document.getElementById('lastUpdated');
+    if (lastUpdatedEl) {
+        lastUpdatedEl.textContent =
+            '数据更新时间: ' + new Date().toLocaleString('zh-CN') + ' · 共 ' + months.length + ' 个月数据';
+    }
 }
 
 // ── Daily charts ──
@@ -272,6 +289,7 @@ async function loadDailyCharts() {
 
 async function loadModelPie() {
     var loader = document.getElementById('loadingModelPie');
+    if (!loader) return;
     try {
         var data = await fetchSummary();
         var breakdown = data.model_breakdown || {};
@@ -290,6 +308,7 @@ async function loadModelPie() {
 
 async function loadTypePie() {
     var loader = document.getElementById('loadingTypePie');
+    if (!loader) return;
     try {
         var data = await fetchTokenTypes();
         var filtered = data.filter(function (d) { return d.value > 0; });
@@ -336,40 +355,56 @@ async function loadMonthlyCharts() {
 
 // ── Event handlers ──
 
-document.getElementById('monthSelector').addEventListener('change', function () {
-    var val = this.value;
-    if (!val) {
-        currentMonth = null;
-        document.getElementById('currentMonthLabel').textContent = '';
-        dailyChartIds.forEach(function (info) {
-            var dom = document.getElementById(info.chartId);
-            var loader = document.getElementById(info.loaderId);
-            if (dom) dom.style.display = 'none';
-            if (loader) { loader.style.display = 'flex'; loader.textContent = '请选择月份'; }
+function bindDashboardEvents() {
+    var monthSel = document.getElementById('monthSelector');
+    if (monthSel && !monthSel._bound) {
+        monthSel._bound = true;
+        monthSel.addEventListener('change', function () {
+            var val = this.value;
+            if (!val) {
+                currentMonth = null;
+                var labelEl = document.getElementById('currentMonthLabel');
+                if (labelEl) labelEl.textContent = '';
+                dailyChartIds.forEach(function (info) {
+                    var dom = document.getElementById(info.chartId);
+                    var loader = document.getElementById(info.loaderId);
+                    if (dom) dom.style.display = 'none';
+                    if (loader) { loader.style.display = 'flex'; loader.textContent = '请选择月份'; }
+                });
+                return;
+            }
+            var parts = val.split('-').map(Number);
+            currentMonth = { year: parts[0], month: parts[1] };
+            var label = parts[0] + '-' + String(parts[1]).padStart(2, '0');
+            var labelEl = document.getElementById('currentMonthLabel');
+            if (labelEl) labelEl.textContent = '当前显示: ' + label;
+            loadDailyCharts();
         });
-        return;
     }
-    var parts = val.split('-').map(Number);
-    currentMonth = { year: parts[0], month: parts[1] };
-    var label = parts[0] + '-' + String(parts[1]).padStart(2, '0');
-    document.getElementById('currentMonthLabel').textContent = '当前显示: ' + label;
-    loadDailyCharts();
-});
 
-document.getElementById('keyNameSelector').addEventListener('change', async function () {
-    currentKeyName = this.value;
-    await loadSummary();
-    loadModelPie();
-    loadTypePie();
-});
+    var keySel = document.getElementById('keyNameSelector');
+    if (keySel && !keySel._bound) {
+        keySel._bound = true;
+        keySel.addEventListener('change', async function () {
+            currentKeyName = this.value;
+            await loadSummary();
+            loadModelPie();
+            loadTypePie();
+        });
+    }
 
-document.getElementById('platformSelector').addEventListener('change', async function () {
-    currentPlatform = this.value;
-    filterChartsByPlatform();
-    await loadSummary();
-    loadModelPie();
-    loadTypePie();
-});
+    var platSel = document.getElementById('platformSelector');
+    if (platSel && !platSel._bound) {
+        platSel._bound = true;
+        platSel.addEventListener('change', async function () {
+            currentPlatform = this.value;
+            filterChartsByPlatform();
+            await loadSummary();
+            loadModelPie();
+            loadTypePie();
+        });
+    }
+}
 
 // ── Refresh ──
 
@@ -385,12 +420,15 @@ async function refreshData() {
     }
 }
 
-// ── Initialise ──
+// ── Initialise (exported) ──
 
-async function init() {
-    await loadSummary();
-    await loadModelPie();
-    await loadTypePie();
+function initDashboard() {
+    var el = document.getElementById('page-dashboard');
+    if (!el || el.dataset.initialized) return;
+    el.dataset.initialized = '1';
+
+    bindDashboardEvents();
+    loadSummary();
+    loadModelPie();
+    loadTypePie();
 }
-
-init();
