@@ -12,10 +12,11 @@ var currentKeyName = '';       // '' = overview (all users)
 var currentPlatform = '';      // '' = all platforms
 var summaryData = null;        // cached /api/summary response
 var modelsList = [];           // list of model names from /api/summary
+var modelPlatformMap = {};     // modelName -> platform name (from /api/models)
 
 // Dynamic chart containers
-var dailyChartIds = [];
-var monthlyChartIds = [];
+var dailyChartIds = [];        // [{ chartId, loaderId, model, platform }]
+var monthlyChartIds = [];      // [{ chartId, loaderId, model, platform }]
 var dailyModelMap = {};        // modelName -> { chartId, loaderId }
 var monthlyModelMap = {};
 
@@ -88,22 +89,47 @@ function clearDynamicCharts() {
     monthlyModelMap = {};
 }
 
+function filterChartsByPlatform() {
+    var platform = currentPlatform;
+    // Show/hide daily chart cards
+    var dailyCards = document.querySelectorAll('#dailyCharts .chart-card');
+    dailyCards.forEach(function (card) {
+        if (!platform || card.getAttribute('data-platform') === platform) {
+            card.style.display = '';
+        } else {
+            card.style.display = 'none';
+        }
+    });
+    // Show/hide monthly chart cards
+    var monthlyCards = document.querySelectorAll('#monthlyCharts .chart-card');
+    monthlyCards.forEach(function (card) {
+        if (!platform || card.getAttribute('data-platform') === platform) {
+            card.style.display = '';
+        } else {
+            card.style.display = 'none';
+        }
+    });
+}
+
 function buildDynamicCharts(models) {
     clearDynamicCharts();
     modelsList = models.slice();
 
     models.forEach(function (modelName, idx) {
+        var platform = modelPlatformMap[modelName] || '';
+
         // Daily chart
         var dailyChartId = 'chartDaily_' + idx;
         var dailyLoaderId = 'loadingDaily_' + idx;
         var dailyCard = document.createElement('div');
         dailyCard.className = 'chart-card';
+        dailyCard.setAttribute('data-platform', platform);
         dailyCard.innerHTML =
             '<div class="chart-card__title">每日用量 - ' + modelName + '</div>' +
             '<div class="chart-container chart-container--lg" id="' + dailyChartId + '"></div>' +
             '<div class="loading" id="' + dailyLoaderId + '">加载中</div>';
         document.getElementById('dailyCharts').appendChild(dailyCard);
-        dailyChartIds.push({ chartId: dailyChartId, loaderId: dailyLoaderId, model: modelName });
+        dailyChartIds.push({ chartId: dailyChartId, loaderId: dailyLoaderId, model: modelName, platform: platform });
         dailyModelMap[modelName] = { chartId: dailyChartId, loaderId: dailyLoaderId };
 
         // Monthly chart
@@ -111,14 +137,18 @@ function buildDynamicCharts(models) {
         var monthlyLoaderId = 'loadingMonthly_' + idx;
         var monthlyCard = document.createElement('div');
         monthlyCard.className = 'chart-card';
+        monthlyCard.setAttribute('data-platform', platform);
         monthlyCard.innerHTML =
             '<div class="chart-card__title">月度趋势 - ' + modelName + '</div>' +
             '<div class="chart-container chart-container--lg" id="' + monthlyChartId + '"></div>' +
             '<div class="loading" id="' + monthlyLoaderId + '">加载中</div>';
         document.getElementById('monthlyCharts').appendChild(monthlyCard);
-        monthlyChartIds.push({ chartId: monthlyChartId, loaderId: monthlyLoaderId, model: modelName });
+        monthlyChartIds.push({ chartId: monthlyChartId, loaderId: monthlyLoaderId, model: modelName, platform: platform });
         monthlyModelMap[modelName] = { chartId: monthlyChartId, loaderId: monthlyLoaderId };
     });
+
+    // Apply current platform filter
+    filterChartsByPlatform();
 }
 
 // ── Summary loader ──
@@ -138,6 +168,15 @@ async function loadSummary() {
     var keyNames = data.api_key_names || [];
     var platforms = data.platforms || [];
     var models = data.models || [];
+
+    // Fetch model→platform mapping (only once, then cached)
+    if (Object.keys(modelPlatformMap).length === 0) {
+        try {
+            modelPlatformMap = await fetchModels();
+        } catch (e) {
+            console.error('Failed to fetch models:', e);
+        }
+    }
 
     // Populate selectors (preserve previous selection when possible)
     var prevMonthVal = populateMonthSelector(months);
@@ -327,6 +366,7 @@ document.getElementById('keyNameSelector').addEventListener('change', function (
 
 document.getElementById('platformSelector').addEventListener('change', function () {
     currentPlatform = this.value;
+    filterChartsByPlatform();
     loadSummary();
     loadModelPie();
     loadTypePie();
