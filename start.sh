@@ -88,9 +88,11 @@ EOF
         EXISTING=$(pgrep -f "token_proxy" 2>/dev/null || true)
         if [ -z "$EXISTING" ]; then
             "$PROXY_BIN" --db "$PROXY_DB" --port "$PROXY_PORT" &
-            echo -e "${GREEN}✓ 代理已启动 (PID: $!)${NC}"
+            PROXY_PID=$!
+            echo -e "${GREEN}✓ 代理已启动 (PID: $PROXY_PID)${NC}"
         else
-            echo -e "${GREEN}✓ 代理运行中 (PID: $EXISTING)${NC}"
+            PROXY_PID=$EXISTING
+            echo -e "${GREEN}✓ 代理运行中 (PID: $PROXY_PID)${NC}"
         fi
     fi
     echo "   地址: http://localhost:$PROXY_PORT/v1"
@@ -100,6 +102,22 @@ fi
 # ═══════════════════════════════════════════════════════════════════════
 # Dashboard (always)
 # ═══════════════════════════════════════════════════════════════════════
+
+# ── cleanup: 必须在启动后台进程之前注册 ──────────────────────────
+#    这样即使在启动等待循环中按 Ctrl+C 也能正确清理
+cleanup() {
+    echo ""
+    echo "[INFO] 正在关闭仪表板..."
+    # 先尝试优雅关闭 (SIGTERM)
+    if [ -n "${DASHBOARD_PID:-}" ]; then
+        kill $DASHBOARD_PID 2>/dev/null || true
+        sleep 2
+        kill -9 $DASHBOARD_PID 2>/dev/null || true
+    fi
+    echo "[INFO] 仪表板已关闭（代理继续运行）"
+    exit 0
+}
+trap cleanup INT TERM
 
 echo "[dash] 启动仪表板..."
 if ! $START_ALL; then
@@ -156,13 +174,5 @@ if ! $NO_BROWSER; then
         wslview "$DASHBOARD_URL" > /dev/null 2>&1 &
     fi
 fi
-
-cleanup() {
-    echo ""
-    kill $DASHBOARD_PID 2>/dev/null || true
-    echo "[INFO] 仪表板已关闭"
-    exit 0
-}
-trap cleanup INT TERM
 
 wait $DASHBOARD_PID
