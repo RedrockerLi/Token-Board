@@ -292,6 +292,49 @@ def _merge_config_tables(local_conn: sqlite3.Connection, remote_conn: sqlite3.Co
     local_conn.commit()
 
 
+def _recalculate_all_costs(conn: sqlite3.Connection):
+    """Recalculate cost for all request_log entries using current pricing."""
+    pricing = conn.execute(
+        "SELECT model_pattern, input_price, output_price FROM model_pricing ORDER BY id"
+    ).fetchall()
+    if not pricing:
+        return
+
+    # Build a list of (pattern, input_price, output_price) and match each model
+    models = [r[0] for r in conn.execute("SELECT DISTINCT model FROM request_log").fetchall()]
+    for model in models:
+        for pattern, inp, out in pricing:
+            if _simple_glob(pattern, model):
+                conn.execute(
+                    """UPDATE request_log
+                       SET cost = (prompt_tokens / 1000000.0) * ? + (completion_tokens / 1000000.0) * ?
+                       WHERE model = ?""",
+                    (inp, out, model),
+                )
+                break  # first match wins
+    conn.commit()
+
+
+def _simple_glob(pattern: str, text: str) -> bool:
+    """Simple glob match (* and ? only)."""
+    pi = mi = 0
+    star = -1
+    match_start = 0
+    while mi < len(text):
+        if pi < len(pattern) and (pattern[pi] == '?' or
+                                   pattern[pi].lower() == text[mi].lower()):
+            pi += 1; mi += 1
+        elif pi < len(pattern) and pattern[pi] == '*':
+            star = pi; match_start = mi; pi += 1
+        elif star != -1:
+            pi = star + 1; match_start += 1; mi = match_start
+        else:
+            return False
+    while pi < len(pattern) and pattern[pi] == '*':
+        pi += 1
+    return pi == len(pattern)
+
+
 def _trim_old(conn: sqlite3.Connection):
     """Delete request_log records older than 30 days."""
     conn.execute("DELETE FROM request_log WHERE date(requested_at) < date('now', '-30 days')")
@@ -321,6 +364,7 @@ def sync(db_path: str) -> dict:
         # 1. Download remote DB (skip merge if first sync)
         has_remote = _webdav_download(config, remote_path)
         new_count = 0
+        pricing_count = 0
 
         if has_remote:
             # 2. Ensure remote DB has the correct schema
@@ -329,19 +373,43 @@ def sync(db_path: str) -> dict:
             remote_conn.close()
 
             # 3. Open local DB
-            local_conn = sqlite3.connect(db_path)
+            local_conn = sqlite3.connect(db_path, timeout=10)
             local_conn.row_factory = sqlite3.Row
+            local_conn.execute("PRAGMA busy_timeout=5000")
 
-            # 4. Merge remote request_log into local
+            # 4. Merge remote model_pricing into local (INSERT OR IGNORE: local wins)
+            remote_pricing_conn = sqlite3.connect(remote_path)
+            remote_pricing = remote_pricing_conn.execute(
+                "SELECT model_pattern, input_price, output_price, currency FROM model_pricing"
+            ).fetchall()
+            remote_pricing_conn.close()
+            pricing_count = 0
+            for rp in remote_pricing:
+                try:
+                    local_conn.execute(
+                        "INSERT OR IGNORE INTO model_pricing (model_pattern, input_price, output_price, currency) VALUES (?,?,?,?)",
+                        rp,
+                    )
+                    if local_conn.total_changes:
+                        pricing_count += 1
+                except sqlite3.IntegrityError:
+                    pass  # local already has this pattern, keep local
+            local_conn.commit()
+
+            # Recalculate costs for any models whose pricing was just merged
+            if pricing_count > 0:
+                _recalculate_all_costs(local_conn)
+
+            # 5. Merge remote request_log into local
             remote_conn = sqlite3.connect(remote_path)
             remote_conn.row_factory = sqlite3.Row
             new_count = _merge_request_log(local_conn, remote_conn)
             remote_conn.close()
 
-            # 5. Close local
+            # 6. Close local
             local_conn.close()
 
-        # 6. Create trimmed copy for upload (30 days, usage only — no keys)
+        # 7. Create trimmed copy for upload (30 days, request_log + model_pricing, no keys)
         shutil.copy(db_path, merged_path)
         merged_conn = sqlite3.connect(merged_path)
         _trim_old(merged_conn)
@@ -351,7 +419,7 @@ def sync(db_path: str) -> dict:
         merged_conn.commit()
         merged_conn.close()
 
-        # 7. Count uploaded records
+        # 8. Count uploaded records
         upload_conn = sqlite3.connect(merged_path)
         uploaded_count = upload_conn.execute("SELECT COUNT(*) FROM request_log").fetchone()[0]
         upload_conn.close()
@@ -360,7 +428,8 @@ def sync(db_path: str) -> dict:
         _webdav_upload(config, merged_path)
 
         if has_remote:
-            msg = f"同步成功 — 从远端拉取 {new_count} 条，上传 {uploaded_count} 条至云端"
+            extra = f"，{pricing_count} 条定价" if pricing_count else ""
+            msg = f"同步成功 — 从远端拉取 {new_count} 条记录{extra}，上传 {uploaded_count} 条至云端"
         else:
             msg = f"首次同步成功，已上传 {uploaded_count} 条至云端"
         return {
@@ -368,6 +437,7 @@ def sync(db_path: str) -> dict:
             "message": msg,
             "remote_records": new_count,
             "uploaded_records": uploaded_count,
+            "pricing_records": pricing_count,
         }
 
     except WebDAVError as e:

@@ -234,6 +234,9 @@ class ProxyDatabase:
                 (data["model_pattern"], data["input_price"], data["output_price"]),
             )
             conn.commit()
+            # Recalculate costs for matching existing requests
+            self._recalculate_costs(conn, data["model_pattern"],
+                                    data["input_price"], data["output_price"])
             return cursor.lastrowid
         finally:
             conn.close()
@@ -241,6 +244,11 @@ class ProxyDatabase:
     def update_pricing(self, pricing_id: int, data: dict) -> bool:
         conn = self._connect()
         try:
+            # Fetch the pattern before updating
+            pattern = conn.execute(
+                "SELECT model_pattern FROM model_pricing WHERE id = ?", (pricing_id,)
+            ).fetchone()
+
             fields = []
             values = []
             for key in ("model_pattern", "input_price", "output_price"):
@@ -255,6 +263,11 @@ class ProxyDatabase:
                 values,
             )
             conn.commit()
+
+            # Recalculate costs for matching requests
+            if pattern:
+                self._recalculate_costs(conn, data.get("model_pattern", pattern[0]),
+                                        data.get("input_price"), data.get("output_price"))
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -524,6 +537,35 @@ class ProxyDatabase:
             }
         finally:
             conn.close()
+
+    def _recalculate_costs(self, conn, pattern: str,
+                           input_price: float | None,
+                           output_price: float | None):
+        """Recalculate cost for all request_log entries matching a pricing pattern."""
+        if input_price is None and output_price is None:
+            return
+
+        # Get current prices if only one changed
+        row = conn.execute(
+            "SELECT input_price, output_price FROM model_pricing WHERE model_pattern = ?",
+            (pattern,),
+        ).fetchone()
+        if not row:
+            return
+        inp = input_price if input_price is not None else row["input_price"]
+        out = output_price if output_price is not None else row["output_price"]
+
+        # Find matching models
+        models = conn.execute("SELECT DISTINCT model FROM request_log").fetchall()
+        for (model,) in models:
+            if self._glob_match(pattern, model):
+                conn.execute(
+                    """UPDATE request_log
+                       SET cost = (prompt_tokens / 1000000.0) * ? + (completion_tokens / 1000000.0) * ?
+                       WHERE model = ?""",
+                    (inp, out, model),
+                )
+        conn.commit()
 
     @staticmethod
     def _glob_match(pattern: str, model: str) -> bool:
