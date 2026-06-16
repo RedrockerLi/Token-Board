@@ -409,3 +409,34 @@ def request_logs():
             date_to=request.args.get("to"),
         )
     )
+
+
+# ── Performance Metrics ────────────────────────────────────────────────
+
+@bp_proxy.route("/perf/summary")
+def perf_summary():
+    minutes = request.args.get("minutes", 15, type=int)
+    return jsonify(_proxy_db().get_perf_summary(minutes))
+
+
+@bp_proxy.route("/perf/latency")
+def perf_latency():
+    minutes = request.args.get("minutes", 60, type=int)
+    return jsonify(_proxy_db().get_perf_latency(minutes))
+
+
+@bp_proxy.route("/perf/throughput")
+def perf_throughput():
+    minutes = request.args.get("minutes", 60, type=int)
+    return jsonify(_proxy_db().get_perf_throughput(minutes))
+
+
+@bp_proxy.route("/perf/models")
+def perf_models():
+    minutes = request.args.get("minutes", 60, type=int)
+    return jsonify(_proxy_db().get_perf_models(minutes))
+
+
+@bp_proxy.route("/perf/realtime")
+def perf_realtime():
+    return jsonify(_proxy_db().get_perf_realtime())

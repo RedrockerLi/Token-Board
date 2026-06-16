@@ -112,6 +112,14 @@ const PAGES = [
         initFn: 'initLogsPage',
         destroyFn: null,
     },
+    {
+        hash: '#/proxy/perf',
+        container: 'page-proxy-perf',
+        title: '性能监控 · Token Board',
+        module: '/static/js/proxy_perf.js',
+        initFn: 'initPerfPage',
+        destroyFn: 'destroyPerfPage',
+    },
 ];
 
 const DEFAULT_HASH = '#/dashboard';

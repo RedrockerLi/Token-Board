@@ -9,6 +9,7 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <chrono>
 #include <cstdio>
 
 using json = nlohmann::json;
@@ -58,6 +59,10 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                                           httplib::Response &res) {
     add_cors_headers(res);
 
+    // ── Performance tracking: record start time & in-flight count ──
+    auto t0 = std::chrono::steady_clock::now();
+    int concurrent_before = in_flight_requests_.fetch_add(1, std::memory_order_relaxed);
+
     // 1. Extract Bearer token
     std::string auth = req.has_header("Authorization")
                            ? req.get_header_value("Authorization")
@@ -72,6 +77,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         res.status = 401;
         res.set_content(json_error("Missing API key. Use: Authorization: Bearer <key>", 401),
                         "application/json");
+        in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
 
@@ -81,6 +87,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         res.status = 401;
         res.set_content(json_error(route_result.error, 401),
                         "application/json");
+        in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
 
@@ -140,7 +147,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
 
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, route_result, body, content_type, model_copy](
+            [this, route_result, body, content_type, model_copy, t0, concurrent_before](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
 
                 std::string accumulated;
@@ -178,6 +185,16 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                 }
 
                 tracker_.mark_key_used(route_result.local_key_id);
+
+                // ── Perf: total proxy latency + in-flight snapshot ──
+                auto t1 = std::chrono::steady_clock::now();
+                int total_latency = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+                tracker_.log_perf_event(model_copy, fwd.duration_ms, total_latency,
+                                        fwd.status_code, fwd.status_code >= 400,
+                                        concurrent_before);
+                in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
+
                 sink.done();
                 return true;
             },
@@ -210,6 +227,15 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         }
 
         tracker_.mark_key_used(route_result.local_key_id);
+
+        // ── Perf: total proxy latency + in-flight snapshot ──
+        auto t1 = std::chrono::steady_clock::now();
+        int total_latency = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        tracker_.log_perf_event(req_model, fwd.duration_ms, total_latency,
+                                fwd.status_code, fwd.status_code >= 400,
+                                concurrent_before);
+        in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
 
         if (fwd.success) {
             // Forward the response as-is

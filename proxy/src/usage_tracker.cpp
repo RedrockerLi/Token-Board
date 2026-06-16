@@ -134,6 +134,16 @@ void UsageTracker::log_request(int account_id, int local_key_id,
             is_streaming ? 1 : 0, status_code, duration_ms);
 }
 
+// ── log_perf_event ───────────────────────────────────────────────────────
+
+void UsageTracker::log_perf_event(const std::string &model,
+                                  int upstream_latency_ms,
+                                  int total_latency_ms, int status_code,
+                                  bool is_error, int concurrent_count) {
+    db_.log_perf_event(model, upstream_latency_ms, total_latency_ms,
+                       status_code, is_error, concurrent_count);
+}
+
 // ── mark_key_used ────────────────────────────────────────────────────────
 
 void UsageTracker::mark_key_used(int local_key_id) {

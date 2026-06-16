@@ -133,6 +133,20 @@ void Database::create_schema() {
             pattern         TEXT NOT NULL,
             upstream_model  TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS perf_events (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            model               TEXT NOT NULL,
+            upstream_latency_ms INTEGER NOT NULL DEFAULT 0,
+            total_latency_ms    INTEGER NOT NULL DEFAULT 0,
+            status_code         INTEGER NOT NULL,
+            is_error            INTEGER NOT NULL DEFAULT 0,
+            concurrent_count    INTEGER NOT NULL DEFAULT 0,
+            requested_at        TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_perf_events_time
+            ON perf_events(requested_at);
     )SQL";
 
     char *err = nullptr;
@@ -190,6 +204,15 @@ void Database::prepare_statements() {
             "WHERE id = ?1",
             stmt_update_last_used_);
 
+    PREPARE("INSERT INTO perf_events "
+            "(model, upstream_latency_ms, total_latency_ms, status_code, is_error, concurrent_count) "
+            "VALUES (?1,?2,?3,?4,?5,?6)",
+            stmt_insert_perf_event_);
+
+    PREPARE("DELETE FROM perf_events "
+            "WHERE requested_at < datetime('now', '-' || ?1 || ' minutes', 'localtime')",
+            stmt_cleanup_perf_events_);
+
     #undef PREPARE
 }
 
@@ -203,6 +226,8 @@ void Database::finalize_statements() {
     FINALIZE(stmt_get_template_entries_);
     FINALIZE(stmt_get_pricing_);
     FINALIZE(stmt_update_last_used_);
+    FINALIZE(stmt_insert_perf_event_);
+    FINALIZE(stmt_cleanup_perf_events_);
     #undef FINALIZE
 }
 
@@ -368,4 +393,39 @@ std::vector<Database::PricingEntry> Database::get_all_pricing() {
     }
     sqlite3_reset(stmt_get_pricing_);
     return result;
+}
+
+// ── log_perf_event ───────────────────────────────────────────────────────
+
+void Database::log_perf_event(const std::string &model,
+                              int upstream_latency_ms, int total_latency_ms,
+                              int status_code, bool is_error,
+                              int concurrent_count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_insert_perf_event_);
+    sqlite3_bind_text(stmt_insert_perf_event_, 1,
+                      model.c_str(), model.size(), SQLITE_STATIC);
+    sqlite3_bind_int(stmt_insert_perf_event_, 2, upstream_latency_ms);
+    sqlite3_bind_int(stmt_insert_perf_event_, 3, total_latency_ms);
+    sqlite3_bind_int(stmt_insert_perf_event_, 4, status_code);
+    sqlite3_bind_int(stmt_insert_perf_event_, 5, is_error ? 1 : 0);
+    sqlite3_bind_int(stmt_insert_perf_event_, 6, concurrent_count);
+
+    int rc = sqlite3_step(stmt_insert_perf_event_);
+    if (rc != SQLITE_DONE)
+        fprintf(stderr, "[DB] log_perf_event insert error: %s\n",
+                sqlite3_errmsg(db_));
+    sqlite3_reset(stmt_insert_perf_event_);
+}
+
+// ── cleanup_old_perf_events ──────────────────────────────────────────────
+
+void Database::cleanup_old_perf_events(int max_age_minutes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_cleanup_perf_events_);
+    sqlite3_bind_int(stmt_cleanup_perf_events_, 1, max_age_minutes);
+    sqlite3_step(stmt_cleanup_perf_events_);
+    sqlite3_reset(stmt_cleanup_perf_events_);
 }

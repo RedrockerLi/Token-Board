@@ -432,6 +432,7 @@ def sync(db_path: str) -> dict:
         merged_conn.execute("DELETE FROM local_keys")
         merged_conn.execute("DELETE FROM sync_config")
         merged_conn.execute("DELETE FROM key_model_map")
+        merged_conn.execute("DELETE FROM perf_events")
         merged_conn.commit()
         merged_conn.close()
 

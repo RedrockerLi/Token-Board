@@ -32,6 +32,11 @@ public:
     void log_request(int account_id, int local_key_id, const UsageInfo &usage,
                      bool is_streaming, int status_code, int duration_ms);
 
+    /// Write a performance-metrics event (local-only, not synced).
+    void log_perf_event(const std::string &model, int upstream_latency_ms,
+                        int total_latency_ms, int status_code,
+                        bool is_error, int concurrent_count);
+
     /// Update the `last_used_at` timestamp on the local key.
     void mark_key_used(int local_key_id);
 

@@ -77,6 +77,15 @@ public:
 
     std::vector<PricingEntry> get_all_pricing();
 
+    // ── Performance metrics (local-only, not synced) ────────────────────
+
+    void log_perf_event(const std::string &model, int upstream_latency_ms,
+                        int total_latency_ms, int status_code,
+                        bool is_error, int concurrent_count);
+
+    /// Delete perf events older than `max_age_minutes` (default 24h).
+    void cleanup_old_perf_events(int max_age_minutes = 1440);
+
 private:
     void create_schema();
     void prepare_statements();
@@ -94,4 +103,6 @@ private:
     sqlite3_stmt *stmt_get_template_entries_ = nullptr;
     sqlite3_stmt *stmt_get_pricing_ = nullptr;
     sqlite3_stmt *stmt_update_last_used_ = nullptr;
+    sqlite3_stmt *stmt_insert_perf_event_ = nullptr;
+    sqlite3_stmt *stmt_cleanup_perf_events_ = nullptr;
 };

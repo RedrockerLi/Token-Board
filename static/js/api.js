@@ -79,3 +79,25 @@ async function proxyFetchJSON(url, options = {}) {
     }
     return resp.json();
 }
+
+// ── Performance metrics API wrappers ──
+
+async function fetchPerfSummary(minutes) {
+    return fetchJSON(buildParams('/api/proxy/perf/summary', { minutes }));
+}
+
+async function fetchPerfLatency(minutes) {
+    return fetchJSON(buildParams('/api/proxy/perf/latency', { minutes }));
+}
+
+async function fetchPerfThroughput(minutes) {
+    return fetchJSON(buildParams('/api/proxy/perf/throughput', { minutes }));
+}
+
+async function fetchPerfModels(minutes) {
+    return fetchJSON(buildParams('/api/proxy/perf/models', { minutes }));
+}
+
+async function fetchPerfRealtime() {
+    return fetchJSON('/api/proxy/perf/realtime');
+}

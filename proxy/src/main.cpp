@@ -18,6 +18,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 
 // Signal-safe flag for graceful shutdown
 static volatile sig_atomic_t g_shutdown = 0;
@@ -76,9 +77,16 @@ int main(int argc, char *argv[]) {
         server.listen(cfg.host.c_str(), cfg.port);
     });
 
-    // Wait for signal
+    // Wait for signal, with periodic perf_events cleanup (every 5 min)
+    auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
     while (!g_shutdown) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        auto now = std::chrono::steady_clock::now();
+        if (now >= cleanup_deadline) {
+            db.cleanup_old_perf_events(1440);  // keep last 24 hours
+            cleanup_deadline = now + std::chrono::minutes(5);
+        }
     }
 
     printf("\nShutting down...\n");

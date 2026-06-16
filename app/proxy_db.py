@@ -49,6 +49,17 @@ class ProxyDatabase:
             sort_order INTEGER NOT NULL DEFAULT 0,
             pattern TEXT NOT NULL,
             upstream_model TEXT NOT NULL)""")
+        # Performance metrics (local-only, not synced)
+        conn.execute("""CREATE TABLE IF NOT EXISTS perf_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model TEXT NOT NULL,
+            upstream_latency_ms INTEGER NOT NULL DEFAULT 0,
+            total_latency_ms INTEGER NOT NULL DEFAULT 0,
+            status_code INTEGER NOT NULL,
+            is_error INTEGER NOT NULL DEFAULT 0,
+            concurrent_count INTEGER NOT NULL DEFAULT 0,
+            requested_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_perf_events_time ON perf_events(requested_at)")
         conn.commit()
         return conn
 
@@ -706,6 +717,174 @@ class ProxyDatabase:
             return {
                 "record_count": len(rows),
                 "dashboard_records": dash_count,
+            }
+        finally:
+            conn.close()
+
+    # ── Performance Metrics (local-only) ───────────────────────────────
+
+    def get_perf_summary(self, window_minutes: int = 15) -> dict:
+        """Aggregated performance stats for the last N minutes."""
+        conn = self._connect()
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM perf_events "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                (str(window_minutes),)
+            ).fetchone()[0]
+
+            errors = conn.execute(
+                "SELECT COUNT(*) FROM perf_events "
+                "WHERE is_error = 1 AND requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                (str(window_minutes),)
+            ).fetchone()[0]
+
+            tokens = conn.execute(
+                "SELECT COALESCE(SUM(total_tokens), 0) FROM request_log "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                (str(window_minutes),)
+            ).fetchone()[0]
+
+            peak_concurrent = conn.execute(
+                "SELECT COALESCE(MAX(concurrent_count + 1), 0) FROM perf_events "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                (str(window_minutes),)
+            ).fetchone()[0]
+
+            avg_latency = conn.execute(
+                "SELECT COALESCE(AVG(total_latency_ms), 0) FROM perf_events "
+                "WHERE is_error = 0 AND requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                (str(window_minutes),)
+            ).fetchone()[0]
+
+            return {
+                "total_requests": total,
+                "error_count": errors,
+                "success_rate": round((total - errors) / max(total, 1) * 100, 1),
+                "total_tokens": tokens,
+                "peak_concurrent": peak_concurrent,
+                "avg_latency_ms": round(avg_latency, 1),
+            }
+        finally:
+            conn.close()
+
+    def get_perf_latency(self, window_minutes: int = 60) -> list[dict]:
+        """Latency percentiles (P50/P95/P99) per 1-minute bucket."""
+        conn = self._connect()
+        try:
+            buckets = conn.execute(
+                "SELECT DISTINCT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket "
+                "FROM perf_events "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime') "
+                "ORDER BY bucket",
+                (str(window_minutes),)
+            ).fetchall()
+
+            result = []
+            for (bucket,) in buckets:
+                rows = conn.execute(
+                    "SELECT total_latency_ms, upstream_latency_ms FROM perf_events "
+                    "WHERE strftime('%Y-%m-%d %H:%M', requested_at) = ? "
+                    "ORDER BY total_latency_ms",
+                    (bucket,)
+                ).fetchall()
+
+                if not rows:
+                    continue
+
+                total_vals = [r[0] for r in rows]
+                upstream_vals = [r[1] for r in rows]
+                n = len(total_vals)
+
+                def percentile(sorted_vals, p):
+                    k = max(0, min(n - 1, int(n * p / 100)))
+                    return sorted_vals[k]
+
+                result.append({
+                    "bucket": bucket,
+                    "p50_total": percentile(total_vals, 50),
+                    "p95_total": percentile(total_vals, 95),
+                    "p99_total": percentile(total_vals, 99),
+                    "p50_upstream": percentile(upstream_vals, 50),
+                    "p95_upstream": percentile(upstream_vals, 95),
+                    "p99_upstream": percentile(upstream_vals, 99),
+                    "count": n,
+                })
+            return result
+        finally:
+            conn.close()
+
+    def get_perf_throughput(self, window_minutes: int = 60) -> list[dict]:
+        """Request count and peak concurrency per 1-minute bucket."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
+                "COUNT(*) AS request_count, "
+                "MAX(concurrent_count + 1) AS peak_concurrent "
+                "FROM perf_events "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime') "
+                "GROUP BY bucket "
+                "ORDER BY bucket",
+                (str(window_minutes),)
+            ).fetchall()
+
+            return [{
+                "bucket": r[0],
+                "requests": r[1],
+                "peak_concurrent": r[2],
+            } for r in rows]
+        finally:
+            conn.close()
+
+    def get_perf_models(self, window_minutes: int = 60) -> list[dict]:
+        """Per-model performance breakdown for the last N minutes."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT model, COUNT(*) AS request_count, "
+                "AVG(CASE WHEN is_error = 0 THEN total_latency_ms END) AS avg_latency_ms, "
+                "MAX(CASE WHEN is_error = 0 THEN total_latency_ms END) AS max_latency_ms, "
+                "SUM(CASE WHEN is_error = 0 THEN 1 ELSE 0 END) AS success_count, "
+                "SUM(is_error) AS error_count "
+                "FROM perf_events "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime') "
+                "GROUP BY model "
+                "ORDER BY request_count DESC",
+                (str(window_minutes),)
+            ).fetchall()
+
+            return [{
+                "model": r[0],
+                "requests": r[1],
+                "avg_latency_ms": round(r[2] or 0, 1),
+                "max_latency_ms": r[3] or 0,
+                "success_rate": round(r[4] / max(r[1], 1) * 100, 1),
+            } for r in rows]
+        finally:
+            conn.close()
+
+    def get_perf_realtime(self, window_seconds: int = 60) -> dict:
+        """Real-time metrics: current RPM estimate and latest concurrency."""
+        conn = self._connect()
+        try:
+            recent_count = conn.execute(
+                "SELECT COUNT(*) FROM perf_events "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' seconds', 'localtime')",
+                (str(window_seconds),)
+            ).fetchone()[0]
+
+            rpm = round(recent_count / max(window_seconds / 60.0, 0.1), 1)
+
+            latest_concurrent = conn.execute(
+                "SELECT concurrent_count + 1 FROM perf_events "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+
+            return {
+                "rpm": rpm,
+                "recent_requests": recent_count,
+                "latest_concurrent": latest_concurrent[0] if latest_concurrent else 0,
             }
         finally:
             conn.close()
