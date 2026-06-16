@@ -210,7 +210,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                         accumulated.clear();
                         first_response = true;
                         return upstream_.forward(
-                            route_result.base_url, route_result.upstream_key,
+                            "POST", route_result.base_url, route_result.upstream_key,
                             "/chat/completions", body, content_type, on_chunk);
                     },
                     /*is_streaming=*/true);
@@ -250,7 +250,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         auto fwd = forward_with_retry(
             [&]() {
                 return upstream_.forward(
-                    route_result.base_url, route_result.upstream_key,
+                    "POST", route_result.base_url, route_result.upstream_key,
                     "/chat/completions", body, content_type, nullptr);
             },
             /*is_streaming=*/false);
@@ -326,7 +326,7 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
 
     auto fwd = forward_with_retry(
         [&]() {
-            return upstream_.forward(route_result.base_url, route_result.upstream_key,
+            return upstream_.forward("GET", route_result.base_url, route_result.upstream_key,
                                      "/models", "", "application/json", nullptr);
         },
         /*is_streaming=*/false);

@@ -30,7 +30,8 @@ public:
     /// to the callback as it arrives (SSE streaming).  The full body is
     /// still accumulated and returned in `ForwardResult::body` for later
     /// usage parsing.
-    ForwardResult forward(const std::string &base_url,
+    ForwardResult forward(const std::string &method,
+                          const std::string &base_url,
                           const std::string &upstream_key,
                           const std::string &path,
                           const std::string &body,

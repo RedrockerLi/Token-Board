@@ -16,7 +16,8 @@ bool UpstreamClient::is_retryable(int status_code) {
 }
 
 UpstreamClient::ForwardResult
-UpstreamClient::forward(const std::string &base_url,
+UpstreamClient::forward(const std::string &method,
+                        const std::string &base_url,
                         const std::string &upstream_key,
                         const std::string &path,
                         const std::string &body,
@@ -84,7 +85,7 @@ UpstreamClient::forward(const std::string &base_url,
         };
 
         httplib::Request req;
-        req.method = "POST";
+        req.method = method;
         req.path = full_path;
         req.headers = headers;
         req.body = body;
@@ -117,9 +118,13 @@ UpstreamClient::forward(const std::string &base_url,
                            std::string(httplib::to_string(err));
         }
     } else {
-        // ── Non-streaming: simple synchronous POST ─────────────────
-        httplib::Result upstream_res =
-            cli.Post(full_path, headers, body, content_type.c_str());
+        // ── Non-streaming: use GET or POST based on method ─────
+        httplib::Result upstream_res;
+        if (method == "GET") {
+            upstream_res = cli.Get(full_path, headers);
+        } else {
+            upstream_res = cli.Post(full_path, headers, body, content_type.c_str());
+        }
 
         auto t1 = std::chrono::steady_clock::now();
         result.duration_ms = static_cast<int>(
