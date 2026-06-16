@@ -59,7 +59,7 @@ class ProxyDatabase:
             status_code INTEGER NOT NULL,
             is_error INTEGER NOT NULL DEFAULT 0,
             concurrent_count INTEGER NOT NULL DEFAULT 0,
-            requested_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))""")
+            requested_at TEXT NOT NULL DEFAULT (datetime('now')))""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_perf_events_time ON perf_events(requested_at)")
         conn.commit()
         return conn
@@ -731,31 +731,31 @@ class ProxyDatabase:
         try:
             total = conn.execute(
                 "SELECT COUNT(*) FROM perf_events "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
 
             errors = conn.execute(
                 "SELECT COUNT(*) FROM perf_events "
-                "WHERE is_error = 1 AND requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                "WHERE is_error = 1 AND requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
 
             tokens = conn.execute(
                 "SELECT COALESCE(SUM(total_tokens), 0) FROM request_log "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
 
             peak_concurrent = conn.execute(
                 "SELECT COALESCE(MAX(concurrent_count + 1), 0) FROM perf_events "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
 
             avg_latency = conn.execute(
                 "SELECT COALESCE(AVG(total_latency_ms), 0) FROM perf_events "
-                "WHERE is_error = 0 AND requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime')",
+                "WHERE is_error = 0 AND requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
 
@@ -777,7 +777,7 @@ class ProxyDatabase:
             buckets = conn.execute(
                 "SELECT DISTINCT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket "
                 "FROM perf_events "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime') "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "ORDER BY bucket",
                 (str(window_minutes),)
             ).fetchall()
@@ -825,7 +825,7 @@ class ProxyDatabase:
                 "COUNT(*) AS request_count, "
                 "MAX(concurrent_count + 1) AS peak_concurrent "
                 "FROM perf_events "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime') "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "GROUP BY bucket "
                 "ORDER BY bucket",
                 (str(window_minutes),)
@@ -850,7 +850,7 @@ class ProxyDatabase:
                 "SUM(CASE WHEN is_error = 0 THEN 1 ELSE 0 END) AS success_count, "
                 "SUM(is_error) AS error_count "
                 "FROM perf_events "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes', 'localtime') "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "GROUP BY model "
                 "ORDER BY request_count DESC",
                 (str(window_minutes),)
@@ -872,7 +872,7 @@ class ProxyDatabase:
         try:
             recent_count = conn.execute(
                 "SELECT COUNT(*) FROM perf_events "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' seconds', 'localtime')",
+                "WHERE requested_at >= datetime('now', '-' || ? || ' seconds')",
                 (str(window_seconds),)
             ).fetchone()[0]
 

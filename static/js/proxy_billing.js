@@ -5,6 +5,20 @@
  * Lazy-loaded by app.js when navigating to #/proxy/billing or #/proxy/logs.
  */
 
+/**
+ * Format a UTC timestamp string from SQLite (YYYY-MM-DD HH:MM:SS)
+ * into the browser's local timezone display.
+ */
+function fmtTime(ts) {
+    if (!ts) return '';
+    // SQLite datetime('now') returns "YYYY-MM-DD HH:MM:SS" in UTC.
+    // Convert to ISO 8601 so JS Date parses it as UTC reliably.
+    const iso = ts.replace(' ', 'T') + 'Z';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return ts; // fallback for malformed values
+    return d.toLocaleString();
+}
+
 // ── Billing Page ─────────────────────────────────────────────────────────
 
 async function loadBillingStats() {
@@ -356,7 +370,7 @@ async function loadLogsTable() {
 
         tbody.innerHTML = data.items.map((r) => `
             <tr>
-                <td>${esc(r.requested_at || '')}</td>
+                <td>${esc(fmtTime(r.requested_at))}</td>
                 <td>${esc(r.account_name || `ID:${r.account_id}`)}</td>
                 <td><code>${esc(r.model)}</code></td>
                 <td>${fmtNum(r.prompt_tokens)} / ${fmtNum(r.completion_tokens)} / ${fmtNum(r.total_tokens)}</td>

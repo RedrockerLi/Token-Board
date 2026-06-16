@@ -89,7 +89,7 @@ void Database::create_schema() {
             is_streaming     INTEGER NOT NULL DEFAULT 0,
             status_code      INTEGER NOT NULL,
             duration_ms      INTEGER NOT NULL DEFAULT 0,
-            requested_at     TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            requested_at     TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_rl_account
@@ -142,7 +142,7 @@ void Database::create_schema() {
             status_code         INTEGER NOT NULL,
             is_error            INTEGER NOT NULL DEFAULT 0,
             concurrent_count    INTEGER NOT NULL DEFAULT 0,
-            requested_at        TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            requested_at        TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_perf_events_time
@@ -200,7 +200,7 @@ void Database::prepare_statements() {
             "FROM model_pricing ORDER BY id",
             stmt_get_pricing_);
 
-    PREPARE("UPDATE local_keys SET last_used_at = datetime('now', 'localtime') "
+    PREPARE("UPDATE local_keys SET last_used_at = datetime('now') "
             "WHERE id = ?1",
             stmt_update_last_used_);
 
@@ -210,7 +210,7 @@ void Database::prepare_statements() {
             stmt_insert_perf_event_);
 
     PREPARE("DELETE FROM perf_events "
-            "WHERE requested_at < datetime('now', '-' || ?1 || ' minutes', 'localtime')",
+            "WHERE requested_at < datetime('now', '-' || ?1 || ' minutes')",
             stmt_cleanup_perf_events_);
 
     #undef PREPARE
