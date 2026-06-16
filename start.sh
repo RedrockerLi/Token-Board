@@ -54,6 +54,26 @@ if $START_ALL; then
     HAS_SYSTEMD=false
     systemctl --user daemon-reload 2>/dev/null && HAS_SYSTEMD=true
 
+    # ── 先停 systemd 服务（防止 Restart=always 自动复活）──
+    if $HAS_SYSTEMD && systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        echo "[proxy] 停止 systemd 服务..."
+        systemctl --user stop "$SERVICE_NAME"
+    fi
+
+    # ── 清理所有残留代理进程（包括非 systemd 启动的）──
+    EXISTING=$(pgrep -f "token_proxy" 2>/dev/null || true)
+    if [ -n "$EXISTING" ]; then
+        echo "[proxy] 清理旧代理进程: $EXISTING"
+        kill $EXISTING 2>/dev/null || true
+        sleep 1
+        STILL=$(pgrep -f "token_proxy" 2>/dev/null || true)
+        if [ -n "$STILL" ]; then
+            echo "[proxy] SIGTERM 无效，使用 SIGKILL: $STILL"
+            kill -9 $STILL 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+
     if $HAS_SYSTEMD; then
         if [ ! -f "$SERVICE_FILE" ]; then
             echo "[proxy] 安装 systemd 服务（开机自启）..."
@@ -83,14 +103,9 @@ EOF
         systemctl --user restart "$SERVICE_NAME"
         echo -e "${GREEN}✓ 代理已重启 (systemd)${NC}"
     else
-        EXISTING=$(pgrep -f "token_proxy" 2>/dev/null || true)
-        if [ -n "$EXISTING" ]; then
-            kill $EXISTING 2>/dev/null || true
-            sleep 1
-        fi
         "$PROXY_BIN" --db "$PROXY_DB" --port "$PROXY_PORT" &
         PROXY_PID=$!
-        echo -e "${GREEN}✓ 代理已重启 (PID: $PROXY_PID)${NC}"
+        echo -e "${GREEN}✓ 代理已启动 (PID: $PROXY_PID)${NC}"
     fi
     echo "   地址: http://localhost:$PROXY_PORT/v1"
     echo ""
