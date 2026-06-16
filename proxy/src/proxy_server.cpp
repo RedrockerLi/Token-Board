@@ -10,7 +10,6 @@
 #include "json.hpp"
 
 #include <cstdio>
-#include <regex>
 
 using json = nlohmann::json;
 
@@ -85,15 +84,49 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         return;
     }
 
-    // 3. Forward to upstream
+    // 3. Apply model mapping (template first, then key_model_map fallback)
     std::string body = req.body;
+    std::string req_model = extract_model(body);
+    std::vector<Database::ModelMapping> mappings;
+    int template_id = db_.get_key_template_id(route_result.local_key_id);
+    if (template_id > 0) {
+        mappings = db_.get_template_entries(template_id);
+        fprintf(stderr, "[Proxy] Using template %d: %zu mapping(s)\n", template_id, mappings.size());
+    } else {
+        mappings = db_.get_key_model_mappings(route_result.local_key_id);
+        fprintf(stderr, "[Proxy] Got %zu model mappings for key_id=%d\n",
+                mappings.size(), route_result.local_key_id);
+    }
+    for (const auto &m : mappings) {
+        if (glob_match(m.pattern, req_model)) {
+            fprintf(stderr, "[Proxy] Model map: %s → %s (pattern: %s)\n",
+                    req_model.c_str(), m.upstream_model.c_str(), m.pattern.c_str());
+            try {
+                json j = json::parse(body);
+                j["model"] = m.upstream_model;
+                body = j.dump();
+            } catch (...) {
+                size_t pos = body.find("\"model\"");
+                if (pos != std::string::npos) {
+                    auto colon = body.find(':', pos);
+                    auto q1 = body.find('"', colon + 1);
+                    auto q2 = body.find('"', q1 + 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos)
+                        body.replace(q1 + 1, q2 - q1 - 1, m.upstream_model);
+                }
+            }
+            req_model = m.upstream_model;
+            break;
+        }
+    }
+
+    // 4. Forward to upstream
     std::string content_type = req.has_header("Content-Type")
                                    ? req.get_header_value("Content-Type")
                                    : "application/json";
 
     bool is_stream = is_streaming_request(body);
 
-    std::string req_model = extract_model(body);
     fprintf(stderr, "[Proxy] %s request from key_id=%d to account=%d model=%s\n",
             is_stream ? "streaming" : "non-streaming",
             route_result.local_key_id, route_result.account_id,
@@ -192,21 +225,66 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
     }
 }
 
+// ── handle_list_models ─────────────────────────────────────────────────
+
+void ProxyServer::handle_list_models(const httplib::Request &req,
+                                      httplib::Response &res) {
+    add_cors_headers(res);
+
+    std::string auth = req.has_header("Authorization")
+                           ? req.get_header_value("Authorization")
+                           : "";
+
+    std::string local_key;
+    if (auth.rfind("Bearer ", 0) == 0)
+        local_key = auth.substr(7);
+
+    if (local_key.empty()) {
+        res.status = 401;
+        res.set_content(json_error("Missing API key", 401), "application/json");
+        return;
+    }
+
+    auto route_result = router_.route(local_key);
+    if (!route_result.success) {
+        res.status = 401;
+        res.set_content(json_error(route_result.error, 401), "application/json");
+        return;
+    }
+
+    auto fwd = upstream_.forward(route_result.base_url, route_result.upstream_key,
+                                 "/models", "", "application/json", nullptr);
+    if (fwd.success) {
+        res.status = fwd.status_code;
+        res.set_content(fwd.body, "application/json");
+    } else {
+        res.status = 502;
+        res.set_content(json_error("Upstream error: " + fwd.error, 502), "application/json");
+    }
+}
+
 // ── setup_routes ─────────────────────────────────────────────────────────
 
 void ProxyServer::setup_routes(httplib::Server &server) {
     // CORS preflight
-    server.Options("/v1/chat/completions",
-                   [this](const httplib::Request &, httplib::Response &res) {
-                       add_cors_headers(res);
-                       res.status = 204;
-                   });
+    auto cors_handler = [this](const httplib::Request &, httplib::Response &res) {
+        add_cors_headers(res);
+        res.status = 204;
+    };
+    server.Options("/v1/chat/completions", cors_handler);
+    server.Options("/v1/models", cors_handler);
 
     // Main proxy endpoint
     server.Post("/v1/chat/completions",
                 [this](const httplib::Request &req, httplib::Response &res) {
                     handle_chat_completions(req, res);
                 });
+
+    // Model listing
+    server.Get("/v1/models",
+               [this](const httplib::Request &req, httplib::Response &res) {
+                   handle_list_models(req, res);
+               });
 
     // Health check
     server.Get("/health", [this](const httplib::Request &, httplib::Response &res) {

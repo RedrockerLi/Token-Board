@@ -29,6 +29,27 @@ class ProxyDatabase:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # Ensure new tables exist (C++ proxy also creates them, but Flask may connect first)
+        conn.execute("""CREATE TABLE IF NOT EXISTS account_models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL, model_id TEXT NOT NULL,
+            UNIQUE(account_id, model_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS key_model_map (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id INTEGER NOT NULL, pattern TEXT NOT NULL,
+            upstream_model TEXT NOT NULL,
+            UNIQUE(key_id, pattern))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS model_map_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 0)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS model_map_template_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL REFERENCES model_map_templates(id) ON DELETE CASCADE,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            pattern TEXT NOT NULL,
+            upstream_model TEXT NOT NULL)""")
+        conn.commit()
         return conn
 
     # ── Stats ──────────────────────────────────────────────────────────
@@ -150,13 +171,171 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    # ── Account Models ────────────────────────────────────────────────
+
+    def update_account_models(self, account_id: int, models: list[str]) -> int:
+        """Replace all models for an account. Returns count of models stored."""
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM account_models WHERE account_id = ?", (account_id,))
+            for m in models:
+                conn.execute(
+                    "INSERT OR IGNORE INTO account_models (account_id, model_id) VALUES (?,?)",
+                    (account_id, m),
+                )
+            conn.commit()
+            return len(models)
+        finally:
+            conn.close()
+
+    def get_account_models(self, account_id: int) -> list[str]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT model_id FROM account_models WHERE account_id = ? ORDER BY id",
+                (account_id,),
+            ).fetchall()
+            return [r[0] for r in rows]
+        finally:
+            conn.close()
+
+    # ── Key Model Map ──────────────────────────────────────────────────
+
+    def update_key_model_map(self, key_id: int, mappings: list[dict]) -> int:
+        """Replace all mappings for a key. Each mapping: {pattern, upstream_model}."""
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM key_model_map WHERE key_id = ?", (key_id,))
+            for m in mappings:
+                conn.execute(
+                    "INSERT OR IGNORE INTO key_model_map (key_id, pattern, upstream_model) VALUES (?,?,?)",
+                    (key_id, m["pattern"], m["upstream_model"]),
+                )
+            conn.commit()
+            return len(mappings)
+        finally:
+            conn.close()
+
+    def get_key_model_map(self, key_id: int) -> list[dict]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, pattern, upstream_model FROM key_model_map WHERE key_id = ? ORDER BY id",
+                (key_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def lookup_model_map(self, key_id: int, model: str) -> str | None:
+        """Return upstream_model if pattern matches, else None. First match wins."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT pattern, upstream_model FROM key_model_map WHERE key_id = ? ORDER BY id",
+                (key_id,),
+            ).fetchall()
+            import re
+            for row in rows:
+                try:
+                    if re.search(row["pattern"], model):
+                        return row["upstream_model"]
+                except re.error:
+                    pass
+            return None
+        finally:
+            conn.close()
+
+    # ── Model Map Templates ───────────────────────────────────────────
+
+    def get_templates(self) -> list[dict]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, name, sort_order FROM model_map_templates ORDER BY sort_order, id"
+            ).fetchall()
+            result = []
+            for r in rows:
+                entries = conn.execute(
+                    "SELECT id, pattern, upstream_model, sort_order FROM model_map_template_entries WHERE template_id = ? ORDER BY sort_order, id",
+                    (r["id"],),
+                ).fetchall()
+                result.append({"id": r["id"], "name": r["name"], "sort_order": r["sort_order"],
+                               "entries": [dict(e) for e in entries]})
+            return result
+        finally:
+            conn.close()
+
+    def create_template(self, data: dict) -> int:
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO model_map_templates (name) VALUES (?)", (data["name"],))
+            tid = cursor.lastrowid
+            for i, e in enumerate(data.get("entries", [])):
+                conn.execute(
+                    "INSERT INTO model_map_template_entries (template_id, sort_order, pattern, upstream_model) VALUES (?,?,?,?)",
+                    (tid, i, e["pattern"], e["upstream_model"]))
+            conn.commit()
+            return tid
+        finally:
+            conn.close()
+
+    def update_template(self, tid: int, data: dict) -> bool:
+        conn = self._connect()
+        try:
+            if "name" in data:
+                conn.execute("UPDATE model_map_templates SET name=? WHERE id=?", (data["name"], tid))
+            if "entries" in data:
+                conn.execute("DELETE FROM model_map_template_entries WHERE template_id=?", (tid,))
+                for i, e in enumerate(data["entries"]):
+                    conn.execute(
+                        "INSERT INTO model_map_template_entries (template_id, sort_order, pattern, upstream_model) VALUES (?,?,?,?)",
+                        (tid, i, e["pattern"], e["upstream_model"]))
+            if "sort_order" in data:
+                conn.execute("UPDATE model_map_templates SET sort_order=? WHERE id=?", (data["sort_order"], tid))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def delete_template(self, tid: int) -> bool:
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM model_map_templates WHERE id=?", (tid,))
+            conn.commit()
+            return conn.total_changes > 0
+        finally:
+            conn.close()
+
+    def reorder_template_entries(self, tid: int, entry_id: int, direction: str) -> bool:
+        conn = self._connect()
+        try:
+            entries = conn.execute(
+                "SELECT id, sort_order FROM model_map_template_entries WHERE template_id=? ORDER BY sort_order, id",
+                (tid,)).fetchall()
+            idx = next((i for i, e in enumerate(entries) if e["id"] == entry_id), None)
+            if idx is None: return False
+            if direction == "up" and idx > 0:
+                a, b = entries[idx - 1], entries[idx]
+                conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (b["sort_order"], a["id"]))
+                conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (a["sort_order"], b["id"]))
+            elif direction == "down" and idx < len(entries) - 1:
+                a, b = entries[idx], entries[idx + 1]
+                conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (b["sort_order"], a["id"]))
+                conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (a["sort_order"], b["id"]))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
     # ── Local API Keys ─────────────────────────────────────────────────
 
     def get_keys(self) -> list[dict]:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT k.id, k.key_value, k.label, k.account_id, "
+                "SELECT k.id, k.key_value, k.label, k.account_id, k.template_id, "
                 "a.name AS account_name, k.created_at, k.last_used_at "
                 "FROM local_keys k "
                 "LEFT JOIN upstream_accounts a ON k.account_id = a.id "
@@ -186,7 +365,7 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("label", "account_id"):
+            for key in ("label", "account_id", "template_id"):
                 if key in data:
                     fields.append(f"{key} = ?")
                     values.append(data[key])
@@ -278,6 +457,28 @@ class ProxyDatabase:
             conn.execute("DELETE FROM model_pricing WHERE id = ?", (pricing_id,))
             conn.commit()
             return conn.total_changes > 0
+        finally:
+            conn.close()
+
+    def reorder_pricing(self, pid: int, direction: str) -> bool:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id FROM model_pricing ORDER BY id").fetchall()
+            idx = next((i for i, r in enumerate(rows) if r["id"] == pid), None)
+            if idx is None: return False
+            if direction == "up" and idx > 0:
+                a, b = rows[idx - 1]["id"], rows[idx]["id"]
+                conn.execute("UPDATE model_pricing SET id=-1 WHERE id=?", (a,))
+                conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (a, b))
+                conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (b, -1))
+            elif direction == "down" and idx < len(rows) - 1:
+                a, b = rows[idx]["id"], rows[idx + 1]["id"]
+                conn.execute("UPDATE model_pricing SET id=-1 WHERE id=?", (a,))
+                conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (a, b))
+                conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (b, -1))
+            conn.commit()
+            return True
         finally:
             conn.close()
 
@@ -456,7 +657,8 @@ class ProxyDatabase:
 
         conn = self._connect()
         try:
-            # Aggregate by date + account + model
+            # Layer 3: Exclude "unknown" model and NULL account_name (would become "unknown")
+            # Filter at the SQL level so these never reach the dashboard DB
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
@@ -470,6 +672,8 @@ class ProxyDatabase:
                 LEFT JOIN upstream_accounts a ON r.account_id = a.id
                 WHERE CAST(strftime('%Y', r.requested_at) AS INTEGER) = ?
                   AND CAST(strftime('%m', r.requested_at) AS INTEGER) = ?
+                  AND LOWER(r.model) != 'unknown'
+                  AND a.name IS NOT NULL
                 GROUP BY date(r.requested_at), a.name, r.model
                 ORDER BY date(r.requested_at), a.name, r.model
             """, (year, month)).fetchall()
@@ -482,10 +686,16 @@ class ProxyDatabase:
             dash_db = DashboardDatabase(dash_db_path)
             dash_count = 0
             for r in rows:
-                name = r["account_name"] or "unknown"
+                name = r["account_name"]
+                model = r["model"]
+                # Layer 3 (belt-and-suspenders): skip any "unknown" model or account
+                if not name or name.lower() == "unknown":
+                    continue
+                if not model or model.lower() == "unknown":
+                    continue
                 dash_count += dash_db.upsert_proxy_data(
                     date=r["date"],
-                    model=r["model"],
+                    model=model,
                     account_name=name,
                     prompt_tokens=r["prompt_tokens"],
                     completion_tokens=r["completion_tokens"],

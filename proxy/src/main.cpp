@@ -27,6 +27,9 @@ extern "C" void signal_handler(int /*signum*/) {
 }
 
 int main(int argc, char *argv[]) {
+    // Unbuffered stderr for real-time logging
+    setbuf(stderr, NULL);
+
     // ── Parse config ──────────────────────────────────────────────────
     Config cfg = parse_args(argc, argv);
 

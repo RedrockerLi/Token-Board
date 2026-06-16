@@ -404,6 +404,17 @@ def sync(db_path: str) -> dict:
             if pricing_count > 0:
                 _recalculate_all_costs(local_conn)
 
+            # Merge remote templates (no secrets, bidirectional via INSERT OR IGNORE)
+            rmt_conn = sqlite3.connect(remote_path)
+            rmt_tmpl = rmt_conn.execute(
+                "SELECT name, sort_order FROM model_map_templates").fetchall()
+            rmt_conn.close()
+            for rt in rmt_tmpl:
+                local_conn.execute(
+                    "INSERT OR IGNORE INTO model_map_templates (name, sort_order) VALUES (?,?)",
+                    (rt[0], rt[1]))
+            local_conn.commit()
+
             # 5. Merge remote request_log into local
             remote_conn = sqlite3.connect(remote_path)
             remote_conn.row_factory = sqlite3.Row
@@ -420,6 +431,7 @@ def sync(db_path: str) -> dict:
         merged_conn.execute("DELETE FROM upstream_accounts")
         merged_conn.execute("DELETE FROM local_keys")
         merged_conn.execute("DELETE FROM sync_config")
+        merged_conn.execute("DELETE FROM key_model_map")
         merged_conn.commit()
         merged_conn.close()
 
@@ -516,6 +528,17 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
             local_conn.close()
             remote_conn.close()
 
+            # Layer 2: Delete any "unknown" entries merged from remote
+            cleaned = _cleanup_unknown_entries(db_path)
+            if cleaned > 0:
+                print(f"[Sync] Cleaned up {cleaned} 'unknown' entries from remote merge", flush=True)
+
+        # Layer 2: Clean up any local "unknown" entries before uploading
+        if os.path.exists(db_path):
+            cleaned = _cleanup_unknown_entries(db_path)
+            if cleaned > 0:
+                print(f"[Sync] Cleaned up {cleaned} local 'unknown' entries before upload", flush=True)
+
         # 2. Upload local copy (always, even if no remote)
         upload_count = 0
         if os.path.exists(db_path):
@@ -542,6 +565,33 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
     finally:
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _cleanup_unknown_entries(db_path: str) -> int:
+    """Layer 2: Delete all rows where model or api_key_name is 'unknown'.
+
+    Returns total number of rows deleted.
+    """
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.execute("PRAGMA busy_timeout=5000")
+    total = 0
+    try:
+        for table in ("token_usage", "request_usage", "cost_entry"):
+            # Delete rows with model = 'unknown' (case-insensitive)
+            cursor = conn.execute(
+                f"DELETE FROM {table} WHERE LOWER(model) = 'unknown'"
+            )
+            total += cursor.rowcount
+            # For tables with api_key_name column, also delete those
+            if table != "cost_entry":
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE LOWER(api_key_name) = 'unknown'"
+                )
+                total += cursor.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return total
 
 
 def _get_table_columns(conn, table: str) -> list[str]:
@@ -601,6 +651,31 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE TABLE IF NOT EXISTS sync_config (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS account_models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            model_id TEXT NOT NULL,
+            UNIQUE(account_id, model_id)
+        );
+        CREATE TABLE IF NOT EXISTS key_model_map (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id INTEGER NOT NULL,
+            pattern TEXT NOT NULL,
+            upstream_model TEXT NOT NULL,
+            UNIQUE(key_id, pattern)
+        );
+        CREATE TABLE IF NOT EXISTS model_map_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS model_map_template_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            pattern TEXT NOT NULL,
+            upstream_model TEXT NOT NULL
         );
     """)
     conn.commit()

@@ -3,6 +3,10 @@
 #include <string>
 #include <vector>
 
+/// Shell-style glob match: supports * (any chars) and ? (single char).
+/// Case-insensitive. Returns true if pattern matches text.
+bool glob_match(const std::string &pattern, const std::string &text);
+
 class Database;
 
 /// In-memory model-pricing table loaded from SQLite.

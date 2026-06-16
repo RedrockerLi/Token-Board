@@ -2,7 +2,6 @@
  * proxy_manager.js — Account, Key, and Pricing management pages.
  *
  * Exports: initAccountsPage(), initKeysPage(), initPricingPage()
- * Lazy-loaded by app.js when navigating to #/proxy/accounts etc.
  */
 
 // ── Shared Helpers ───────────────────────────────────────────────────────
@@ -20,7 +19,6 @@ async function proxyFetch(url, options = {}) {
 }
 
 function showToast(msg, type = 'success') {
-    // Simple toast notification
     const toast = document.createElement('div');
     toast.className = `toast toast--${type}`;
     toast.textContent = msg;
@@ -38,17 +36,40 @@ function showToast(msg, type = 'success') {
     }, 3000);
 }
 
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function maskKey(key) {
+    if (!key) return '***';
+    return key.length > 12 ? key.slice(0, 6) + '...' + key.slice(-4) : key.slice(0, 4) + '...';
+}
+
+function openModal(id) {
+    const modal = document.getElementById(id);
+    if (modal) modal.style.display = '';
+}
+
+function closeModal(id) {
+    const modal = document.getElementById(id);
+    if (modal) modal.style.display = 'none';
+    if (id === 'keyModal') {
+        const disp = document.getElementById('generatedKeyDisplay');
+        if (disp) disp.style.display = 'none';
+    }
+}
+
 // ── Accounts Page ────────────────────────────────────────────────────────
 
 async function loadAccountsTable() {
     const tbody = document.querySelector('#accountsTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
-
+    tbody.innerHTML = '<tr><td colspan="5" class="td-loading">加载中...</td></tr>';
     try {
         const accounts = await proxyFetch('/api/proxy/accounts');
         if (!accounts.length) {
-            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无账户，请点击"添加账户"</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" class="td-empty">暂无账户，请点击"添加账户"</td></tr>';
             return;
         }
         tbody.innerHTML = accounts.map((a) => `
@@ -59,12 +80,12 @@ async function loadAccountsTable() {
                 <td>${esc(a.created_at || '')}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
-                    <button class="btn btn--sm" onclick="deleteAccount(${a.id}, '${esc(a.name)}')" style="color:#EF4444;">删除</button>
+                    <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${esc(a.name)}')">更新模型</button>
                 </td>
             </tr>
         `).join('');
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="6" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -73,7 +94,6 @@ async function saveAccount(e) {
     const form = e.target;
     const data = Object.fromEntries(new FormData(form));
     const id = form.dataset.editId;
-
     try {
         if (id) {
             await proxyFetch(`/api/proxy/accounts/${id}`, {
@@ -90,6 +110,8 @@ async function saveAccount(e) {
         }
         form.reset();
         form.dataset.editId = '';
+        document.getElementById('accountDeleteBtn').style.display = 'none';
+        document.getElementById('accountModelBtn').style.display = 'none';
         form.querySelector('[type=submit]').textContent = '添加账户';
         closeModal('accountModal');
         loadAccountsTable();
@@ -99,7 +121,6 @@ async function saveAccount(e) {
 }
 
 function editAccount(id) {
-    // Load account data and populate form
     proxyFetch('/api/proxy/accounts').then((accounts) => {
         const acc = accounts.find((a) => a.id === id);
         if (!acc) return;
@@ -108,13 +129,17 @@ function editAccount(id) {
         form['upstream_key'].value = acc.upstream_key;
         form['base_url'].value = acc.base_url;
         form.dataset.editId = id;
-        form.querySelector('[type=submit]').textContent = '更新账户';
+        form.querySelector('[type=submit]').textContent = '保存';
+        document.getElementById('accountDeleteBtn').style.display = '';
+        document.getElementById('accountModelBtn').style.display = '';
+        document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name); };
+        document.getElementById('accountModelBtn').onclick = () => updateAccountModels(id, acc.name);
         openModal('accountModal');
     });
 }
 
 async function deleteAccount(id, name) {
-    if (!confirm(`确定删除账户 "${name}"？\\n\\n如果有本地密钥关联此账户，删除将被拒绝。`)) return;
+    if (!confirm(`确定删除账户 "${name}"？\n\n如果有本地密钥关联此账户，删除将被拒绝。`)) return;
     try {
         await proxyFetch(`/api/proxy/accounts/${id}`, { method: 'DELETE' });
         showToast('账户已删除');
@@ -124,11 +149,22 @@ async function deleteAccount(id, name) {
     }
 }
 
+async function updateAccountModels(id, name) {
+    const btns = document.querySelectorAll('#accountModelBtn, [onclick*="updateAccountModels"]');
+    btns.forEach(b => { b.disabled = true; b.textContent = '获取中...'; });
+    try {
+        const result = await proxyFetch(`/api/proxy/accounts/${id}/models`, { method: 'POST', body: '{}' });
+        showToast(`${name}: 获取到 ${result.count} 个模型`);
+    } catch (err) {
+        showToast(`获取失败: ${err.message}`, 'error');
+    }
+    btns.forEach(b => { b.disabled = false; b.textContent = '更新模型'; });
+}
+
 function initAccountsPage() {
     const el = document.getElementById('page-proxy-accounts');
     if (!el || el.dataset.initialized) return;
     el.dataset.initialized = '1';
-
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">上游账户管理</h1>
@@ -139,8 +175,6 @@ function initAccountsPage() {
             <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>创建时间</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
-
-        <!-- Account Modal -->
         <div class="modal-overlay" id="accountModal" style="display:none">
             <div class="modal">
                 <div class="modal__header">
@@ -151,12 +185,15 @@ function initAccountsPage() {
                     <label>名称 <input name="name" required></label>
                     <label>上游 API Key <input name="upstream_key" required></label>
                     <label>Base URL（OpenAI 兼容） <input name="base_url" placeholder="https://api.example.com/v1"></label>
-                    <button type="submit" class="btn btn--primary">添加账户</button>
+                    <div style="display:flex; gap:8px;">
+                        <button type="submit" class="btn btn--primary">添加账户</button>
+                        <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
+                        <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:#EF4444;">删除账户</button>
+                    </div>
                 </form>
             </div>
         </div>
     `;
-
     loadAccountsTable();
 }
 
@@ -165,12 +202,11 @@ function initAccountsPage() {
 async function loadKeysTable() {
     const tbody = document.querySelector('#keysTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="7" class="td-loading">加载中...</td></tr>';
-
+    tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
     try {
         const keys = await proxyFetch('/api/proxy/keys');
         if (!keys.length) {
-            tbody.innerHTML = '<tr><td colspan="7" class="td-empty">暂无密钥，请点击"生成密钥"</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无密钥，请点击"生成密钥"</td></tr>';
             return;
         }
         tbody.innerHTML = keys.map((k) => `
@@ -181,13 +217,13 @@ async function loadKeysTable() {
                 <td>${esc(k.last_used_at || '从未使用')}</td>
                 <td>${esc(k.created_at || '')}</td>
                 <td>
-                    <button class="btn btn--sm" onclick="editKey(${k.id})">编辑</button>
+                    <button class="btn btn--sm" onclick="openEditKeyModal(${k.id})">编辑</button>
                     <button class="btn btn--sm" onclick="deleteKey(${k.id}, '${esc(k.label || k.key_masked)}')" style="color:#EF4444;">删除</button>
                 </td>
             </tr>
         `).join('');
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="7" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -200,7 +236,6 @@ async function generateKey(e) {
             method: 'POST',
             body: JSON.stringify(data),
         });
-        // Show the generated key prominently
         document.getElementById('generatedKeyDisplay').style.display = '';
         document.getElementById('generatedKeyValue').textContent = result.key_value;
         showToast('密钥已生成！请立即复制保存');
@@ -215,7 +250,7 @@ function copyKey(text) {
 }
 
 async function deleteKey(id, label) {
-    if (!confirm(`确定删除密钥 "${label}"？\\n\\n此操作不可恢复，使用该密钥的 AI 工具将立即无法连接。`)) return;
+    if (!confirm(`确定删除密钥 "${label}"？\n\n此操作不可恢复，使用该密钥的 AI 工具将立即无法连接。`)) return;
     try {
         await proxyFetch(`/api/proxy/keys/${id}`, { method: 'DELETE' });
         showToast('密钥已删除');
@@ -225,19 +260,128 @@ async function deleteKey(id, label) {
     }
 }
 
-async function editKey(id) {
-    const label = prompt('新标签（留空不变）：');
-    if (label === null) return;
-    const accId = prompt('新账户 ID（留空不变）：');
+async function openEditKeyModal(id) {
+    try {
+        const [keys, accounts] = await Promise.all([
+            proxyFetch('/api/proxy/keys'),
+            proxyFetch('/api/proxy/accounts'),
+        ]);
+        const key = keys.find((k) => k.id === id);
+        if (!key) return;
+
+        // Populate form
+        document.getElementById('editKeyLabel').value = key.label || '';
+        const accountSel = document.getElementById('editKeyAccount');
+        accountSel.innerHTML = accounts.map((a) =>
+            `<option value="${a.id}" ${a.id === key.account_id ? 'selected' : ''}>${esc(a.name)}</option>`
+        ).join('');
+
+        // Load template selector
+        const templates = await proxyFetch('/api/proxy/templates');
+        const tsel = document.getElementById('keyTemplateSelect');
+        tsel.innerHTML = '<option value="">不使用模板</option>' + templates.map(t =>
+            `<option value="${t.id}" ${key.template_id === t.id ? 'selected' : ''}>${esc(t.name)} (${t.entries ? t.entries.length : 0} 条)</option>`
+        ).join('');
+
+        document.getElementById('editKeyId').value = id;
+        openModal('editKeyModal');
+    } catch (err) {
+        showToast(err.message, 'error');
+    }
+}
+
+async function loadKeyModelMappings(keyId) {
+    const container = document.getElementById('keyModelMappings');
+    container.innerHTML = '加载中...';
+    try {
+        const mappings = await proxyFetch(`/api/proxy/keys/${keyId}/model-map`);
+        await renderKeyMappings(mappings);
+    } catch (err) {
+        container.innerHTML = `<span style="color:#EF4444;">加载失败</span>`;
+    }
+}
+
+async function renderKeyMappings(mappings) {
+    const container = document.getElementById('keyModelMappings');
+    const accountId = document.getElementById('editKeyAccount').value;
+
+    let models = [];
+    try {
+        models = await proxyFetch(`/api/proxy/accounts/${accountId}/models`);
+    } catch (e) { /* no models yet */ }
+
+    const options = models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    const emptyMsg = models.length ? '' : '<option value="">该账户暂无模型</option>';
+
+    let html = '';
+    mappings.forEach((m) => {
+        const opts = options.replace(`value="${esc(m.upstream_model)}"`, `value="${esc(m.upstream_model)}" selected`);
+        html += `
+            <div class="map-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+                <input value="${esc(m.pattern)}" placeholder="正则匹配" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
+                <span style="color:var(--color-text-tertiary);">→</span>
+                <select style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">${emptyMsg}${opts}</select>
+                <button class="btn btn--sm" onclick="this.parentElement.remove()" style="color:#EF4444;">✕</button>
+            </div>`;
+    });
+    // Add blank row
+    html += `
+        <div class="map-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+            <input placeholder="正则匹配" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
+            <span style="color:var(--color-text-tertiary);">→</span>
+            <select style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">${emptyMsg}${options}</select>
+            <button class="btn btn--sm" onclick="addKeyMapping()" style="color:#0070F3;">+</button>
+        </div>`;
+    container.innerHTML = html;
+}
+
+function addKeyMapping() {
+    const container = document.getElementById('keyModelMappings');
+    const rows = container.querySelectorAll('.map-row');
+    const lastRow = rows[rows.length - 1];
+    lastRow.querySelector('button').textContent = '✕';
+    lastRow.querySelector('button').style.color = '#EF4444';
+    lastRow.querySelector('button').onclick = function() { this.parentElement.remove(); };
+    // Clone the select from the row above (or last existing row)
+    const templateSelect = rows[rows.length - 2]?.querySelector('select')?.cloneNode(true) || lastRow.querySelector('select').cloneNode(true);
+    const div = document.createElement('div');
+    div.className = 'map-row';
+    div.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
+    div.innerHTML = `
+        <input placeholder="正则匹配" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
+        <span style="color:var(--color-text-tertiary);">→</span>
+        <select style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">${templateSelect.innerHTML}</select>
+        <button class="btn btn--sm" onclick="addKeyMapping()" style="color:#0070F3;">+</button>`;
+    container.appendChild(div);
+}
+
+async function onKeyAccountChange() {
+    const keyId = document.getElementById('editKeyId').value;
+    try {
+        // Reload mappings for the new account (keep existing mappings, just refresh dropdowns)
+        const mappings = await proxyFetch(`/api/proxy/keys/${keyId}/model-map`);
+        await renderKeyMappings(mappings);
+    } catch (e) {
+        await renderKeyMappings([]);
+    }
+}
+
+async function saveKeyEdit(e) {
+    e.preventDefault();
+    const form = e.target;
+    const id = form['id'].value;
+    const label = form['label'].value;
+    const accountId = parseInt(form['account_id'].value);
+    const templateId = form['template_id'].value ? parseInt(form['template_id'].value) : null;
+
     try {
         const data = {};
         if (label) data.label = label;
-        if (accId) data.account_id = parseInt(accId);
-        await proxyFetch(`/api/proxy/keys/${id}`, {
-            method: 'PUT',
-            body: JSON.stringify(data),
-        });
+        data.account_id = accountId;
+        data.template_id = templateId;
+        await proxyFetch(`/api/proxy/keys/${id}`, { method: 'PUT', body: JSON.stringify(data) });
         showToast('密钥已更新');
+        closeModal('editKeyModal');
         loadKeysTable();
     } catch (err) {
         showToast(err.message, 'error');
@@ -249,11 +393,9 @@ async function loadAccountOptions() {
         const accounts = await proxyFetch('/api/proxy/accounts');
         const sel = document.getElementById('keyAccountSelect');
         if (!sel) return;
-        sel.innerHTML = accounts
-            .map((a) => `<option value="${a.id}">${esc(a.name)}</option>`)
-            .join('');
+        sel.innerHTML = accounts.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
     } catch (err) {
-        console.error('Failed to load accounts for key form:', err);
+        console.error('Failed to load accounts:', err);
     }
 }
 
@@ -273,7 +415,7 @@ function initKeysPage() {
             <tbody></tbody>
         </table>
 
-        <!-- Key Generation Modal -->
+        <!-- Generate Key Modal -->
         <div class="modal-overlay" id="keyModal" style="display:none">
             <div class="modal">
                 <div class="modal__header">
@@ -292,10 +434,194 @@ function initKeysPage() {
                 </div>
             </div>
         </div>
+
+        <!-- Edit Key Modal -->
+        <div class="modal-overlay" id="editKeyModal" style="display:none">
+            <div class="modal">
+                <div class="modal__header">
+                    <h3>编辑密钥</h3>
+                    <button class="modal__close" onclick="closeModal('editKeyModal')">&times;</button>
+                </div>
+                <form id="editKeyForm" onsubmit="saveKeyEdit(event)">
+                    <input type="hidden" name="id" id="editKeyId">
+                    <label>标签 <input name="label" id="editKeyLabel" placeholder="例如: Claude Code"></label>
+                    <label>关联账户 <select name="account_id" id="editKeyAccount"></select></label>
+                    <label>模型映射模板 <select name="template_id" id="keyTemplateSelect"><option value="">不使用模板</option></select></label>
+                    <button type="submit" class="btn btn--primary" style="margin-top:12px;">保存</button>
+                </form>
+            </div>
+        </div>
     `;
 
     loadAccountOptions();
     loadKeysTable();
+}
+
+// ── Templates Page ──────────────────────────────────────────────────
+
+async function loadTemplatesTable() {
+    const tbody = document.querySelector('#templatesTable tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '<tr><td colspan="4" class="td-loading">加载中...</td></tr>';
+    try {
+        const templates = await proxyFetch('/api/proxy/templates');
+        if (!templates.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="td-empty">暂无模板，请点击"新建模板"</td></tr>';
+            return;
+        }
+        tbody.innerHTML = templates.map((t) => `
+            <tr>
+                <td>${esc(t.name)}</td>
+                <td>${t.entries ? t.entries.length : 0} 条映射</td>
+                <td>${t.entries ? t.entries.map(e => `<code>${esc(e.pattern)} → ${esc(e.upstream_model)}</code>`).join('<br>') : ''}</td>
+                <td>
+                    <button class="btn btn--sm" onclick="editTemplate(${t.id})">编辑</button>
+                    <button class="btn btn--sm" onclick="deleteTemplate(${t.id}, '${esc(t.name)}')" style="color:#EF4444;">删除</button>
+                </td>
+            </tr>
+        `).join('');
+    } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="4" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+    }
+}
+
+async function openTemplateModal(id) {
+    document.getElementById('templateForm').dataset.editId = id || '';
+    document.getElementById('templateForm').querySelector('[type=submit]').textContent = id ? '保存' : '创建';
+    document.getElementById('templateMappings').innerHTML = '';
+
+    if (id) {
+        const templates = await proxyFetch('/api/proxy/templates');
+        const t = templates.find(t => t.id === id);
+        if (!t) return;
+        document.getElementById('templateName').value = t.name;
+        if (t.entries) {
+            document.getElementById('templateMappings').innerHTML = t.entries.map((e, i) => mappingRow(e.pattern, e.upstream_model)).join('');
+        }
+    }
+    openModal('templateModal');
+    populateTemplateAcctSelect();
+    addMappingRow();
+}
+
+function mappingRow(pattern, upstream) {
+    return `<div class="map-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+        <input value="${esc(pattern||'')}" placeholder="正则" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
+        <span style="color:var(--color-text-tertiary);">→</span>
+        <select style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onfocus="loadUpstreamModels(this)"><option value="${esc(upstream||'')}">${esc(upstream||'点击获取模型')}</option></select>
+        <button class="btn btn--sm" onclick="moveMapping(this, 'up')" title="上移">▲</button>
+        <button class="btn btn--sm" onclick="moveMapping(this, 'down')" title="下移">▼</button>
+        <button class="btn btn--sm" onclick="this.parentElement.remove()" style="color:#EF4444;">✕</button>
+    </div>`;
+}
+
+function refreshAllModelDropdowns() {
+    document.querySelectorAll('#templateMappings select').forEach(s => { s.innerHTML = '<option value="">点击获取模型</option>'; });
+}
+
+async function populateTemplateAcctSelect() {
+    try {
+        const accounts = await proxyFetch('/api/proxy/accounts');
+        const sel = document.getElementById('templateAcctSelect');
+        if (!sel) return;
+        sel.innerHTML = '<option value="">-- 选择账户 --</option>' + accounts.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
+    } catch (e) {}
+}
+
+function addMappingRow() {
+    const div = document.createElement('div');
+    div.innerHTML = mappingRow('', '');
+    document.getElementById('templateMappings').appendChild(div.firstElementChild);
+}
+
+function moveMapping(btn, dir) {
+    const row = btn.parentElement;
+    if (dir === 'up' && row.previousElementSibling) {
+        row.parentElement.insertBefore(row, row.previousElementSibling);
+    } else if (dir === 'down' && row.nextElementSibling) {
+        row.parentElement.insertBefore(row.nextElementSibling, row);
+    }
+}
+
+async function loadUpstreamModels(sel) {
+    if (sel.options.length > 1) return;
+    const acctId = document.getElementById('templateAcctSelect')?.value;
+    if (!acctId) { sel.innerHTML = '<option value="">请先选择上游账户</option>'; return; }
+    try {
+        const models = await proxyFetch(`/api/proxy/accounts/${acctId}/models`);
+        if (!models.length) { sel.innerHTML = '<option value="">该账户暂无模型</option>'; return; }
+        const cur = sel.value;
+        sel.innerHTML = models.map(m => `<option value="${esc(m)}" ${m===cur?'selected':''}>${esc(m)}</option>`).join('');
+    } catch (e) {
+        sel.innerHTML = '<option value="">加载失败</option>';
+    }
+}
+
+async function saveTemplate(e) {
+    e.preventDefault();
+    const form = e.target;
+    const id = form.dataset.editId;
+    const name = document.getElementById('templateName').value;
+    const rows = document.querySelectorAll('#templateMappings .map-row');
+    const entries = [];
+    rows.forEach(row => {
+        const inputs = row.querySelectorAll('input, select');
+        const pattern = inputs[0].value.trim();
+        const upstream = inputs[1].value.trim();
+        if (pattern && upstream) entries.push({ pattern, upstream_model: upstream });
+    });
+    try {
+        if (id) {
+            await proxyFetch(`/api/proxy/templates/${id}`, { method: 'PUT', body: JSON.stringify({ name, entries }) });
+            showToast('模板已更新');
+        } else {
+            await proxyFetch('/api/proxy/templates', { method: 'POST', body: JSON.stringify({ name, entries }) });
+            showToast('模板已创建');
+        }
+        closeModal('templateModal');
+        loadTemplatesTable();
+    } catch (err) { showToast(err.message, 'error'); }
+}
+
+async function deleteTemplate(id, name) {
+    if (!confirm(`删除模板 "${name}"？`)) return;
+    try {
+        await proxyFetch(`/api/proxy/templates/${id}`, { method: 'DELETE' });
+        showToast('模板已删除');
+        loadTemplatesTable();
+    } catch (err) { showToast(err.message, 'error'); }
+}
+
+function editTemplate(id) { openTemplateModal(id); }
+
+function initTemplatesPage() {
+    const el = document.getElementById('page-proxy-templates');
+    if (!el || el.dataset.initialized) return;
+    el.dataset.initialized = '1';
+    el.innerHTML = `
+        <div class="page-header">
+            <h1 class="page-title">模型映射模板</h1>
+            <p class="page-subtitle">创建可复用的模型映射模板，在密钥管理中引用</p>
+            <button class="btn btn--primary" onclick="openTemplateModal()">+ 新建模板</button>
+        </div>
+        <table class="mgmt-table" id="templatesTable">
+            <thead><tr><th>名称</th><th>条目数</th><th>映射预览</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+        </table>
+        <div class="modal-overlay" id="templateModal" style="display:none">
+            <div class="modal" style="max-width:640px;">
+                <div class="modal__header"><h3>编辑模板</h3><button class="modal__close" onclick="closeModal('templateModal')">&times;</button></div>
+                <form id="templateForm" onsubmit="saveTemplate(event)" data-edit-id="">
+                    <label>模板名称 <input id="templateName" name="name" required></label>
+                    <label>获取模型列表的上游账户 <select id="templateAcctSelect" onchange="refreshAllModelDropdowns()"></select></label>
+                    <label>映射条目 <button type="button" class="btn btn--sm" onclick="addMappingRow()">+ 添加</button></label>
+                    <div id="templateMappings" style="max-height:350px;overflow-y:auto;"></div>
+                    <button type="submit" class="btn btn--primary">创建</button>
+                </form>
+            </div>
+        </div>
+    `;
+    loadTemplatesTable();
 }
 
 // ── Pricing Page ─────────────────────────────────────────────────────────
@@ -304,7 +630,6 @@ async function loadPricingTable() {
     const tbody = document.querySelector('#pricingTable tbody');
     if (!tbody) return;
     tbody.innerHTML = '<tr><td colspan="5" class="td-loading">加载中...</td></tr>';
-
     try {
         const pricing = await proxyFetch('/api/proxy/pricing');
         if (!pricing.length) {
@@ -318,6 +643,8 @@ async function loadPricingTable() {
                 <td>¥${p.output_price.toFixed(2)} / 1M tokens</td>
                 <td>${esc(p.currency)}</td>
                 <td>
+                    <button class="btn btn--sm" onclick="reorderPricing(${p.id},'up')">▲</button>
+                    <button class="btn btn--sm" onclick="reorderPricing(${p.id},'down')">▼</button>
                     <button class="btn btn--sm" onclick="editPricing(${p.id}, '${esc(p.model_pattern)}', ${p.input_price}, ${p.output_price})">编辑</button>
                     <button class="btn btn--sm" onclick="deletePricing(${p.id})">删除</button>
                 </td>
@@ -333,25 +660,13 @@ async function savePricing(e) {
     const form = e.target;
     const data = Object.fromEntries(new FormData(form));
     const id = form.dataset.editId;
-
-    const payload = {
-        model_pattern: data.model_pattern,
-        input_price: parseFloat(data.input_price),
-        output_price: parseFloat(data.output_price),
-    };
-
+    const payload = { model_pattern: data.model_pattern, input_price: parseFloat(data.input_price), output_price: parseFloat(data.output_price) };
     try {
         if (id) {
-            await proxyFetch(`/api/proxy/pricing/${id}`, {
-                method: 'PUT',
-                body: JSON.stringify(payload),
-            });
+            await proxyFetch(`/api/proxy/pricing/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
             showToast('定价已更新');
         } else {
-            await proxyFetch('/api/proxy/pricing', {
-                method: 'POST',
-                body: JSON.stringify(payload),
-            });
+            await proxyFetch('/api/proxy/pricing', { method: 'POST', body: JSON.stringify(payload) });
             showToast('定价已添加');
         }
         form.reset();
@@ -385,23 +700,27 @@ async function deletePricing(id) {
     }
 }
 
+async function reorderPricing(id, dir) {
+    try {
+        await proxyFetch('/api/proxy/pricing/reorder', { method: 'POST', body: JSON.stringify({ id, direction: dir }) });
+        loadPricingTable();
+    } catch (err) { showToast(err.message, 'error'); }
+}
+
 function initPricingPage() {
     const el = document.getElementById('page-proxy-pricing');
     if (!el || el.dataset.initialized) return;
     el.dataset.initialized = '1';
-
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">模型定价管理</h1>
-            <p class="page-subtitle">配置模型价格（每千 token 价格，人民币）</p>
+            <p class="page-subtitle">配置模型价格（百万元 token 价格，人民币）</p>
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
         <table class="mgmt-table" id="pricingTable">
             <thead><tr><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>货币</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
-
-        <!-- Pricing Modal -->
         <div class="modal-overlay" id="pricingModal" style="display:none">
             <div class="modal">
                 <div class="modal__header">
@@ -417,39 +736,5 @@ function initPricingPage() {
             </div>
         </div>
     `;
-
     loadPricingTable();
-}
-
-// ── Modal Helpers ────────────────────────────────────────────────────────
-
-function openModal(id) {
-    const modal = document.getElementById(id);
-    if (modal) modal.style.display = '';
-}
-
-function closeModal(id) {
-    const modal = document.getElementById(id);
-    if (modal) modal.style.display = 'none';
-    // Reset generated key display when closing key modal
-    if (id === 'keyModal') {
-        const disp = document.getElementById('generatedKeyDisplay');
-        if (disp) disp.style.display = 'none';
-    }
-}
-
-// ── Utilities ────────────────────────────────────────────────────────────
-
-function esc(s) {
-    if (s == null) return '';
-    return String(s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
-
-function maskKey(key) {
-    if (!key) return '***';
-    return key.length > 12 ? key.slice(0, 6) + '...' + key.slice(-4) : key.slice(0, 4) + '...';
 }

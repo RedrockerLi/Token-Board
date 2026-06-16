@@ -4,41 +4,35 @@
 #include <algorithm>
 #include <cstring>
 
-// ── match_pattern — simple glob with * and ? ─────────────────────────────
+// ── glob_match — shell-style glob with * and ? ────────────────────────────
 
-bool ModelPricing::match_pattern(const std::string &pattern,
-                                 const std::string &model) {
-    // Simple recursive glob matcher (no backtracking for **).
-    // Handles the patterns we use: literal prefixes with * suffix, full *, etc.
-
+bool glob_match(const std::string &pattern, const std::string &text) {
     size_t pi = 0, mi = 0;
     size_t star_pos = std::string::npos;
     size_t match_pos = 0;
 
-    while (mi < model.size()) {
+    while (mi < text.size()) {
         if (pi < pattern.size() &&
             (pattern[pi] == '?' ||
-             tolower(pattern[pi]) == tolower(model[mi]))) {
-            ++pi;
-            ++mi;
+             tolower(pattern[pi]) == tolower(text[mi]))) {
+            ++pi; ++mi;
         } else if (pi < pattern.size() && pattern[pi] == '*') {
-            star_pos = pi;
-            match_pos = mi;
-            ++pi;
+            star_pos = pi; match_pos = mi; ++pi;
         } else if (star_pos != std::string::npos) {
-            pi = star_pos + 1;
-            match_pos++;
-            mi = match_pos;
+            pi = star_pos + 1; match_pos++; mi = match_pos;
         } else {
             return false;
         }
     }
-
-    // Consume trailing stars
-    while (pi < pattern.size() && pattern[pi] == '*')
-        ++pi;
-
+    while (pi < pattern.size() && pattern[pi] == '*') ++pi;
     return pi == pattern.size();
+}
+
+// ── ModelPricing::match_pattern (delegates to glob_match) ──────────────────
+
+bool ModelPricing::match_pattern(const std::string &pattern,
+                                 const std::string &model) {
+    return glob_match(pattern, model);
 }
 
 // ── load ─────────────────────────────────────────────────────────────────

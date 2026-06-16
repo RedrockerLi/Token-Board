@@ -82,9 +82,13 @@ function clearDynamicCharts() {
 
 function buildDynamicCharts(models) {
     clearDynamicCharts();
-    modelsList = models.slice();
+    // Layer 1: Filter out "unknown" model — never show it in dashboard charts
+    var filteredModels = models.filter(function (m) {
+        return m.toLowerCase() !== 'unknown';
+    });
+    modelsList = filteredModels.slice();
 
-    models.forEach(function (modelName, idx) {
+    filteredModels.forEach(function (modelName, idx) {
         // Daily chart
         var dailyChartId = 'chartDaily_' + idx;
         var dailyLoaderId = 'loadingDaily_' + idx;

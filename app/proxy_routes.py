@@ -58,6 +58,56 @@ def delete_account(account_id):
     return jsonify({"status": "ok"})
 
 
+# ── Account Models ───────────────────────────────────────────────────
+
+@bp_proxy.route("/accounts/<int:account_id>/models", methods=["POST"])
+def update_account_models(account_id):
+    """Fetch models from upstream and store them for this account."""
+    import requests
+    from requests.auth import HTTPBasicAuth
+
+    acc = _proxy_db().get_accounts()
+    acc = [a for a in acc if a["id"] == account_id]
+    if not acc:
+        return jsonify({"error": "Account not found"}), 404
+    acc = acc[0]
+
+    try:
+        url = acc["base_url"].rstrip("/") + "/models"
+        resp = requests.get(
+            url,
+            headers={"Authorization": "Bearer " + acc["upstream_key"]},
+            timeout=15,
+        )
+        if not resp.ok:
+            return jsonify({"error": f"Upstream HTTP {resp.status_code}: {resp.text[:200]}"}), 400
+        data = resp.json()
+        models = [m["id"] for m in data.get("data", [])]
+        count = _proxy_db().update_account_models(account_id, models)
+        return jsonify({"status": "ok", "count": count, "models": models})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@bp_proxy.route("/accounts/<int:account_id>/models", methods=["GET"])
+def get_account_models(account_id):
+    return jsonify(_proxy_db().get_account_models(account_id))
+
+
+# ── Key Model Map ─────────────────────────────────────────────────────
+
+@bp_proxy.route("/keys/<int:key_id>/model-map", methods=["PUT"])
+def update_key_model_map(key_id):
+    data = request.get_json(force=True)
+    count = _proxy_db().update_key_model_map(key_id, data.get("mappings", []))
+    return jsonify({"status": "ok", "count": count})
+
+
+@bp_proxy.route("/keys/<int:key_id>/model-map", methods=["GET"])
+def get_key_model_map(key_id):
+    return jsonify(_proxy_db().get_key_model_map(key_id))
+
+
 # ── Keys CRUD ──────────────────────────────────────────────────────────
 
 @bp_proxy.route("/keys", methods=["GET"])
@@ -102,6 +152,41 @@ def delete_key(key_id):
     return jsonify({"status": "ok"})
 
 
+# ── Model Map Templates CRUD ──────────────────────────────────────
+
+@bp_proxy.route("/templates", methods=["GET"])
+def list_templates():
+    return jsonify(_proxy_db().get_templates())
+
+@bp_proxy.route("/templates", methods=["POST"])
+def create_template():
+    data = request.get_json(force=True)
+    if not data.get("name"):
+        return jsonify({"error": "name is required"}), 400
+    tid = _proxy_db().create_template(data)
+    return jsonify({"id": tid}), 201
+
+@bp_proxy.route("/templates/<int:tid>", methods=["PUT"])
+def update_template(tid):
+    data = request.get_json(force=True)
+    ok = _proxy_db().update_template(tid, data)
+    if not ok: return jsonify({"error": "Template not found"}), 404
+    return jsonify({"status": "ok"})
+
+@bp_proxy.route("/templates/<int:tid>", methods=["DELETE"])
+def delete_template(tid):
+    ok = _proxy_db().delete_template(tid)
+    if not ok: return jsonify({"error": "Template not found"}), 404
+    return jsonify({"status": "ok"})
+
+@bp_proxy.route("/templates/<int:tid>/entries/reorder", methods=["POST"])
+def reorder_template_entries(tid):
+    data = request.get_json(force=True)
+    ok = _proxy_db().reorder_template_entries(tid, data["entry_id"], data["direction"])
+    if not ok: return jsonify({"error": "Entry not found"}), 404
+    return jsonify({"status": "ok"})
+
+
 # ── Model Pricing CRUD ─────────────────────────────────────────────────
 
 @bp_proxy.route("/pricing", methods=["GET"])
@@ -133,6 +218,15 @@ def update_pricing(pricing_id):
 @bp_proxy.route("/pricing/<int:pricing_id>", methods=["DELETE"])
 def delete_pricing(pricing_id):
     ok = _proxy_db().delete_pricing(pricing_id)
+    if not ok:
+        return jsonify({"error": "Pricing entry not found"}), 404
+    return jsonify({"status": "ok"})
+
+
+@bp_proxy.route("/pricing/reorder", methods=["POST"])
+def reorder_pricing():
+    data = request.get_json(force=True)
+    ok = _proxy_db().reorder_pricing(data["id"], data["direction"])
     if not ok:
         return jsonify({"error": "Pricing entry not found"}), 404
     return jsonify({"status": "ok"})

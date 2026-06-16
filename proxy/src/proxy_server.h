@@ -31,6 +31,8 @@ public:
 private:
     void handle_chat_completions(const httplib::Request &req,
                                  httplib::Response &res);
+    void handle_list_models(const httplib::Request &req,
+                            httplib::Response &res);
     void add_cors_headers(httplib::Response &res);
 
     Database &db_;

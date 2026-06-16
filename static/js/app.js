@@ -91,6 +91,13 @@ const PAGES = [
         destroyFn: null,
     },
     {
+        hash: '#/proxy/templates',
+        container: 'page-proxy-templates',
+        title: '模型映射 · Token Board',
+        initFn: 'initTemplatesPage',
+        destroyFn: null,
+    },
+    {
         hash: '#/proxy/pricing',
         container: 'page-proxy-pricing',
         title: '模型定价 · Token Board',

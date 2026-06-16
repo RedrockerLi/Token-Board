@@ -80,20 +80,17 @@ EOF
             echo -e "${GREEN}✓ 服务已安装（开机自启）${NC}"
         fi
 
-        if ! systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            systemctl --user start "$SERVICE_NAME"
-        fi
-        echo -e "${GREEN}✓ 代理运行中 (systemd)${NC}"
+        systemctl --user restart "$SERVICE_NAME"
+        echo -e "${GREEN}✓ 代理已重启 (systemd)${NC}"
     else
         EXISTING=$(pgrep -f "token_proxy" 2>/dev/null || true)
-        if [ -z "$EXISTING" ]; then
-            "$PROXY_BIN" --db "$PROXY_DB" --port "$PROXY_PORT" &
-            PROXY_PID=$!
-            echo -e "${GREEN}✓ 代理已启动 (PID: $PROXY_PID)${NC}"
-        else
-            PROXY_PID=$EXISTING
-            echo -e "${GREEN}✓ 代理运行中 (PID: $PROXY_PID)${NC}"
+        if [ -n "$EXISTING" ]; then
+            kill $EXISTING 2>/dev/null || true
+            sleep 1
         fi
+        "$PROXY_BIN" --db "$PROXY_DB" --port "$PROXY_PORT" &
+        PROXY_PID=$!
+        echo -e "${GREEN}✓ 代理已重启 (PID: $PROXY_PID)${NC}"
     fi
     echo "   地址: http://localhost:$PROXY_PORT/v1"
     echo ""

@@ -72,6 +72,7 @@ void Database::create_schema() {
             key_value   TEXT NOT NULL UNIQUE,
             label       TEXT,
             account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id),
+            template_id INTEGER REFERENCES model_map_templates(id),
             created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
             last_used_at TEXT
         );
@@ -102,6 +103,35 @@ void Database::create_schema() {
             input_price    REAL NOT NULL,
             output_price   REAL NOT NULL,
             currency       TEXT NOT NULL DEFAULT 'CNY'
+        );
+
+        CREATE TABLE IF NOT EXISTS account_models (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id),
+            model_id    TEXT NOT NULL,
+            UNIQUE(account_id, model_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS key_model_map (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id          INTEGER NOT NULL REFERENCES local_keys(id),
+            pattern         TEXT NOT NULL,
+            upstream_model  TEXT NOT NULL,
+            UNIQUE(key_id, pattern)
+        );
+
+        CREATE TABLE IF NOT EXISTS model_map_templates (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL UNIQUE,
+            sort_order   INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS model_map_template_entries (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id     INTEGER NOT NULL REFERENCES model_map_templates(id) ON DELETE CASCADE,
+            sort_order       INTEGER NOT NULL DEFAULT 0,
+            pattern         TEXT NOT NULL,
+            upstream_model  TEXT NOT NULL
         );
     )SQL";
 
@@ -141,6 +171,17 @@ void Database::prepare_statements() {
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             stmt_insert_log_);
 
+    PREPARE("SELECT pattern, upstream_model FROM key_model_map "
+            "WHERE key_id = ?1 ORDER BY id",
+            stmt_get_key_mappings_);
+
+    PREPARE("SELECT template_id FROM local_keys WHERE id = ?1",
+            stmt_get_key_template_);
+
+    PREPARE("SELECT pattern, upstream_model FROM model_map_template_entries "
+            "WHERE template_id = ?1 ORDER BY sort_order, id",
+            stmt_get_template_entries_);
+
     PREPARE("SELECT id, model_pattern, input_price, output_price "
             "FROM model_pricing ORDER BY id",
             stmt_get_pricing_);
@@ -157,6 +198,9 @@ void Database::finalize_statements() {
     FINALIZE(stmt_lookup_key_);
     FINALIZE(stmt_get_account_);
     FINALIZE(stmt_insert_log_);
+    FINALIZE(stmt_get_key_mappings_);
+    FINALIZE(stmt_get_key_template_);
+    FINALIZE(stmt_get_template_entries_);
     FINALIZE(stmt_get_pricing_);
     FINALIZE(stmt_update_last_used_);
     #undef FINALIZE
@@ -250,6 +294,59 @@ void Database::update_key_last_used(int local_key_id) {
     sqlite3_bind_int(stmt_update_last_used_, 1, local_key_id);
     sqlite3_step(stmt_update_last_used_);
     sqlite3_reset(stmt_update_last_used_);
+}
+
+// ── get_key_template_id ──────────────────────────────────────────────────
+
+int Database::get_key_template_id(int key_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sqlite3_reset(stmt_get_key_template_);
+    sqlite3_bind_int(stmt_get_key_template_, 1, key_id);
+    int tid = 0;
+    if (sqlite3_step(stmt_get_key_template_) == SQLITE_ROW)
+        tid = sqlite3_column_type(stmt_get_key_template_, 0) != SQLITE_NULL
+                  ? sqlite3_column_int(stmt_get_key_template_, 0) : 0;
+    sqlite3_reset(stmt_get_key_template_);
+    return tid;
+}
+
+// ── get_template_entries ─────────────────────────────────────────────────
+
+std::vector<Database::ModelMapping> Database::get_template_entries(int template_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<ModelMapping> result;
+    sqlite3_reset(stmt_get_template_entries_);
+    sqlite3_bind_int(stmt_get_template_entries_, 1, template_id);
+    while (sqlite3_step(stmt_get_template_entries_) == SQLITE_ROW) {
+        ModelMapping m;
+        m.pattern = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_template_entries_, 0));
+        m.upstream_model = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_template_entries_, 1));
+        result.push_back(m);
+    }
+    sqlite3_reset(stmt_get_template_entries_);
+    return result;
+}
+
+// ── get_key_model_mappings ──────────────────────────────────────────────
+
+std::vector<Database::ModelMapping> Database::get_key_model_mappings(int key_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<ModelMapping> result;
+    sqlite3_reset(stmt_get_key_mappings_);
+    sqlite3_bind_int(stmt_get_key_mappings_, 1, key_id);
+
+    while (sqlite3_step(stmt_get_key_mappings_) == SQLITE_ROW) {
+        ModelMapping m;
+        m.pattern = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_key_mappings_, 0));
+        m.upstream_model = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_key_mappings_, 1));
+        result.push_back(m);
+    }
+    sqlite3_reset(stmt_get_key_mappings_);
+    return result;
 }
 
 // ── get_all_pricing ─────────────────────────────────────────────────────
