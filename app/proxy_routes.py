@@ -146,7 +146,10 @@ def update_key(key_id):
 
 @bp_proxy.route("/keys/<int:key_id>", methods=["DELETE"])
 def delete_key(key_id):
-    ok = _proxy_db().delete_key(key_id)
+    try:
+        ok = _proxy_db().delete_key(key_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
     if not ok:
         return jsonify({"error": "Key not found"}), 404
     return jsonify({"status": "ok"})
@@ -175,7 +178,10 @@ def update_template(tid):
 
 @bp_proxy.route("/templates/<int:tid>", methods=["DELETE"])
 def delete_template(tid):
-    ok = _proxy_db().delete_template(tid)
+    try:
+        ok = _proxy_db().delete_template(tid)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
     if not ok: return jsonify({"error": "Template not found"}), 404
     return jsonify({"status": "ok"})
 

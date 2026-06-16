@@ -10,6 +10,7 @@ supports concurrent readers alongside a single writer).
 import secrets
 import sqlite3
 import string
+import threading
 from datetime import datetime, timezone
 
 
@@ -23,6 +24,23 @@ class ProxyDatabase:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._sync_timer: threading.Timer | None = None
+
+    def _schedule_config_sync(self):
+        """Debounced auto-sync: wait 3s after last config change, then upload."""
+        if self._sync_timer:
+            self._sync_timer.cancel()
+        self._sync_timer = threading.Timer(3.0, self._do_config_sync)
+        self._sync_timer.daemon = True
+        self._sync_timer.start()
+
+    def _do_config_sync(self):
+        """Upload config to cloud in a background thread."""
+        from app.sync import sync_config_upload
+        try:
+            sync_config_upload(self.db_path)
+        except Exception:
+            pass  # sync failures should never crash the app
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -140,6 +158,7 @@ class ProxyDatabase:
                 ),
             )
             conn.commit()
+            self._schedule_config_sync()
             return cursor.lastrowid
         finally:
             conn.close()
@@ -161,6 +180,7 @@ class ProxyDatabase:
                 values,
             )
             conn.commit()
+            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -170,15 +190,24 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             # Check if any local keys reference this account
-            refs = conn.execute(
+            key_refs = conn.execute(
                 "SELECT COUNT(*) FROM local_keys WHERE account_id = ?",
                 (account_id,),
             ).fetchone()[0]
-            if refs > 0:
-                return {"ok": False, "error": f"无法删除：有 {refs} 个本地密钥仍在使用此账户，请先删除相关密钥"}
+            if key_refs > 0:
+                return {"ok": False, "error": f"无法删除：有 {key_refs} 个本地密钥仍在使用此账户，请先删除相关密钥"}
+
+            # Check if any request logs reference this account
+            log_refs = conn.execute(
+                "SELECT COUNT(*) FROM request_log WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            if log_refs > 0:
+                return {"ok": False, "error": f"无法删除：有 {log_refs} 条请求记录关联此账户，请先清理相关日志"}
 
             conn.execute("DELETE FROM upstream_accounts WHERE id = ?", (account_id,))
             conn.commit()
+            self._schedule_config_sync()
             return {"ok": conn.total_changes > 0, "error": ""}
         finally:
             conn.close()
@@ -196,6 +225,7 @@ class ProxyDatabase:
                     (account_id, m),
                 )
             conn.commit()
+            self._schedule_config_sync()
             return len(models)
         finally:
             conn.close()
@@ -224,6 +254,7 @@ class ProxyDatabase:
                     (key_id, m["pattern"], m["upstream_model"]),
                 )
             conn.commit()
+            self._schedule_config_sync()
             return len(mappings)
         finally:
             conn.close()
@@ -289,6 +320,7 @@ class ProxyDatabase:
                     "INSERT INTO model_map_template_entries (template_id, sort_order, pattern, upstream_model) VALUES (?,?,?,?)",
                     (tid, i, e["pattern"], e["upstream_model"]))
             conn.commit()
+            self._schedule_config_sync()
             return tid
         finally:
             conn.close()
@@ -307,6 +339,7 @@ class ProxyDatabase:
             if "sort_order" in data:
                 conn.execute("UPDATE model_map_templates SET sort_order=? WHERE id=?", (data["sort_order"], tid))
             conn.commit()
+            self._schedule_config_sync()
             return True
         finally:
             conn.close()
@@ -314,8 +347,14 @@ class ProxyDatabase:
     def delete_template(self, tid: int) -> bool:
         conn = self._connect()
         try:
+            # Auto-detach any keys referencing this template
+            conn.execute(
+                "UPDATE local_keys SET template_id = NULL WHERE template_id = ?",
+                (tid,),
+            )
             conn.execute("DELETE FROM model_map_templates WHERE id=?", (tid,))
             conn.commit()
+            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -337,6 +376,7 @@ class ProxyDatabase:
                 conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (b["sort_order"], a["id"]))
                 conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (a["sort_order"], b["id"]))
             conn.commit()
+            self._schedule_config_sync()
             return True
         finally:
             conn.close()
@@ -368,6 +408,7 @@ class ProxyDatabase:
                 (key_value, data.get("label", ""), data["account_id"]),
             )
             conn.commit()
+            self._schedule_config_sync()
             return key_value
         finally:
             conn.close()
@@ -389,16 +430,28 @@ class ProxyDatabase:
                 values,
             )
             conn.commit()
+            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
 
     def delete_key(self, key_id: int) -> bool:
-        """Hard-delete a local key."""
+        """Hard-delete a local key and its model mappings."""
         conn = self._connect()
         try:
+            # Check for request_log references (FK constraint)
+            refs = conn.execute(
+                "SELECT COUNT(*) FROM request_log WHERE local_key_id = ?",
+                (key_id,),
+            ).fetchone()[0]
+            if refs > 0:
+                raise ValueError(f"无法删除：该密钥有 {refs} 条请求记录，请先清理相关日志")
+
+            # Clean up associated model map entries
+            conn.execute("DELETE FROM key_model_map WHERE key_id = ?", (key_id,))
             conn.execute("DELETE FROM local_keys WHERE id = ?", (key_id,))
             conn.commit()
+            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -468,6 +521,7 @@ class ProxyDatabase:
         try:
             conn.execute("DELETE FROM model_pricing WHERE id = ?", (pricing_id,))
             conn.commit()
+            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -490,6 +544,7 @@ class ProxyDatabase:
                 conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (a, b))
                 conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (b, -1))
             conn.commit()
+            self._schedule_config_sync()
             return True
         finally:
             conn.close()

@@ -194,7 +194,7 @@ async function triggerSync() {
         showToast('同步失败: ' + err.message, 'error');
     }
     btn.disabled = false;
-    btn.textContent = '同步数据';
+    btn.textContent = '同步使用记录';
 }
 
 async function openSyncConfig() {
@@ -258,7 +258,7 @@ function initBillingPage() {
                 </div>
                 <div class="controls-group">
                     <button class="btn btn--sm" onclick="openSyncConfig()" title="同步设置">⚙</button>
-                    <button class="btn btn--sm" id="btnSync" onclick="triggerSync()">同步数据</button>
+                    <button class="btn btn--sm" id="btnSync" onclick="triggerSync()">同步使用记录</button>
                 </div>
             </div>
         </div>

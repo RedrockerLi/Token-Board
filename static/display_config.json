@@ -3,8 +3,12 @@
         "PC-AI-chat"
     ],
     "hidden_models": [
-        "ds-v4-flash",
-        "minimax-m27",
-        "minimax-m27-eic"
+        "ds-v4-flash"
+    ],
+    "model_aliases": [
+        {
+            "name": "MiniMax-M2.7",
+            "models": ["minimax-m27", "minimax-m27-eic"]
+        }
     ]
 }

@@ -21,6 +21,39 @@ var monthlyChartIds = [];      // [{ chartId, loaderId, model, platform }]
 var dailyModelMap = {};        // modelName -> { chartId, loaderId }
 var monthlyModelMap = {};
 
+// ── Model alias helpers ──
+
+/** Build alias lookup maps from displayConfig.model_aliases.
+ *  Each alias entry: { name: "Display Name", models: ["model-a", "model-b"] }
+ *  apiModels: list of actual model names from the API (used for case-sensitive resolution).
+ *  Returns { aliasToModels: { displayName: [actual_model_names] }, modelToAlias: { lowercase_model: displayName } } */
+function buildAliasMaps(apiModels) {
+    var aliases = displayConfig.model_aliases || [];
+    var aliasToModels = {};
+    var modelToAlias = {};
+
+    // Build case-insensitive lookup: lowercase → actual API model name
+    var apiModelLookup = {};
+    (apiModels || []).forEach(function (m) {
+        apiModelLookup[m.toLowerCase()] = m;
+    });
+
+    aliases.forEach(function (a) {
+        if (a.name && a.models && a.models.length > 0) {
+            var resolvedModels = [];
+            a.models.forEach(function (m) {
+                var lower = m.toLowerCase();
+                // Resolve to actual case from API data (backend matching is case-sensitive)
+                var actual = apiModelLookup[lower] || m;
+                resolvedModels.push(actual);
+                modelToAlias[lower] = a.name;
+            });
+            aliasToModels[a.name] = resolvedModels;
+        }
+    });
+    return { aliasToModels: aliasToModels, modelToAlias: modelToAlias };
+}
+
 // ── Subtitle ──
 
 function updateSubtitle() {
@@ -92,7 +125,28 @@ function buildDynamicCharts(models) {
     });
     modelsList = filteredModels.slice();
 
-    filteredModels.forEach(function (modelName, idx) {
+    // Layer 2: Build alias maps and exclude individual models that belong to an alias group
+    var aliasMaps = buildAliasMaps(models);
+    var modelToAlias = aliasMaps.modelToAlias;
+    var aliasToModels = aliasMaps.aliasToModels;
+
+    // Remove individual models that are covered by an alias group
+    filteredModels = filteredModels.filter(function (m) {
+        return !(m.toLowerCase() in modelToAlias);
+    });
+
+    // Add alias group display names as chart entries
+    var chartEntries = filteredModels.slice();  // standalone models
+    Object.keys(aliasToModels).forEach(function (aliasName) {
+        chartEntries.push(aliasName);
+    });
+
+    modelsList = chartEntries.slice();
+    var idx = 0;
+
+    chartEntries.forEach(function (modelName) {
+        var aliasModels = aliasToModels[modelName] || null;  // non-null if this is an alias group
+
         // Daily chart
         var dailyChartId = 'chartDaily_' + idx;
         var dailyLoaderId = 'loadingDaily_' + idx;
@@ -104,7 +158,9 @@ function buildDynamicCharts(models) {
             '<div class="loading" id="' + dailyLoaderId + '">加载中</div>';
         var dailyContainer = document.getElementById('dailyCharts');
         if (dailyContainer) dailyContainer.appendChild(dailyCard);
-        dailyChartIds.push({ chartId: dailyChartId, loaderId: dailyLoaderId, model: modelName });
+        var dailyEntry = { chartId: dailyChartId, loaderId: dailyLoaderId, model: modelName };
+        if (aliasModels) dailyEntry.aliasModels = aliasModels;
+        dailyChartIds.push(dailyEntry);
         dailyModelMap[modelName] = { chartId: dailyChartId, loaderId: dailyLoaderId };
 
         // Monthly chart
@@ -118,8 +174,12 @@ function buildDynamicCharts(models) {
             '<div class="loading" id="' + monthlyLoaderId + '">加载中</div>';
         var monthlyContainer = document.getElementById('monthlyCharts');
         if (monthlyContainer) monthlyContainer.appendChild(monthlyCard);
-        monthlyChartIds.push({ chartId: monthlyChartId, loaderId: monthlyLoaderId, model: modelName });
+        var monthlyEntry = { chartId: monthlyChartId, loaderId: monthlyLoaderId, model: modelName };
+        if (aliasModels) monthlyEntry.aliasModels = aliasModels;
+        monthlyChartIds.push(monthlyEntry);
         monthlyModelMap[modelName] = { chartId: monthlyChartId, loaderId: monthlyLoaderId };
+
+        idx++;
     });
 
 }
@@ -204,7 +264,7 @@ async function loadSummary() {
 
 // ── Daily charts ──
 
-async function loadDailyChartForModel(modelName, chartId, loaderId) {
+async function loadDailyChartForModel(modelName, chartId, loaderId, aliasModels) {
     var dom = document.getElementById(chartId);
     var loader = document.getElementById(loaderId);
     if (!dom || !loader) return;
@@ -218,8 +278,29 @@ async function loadDailyChartForModel(modelName, chartId, loaderId) {
     }
 
     try {
-        var data = await fetchDaily(currentMonth.year, currentMonth.month, modelName);
-        var days = data.days || [];
+        var days;
+        if (aliasModels && aliasModels.length > 0) {
+            // Merge multiple models (aliases) into one chart
+            var allResults = await Promise.all(aliasModels.map(function (m) {
+                return fetchDaily(currentMonth.year, currentMonth.month, m);
+            }));
+            var merged = {};
+            allResults.forEach(function (result) {
+                (result.days || []).forEach(function (d) {
+                    if (!merged[d.date]) {
+                        merged[d.date] = { date: d.date, output_tokens: 0, input_tokens: 0, requests: 0, cost: 0 };
+                    }
+                    merged[d.date].output_tokens += d.output_tokens || 0;
+                    merged[d.date].input_tokens += d.input_tokens || 0;
+                    merged[d.date].requests += d.requests || 0;
+                    merged[d.date].cost += (d.cost || 0);
+                });
+            });
+            days = Object.keys(merged).sort().map(function (date) { return merged[date]; });
+        } else {
+            var data = await fetchDaily(currentMonth.year, currentMonth.month, modelName);
+            days = data.days || [];
+        }
 
         var labels = days.map(function (d) { return d.date; });
         var outputVals = days.map(function (d) { return d.output_tokens; });
@@ -237,7 +318,7 @@ async function loadDailyChartForModel(modelName, chartId, loaderId) {
 
 async function loadDailyCharts() {
     var tasks = dailyChartIds.map(function (info) {
-        return loadDailyChartForModel(info.model, info.chartId, info.loaderId);
+        return loadDailyChartForModel(info.model, info.chartId, info.loaderId, info.aliasModels);
     });
     await Promise.all(tasks);
 }
@@ -252,9 +333,29 @@ async function loadModelPie() {
         var data = await fetchSummary();
         var breakdown = data.model_breakdown || {};
         var hiddenModels = (displayConfig.hidden_models || []).map(function (m) { return m.toLowerCase(); });
-        var pieData = Object.entries(breakdown)
-            .map(function (entry) { return { name: entry[0], value: entry[1].total_tokens }; })
-            .filter(function (d) { return d.value > 0 && hiddenModels.indexOf(d.name.toLowerCase()) === -1; })
+        var aliasMaps = buildAliasMaps(Object.keys(breakdown));
+        var modelToAlias = aliasMaps.modelToAlias;
+        var aliasToModels = aliasMaps.aliasToModels;
+
+        // Merge individual model entries into alias groups
+        var merged = {};
+        Object.entries(breakdown).forEach(function (entry) {
+            var modelName = entry[0];
+            var tokens = entry[1].total_tokens || 0;
+            var lower = modelName.toLowerCase();
+            if (hiddenModels.indexOf(lower) !== -1) return;
+            if (lower in modelToAlias) {
+                // This model belongs to an alias group → merge
+                var aliasName = modelToAlias[lower];
+                merged[aliasName] = (merged[aliasName] || 0) + tokens;
+            } else {
+                merged[modelName] = (merged[modelName] || 0) + tokens;
+            }
+        });
+
+        var pieData = Object.entries(merged)
+            .map(function (entry) { return { name: entry[0], value: entry[1] }; })
+            .filter(function (d) { return d.value > 0; })
             .sort(function (a, b) { return b.value - a.value; });
 
         renderPieChart('chartModelPie', pieData, chartColors);
@@ -281,7 +382,7 @@ async function loadTypePie() {
 
 // ── Monthly trend charts ──
 
-async function loadMonthlyTrendForModel(modelName, chartId, loaderId) {
+async function loadMonthlyTrendForModel(modelName, chartId, loaderId, aliasModels) {
     var dom = document.getElementById(chartId);
     var loader = document.getElementById(loaderId);
     if (!dom || !loader) return;
@@ -289,16 +390,37 @@ async function loadMonthlyTrendForModel(modelName, chartId, loaderId) {
     dom.style.display = 'none';
 
     try {
-        var data = await fetchMonthly(modelName);
+        var monthlyData;
+        if (aliasModels && aliasModels.length > 0) {
+            // Merge multiple models (aliases) into one chart
+            var allResults = await Promise.all(aliasModels.map(function (m) {
+                return fetchMonthly(m);
+            }));
+            var merged = {};
+            allResults.forEach(function (result) {
+                result.forEach(function (d) {
+                    if (!merged[d.label]) {
+                        merged[d.label] = { label: d.label, output_tokens: 0, input_tokens: 0, requests: 0, cost: 0 };
+                    }
+                    merged[d.label].output_tokens += d.output_tokens || 0;
+                    merged[d.label].input_tokens += d.input_tokens || 0;
+                    merged[d.label].requests += d.requests || 0;
+                    merged[d.label].cost += (d.cost || 0);
+                });
+            });
+            monthlyData = Object.keys(merged).sort().map(function (label) { return merged[label]; });
+        } else {
+            monthlyData = await fetchMonthly(modelName);
+        }
 
-        var labels = data.map(function (d) { return d.label; });
-        var outputVals = data.map(function (d) { return d.output_tokens; });
-        var inputVals = data.map(function (d) { return d.input_tokens; });
-        var requestVals = data.map(function (d) { return d.requests; });
-        var costVals = data.map(function (d) { return d.cost; });
+        var labels = monthlyData.map(function (d) { return d.label; });
+        var outputVals = monthlyData.map(function (d) { return d.output_tokens; });
+        var inputVals = monthlyData.map(function (d) { return d.input_tokens; });
+        var requestVals = monthlyData.map(function (d) { return d.requests; });
+        var costVals = monthlyData.map(function (d) { return d.cost; });
 
         renderTimeSeriesChart(chartId, loaderId, labels, outputVals, inputVals,
-                              requestVals, costVals, data, 0);
+                              requestVals, costVals, monthlyData, 0);
     } catch (err) {
         console.error('Failed to load monthly trend for ' + modelName + ':', err);
         loader.textContent = '加载失败';
@@ -307,7 +429,7 @@ async function loadMonthlyTrendForModel(modelName, chartId, loaderId) {
 
 async function loadMonthlyCharts() {
     var tasks = monthlyChartIds.map(function (info) {
-        return loadMonthlyTrendForModel(info.model, info.chartId, info.loaderId);
+        return loadMonthlyTrendForModel(info.model, info.chartId, info.loaderId, info.aliasModels);
     });
     await Promise.all(tasks);
 }

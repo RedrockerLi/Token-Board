@@ -6,7 +6,7 @@
  */
 
 // ── Display filter config (loaded from /static/display_config.json) ──
-var displayConfig = { hidden_users: [], hidden_models: [] };
+var displayConfig = { hidden_users: [], hidden_models: [], model_aliases: [] };
 var _displayConfigLoaded = false;
 
 async function loadDisplayConfig() {
@@ -16,7 +16,7 @@ async function loadDisplayConfig() {
         _displayConfigLoaded = true;
     } catch (e) {
         console.warn('Failed to load display config, using defaults:', e);
-        displayConfig = { hidden_users: [], hidden_models: [] };
+        displayConfig = { hidden_users: [], hidden_models: [], model_aliases: [] };
         _displayConfigLoaded = true;
     }
 }

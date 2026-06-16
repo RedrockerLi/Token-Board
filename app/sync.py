@@ -111,10 +111,17 @@ class WebDAVError(Exception):
     pass
 
 
-def _webdav_download(config: SyncConfig, dest_path: str) -> bool:
+def _build_url(config: SyncConfig, remote_filename: str | None = None) -> str:
+    """Build the full WebDAV URL. Override filename if provided."""
+    fn = remote_filename or config.filename
+    return f"{config.base_url.rstrip('/')}/{config.folder.strip('/')}/{fn}"
+
+
+def _webdav_download(config: SyncConfig, dest_path: str, remote_filename: str | None = None) -> bool:
     """Download remote DB. Returns True if downloaded, False if not found (first sync)."""
+    url = _build_url(config, remote_filename)
     resp = requests.get(
-        config.full_url,
+        url,
         auth=HTTPBasicAuth(config.username, config.password),
         timeout=30,
     )
@@ -127,9 +134,10 @@ def _webdav_download(config: SyncConfig, dest_path: str) -> bool:
     return True
 
 
-def _webdav_ensure_folder(config: SyncConfig):
+def _webdav_ensure_folder(config: SyncConfig, remote_filename: str | None = None):
     """Ensure the target folder exists on the WebDAV server (create if needed)."""
-    folder_url = config.full_url.rsplit("/", 1)[0] + "/"
+    url = _build_url(config, remote_filename)
+    folder_url = url.rsplit("/", 1)[0] + "/"
     # Try MKCOL first — succeeds if folder is created, returns 405 if already exists
     resp = requests.request(
         "MKCOL", folder_url,
@@ -149,13 +157,14 @@ def _webdav_ensure_folder(config: SyncConfig):
     raise WebDAVError(f"无法创建/访问文件夹 {folder_url}: HTTP {resp.status_code}/{resp2.status_code}")
 
 
-def _webdav_upload(config: SyncConfig, src_path: str):
+def _webdav_upload(config: SyncConfig, src_path: str, remote_filename: str | None = None):
     """Upload a file to WebDAV from src_path."""
-    _webdav_ensure_folder(config)
+    _webdav_ensure_folder(config, remote_filename)
+    url = _build_url(config, remote_filename)
     # Attempt PUT directly; if it fails with 404/409, folder issue already caught above
     with open(src_path, "rb") as f:
         resp = requests.put(
-            config.full_url,
+            url,
             data=f,
             auth=HTTPBasicAuth(config.username, config.password),
             timeout=60,
@@ -369,7 +378,6 @@ def sync(db_path: str) -> dict:
         # 1. Download remote DB (skip merge if first sync)
         has_remote = _webdav_download(config, remote_path)
         new_count = 0
-        pricing_count = 0
 
         if has_remote:
             # 2. Ensure remote DB has the correct schema
@@ -377,78 +385,36 @@ def sync(db_path: str) -> dict:
             _ensure_schema(remote_conn)
             remote_conn.close()
 
-            # 3. Open local DB
+            # 3. Merge remote request_log into local
             local_conn = sqlite3.connect(db_path, timeout=10)
             local_conn.row_factory = sqlite3.Row
             local_conn.execute("PRAGMA busy_timeout=5000")
 
-            # 4. Merge remote model_pricing into local (INSERT OR IGNORE: local wins)
-            remote_pricing_conn = sqlite3.connect(remote_path)
-            remote_pricing = remote_pricing_conn.execute(
-                "SELECT model_pattern, input_price, output_price, currency FROM model_pricing"
-            ).fetchall()
-            remote_pricing_conn.close()
-            pricing_count = 0
-            for rp in remote_pricing:
-                try:
-                    before = local_conn.total_changes
-                    local_conn.execute(
-                        "INSERT OR IGNORE INTO model_pricing (model_pattern, input_price, output_price, currency) VALUES (?,?,?,?)",
-                        rp,
-                    )
-                    if local_conn.total_changes > before:
-                        pricing_count += 1
-                except sqlite3.IntegrityError:
-                    pass  # local already has this pattern, keep local
-            local_conn.commit()
-
-            # Recalculate costs for any models whose pricing was just merged
-            if pricing_count > 0:
-                _recalculate_all_costs(local_conn)
-
-            # Merge remote templates (no secrets, bidirectional via INSERT OR IGNORE)
-            rmt_conn = sqlite3.connect(remote_path)
-            rmt_tmpl = rmt_conn.execute(
-                "SELECT name, sort_order FROM model_map_templates").fetchall()
-            rmt_conn.close()
-            for rt in rmt_tmpl:
-                local_conn.execute(
-                    "INSERT OR IGNORE INTO model_map_templates (name, sort_order) VALUES (?,?)",
-                    (rt[0], rt[1]))
-            local_conn.commit()
-
-            # 5. Merge remote request_log into local
             remote_conn = sqlite3.connect(remote_path)
             remote_conn.row_factory = sqlite3.Row
             new_count = _merge_request_log(local_conn, remote_conn)
             remote_conn.close()
-
-            # 6. Close local
             local_conn.close()
 
-        # 7. Create trimmed copy for upload (30 days, request_log + model_pricing, no keys)
+        # 4. Create trimmed copy for upload (request_log only, 30 days, no config/secrets)
         _safe_copy_db(db_path, merged_path)
         merged_conn = sqlite3.connect(merged_path)
         _trim_old(merged_conn)
-        merged_conn.execute("DELETE FROM upstream_accounts")
-        merged_conn.execute("DELETE FROM local_keys")
-        merged_conn.execute("DELETE FROM sync_config")
-        merged_conn.execute("DELETE FROM key_model_map")
-        merged_conn.execute("DELETE FROM perf_events")
+        # Strip all config/secrets — only request_log goes to cloud
+        for tbl in CONFIG_TABLES + ["sync_config", "perf_events"]:
+            merged_conn.execute(f"DELETE FROM {tbl}")
         merged_conn.commit()
         merged_conn.close()
 
-        # 8. Count uploaded records
+        # 5. Count and upload
         upload_conn = sqlite3.connect(merged_path)
         uploaded_count = upload_conn.execute("SELECT COUNT(*) FROM request_log").fetchone()[0]
         upload_conn.close()
 
-        # 8. Upload
         _webdav_upload(config, merged_path)
 
         if has_remote:
-            extra = f"，{pricing_count} 条定价" if pricing_count else ""
-            msg = f"同步成功 — 从远端拉取 {new_count} 条记录{extra}，上传 {uploaded_count} 条至云端"
+            msg = f"同步成功 — 从远端拉取 {new_count} 条记录，上传 {uploaded_count} 条至云端"
         else:
             msg = f"首次同步成功，已上传 {uploaded_count} 条至云端"
         return {
@@ -456,7 +422,6 @@ def sync(db_path: str) -> dict:
             "message": msg,
             "remote_records": new_count,
             "uploaded_records": uploaded_count,
-            "pricing_records": pricing_count,
         }
 
     except WebDAVError as e:
@@ -467,6 +432,100 @@ def sync(db_path: str) -> dict:
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": f"同步失败: {type(e).__name__}: {e}"}
+    finally:
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ── Config auto-sync ───────────────────────────────────────────────────────
+
+CONFIG_TABLES = [
+    "upstream_accounts",
+    "local_keys",
+    "model_pricing",
+    "account_models",
+    "key_model_map",
+    "model_map_templates",
+    "model_map_template_entries",
+]
+
+
+def sync_config_upload(db_path: str) -> bool:
+    """Export all config tables to cloud (no request_log/perf_events)."""
+    config = load_sync_config(db_path)
+    if not config:
+        return False
+
+    project_root = Path(db_path).resolve().parent
+    tmp_dir = project_root / "tmp"
+    tmp_dir.mkdir(exist_ok=True)
+    config_path = str(tmp_dir / "proxy_config.db")
+
+    try:
+        _safe_copy_db(db_path, config_path)
+        dst = sqlite3.connect(config_path)
+        dst.execute("DELETE FROM request_log")
+        dst.execute("DELETE FROM perf_events")
+        dst.execute("DELETE FROM sync_config")
+        dst.commit()
+        dst.close()
+
+        _webdav_upload(config, config_path, remote_filename="proxy_config.db")
+        return True
+    except (WebDAVError, Exception):
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def sync_config_download(db_path: str) -> bool:
+    """Download config from cloud and merge into local DB (INSERT OR REPLACE)."""
+    config = load_sync_config(db_path)
+    if not config:
+        return False
+
+    project_root = Path(db_path).resolve().parent
+    tmp_dir = project_root / "tmp"
+    tmp_dir.mkdir(exist_ok=True)
+    remote_path = str(tmp_dir / "proxy_config_remote.db")
+
+    try:
+        has_remote = _webdav_download(config, remote_path, remote_filename="proxy_config.db")
+        if not has_remote:
+            return False
+
+        remote_conn = sqlite3.connect(remote_path)
+        local_conn = sqlite3.connect(db_path, timeout=10)
+        local_conn.execute("PRAGMA busy_timeout=5000")
+
+        for table in CONFIG_TABLES:
+            try:
+                rows = remote_conn.execute(f"SELECT * FROM {table}").fetchall()
+                if not rows:
+                    continue
+                cols_desc = remote_conn.execute(f"SELECT * FROM {table} LIMIT 0").description
+                columns = [d[0] for d in cols_desc]
+                placeholders = ",".join(["?"] * len(columns))
+                cols = ",".join(columns)
+                for row in rows:
+                    local_conn.execute(
+                        f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})",
+                        row,
+                    )
+            except sqlite3.OperationalError:
+                pass  # table missing in remote — skip
+
+        local_conn.commit()
+        local_conn.close()
+        remote_conn.close()
+        return True
+    except (WebDAVError, Exception):
+        import traceback
+        traceback.print_exc()
+        return False
     finally:
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -613,14 +672,14 @@ def _ensure_schema(conn: sqlite3.Connection):
             name TEXT NOT NULL UNIQUE,
             upstream_key TEXT NOT NULL,
             base_url TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS local_keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             key_value TEXT NOT NULL UNIQUE,
             label TEXT,
             account_id INTEGER NOT NULL REFERENCES upstream_accounts(id),
-            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
             last_used_at TEXT
         );
         CREATE TABLE IF NOT EXISTS request_log (
@@ -635,7 +694,7 @@ def _ensure_schema(conn: sqlite3.Connection):
             is_streaming INTEGER NOT NULL DEFAULT 0,
             status_code INTEGER NOT NULL,
             duration_ms INTEGER NOT NULL DEFAULT 0,
-            requested_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            requested_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_rl_account ON request_log(account_id);
         CREATE INDEX IF NOT EXISTS idx_rl_time ON request_log(requested_at);
@@ -649,7 +708,7 @@ def _ensure_schema(conn: sqlite3.Connection):
         CREATE TABLE IF NOT EXISTS proxy_config (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS sync_config (
             key TEXT PRIMARY KEY,

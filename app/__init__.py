@@ -45,4 +45,12 @@ def create_app(proxy_db_path: str | None = None):
         flask_app.register_blueprint(bp_proxy)
         print(f" * Proxy management enabled (DB: {proxy_db_path})")
 
+        # Pull latest config from cloud on startup
+        from app.sync import sync_config_download  # noqa: E402
+        try:
+            if sync_config_download(proxy_db_path):
+                print(" * Config synced from cloud")
+        except Exception:
+            pass  # network / not configured — ignore
+
     return flask_app
