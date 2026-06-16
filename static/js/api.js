@@ -5,6 +5,22 @@
  * and thin wrappers around each backend API endpoint.
  */
 
+// ── Display filter config (loaded from /static/display_config.json) ──
+var displayConfig = { hidden_users: [], hidden_models: [] };
+var _displayConfigLoaded = false;
+
+async function loadDisplayConfig() {
+    if (_displayConfigLoaded) return;
+    try {
+        displayConfig = await fetchJSON('/static/display_config.json');
+        _displayConfigLoaded = true;
+    } catch (e) {
+        console.warn('Failed to load display config, using defaults:', e);
+        displayConfig = { hidden_users: [], hidden_models: [] };
+        _displayConfigLoaded = true;
+    }
+}
+
 // ── Number formatters (used globally by charts.js and dashboard.js) ──
 
 function fmtNum(n) {

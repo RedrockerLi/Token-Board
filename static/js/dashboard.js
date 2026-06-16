@@ -58,7 +58,9 @@ function populateKeyNameSelector(keyNames) {
     if (!keySel) return '';
     var prevKeyVal = keySel.value;
     keySel.innerHTML = '<option value="">总览 (所有用户)</option>';
+    var hiddenUsers = displayConfig.hidden_users || [];
     keyNames.forEach(function (name) {
+        if (hiddenUsers.indexOf(name) !== -1) return;
         var opt = document.createElement('option');
         opt.value = name;
         opt.textContent = name;
@@ -82,9 +84,11 @@ function clearDynamicCharts() {
 
 function buildDynamicCharts(models) {
     clearDynamicCharts();
-    // Layer 1: Filter out "unknown" model — never show it in dashboard charts
+    // Layer 1: Filter out hidden models and "unknown" model — never show in dashboard charts
+    var hiddenModels = (displayConfig.hidden_models || []).map(function (m) { return m.toLowerCase(); });
     var filteredModels = models.filter(function (m) {
-        return m.toLowerCase() !== 'unknown';
+        var lower = m.toLowerCase();
+        return lower !== 'unknown' && hiddenModels.indexOf(lower) === -1;
     });
     modelsList = filteredModels.slice();
 
@@ -123,6 +127,7 @@ function buildDynamicCharts(models) {
 // ── Summary loader ──
 
 async function loadSummary() {
+    await loadDisplayConfig();  // Load frontend display filter config first
     var data = await fetchSummary();
     summaryData = data;
 
@@ -240,14 +245,16 @@ async function loadDailyCharts() {
 // ── Pie charts ──
 
 async function loadModelPie() {
+    await loadDisplayConfig();  // Ensure config is loaded (may race with loadSummary)
     var loader = document.getElementById('loadingModelPie');
     if (!loader) return;
     try {
         var data = await fetchSummary();
         var breakdown = data.model_breakdown || {};
+        var hiddenModels = (displayConfig.hidden_models || []).map(function (m) { return m.toLowerCase(); });
         var pieData = Object.entries(breakdown)
             .map(function (entry) { return { name: entry[0], value: entry[1].total_tokens }; })
-            .filter(function (d) { return d.value > 0; })
+            .filter(function (d) { return d.value > 0 && hiddenModels.indexOf(d.name.toLowerCase()) === -1; })
             .sort(function (a, b) { return b.value - a.value; });
 
         renderPieChart('chartModelPie', pieData, chartColors);
