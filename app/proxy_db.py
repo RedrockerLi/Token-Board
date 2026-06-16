@@ -79,6 +79,13 @@ class ProxyDatabase:
             concurrent_count INTEGER NOT NULL DEFAULT 0,
             requested_at TEXT NOT NULL DEFAULT (datetime('now')))""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_perf_events_time ON perf_events(requested_at)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS in_flight_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            local_key_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            is_streaming INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')))""")
         conn.commit()
         return conn
 
@@ -803,7 +810,7 @@ class ProxyDatabase:
             ).fetchone()[0]
 
             peak_concurrent = conn.execute(
-                "SELECT COALESCE(MAX(concurrent_count + 1), 0) FROM perf_events "
+                "SELECT COALESCE(MAX(concurrent_count), 0) FROM perf_events "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
@@ -878,7 +885,7 @@ class ProxyDatabase:
             rows = conn.execute(
                 "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
                 "COUNT(*) AS request_count, "
-                "MAX(concurrent_count + 1) AS peak_concurrent "
+                "MAX(concurrent_count) AS peak_concurrent "
                 "FROM perf_events "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "GROUP BY bucket "
@@ -900,8 +907,8 @@ class ProxyDatabase:
         try:
             rows = conn.execute(
                 "SELECT model, COUNT(*) AS request_count, "
-                "AVG(CASE WHEN is_error = 0 THEN total_latency_ms END) AS avg_latency_ms, "
-                "MAX(CASE WHEN is_error = 0 THEN total_latency_ms END) AS max_latency_ms, "
+                "AVG(CASE WHEN is_error = 0 THEN upstream_latency_ms END) AS avg_latency_ms, "
+                "MAX(CASE WHEN is_error = 0 THEN upstream_latency_ms END) AS max_latency_ms, "
                 "SUM(CASE WHEN is_error = 0 THEN 1 ELSE 0 END) AS success_count, "
                 "SUM(is_error) AS error_count "
                 "FROM perf_events "
@@ -922,7 +929,11 @@ class ProxyDatabase:
             conn.close()
 
     def get_perf_realtime(self, window_seconds: int = 60) -> dict:
-        """Real-time metrics: current RPM estimate and latest concurrency."""
+        """Real-time metrics: current RPM estimate and live concurrency.
+
+        Concurrency is read directly from the in_flight_requests table,
+        which is maintained by the C++ proxy (INSERT on start, DELETE on end).
+        """
         conn = self._connect()
         try:
             recent_count = conn.execute(
@@ -933,15 +944,23 @@ class ProxyDatabase:
 
             rpm = round(recent_count / max(window_seconds / 60.0, 0.1), 1)
 
+            # Live concurrency: count rows currently in the in_flight_requests table
             latest_concurrent = conn.execute(
-                "SELECT concurrent_count + 1 FROM perf_events "
-                "ORDER BY id DESC LIMIT 1"
-            ).fetchone()
+                "SELECT COUNT(*) FROM in_flight_requests"
+            ).fetchone()[0]
+
+            # Also return the in-flight request details for richer dashboards
+            in_flight = conn.execute(
+                "SELECT id, model, is_streaming, "
+                "ROUND((julianday('now') - julianday(started_at)) * 86400) AS elapsed_s "
+                "FROM in_flight_requests ORDER BY started_at"
+            ).fetchall()
 
             return {
                 "rpm": rpm,
                 "recent_requests": recent_count,
-                "latest_concurrent": latest_concurrent[0] if latest_concurrent else 0,
+                "latest_concurrent": latest_concurrent,
+                "in_flight": [dict(r) for r in in_flight],
             }
         finally:
             conn.close()

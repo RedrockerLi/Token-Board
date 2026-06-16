@@ -50,7 +50,7 @@ function buildPerfPageHTML() {
         <!-- Latency Distribution Chart -->
         <div class="section">
             <div class="chart-card">
-                <div class="chart-card__title">TTFT 首Token延迟分布 — 最近 60 分钟</div>
+                <div class="chart-card__title">TTFT 首Token延迟分布</div>
                 <div class="chart-container chart-container--lg" id="chartLatency"></div>
             </div>
         </div>
@@ -59,11 +59,11 @@ function buildPerfPageHTML() {
         <div class="section">
             <div class="charts-grid charts-grid--2col">
                 <div class="chart-card">
-                    <div class="chart-card__title">每分钟请求数 — 最近 60 分钟</div>
+                    <div class="chart-card__title">每分钟请求数</div>
                     <div class="chart-container chart-container--lg" id="chartRPM"></div>
                 </div>
                 <div class="chart-card">
-                    <div class="chart-card__title">代理占用率 — 最近 60 分钟</div>
+                    <div class="chart-card__title">代理占用率</div>
                     <div class="chart-container chart-container--lg" id="chartUtilization"></div>
                 </div>
             </div>
@@ -73,11 +73,11 @@ function buildPerfPageHTML() {
         <div class="section">
             <div class="charts-grid charts-grid--2col">
                 <div class="chart-card">
-                    <div class="chart-card__title">请求成功率 — 最近 60 分钟</div>
+                    <div class="chart-card__title">请求成功率</div>
                     <div class="chart-container chart-container--sm" id="chartSuccessRate"></div>
                 </div>
                 <div class="chart-card">
-                    <div class="chart-card__title">各模型平均延迟 — 最近 60 分钟</div>
+                    <div class="chart-card__title">各模型平均 TTFT</div>
                     <div class="chart-container chart-container--lg" id="chartModelLatency"></div>
                 </div>
             </div>
@@ -266,9 +266,9 @@ function renderModelLatencyChart(domId, models) {
         tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
         grid: { left: 50, right: 20, top: 10, bottom: 60 },
         xAxis: { type: 'category', data: names, axisLabel: { rotate: 30, fontSize: 10 } },
-        yAxis: { type: 'value', name: '平均延迟 (ms)', axisLabel: { fontSize: 10 } },
+        yAxis: { type: 'value', name: 'TTFT (ms)', axisLabel: { fontSize: 10 } },
         series: [{
-            name: '延迟', type: 'bar',
+            name: 'TTFT', type: 'bar',
             data: latencies.map(function(v, i) {
                 return { value: v, itemStyle: { color: colors[i] } };
             }),

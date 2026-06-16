@@ -86,6 +86,22 @@ public:
     /// Delete perf events older than `max_age_minutes` (default 24h).
     void cleanup_old_perf_events(int max_age_minutes = 1440);
 
+    // ── In-flight request tracking ──────────────────────────────────────
+
+    /// Record a request that has just started. Returns the row ID to use
+    /// in the matching request_end() call.
+    int request_start(int local_key_id, int account_id,
+                      const std::string &model, bool is_streaming);
+
+    /// Mark a request as completed (delete its in-flight record).
+    void request_end(int row_id);
+
+    /// Return the current number of in-flight requests.
+    int get_in_flight_count();
+
+    /// Remove in-flight records older than `max_age_minutes` (stuck/crashed).
+    void cleanup_stale_in_flight(int max_age_minutes = 10);
+
 private:
     void create_schema();
     void prepare_statements();
@@ -105,4 +121,8 @@ private:
     sqlite3_stmt *stmt_update_last_used_ = nullptr;
     sqlite3_stmt *stmt_insert_perf_event_ = nullptr;
     sqlite3_stmt *stmt_cleanup_perf_events_ = nullptr;
+    sqlite3_stmt *stmt_insert_in_flight_ = nullptr;
+    sqlite3_stmt *stmt_delete_in_flight_ = nullptr;
+    sqlite3_stmt *stmt_count_in_flight_ = nullptr;
+    sqlite3_stmt *stmt_cleanup_in_flight_ = nullptr;
 };

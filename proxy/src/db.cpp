@@ -42,6 +42,10 @@ bool Database::open(const std::string &path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000", nullptr, nullptr, nullptr);
 
     create_schema();
+
+    // Clear any stale in-flight records from a previous run (e.g. crash)
+    sqlite3_exec(db_, "DELETE FROM in_flight_requests", nullptr, nullptr, nullptr);
+
     prepare_statements();
     fprintf(stderr, "[DB] Opened %s (WAL mode)\n", path.c_str());
     return true;
@@ -147,6 +151,15 @@ void Database::create_schema() {
 
         CREATE INDEX IF NOT EXISTS idx_perf_events_time
             ON perf_events(requested_at);
+
+        CREATE TABLE IF NOT EXISTS in_flight_requests (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            local_key_id    INTEGER NOT NULL,
+            account_id      INTEGER NOT NULL,
+            model           TEXT NOT NULL,
+            is_streaming    INTEGER NOT NULL DEFAULT 0,
+            started_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
     )SQL";
 
     char *err = nullptr;
@@ -213,6 +226,21 @@ void Database::prepare_statements() {
             "WHERE requested_at < datetime('now', '-' || ?1 || ' minutes')",
             stmt_cleanup_perf_events_);
 
+    PREPARE("INSERT INTO in_flight_requests "
+            "(local_key_id, account_id, model, is_streaming) "
+            "VALUES (?1,?2,?3,?4)",
+            stmt_insert_in_flight_);
+
+    PREPARE("DELETE FROM in_flight_requests WHERE id = ?1",
+            stmt_delete_in_flight_);
+
+    PREPARE("SELECT COUNT(*) FROM in_flight_requests",
+            stmt_count_in_flight_);
+
+    PREPARE("DELETE FROM in_flight_requests "
+            "WHERE started_at < datetime('now', '-' || ?1 || ' minutes')",
+            stmt_cleanup_in_flight_);
+
     #undef PREPARE
 }
 
@@ -228,6 +256,10 @@ void Database::finalize_statements() {
     FINALIZE(stmt_update_last_used_);
     FINALIZE(stmt_insert_perf_event_);
     FINALIZE(stmt_cleanup_perf_events_);
+    FINALIZE(stmt_insert_in_flight_);
+    FINALIZE(stmt_delete_in_flight_);
+    FINALIZE(stmt_count_in_flight_);
+    FINALIZE(stmt_cleanup_in_flight_);
     #undef FINALIZE
 }
 
@@ -428,4 +460,57 @@ void Database::cleanup_old_perf_events(int max_age_minutes) {
     sqlite3_bind_int(stmt_cleanup_perf_events_, 1, max_age_minutes);
     sqlite3_step(stmt_cleanup_perf_events_);
     sqlite3_reset(stmt_cleanup_perf_events_);
+}
+
+// ── in_flight_requests tracking ─────────────────────────────────────────
+
+int Database::request_start(int local_key_id, int account_id,
+                             const std::string &model, bool is_streaming) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_insert_in_flight_);
+    sqlite3_bind_int(stmt_insert_in_flight_, 1, local_key_id);
+    sqlite3_bind_int(stmt_insert_in_flight_, 2, account_id);
+    sqlite3_bind_text(stmt_insert_in_flight_, 3,
+                      model.c_str(), model.size(), SQLITE_STATIC);
+    sqlite3_bind_int(stmt_insert_in_flight_, 4, is_streaming ? 1 : 0);
+
+    int rc = sqlite3_step(stmt_insert_in_flight_);
+    if (rc != SQLITE_DONE)
+        fprintf(stderr, "[DB] request_start insert error: %s\n",
+                sqlite3_errmsg(db_));
+    sqlite3_reset(stmt_insert_in_flight_);
+    return static_cast<int>(sqlite3_last_insert_rowid(db_));
+}
+
+void Database::request_end(int row_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_delete_in_flight_);
+    sqlite3_bind_int(stmt_delete_in_flight_, 1, row_id);
+    int rc = sqlite3_step(stmt_delete_in_flight_);
+    if (rc != SQLITE_DONE)
+        fprintf(stderr, "[DB] request_end delete error: %s\n",
+                sqlite3_errmsg(db_));
+    sqlite3_reset(stmt_delete_in_flight_);
+}
+
+int Database::get_in_flight_count() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_count_in_flight_);
+    int count = 0;
+    if (sqlite3_step(stmt_count_in_flight_) == SQLITE_ROW)
+        count = sqlite3_column_int(stmt_count_in_flight_, 0);
+    sqlite3_reset(stmt_count_in_flight_);
+    return count;
+}
+
+void Database::cleanup_stale_in_flight(int max_age_minutes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_cleanup_in_flight_);
+    sqlite3_bind_int(stmt_cleanup_in_flight_, 1, max_age_minutes);
+    sqlite3_step(stmt_cleanup_in_flight_);
+    sqlite3_reset(stmt_cleanup_in_flight_);
 }

@@ -1,7 +1,5 @@
 #pragma once
 
-#include <atomic>
-
 class Database;
 class Router;
 class UpstreamClient;
@@ -42,7 +40,4 @@ private:
     UpstreamClient &upstream_;
     UsageTracker &tracker_;
     ModelPricing &pricing_;
-
-    /// Number of requests currently being processed (in-flight).
-    std::atomic<int> in_flight_requests_{0};
 };

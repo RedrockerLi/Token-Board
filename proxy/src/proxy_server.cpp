@@ -100,9 +100,8 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                                           httplib::Response &res) {
     add_cors_headers(res);
 
-    // ── Performance tracking: record start time & in-flight count ──
+    // ── Performance tracking: record start time ──
     auto t0 = std::chrono::steady_clock::now();
-    int concurrent_before = in_flight_requests_.fetch_add(1, std::memory_order_relaxed);
 
     // 1. Extract Bearer token
     std::string auth = req.has_header("Authorization")
@@ -118,7 +117,6 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         res.status = 401;
         res.set_content(json_error("Missing API key. Use: Authorization: Bearer <key>", 401),
                         "application/json");
-        in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
 
@@ -128,7 +126,6 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         res.status = 401;
         res.set_content(json_error(route_result.error, 401),
                         "application/json");
-        in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
         return;
     }
 
@@ -168,17 +165,24 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         }
     }
 
-    // 4. Forward to upstream
+    // 4. Determine streaming mode & content type
     std::string content_type = req.has_header("Content-Type")
                                    ? req.get_header_value("Content-Type")
                                    : "application/json";
 
     bool is_stream = is_streaming_request(body);
 
-    fprintf(stderr, "[Proxy] %s request from key_id=%d to account=%d model=%s\n",
+    // ── Register in-flight request in DB ──
+    int inflight_id = db_.request_start(route_result.local_key_id,
+                                        route_result.account_id,
+                                        req_model, is_stream);
+    int concurrent_count = db_.get_in_flight_count();
+
+    fprintf(stderr, "[Proxy] %s request from key_id=%d to account=%d model=%s "
+                    "(concurrent=%d, inflight_id=%d)\n",
             is_stream ? "streaming" : "non-streaming",
             route_result.local_key_id, route_result.account_id,
-            req_model.c_str());
+            req_model.c_str(), concurrent_count, inflight_id);
 
     // Capture model for use in streaming lambda
     auto model_copy = req_model;
@@ -188,7 +192,8 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
 
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, route_result, body, content_type, model_copy, t0, concurrent_before](
+            [this, route_result, body, content_type, model_copy, t0,
+             concurrent_count, inflight_id](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
 
                 std::string accumulated;
@@ -225,19 +230,20 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                 } else {
                     fprintf(stderr, "[Proxy] Warning: could not parse usage "
                                     "from streaming response\n");
-                    // Don't write empty records — they pollute the dashboard with "unknown" models
                 }
 
                 tracker_.mark_key_used(route_result.local_key_id);
 
-                // ── Perf: proxy TTFT + in-flight snapshot ──
+                // ── Perf: proxy TTFT + concurrent snapshot ──
                 int proxy_ttft = static_cast<int>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         first_response ? std::chrono::steady_clock::now() - t0 : t_first_resp - t0).count());
                 tracker_.log_perf_event(model_copy, fwd.ttft_ms, proxy_ttft,
                                         fwd.status_code, fwd.status_code >= 400,
-                                        concurrent_before);
-                in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
+                                        concurrent_count);
+
+                // ── Mark request as completed ──
+                db_.request_end(inflight_id);
 
                 sink.done();
                 return true;
@@ -280,12 +286,12 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
         tracker_.log_perf_event(req_model, fwd.ttft_ms, proxy_ttft,
                                 fwd.status_code, fwd.status_code >= 400,
-                                concurrent_before);
-        in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
+                                concurrent_count);
+
+        // ── Mark request as completed ──
+        db_.request_end(inflight_id);
 
         if (fwd.success) {
-            // Forward the response as-is
-            // Parse upstream response to preserve Content-Type
             res.status = fwd.status_code;
             res.set_content(fwd.body, "application/json");
         } else {
