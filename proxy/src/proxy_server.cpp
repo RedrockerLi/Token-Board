@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <thread>
 
 using json = nlohmann::json;
 
@@ -42,6 +43,46 @@ static std::string json_error(const std::string &msg, int code) {
     json j;
     j["error"] = {{"message", msg}, {"type", "auth_error"}, {"code", code}};
     return j.dump();
+}
+
+/// Exponential backoff delay for retry attempt N (1-based index).
+/// Attempt 1→2: 500ms, Attempt 2→3: 1500ms.
+static void retry_backoff(int attempt) {
+    if (attempt == 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    } else if (attempt >= 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    }
+}
+
+/// Retry helper: calls `do_forward()` up to 3 times with exponential
+/// backoff and 4xx-aware early termination.  `is_streaming` controls the
+/// log label.  Returns the last ForwardResult with `retries` populated.
+template <typename F>
+static UpstreamClient::ForwardResult
+forward_with_retry(F &&do_forward, bool is_streaming) {
+    const char *label = is_streaming ? "streaming" : "non-streaming";
+    UpstreamClient::ForwardResult fwd;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            fprintf(stderr, "[Proxy] Retry %d/3 for %s request "
+                            "(backoff %dms, last error: %s)\n",
+                    attempt + 1, label,
+                    attempt == 1 ? 500 : 1500,
+                    fwd.error.c_str());
+        }
+        fwd = do_forward();
+        fwd.retries = attempt;
+        if (fwd.success) break;
+        // Don't retry client errors (4xx)
+        if (!UpstreamClient::is_retryable(fwd.status_code)) {
+            fprintf(stderr, "[Proxy] Not retrying: status %d is a client error\n",
+                    fwd.status_code);
+            break;
+        }
+        retry_backoff(attempt);
+    }
+    return fwd;
 }
 
 // ── add_cors_headers ─────────────────────────────────────────────────────
@@ -164,18 +205,15 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                     return sink.write(data, len);
                 };
 
-                // Retry up to 3 times
-                UpstreamClient::ForwardResult fwd;
-                for (int attempt = 0; attempt < 3; attempt++) {
-                    if (attempt > 0) {
-                        fprintf(stderr, "[Proxy] Retry %d/3 for streaming request\n", attempt + 1);
+                auto fwd = forward_with_retry(
+                    [&]() {
                         accumulated.clear();
-                    }
-                    fwd = upstream_.forward(
-                        route_result.base_url, route_result.upstream_key,
-                        "/chat/completions", body, content_type, on_chunk);
-                    if (fwd.success) break;
-                }
+                        first_response = true;
+                        return upstream_.forward(
+                            route_result.base_url, route_result.upstream_key,
+                            "/chat/completions", body, content_type, on_chunk);
+                    },
+                    /*is_streaming=*/true);
 
                 // Parse usage from accumulated SSE data
                 auto usage = UsageTracker::parse_usage_from_sse(fwd.body);
@@ -209,15 +247,17 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
     } else {
         // ── Non-streaming path ──────────────────────────────────────
 
-        UpstreamClient::ForwardResult fwd;
-        for (int attempt = 0; attempt < 3; attempt++) {
-            if (attempt > 0)
-                fprintf(stderr, "[Proxy] Retry %d/3 for non-streaming request\n", attempt + 1);
-            fwd = upstream_.forward(
-                route_result.base_url, route_result.upstream_key,
-                "/chat/completions", body, content_type, nullptr);
-            if (fwd.success) break;
-        }
+        auto fwd = forward_with_retry(
+            [&]() {
+                return upstream_.forward(
+                    route_result.base_url, route_result.upstream_key,
+                    "/chat/completions", body, content_type, nullptr);
+            },
+            /*is_streaming=*/false);
+
+        // ── Retry / upstream metadata headers ──
+        res.set_header("X-Retry-Count", std::to_string(fwd.retries));
+        res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
         // Parse usage from JSON response
         auto usage = UsageTracker::parse_usage(fwd.body);
@@ -284,8 +324,16 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         return;
     }
 
-    auto fwd = upstream_.forward(route_result.base_url, route_result.upstream_key,
-                                 "/models", "", "application/json", nullptr);
+    auto fwd = forward_with_retry(
+        [&]() {
+            return upstream_.forward(route_result.base_url, route_result.upstream_key,
+                                     "/models", "", "application/json", nullptr);
+        },
+        /*is_streaming=*/false);
+
+    res.set_header("X-Retry-Count", std::to_string(fwd.retries));
+    res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
+
     if (fwd.success) {
         res.status = fwd.status_code;
         res.set_content(fwd.body, "application/json");

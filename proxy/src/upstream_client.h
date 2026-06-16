@@ -16,7 +16,13 @@ public:
         std::string error;
         int duration_ms = 0;  // total upstream call time (streaming: until stream ends)
         int ttft_ms = 0;      // time-to-first-token (streaming: first chunk; non-streaming: =duration_ms)
+        int retries = 0;      // number of retries performed (0 = first attempt succeeded)
     };
+
+    /// Returns true if the status code is safe to retry.
+    /// 4xx errors are client mistakes — retrying won't help.
+    /// 5xx / network errors / timeouts are candidates for retry.
+    static bool is_retryable(int status_code);
 
     /// Forward a request to the upstream API.
     ///

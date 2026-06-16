@@ -1,9 +1,19 @@
 #include "upstream_client.h"
 
 #include <chrono>
+#include <thread>
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
+
+// ── is_retryable ─────────────────────────────────────────────────────────
+
+bool UpstreamClient::is_retryable(int status_code) {
+    // 4xx: client error — retrying with the same request won't help
+    if (status_code >= 400 && status_code < 500) return false;
+    // 5xx / network errors (status_code == 0 or 502) are retryable
+    return true;
+}
 
 UpstreamClient::ForwardResult
 UpstreamClient::forward(const std::string &base_url,
