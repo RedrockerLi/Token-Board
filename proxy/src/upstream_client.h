@@ -14,7 +14,8 @@ public:
         std::string body;    // full response body (for non-streaming)
         bool success = false;
         std::string error;
-        int duration_ms = 0;
+        int duration_ms = 0;  // total upstream call time (streaming: until stream ends)
+        int ttft_ms = 0;      // time-to-first-token (streaming: first chunk; non-streaming: =duration_ms)
     };
 
     /// Forward a request to the upstream API.

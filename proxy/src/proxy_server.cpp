@@ -152,8 +152,14 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
 
                 std::string accumulated;
                 bool client_connected = true;
+                bool first_response = true;
+                std::chrono::steady_clock::time_point t_first_resp;
 
                 auto on_chunk = [&](const char *data, size_t len) -> bool {
+                    if (first_response) {
+                        t_first_resp = std::chrono::steady_clock::now();
+                        first_response = false;
+                    }
                     accumulated.append(data, len);
                     return sink.write(data, len);
                 };
@@ -186,11 +192,11 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
 
                 tracker_.mark_key_used(route_result.local_key_id);
 
-                // ── Perf: total proxy latency + in-flight snapshot ──
-                auto t1 = std::chrono::steady_clock::now();
-                int total_latency = static_cast<int>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
-                tracker_.log_perf_event(model_copy, fwd.duration_ms, total_latency,
+                // ── Perf: proxy TTFT + in-flight snapshot ──
+                int proxy_ttft = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        first_response ? std::chrono::steady_clock::now() - t0 : t_first_resp - t0).count());
+                tracker_.log_perf_event(model_copy, fwd.ttft_ms, proxy_ttft,
                                         fwd.status_code, fwd.status_code >= 400,
                                         concurrent_before);
                 in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);
@@ -228,11 +234,11 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
 
         tracker_.mark_key_used(route_result.local_key_id);
 
-        // ── Perf: total proxy latency + in-flight snapshot ──
+        // ── Perf: proxy TTFT (non-streaming = total time) ──
         auto t1 = std::chrono::steady_clock::now();
-        int total_latency = static_cast<int>(
+        int proxy_ttft = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
-        tracker_.log_perf_event(req_model, fwd.duration_ms, total_latency,
+        tracker_.log_perf_event(req_model, fwd.ttft_ms, proxy_ttft,
                                 fwd.status_code, fwd.status_code >= 400,
                                 concurrent_before);
         in_flight_requests_.fetch_sub(1, std::memory_order_relaxed);

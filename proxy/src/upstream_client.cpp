@@ -56,10 +56,16 @@ UpstreamClient::forward(const std::string &base_url,
         // ── Streaming path: use Request::content_receiver ─────────
         std::string accumulated;
         bool client_connected = true;
+        bool first_chunk = true;
+        std::chrono::steady_clock::time_point t_first;
 
         // ContentReceiverWithProgress: (data, len, offset, total) -> bool
         auto receiver = [&](const char *data, size_t len,
                             uint64_t /*offset*/, uint64_t /*total*/) -> bool {
+            if (first_chunk) {
+                t_first = std::chrono::steady_clock::now();
+                first_chunk = false;
+            }
             accumulated.append(data, len);
             if (client_connected) {
                 client_connected = on_chunk(data, len);
@@ -81,6 +87,12 @@ UpstreamClient::forward(const std::string &base_url,
         auto t1 = std::chrono::steady_clock::now();
         result.duration_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        if (!first_chunk) {
+            result.ttft_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(t_first - t0).count());
+        } else {
+            result.ttft_ms = result.duration_ms;  // no chunks received
+        }
         result.body = std::move(accumulated);
 
         if (ok) {
@@ -102,6 +114,7 @@ UpstreamClient::forward(const std::string &base_url,
         auto t1 = std::chrono::steady_clock::now();
         result.duration_ms = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+        result.ttft_ms = result.duration_ms;  // non-streaming: no first-token concept
 
         if (upstream_res) {
             result.status_code = upstream_res->status;

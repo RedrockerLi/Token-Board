@@ -50,7 +50,7 @@ function buildPerfPageHTML() {
         <!-- Latency Distribution Chart -->
         <div class="section">
             <div class="chart-card">
-                <div class="chart-card__title">延迟分布 (实线=代理全流程 / 虚线=纯上游) — 最近 60 分钟</div>
+                <div class="chart-card__title">TTFT 首Token延迟分布 — 最近 60 分钟</div>
                 <div class="chart-container chart-container--lg" id="chartLatency"></div>
             </div>
         </div>
@@ -63,7 +63,7 @@ function buildPerfPageHTML() {
                     <div class="chart-container chart-container--lg" id="chartRPM"></div>
                 </div>
                 <div class="chart-card">
-                    <div class="chart-card__title">代理占用率 — 最近 60 分钟 (线程池上限 8)</div>
+                    <div class="chart-card__title">代理占用率 — 最近 60 分钟</div>
                     <div class="chart-container chart-container--lg" id="chartUtilization"></div>
                 </div>
             </div>
@@ -110,7 +110,7 @@ function renderLatencyChart(domId, data) {
             }
         },
         legend: {
-            data: ['P50总延迟', 'P50上游', 'P95总延迟', 'P95上游', 'P99总延迟', 'P99上游'],
+            data: ['P50-上游', 'P50-代理', 'P95-上游', 'P95-代理', 'P99-上游', 'P99-代理'],
             bottom: 0,
             textStyle: { fontSize: 10 }
         },
@@ -119,40 +119,40 @@ function renderLatencyChart(domId, data) {
         yAxis: { type: 'value', name: '延迟 (ms)', axisLabel: { fontSize: 10 } },
         series: [
             {
-                name: 'P50总延迟', type: 'line',
-                data: data.map(function(d) { return d.p50_total; }),
-                smooth: true, symbol: 'none',
-                lineStyle: { color: '#0070F3', width: 2 },
-            },
-            {
-                name: 'P50上游', type: 'line',
+                name: 'P50-上游', type: 'line',
                 data: data.map(function(d) { return d.p50_upstream; }),
                 smooth: true, symbol: 'none',
                 lineStyle: { color: '#0070F3', width: 2, type: 'dashed' },
             },
             {
-                name: 'P95总延迟', type: 'line',
-                data: data.map(function(d) { return d.p95_total; }),
+                name: 'P50-代理', type: 'line',
+                data: data.map(function(d) { return d.p50_total; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#F59E0B', width: 2 },
+                lineStyle: { color: '#0070F3', width: 2 },
             },
             {
-                name: 'P95上游', type: 'line',
+                name: 'P95-上游', type: 'line',
                 data: data.map(function(d) { return d.p95_upstream; }),
                 smooth: true, symbol: 'none',
                 lineStyle: { color: '#F59E0B', width: 2, type: 'dashed' },
             },
             {
-                name: 'P99总延迟', type: 'line',
-                data: data.map(function(d) { return d.p99_total; }),
+                name: 'P95-代理', type: 'line',
+                data: data.map(function(d) { return d.p95_total; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#EF4444', width: 1.5 },
+                lineStyle: { color: '#F59E0B', width: 2 },
             },
             {
-                name: 'P99上游', type: 'line',
+                name: 'P99-上游', type: 'line',
                 data: data.map(function(d) { return d.p99_upstream; }),
                 smooth: true, symbol: 'none',
                 lineStyle: { color: '#EF4444', width: 1.5, type: 'dashed' },
+            },
+            {
+                name: 'P99-代理', type: 'line',
+                data: data.map(function(d) { return d.p99_total; }),
+                smooth: true, symbol: 'none',
+                lineStyle: { color: '#EF4444', width: 1.5 },
             },
         ],
     });
