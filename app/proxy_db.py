@@ -29,6 +29,7 @@ class ProxyDatabase:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
         # Ensure new tables exist (C++ proxy also creates them, but Flask may connect first)
         conn.execute("""CREATE TABLE IF NOT EXISTS account_models (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -684,6 +685,7 @@ class ProxyDatabase:
                 WHERE CAST(strftime('%Y', r.requested_at) AS INTEGER) = ?
                   AND CAST(strftime('%m', r.requested_at) AS INTEGER) = ?
                   AND LOWER(r.model) != 'unknown'
+                  AND r.model != ''
                   AND a.name IS NOT NULL
                 GROUP BY date(r.requested_at), a.name, r.model
                 ORDER BY date(r.requested_at), a.name, r.model

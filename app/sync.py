@@ -330,9 +330,11 @@ def _simple_glob(pattern: str, text: str) -> bool:
 def _safe_copy_db(src: str, dst: str):
     """Copy a SQLite database, including WAL data, using the backup API."""
     src_conn = sqlite3.connect(src)
+    src_conn.execute("PRAGMA busy_timeout=5000")
     # Force WAL checkpoint so all data is in the main file
     src_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     dst_conn = sqlite3.connect(dst)
+    dst_conn.execute("PRAGMA busy_timeout=5000")
     src_conn.backup(dst_conn)
     dst_conn.close()
     src_conn.close()
