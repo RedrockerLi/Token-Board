@@ -3,7 +3,8 @@
         "PC-AI-chat"
     ],
     "hidden_models": [
-        "ds-v4-flash"
+        "ds-v4-flash",
+        "Qwen3.5-397B-A17B"
     ],
     "model_aliases": [
         {
