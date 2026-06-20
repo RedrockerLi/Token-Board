@@ -288,10 +288,13 @@ async function loadDailyChartForModel(modelName, chartId, loaderId, aliasModels)
             allResults.forEach(function (result) {
                 (result.days || []).forEach(function (d) {
                     if (!merged[d.date]) {
-                        merged[d.date] = { date: d.date, output_tokens: 0, input_tokens: 0, requests: 0, cost: 0 };
+                        merged[d.date] = { date: d.date, output_tokens: 0, input_tokens: 0, input_cache_hit_tokens: 0, input_cache_miss_tokens: 0, total_tokens: 0, requests: 0, cost: 0 };
                     }
                     merged[d.date].output_tokens += d.output_tokens || 0;
                     merged[d.date].input_tokens += d.input_tokens || 0;
+                    merged[d.date].input_cache_hit_tokens += d.input_cache_hit_tokens || 0;
+                    merged[d.date].input_cache_miss_tokens += d.input_cache_miss_tokens || 0;
+                    merged[d.date].total_tokens += d.total_tokens || 0;
                     merged[d.date].requests += d.requests || 0;
                     merged[d.date].cost += (d.cost || 0);
                 });
@@ -400,10 +403,13 @@ async function loadMonthlyTrendForModel(modelName, chartId, loaderId, aliasModel
             allResults.forEach(function (result) {
                 result.forEach(function (d) {
                     if (!merged[d.label]) {
-                        merged[d.label] = { label: d.label, output_tokens: 0, input_tokens: 0, requests: 0, cost: 0 };
+                        merged[d.label] = { label: d.label, output_tokens: 0, input_tokens: 0, input_cache_hit_tokens: 0, input_cache_miss_tokens: 0, total_tokens: 0, requests: 0, cost: 0 };
                     }
                     merged[d.label].output_tokens += d.output_tokens || 0;
                     merged[d.label].input_tokens += d.input_tokens || 0;
+                    merged[d.label].input_cache_hit_tokens += d.input_cache_hit_tokens || 0;
+                    merged[d.label].input_cache_miss_tokens += d.input_cache_miss_tokens || 0;
+                    merged[d.label].total_tokens += d.total_tokens || 0;
                     merged[d.label].requests += d.requests || 0;
                     merged[d.label].cost += (d.cost || 0);
                 });
