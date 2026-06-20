@@ -8,7 +8,10 @@
     "model_aliases": [
         {
             "name": "MiniMax-M2.7",
-            "models": ["minimax-m27", "minimax-m27-eic"]
+            "models": [
+                "minimax-m27",
+                "minimax-m27-eic"
+            ]
         }
     ]
 }
