@@ -135,10 +135,12 @@ function buildDynamicCharts(models) {
         return !(m.toLowerCase() in modelToAlias);
     });
 
-    // Add alias group display names as chart entries
+    // Add alias group display names as chart entries (respect hidden_models)
     var chartEntries = filteredModels.slice();  // standalone models
     Object.keys(aliasToModels).forEach(function (aliasName) {
-        chartEntries.push(aliasName);
+        if (hiddenModels.indexOf(aliasName.toLowerCase()) === -1) {
+            chartEntries.push(aliasName);
+        }
     });
 
     modelsList = chartEntries.slice();
@@ -350,6 +352,8 @@ async function loadModelPie() {
             if (lower in modelToAlias) {
                 // This model belongs to an alias group → merge
                 var aliasName = modelToAlias[lower];
+                // Also skip if the alias name itself is hidden
+                if (hiddenModels.indexOf(aliasName.toLowerCase()) !== -1) return;
                 merged[aliasName] = (merged[aliasName] || 0) + tokens;
             } else {
                 merged[modelName] = (merged[modelName] || 0) + tokens;
