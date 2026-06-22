@@ -75,7 +75,7 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
             data: labels,
             axisLine: { lineStyle: { color: '#E8EBF0' } },
             axisTick: { show: false },
-            axisLabel: { color: '#9094A2', fontSize: 11, rotate: xAxisLabelRotate || 0 }
+            axisLabel: { show: false }
         },
         yAxis: [
             {

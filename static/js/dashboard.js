@@ -266,6 +266,40 @@ async function loadSummary() {
 
 // ── Daily charts ──
 
+/**
+ * Generate all dates in YYYY-MM-DD format for a given year/month.
+ * @returns {string[]} e.g. ["2026-06-01", "2026-06-02", ...]
+ */
+function generateMonthDates(year, month) {
+    var daysInMonth = new Date(year, month, 0).getDate();  // month is 1-based, Date uses 0-based
+    var dates = [];
+    for (var d = 1; d <= daysInMonth; d++) {
+        var dd = String(d).padStart(2, '0');
+        var mm = String(month).padStart(2, '0');
+        dates.push(year + '-' + mm + '-' + dd);
+    }
+    return dates;
+}
+
+/** Fill missing days with zero values so the chart X-axis shows the entire month. */
+function fillMonthDays(daysMap, year, month) {
+    var allDates = generateMonthDates(year, month);
+    return allDates.map(function (date) {
+        var d = daysMap[date];
+        if (d) return d;
+        return {
+            date: date,
+            output_tokens: 0,
+            input_tokens: 0,
+            input_cache_hit_tokens: 0,
+            input_cache_miss_tokens: 0,
+            total_tokens: 0,
+            requests: 0,
+            cost: 0
+        };
+    });
+}
+
 async function loadDailyChartForModel(modelName, chartId, loaderId, aliasModels) {
     var dom = document.getElementById(chartId);
     var loader = document.getElementById(loaderId);
@@ -280,32 +314,35 @@ async function loadDailyChartForModel(modelName, chartId, loaderId, aliasModels)
     }
 
     try {
-        var days;
+        var daysMap = {};
         if (aliasModels && aliasModels.length > 0) {
             // Merge multiple models (aliases) into one chart
             var allResults = await Promise.all(aliasModels.map(function (m) {
                 return fetchDaily(currentMonth.year, currentMonth.month, m);
             }));
-            var merged = {};
             allResults.forEach(function (result) {
                 (result.days || []).forEach(function (d) {
-                    if (!merged[d.date]) {
-                        merged[d.date] = { date: d.date, output_tokens: 0, input_tokens: 0, input_cache_hit_tokens: 0, input_cache_miss_tokens: 0, total_tokens: 0, requests: 0, cost: 0 };
+                    if (!daysMap[d.date]) {
+                        daysMap[d.date] = { date: d.date, output_tokens: 0, input_tokens: 0, input_cache_hit_tokens: 0, input_cache_miss_tokens: 0, total_tokens: 0, requests: 0, cost: 0 };
                     }
-                    merged[d.date].output_tokens += d.output_tokens || 0;
-                    merged[d.date].input_tokens += d.input_tokens || 0;
-                    merged[d.date].input_cache_hit_tokens += d.input_cache_hit_tokens || 0;
-                    merged[d.date].input_cache_miss_tokens += d.input_cache_miss_tokens || 0;
-                    merged[d.date].total_tokens += d.total_tokens || 0;
-                    merged[d.date].requests += d.requests || 0;
-                    merged[d.date].cost += (d.cost || 0);
+                    daysMap[d.date].output_tokens += d.output_tokens || 0;
+                    daysMap[d.date].input_tokens += d.input_tokens || 0;
+                    daysMap[d.date].input_cache_hit_tokens += d.input_cache_hit_tokens || 0;
+                    daysMap[d.date].input_cache_miss_tokens += d.input_cache_miss_tokens || 0;
+                    daysMap[d.date].total_tokens += d.total_tokens || 0;
+                    daysMap[d.date].requests += d.requests || 0;
+                    daysMap[d.date].cost += (d.cost || 0);
                 });
             });
-            days = Object.keys(merged).sort().map(function (date) { return merged[date]; });
         } else {
             var data = await fetchDaily(currentMonth.year, currentMonth.month, modelName);
-            days = data.days || [];
+            (data.days || []).forEach(function (d) {
+                daysMap[d.date] = d;
+            });
         }
+
+        // Fill in all days of the month — missing days get 0 values
+        var days = fillMonthDays(daysMap, currentMonth.year, currentMonth.month);
 
         var labels = days.map(function (d) { return d.date; });
         var outputVals = days.map(function (d) { return d.output_tokens; });
@@ -313,8 +350,9 @@ async function loadDailyChartForModel(modelName, chartId, loaderId, aliasModels)
         var requestVals = days.map(function (d) { return d.requests; });
         var costVals = days.map(function (d) { return d.cost; });
 
+        var rotate = labels.length > 14 ? 45 : 0;
         renderTimeSeriesChart(chartId, loaderId, labels, outputVals, inputVals,
-                              requestVals, costVals, days, 0);
+                              requestVals, costVals, days, rotate);
     } catch (err) {
         console.error('Failed to load daily chart for ' + modelName + ':', err);
         loader.textContent = '加载失败';
