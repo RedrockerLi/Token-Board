@@ -3,7 +3,6 @@
 #include "router.h"
 #include "upstream_client.h"
 #include "usage_tracker.h"
-#include "model_pricing.h"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
@@ -53,6 +52,30 @@ static void retry_backoff(int attempt) {
     } else if (attempt >= 2) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
     }
+}
+
+/// Shell-style glob match: supports * (any chars) and ? (single char).
+/// Case-insensitive. Used for key_model_map pattern matching.
+static bool glob_match(const std::string &pattern, const std::string &text) {
+    size_t pi = 0, mi = 0;
+    size_t star_pos = std::string::npos;
+    size_t match_pos = 0;
+
+    while (mi < text.size()) {
+        if (pi < pattern.size() &&
+            (pattern[pi] == '?' ||
+             tolower(pattern[pi]) == tolower(text[mi]))) {
+            ++pi; ++mi;
+        } else if (pi < pattern.size() && pattern[pi] == '*') {
+            star_pos = pi; match_pos = mi; ++pi;
+        } else if (star_pos != std::string::npos) {
+            pi = star_pos + 1; match_pos++; mi = match_pos;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pattern.size() && pattern[pi] == '*') ++pi;
+    return pi == pattern.size();
 }
 
 /// Retry helper: calls `do_forward()` up to 3 times with exponential

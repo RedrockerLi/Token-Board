@@ -6,7 +6,6 @@
 
 #include "config.h"
 #include "db.h"
-#include "model_pricing.h"
 #include "proxy_server.h"
 #include "router.h"
 #include "upstream_client.h"
@@ -46,15 +45,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // ── Load model pricing ────────────────────────────────────────────
-    ModelPricing pricing;
-    pricing.load(db);
-
     // ── Create components ─────────────────────────────────────────────
     Router router(db);
     UpstreamClient upstream;
-    UsageTracker tracker(db, pricing);
-    ProxyServer proxy_server(db, router, upstream, tracker, pricing);
+    UsageTracker tracker(db);
+    ProxyServer proxy_server(db, router, upstream, tracker);
 
     // ── Configure httplib server ──────────────────────────────────────
     httplib::Server server;

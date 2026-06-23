@@ -15,7 +15,6 @@ set(PROXY_SOURCES
     src/main.cpp
     src/config.cpp
     src/db.cpp
-    src/model_pricing.cpp
     src/router.cpp
     src/upstream_client.cpp
     src/usage_tracker.cpp

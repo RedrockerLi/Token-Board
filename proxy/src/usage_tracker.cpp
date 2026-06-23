@@ -1,6 +1,5 @@
 #include "usage_tracker.h"
 #include "db.h"
-#include "model_pricing.h"
 
 #include "json.hpp"
 
@@ -117,8 +116,10 @@ void UsageTracker::log_request(int account_id, int local_key_id,
                                const UsageInfo &usage,
                                bool is_streaming, int status_code,
                                int duration_ms) {
-    double cost = pricing_.estimate_cost(
-        usage.model, usage.prompt_tokens, usage.completion_tokens);
+    // Cost is computed automatically by the tr_request_log_insert SQLite
+    // trigger, so we pass 0.0 here. The trigger reads model_pricing and
+    // sets the correct cost immediately after insert.
+    double cost = 0.0;
 
     db_.log_request(account_id, local_key_id, usage.model,
                     usage.prompt_tokens, usage.completion_tokens,

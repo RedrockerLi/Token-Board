@@ -160,6 +160,59 @@ void Database::create_schema() {
             is_streaming    INTEGER NOT NULL DEFAULT 0,
             started_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        -- Trigger: auto-compute cost from model_pricing when a request is logged.
+        -- Removes the need for application-level cost computation.
+        CREATE TRIGGER IF NOT EXISTS tr_request_log_insert
+        AFTER INSERT ON request_log
+        BEGIN
+            UPDATE request_log SET cost = COALESCE((
+                SELECT (NEW.prompt_tokens / 1000000.0) * mp.input_price
+                     + (NEW.completion_tokens / 1000000.0) * mp.output_price
+                FROM model_pricing mp
+                WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
+                ORDER BY mp.id LIMIT 1
+            ), 0.0) WHERE id = NEW.id AND NEW.prompt_tokens + NEW.completion_tokens > 0;
+        END;
+
+        -- Trigger: recalculate all costs when a pricing entry is inserted.
+        CREATE TRIGGER IF NOT EXISTS tr_pricing_insert
+        AFTER INSERT ON model_pricing
+        BEGIN
+            UPDATE request_log SET cost = COALESCE((
+                SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                     + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                FROM model_pricing mp
+                WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                ORDER BY mp.id LIMIT 1
+            ), 0.0);
+        END;
+
+        -- Trigger: recalculate all costs when a pricing entry is updated.
+        CREATE TRIGGER IF NOT EXISTS tr_pricing_update
+        AFTER UPDATE ON model_pricing
+        BEGIN
+            UPDATE request_log SET cost = COALESCE((
+                SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                     + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                FROM model_pricing mp
+                WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                ORDER BY mp.id LIMIT 1
+            ), 0.0);
+        END;
+
+        -- Trigger: recalculate all costs when a pricing entry is deleted.
+        CREATE TRIGGER IF NOT EXISTS tr_pricing_delete
+        AFTER DELETE ON model_pricing
+        BEGIN
+            UPDATE request_log SET cost = COALESCE((
+                SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                     + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                FROM model_pricing mp
+                WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                ORDER BY mp.id LIMIT 1
+            ), 0.0);
+        END;
     )SQL";
 
     char *err = nullptr;

@@ -4,7 +4,6 @@ class Database;
 class Router;
 class UpstreamClient;
 class UsageTracker;
-class ModelPricing;
 
 namespace httplib {
 class Server;
@@ -22,9 +21,8 @@ struct Response;
 class ProxyServer {
 public:
     ProxyServer(Database &db, Router &router, UpstreamClient &upstream,
-                UsageTracker &tracker, ModelPricing &pricing)
-        : db_(db), router_(router), upstream_(upstream), tracker_(tracker),
-          pricing_(pricing) {}
+                UsageTracker &tracker)
+        : db_(db), router_(router), upstream_(upstream), tracker_(tracker) {}
 
     void setup_routes(httplib::Server &server);
 
@@ -41,5 +39,4 @@ private:
     Router &router_;
     UpstreamClient &upstream_;
     UsageTracker &tracker_;
-    ModelPricing &pricing_;
 };

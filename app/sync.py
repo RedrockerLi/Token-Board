@@ -215,6 +215,8 @@ def _record_key(row: dict) -> str:
         str(row.get("prompt_tokens", 0)),
         str(row.get("completion_tokens", 0)),
         str(row.get("total_tokens", 0)),
+        str(row.get("duration_ms", 0)),
+        str(row.get("status_code", 0)),
         str(row.get("requested_at", "")),
     )
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
@@ -240,7 +242,9 @@ def _merge_request_log(local_conn: sqlite3.Connection, remote_conn: sqlite3.Conn
         f"SELECT * FROM request_log WHERE date(requested_at) >= {cutoff}"
     ).fetchall()
 
-    # Insert remote records missing from local (one-way: remote → local)
+    # Insert remote records missing from local (one-way: remote → local).
+    # Deliberately omit cost — the tr_request_log_insert trigger recomputes
+    # it from local model_pricing, which is the single source of truth.
     new_count = 0
     for r in remote_rows:
         rd = dict(r)
@@ -248,13 +252,13 @@ def _merge_request_log(local_conn: sqlite3.Connection, remote_conn: sqlite3.Conn
             local_conn.execute(
                 """INSERT INTO request_log
                    (account_id, local_key_id, model, prompt_tokens,
-                    completion_tokens, total_tokens, cost, is_streaming,
+                    completion_tokens, total_tokens, is_streaming,
                     status_code, duration_ms, requested_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rd["account_id"], rd["local_key_id"], rd["model"],
                     rd["prompt_tokens"], rd["completion_tokens"], rd["total_tokens"],
-                    rd["cost"], rd["is_streaming"], rd["status_code"],
+                    rd["is_streaming"], rd["status_code"],
                     rd["duration_ms"], rd["requested_at"],
                 ),
             )
@@ -262,78 +266,6 @@ def _merge_request_log(local_conn: sqlite3.Connection, remote_conn: sqlite3.Conn
 
     local_conn.commit()
     return new_count
-
-
-def _merge_config_tables(local_conn: sqlite3.Connection, remote_conn: sqlite3.Connection):
-    """Merge upstream_accounts, local_keys, model_pricing from remote into local.
-
-    Uses INSERT OR IGNORE based on unique constraints (name, key_value, model_pattern).
-    """
-    # upstream_accounts: unique on (name)
-    local_conn.execute("""
-        INSERT OR IGNORE INTO upstream_accounts (name, upstream_key, base_url, created_at)
-        SELECT name, upstream_key, base_url, created_at
-        FROM temp_remote.upstream_accounts
-    """)
-
-    # local_keys: unique on (key_value)
-    local_conn.execute("""
-        INSERT OR IGNORE INTO local_keys (key_value, label, account_id, created_at, last_used_at)
-        SELECT key_value, label, account_id, created_at, last_used_at
-        FROM temp_remote.local_keys
-    """)
-
-    # model_pricing: unique on (model_pattern)
-    local_conn.execute("""
-        INSERT OR IGNORE INTO model_pricing (model_pattern, input_price, output_price, currency)
-        SELECT model_pattern, input_price, output_price, currency
-        FROM temp_remote.model_pricing
-    """)
-
-    local_conn.commit()
-
-
-def _recalculate_all_costs(conn: sqlite3.Connection):
-    """Recalculate cost for all request_log entries using current pricing."""
-    pricing = conn.execute(
-        "SELECT model_pattern, input_price, output_price FROM model_pricing ORDER BY id"
-    ).fetchall()
-    if not pricing:
-        return
-
-    # Build a list of (pattern, input_price, output_price) and match each model
-    models = [r[0] for r in conn.execute("SELECT DISTINCT model FROM request_log").fetchall()]
-    for model in models:
-        for pattern, inp, out in pricing:
-            if _simple_glob(pattern, model):
-                conn.execute(
-                    """UPDATE request_log
-                       SET cost = (prompt_tokens / 1000000.0) * ? + (completion_tokens / 1000000.0) * ?
-                       WHERE model = ?""",
-                    (inp, out, model),
-                )
-                break  # first match wins
-    conn.commit()
-
-
-def _simple_glob(pattern: str, text: str) -> bool:
-    """Simple glob match (* and ? only)."""
-    pi = mi = 0
-    star = -1
-    match_start = 0
-    while mi < len(text):
-        if pi < len(pattern) and (pattern[pi] == '?' or
-                                   pattern[pi].lower() == text[mi].lower()):
-            pi += 1; mi += 1
-        elif pi < len(pattern) and pattern[pi] == '*':
-            star = pi; match_start = mi; pi += 1
-        elif star != -1:
-            pi = star + 1; match_start += 1; mi = match_start
-        else:
-            return False
-    while pi < len(pattern) and pattern[pi] == '*':
-        pi += 1
-    return pi == len(pattern)
 
 
 def _safe_copy_db(src: str, dst: str):
@@ -400,8 +332,13 @@ def sync(db_path: str) -> dict:
         _safe_copy_db(db_path, merged_path)
         merged_conn = sqlite3.connect(merged_path)
         _trim_old(merged_conn)
-        # Strip all config/secrets — only request_log goes to cloud
+        # Strip all config/secrets — only request_log goes to cloud.
+        # Keep model_pricing: it's not a secret, and deleting it triggers
+        # tr_pricing_delete which zeros out all request_log costs, breaking
+        # billing on other machines that sync this data.
         for tbl in CONFIG_TABLES + ["sync_config", "perf_events"]:
+            if tbl == "model_pricing":
+                continue
             merged_conn.execute(f"DELETE FROM {tbl}")
         merged_conn.commit()
         merged_conn.close()
@@ -511,8 +448,9 @@ def sync_config_download(db_path: str) -> bool:
                 placeholders = ",".join(["?"] * len(columns))
                 cols = ",".join(columns)
                 for row in rows:
+                    # INSERT OR IGNORE: local config wins. Cloud is transport.
                     local_conn.execute(
-                        f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})",
+                        f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})",
                         row,
                     )
             except sqlite3.OperationalError:
@@ -578,8 +516,10 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
                 for row in rows:
                     try:
                         before = local_conn.total_changes
+                        # INSERT OR IGNORE: local data wins. Cloud is only
+                        # a transport; the local DB is the source of truth.
                         local_conn.execute(
-                            f"INSERT OR REPLACE INTO {table} ({col_list}) VALUES ({placeholders})",
+                            f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})",
                             tuple(row),
                         )
                         if local_conn.total_changes > before:

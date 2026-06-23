@@ -40,6 +40,19 @@ class ProxyDatabase:
         try:
             sync_config_upload(self.db_path)
         except Exception:
+            pass
+
+    def _sync_to_dashboard(self):
+        """Re-export current month to dashboard.db after pricing changes.
+
+        Triggers recalculate proxy.db costs instantly, but dashboard.db
+        holds frozen snapshots from the last export. This keeps them in sync.
+        """
+        from datetime import datetime
+        try:
+            now = datetime.now()
+            self.export_to_dashboard(now.year, now.month)
+        except Exception:
             pass  # sync failures should never crash the app
 
     def _connect(self) -> sqlite3.Connection:
@@ -86,6 +99,52 @@ class ProxyDatabase:
             model TEXT NOT NULL,
             is_streaming INTEGER NOT NULL DEFAULT 0,
             started_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+
+        # ── Triggers: automatic cost computation from model_pricing ──────
+        conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_request_log_insert
+            AFTER INSERT ON request_log
+            BEGIN
+                UPDATE request_log SET cost = COALESCE((
+                    SELECT (NEW.prompt_tokens / 1000000.0) * mp.input_price
+                         + (NEW.completion_tokens / 1000000.0) * mp.output_price
+                    FROM model_pricing mp
+                    WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
+                    ORDER BY mp.id LIMIT 1
+                ), 0.0) WHERE id = NEW.id AND NEW.prompt_tokens + NEW.completion_tokens > 0;
+            END""")
+        conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_pricing_insert
+            AFTER INSERT ON model_pricing
+            BEGIN
+                UPDATE request_log SET cost = COALESCE((
+                    SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                         + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                    FROM model_pricing mp
+                    WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                    ORDER BY mp.id LIMIT 1
+                ), 0.0);
+            END""")
+        conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_pricing_update
+            AFTER UPDATE ON model_pricing
+            BEGIN
+                UPDATE request_log SET cost = COALESCE((
+                    SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                         + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                    FROM model_pricing mp
+                    WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                    ORDER BY mp.id LIMIT 1
+                ), 0.0);
+            END""")
+        conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_pricing_delete
+            AFTER DELETE ON model_pricing
+            BEGIN
+                UPDATE request_log SET cost = COALESCE((
+                    SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                         + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                    FROM model_pricing mp
+                    WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                    ORDER BY mp.id LIMIT 1
+                ), 0.0);
+            END""")
         conn.commit()
         return conn
 
@@ -485,9 +544,9 @@ class ProxyDatabase:
                 (data["model_pattern"], data["input_price"], data["output_price"]),
             )
             conn.commit()
-            # Recalculate costs for matching existing requests
-            self._recalculate_costs(conn, data["model_pattern"],
-                                    data["input_price"], data["output_price"])
+            # tr_pricing_insert trigger auto-recalculates all costs
+            self._schedule_config_sync()
+            self._sync_to_dashboard()
             return cursor.lastrowid
         finally:
             conn.close()
@@ -495,11 +554,6 @@ class ProxyDatabase:
     def update_pricing(self, pricing_id: int, data: dict) -> bool:
         conn = self._connect()
         try:
-            # Fetch the pattern before updating
-            pattern = conn.execute(
-                "SELECT model_pattern FROM model_pricing WHERE id = ?", (pricing_id,)
-            ).fetchone()
-
             fields = []
             values = []
             for key in ("model_pattern", "input_price", "output_price"):
@@ -514,11 +568,9 @@ class ProxyDatabase:
                 values,
             )
             conn.commit()
-
-            # Recalculate costs for matching requests
-            if pattern:
-                self._recalculate_costs(conn, data.get("model_pattern", pattern[0]),
-                                        data.get("input_price"), data.get("output_price"))
+            # tr_pricing_update trigger auto-recalculates all costs
+            self._schedule_config_sync()
+            self._sync_to_dashboard()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -528,7 +580,9 @@ class ProxyDatabase:
         try:
             conn.execute("DELETE FROM model_pricing WHERE id = ?", (pricing_id,))
             conn.commit()
+            # tr_pricing_delete trigger auto-recalculates all costs
             self._schedule_config_sync()
+            self._sync_to_dashboard()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -551,7 +605,9 @@ class ProxyDatabase:
                 conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (a, b))
                 conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (b, -1))
             conn.commit()
+            # tr_pricing_update triggers fire on the ID swap, auto-recalculating all costs
             self._schedule_config_sync()
+            self._sync_to_dashboard()
             return True
         finally:
             conn.close()
@@ -965,56 +1021,3 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    def _recalculate_costs(self, conn, pattern: str,
-                           input_price: float | None,
-                           output_price: float | None):
-        """Recalculate cost for all request_log entries matching a pricing pattern."""
-        if input_price is None and output_price is None:
-            return
-
-        # Get current prices if only one changed
-        row = conn.execute(
-            "SELECT input_price, output_price FROM model_pricing WHERE model_pattern = ?",
-            (pattern,),
-        ).fetchone()
-        if not row:
-            return
-        inp = input_price if input_price is not None else row["input_price"]
-        out = output_price if output_price is not None else row["output_price"]
-
-        # Find matching models
-        models = conn.execute("SELECT DISTINCT model FROM request_log").fetchall()
-        for (model,) in models:
-            if self._glob_match(pattern, model):
-                conn.execute(
-                    """UPDATE request_log
-                       SET cost = (prompt_tokens / 1000000.0) * ? + (completion_tokens / 1000000.0) * ?
-                       WHERE model = ?""",
-                    (inp, out, model),
-                )
-        conn.commit()
-
-    @staticmethod
-    def _glob_match(pattern: str, model: str) -> bool:
-        """Simple glob match (*, ? only)."""
-        pi = mi = 0
-        star = -1
-        match_start = 0
-        while mi < len(model):
-            if pi < len(pattern) and (pattern[pi] == '?' or
-                                       pattern[pi].lower() == model[mi].lower()):
-                pi += 1
-                mi += 1
-            elif pi < len(pattern) and pattern[pi] == '*':
-                star = pi
-                match_start = mi
-                pi += 1
-            elif star != -1:
-                pi = star + 1
-                match_start += 1
-                mi = match_start
-            else:
-                return False
-        while pi < len(pattern) and pattern[pi] == '*':
-            pi += 1
-        return pi == len(pattern)

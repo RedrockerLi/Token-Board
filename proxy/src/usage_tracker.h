@@ -4,15 +4,15 @@
 #include <string>
 
 class Database;
-class ModelPricing;
 
 /// Extracts OpenAI-compatible usage info from responses and persists them.
 ///
 /// Handles both non-streaming JSON and streaming SSE response formats.
+/// Cost is computed automatically by a SQLite trigger on request_log INSERT,
+/// so no pricing logic is needed here.
 class UsageTracker {
 public:
-    UsageTracker(Database &db, ModelPricing &pricing)
-        : db_(db), pricing_(pricing) {}
+    UsageTracker(Database &db) : db_(db) {}
 
     struct UsageInfo {
         std::string model;
@@ -42,5 +42,4 @@ public:
 
 private:
     Database &db_;
-    ModelPricing &pricing_;
 };
