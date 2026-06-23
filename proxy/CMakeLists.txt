@@ -16,6 +16,7 @@ set(PROXY_SOURCES
     src/config.cpp
     src/db.cpp
     src/router.cpp
+    src/think_filter.cpp
     src/upstream_client.cpp
     src/usage_tracker.cpp
     src/proxy_server.cpp

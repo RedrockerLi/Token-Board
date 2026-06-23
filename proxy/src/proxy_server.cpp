@@ -1,6 +1,7 @@
 #include "proxy_server.h"
 #include "db.h"
 #include "router.h"
+#include "think_filter.h"
 #include "upstream_client.h"
 #include "usage_tracker.h"
 
@@ -108,62 +109,61 @@ forward_with_retry(F &&do_forward, bool is_streaming) {
     return fwd;
 }
 
-// ── add_cors_headers ─────────────────────────────────────────────────────
+// ── Auth / routing helpers ───────────────────────────────────────────────
 
-void ProxyServer::add_cors_headers(httplib::Response &res) {
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers",
-                   "Authorization, Content-Type");
-}
+/// Result of extracting Bearer token + looking up route.
+struct AuthResult {
+    bool success = false;
+    Router::RouteResult route;   // valid only if success
+    std::string error_json;       // 401 JSON body when !success
+};
 
-// ── handle_chat_completions ──────────────────────────────────────────────
-
-void ProxyServer::handle_chat_completions(const httplib::Request &req,
-                                          httplib::Response &res) {
-    add_cors_headers(res);
-
-    // ── Performance tracking: record start time ──
-    auto t0 = std::chrono::steady_clock::now();
-
-    // 1. Extract Bearer token
+/// Extract Bearer token from request and look up the upstream route.
+/// Returns 401 error info when authentication or routing fails.
+static AuthResult extract_and_route(const httplib::Request &req,
+                                     Router &router) {
+    AuthResult ar;
     std::string auth = req.has_header("Authorization")
-                           ? req.get_header_value("Authorization")
-                           : "";
-
+                          ? req.get_header_value("Authorization")
+                          : "";
     std::string local_key;
-    if (auth.rfind("Bearer ", 0) == 0) {
+    if (auth.rfind("Bearer ", 0) == 0)
         local_key = auth.substr(7);
-    }
 
     if (local_key.empty()) {
-        res.status = 401;
-        res.set_content(json_error("Missing API key. Use: Authorization: Bearer <key>", 401),
-                        "application/json");
-        return;
+        ar.error_json = json_error("Missing API key. "
+                                    "Use: Authorization: Bearer <key>", 401);
+        return ar;
     }
 
-    // 2. Route — look up local key → upstream account
-    auto route_result = router_.route(local_key);
-    if (!route_result.success) {
-        res.status = 401;
-        res.set_content(json_error(route_result.error, 401),
-                        "application/json");
-        return;
+    ar.route = router.route(local_key);
+    if (!ar.route.success) {
+        ar.error_json = json_error(ar.route.error, 401);
+        return ar;
     }
 
-    // 3. Apply model mapping (template first, then key_model_map fallback)
-    std::string body = req.body;
+    ar.success = true;
+    return ar;
+}
+
+// ── Model-mapping helper ─────────────────────────────────────────────────
+
+/// Apply model mapping (template or key_model_map) to the request body.
+/// Returns the resolved upstream model name; `body` is modified in-place.
+static std::string apply_model_mapping(Database &db,
+                                        int local_key_id,
+                                        std::string &body) {
     std::string req_model = extract_model(body);
     std::vector<Database::ModelMapping> mappings;
-    int template_id = db_.get_key_template_id(route_result.local_key_id);
+    int template_id = db.get_key_template_id(local_key_id);
     if (template_id > 0) {
-        mappings = db_.get_template_entries(template_id);
-        fprintf(stderr, "[Proxy] Using template %d: %zu mapping(s)\n", template_id, mappings.size());
+        mappings = db.get_template_entries(template_id);
+        fprintf(stderr, "[Proxy] Using template %d: %zu mapping(s)\n",
+                template_id, mappings.size());
     } else {
-        mappings = db_.get_key_model_mappings(route_result.local_key_id);
+        mappings = db.get_key_model_mappings(local_key_id);
         fprintf(stderr, "[Proxy] Got %zu model mappings for key_id=%d\n",
-                mappings.size(), route_result.local_key_id);
+                mappings.size(), local_key_id);
     }
     for (const auto &m : mappings) {
         if (glob_match(m.pattern, req_model)) {
@@ -183,28 +183,58 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                         body.replace(q1 + 1, q2 - q1 - 1, m.upstream_model);
                 }
             }
-            req_model = m.upstream_model;
-            break;
+            return m.upstream_model;
         }
     }
+    return req_model;
+}
 
-    // 4. Determine streaming mode & content type
+// ── add_cors_headers ─────────────────────────────────────────────────────
+
+void ProxyServer::add_cors_headers(httplib::Response &res) {
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers",
+                   "Authorization, Content-Type");
+}
+
+// ── handle_chat_completions ──────────────────────────────────────────────
+
+void ProxyServer::handle_chat_completions(const httplib::Request &req,
+                                          httplib::Response &res) {
+    add_cors_headers(res);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 1. Auth + route lookup
+    auto ar = extract_and_route(req, router_);
+    if (!ar.success) {
+        res.status = 401;
+        res.set_content(ar.error_json, "application/json");
+        return;
+    }
+
+    // 2. Apply model mapping
+    std::string body = req.body;
+    std::string req_model = apply_model_mapping(db_, ar.route.local_key_id, body);
+
+    // 3. Determine streaming mode & content type
     std::string content_type = req.has_header("Content-Type")
                                    ? req.get_header_value("Content-Type")
                                    : "application/json";
 
     bool is_stream = is_streaming_request(body);
 
-    // ── Register in-flight request in DB ──
-    int inflight_id = db_.request_start(route_result.local_key_id,
-                                        route_result.account_id,
+    // ── Register in-flight request ──
+    int inflight_id = db_.request_start(ar.route.local_key_id,
+                                        ar.route.account_id,
                                         req_model, is_stream);
     int concurrent_count = db_.get_in_flight_count();
 
     fprintf(stderr, "[Proxy] %s request from key_id=%d to account=%d model=%s "
                     "(concurrent=%d, inflight_id=%d)\n",
             is_stream ? "streaming" : "non-streaming",
-            route_result.local_key_id, route_result.account_id,
+            ar.route.local_key_id, ar.route.account_id,
             req_model.c_str(), concurrent_count, inflight_id);
 
     // Capture model for use in streaming lambda
@@ -215,7 +245,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
 
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, route_result, body, content_type, model_copy, t0,
+            [this, route = ar.route, body, content_type, model_copy, t0,
              concurrent_count, inflight_id](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
 
@@ -224,13 +254,28 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                 bool first_response = true;
                 std::chrono::steady_clock::time_point t_first_resp;
 
+                // ── Think-tag filter for streaming ──
+                ThinkStreamFilter filter;
+                bool has_reasoning = false;
+
                 auto on_chunk = [&](const char *data, size_t len) -> bool {
                     if (first_response) {
                         t_first_resp = std::chrono::steady_clock::now();
                         first_response = false;
                     }
                     accumulated.append(data, len);
-                    return sink.write(data, len);
+
+                    if (!has_reasoning &&
+                        sse_chunk_has_reasoning(data, len))
+                        has_reasoning = true;
+
+                    if (has_reasoning)
+                        return sink.write(data, len);
+
+                    std::string filtered = filter.feed(data, len);
+                    if (!filtered.empty())
+                        return sink.write(filtered.data(), filtered.size());
+                    return true;  // chunk suppressed (inside think block)
                 };
 
                 auto fwd = forward_with_retry(
@@ -238,7 +283,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                         accumulated.clear();
                         first_response = true;
                         return upstream_.forward(
-                            "POST", route_result.base_url, route_result.upstream_key,
+                            "POST", route.base_url, route.upstream_key,
                             "/chat/completions", body, content_type, on_chunk);
                     },
                     /*is_streaming=*/true);
@@ -246,8 +291,8 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                 // Parse usage from accumulated SSE data
                 auto usage = UsageTracker::parse_usage_from_sse(fwd.body);
                 if (usage.has_value()) {
-                    tracker_.log_request(route_result.account_id,
-                                         route_result.local_key_id,
+                    tracker_.log_request(route.account_id,
+                                         route.local_key_id,
                                          *usage, true, fwd.status_code,
                                          fwd.duration_ms);
                 } else {
@@ -255,7 +300,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                                     "from streaming response\n");
                 }
 
-                tracker_.mark_key_used(route_result.local_key_id);
+                tracker_.mark_key_used(route.local_key_id);
 
                 // ── Perf: proxy TTFT + concurrent snapshot ──
                 int proxy_ttft = static_cast<int>(
@@ -279,7 +324,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         auto fwd = forward_with_retry(
             [&]() {
                 return upstream_.forward(
-                    "POST", route_result.base_url, route_result.upstream_key,
+                    "POST", ar.route.base_url, ar.route.upstream_key,
                     "/chat/completions", body, content_type, nullptr);
             },
             /*is_streaming=*/false);
@@ -291,8 +336,8 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         // Parse usage from JSON response
         auto usage = UsageTracker::parse_usage(fwd.body);
         if (usage.has_value()) {
-            tracker_.log_request(route_result.account_id,
-                                 route_result.local_key_id,
+            tracker_.log_request(ar.route.account_id,
+                                 ar.route.local_key_id,
                                  *usage, false, fwd.status_code,
                                  fwd.duration_ms);
         } else {
@@ -301,7 +346,7 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
                             req_model.c_str());
         }
 
-        tracker_.mark_key_used(route_result.local_key_id);
+        tracker_.mark_key_used(ar.route.local_key_id);
 
         // ── Perf: proxy TTFT (non-streaming = total time) ──
         auto t1 = std::chrono::steady_clock::now();
@@ -315,8 +360,10 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
         db_.request_end(inflight_id);
 
         if (fwd.success) {
+            // Sanitize: strip <think> tags from response
+            std::string clean_body = sanitize_response_body(fwd.body);
             res.status = fwd.status_code;
-            res.set_content(fwd.body, "application/json");
+            res.set_content(clean_body, "application/json");
         } else {
             res.status = 502;
             res.set_content(
@@ -332,30 +379,17 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
                                       httplib::Response &res) {
     add_cors_headers(res);
 
-    std::string auth = req.has_header("Authorization")
-                           ? req.get_header_value("Authorization")
-                           : "";
-
-    std::string local_key;
-    if (auth.rfind("Bearer ", 0) == 0)
-        local_key = auth.substr(7);
-
-    if (local_key.empty()) {
+    auto ar = extract_and_route(req, router_);
+    if (!ar.success) {
         res.status = 401;
-        res.set_content(json_error("Missing API key", 401), "application/json");
-        return;
-    }
-
-    auto route_result = router_.route(local_key);
-    if (!route_result.success) {
-        res.status = 401;
-        res.set_content(json_error(route_result.error, 401), "application/json");
+        res.set_content(ar.error_json, "application/json");
         return;
     }
 
     auto fwd = forward_with_retry(
         [&]() {
-            return upstream_.forward("GET", route_result.base_url, route_result.upstream_key,
+            return upstream_.forward("GET", ar.route.base_url,
+                                     ar.route.upstream_key,
                                      "/models", "", "application/json", nullptr);
         },
         /*is_streaming=*/false);
@@ -368,7 +402,8 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         res.set_content(fwd.body, "application/json");
     } else {
         res.status = 502;
-        res.set_content(json_error("Upstream error: " + fwd.error, 502), "application/json");
+        res.set_content(json_error("Upstream error: " + fwd.error, 502),
+                        "application/json");
     }
 }
 
@@ -378,69 +413,21 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                                     httplib::Response &res) {
     add_cors_headers(res);
 
-    // ── Performance tracking: record start time ──
     auto t0 = std::chrono::steady_clock::now();
 
-    // 1. Extract Bearer token
-    std::string auth = req.has_header("Authorization")
-                           ? req.get_header_value("Authorization")
-                           : "";
-
-    std::string local_key;
-    if (auth.rfind("Bearer ", 0) == 0) {
-        local_key = auth.substr(7);
-    }
-
-    if (local_key.empty()) {
+    // 1. Auth + route lookup
+    auto ar = extract_and_route(req, router_);
+    if (!ar.success) {
         res.status = 401;
-        res.set_content(json_error("Missing API key. Use: Authorization: Bearer <key>", 401),
-                        "application/json");
+        res.set_content(ar.error_json, "application/json");
         return;
     }
 
-    // 2. Route — look up local key → upstream account
-    auto route_result = router_.route(local_key);
-    if (!route_result.success) {
-        res.status = 401;
-        res.set_content(json_error(route_result.error, 401),
-                        "application/json");
-        return;
-    }
-
-    // 3. Apply model mapping (template first, then key_model_map fallback)
+    // 2. Apply model mapping
     std::string body = req.body;
-    std::string req_model = extract_model(body);
-    std::vector<Database::ModelMapping> mappings;
-    int template_id = db_.get_key_template_id(route_result.local_key_id);
-    if (template_id > 0) {
-        mappings = db_.get_template_entries(template_id);
-    } else {
-        mappings = db_.get_key_model_mappings(route_result.local_key_id);
-    }
-    for (const auto &m : mappings) {
-        if (glob_match(m.pattern, req_model)) {
-            fprintf(stderr, "[Proxy] Model map: %s → %s (pattern: %s)\n",
-                    req_model.c_str(), m.upstream_model.c_str(), m.pattern.c_str());
-            try {
-                json j = json::parse(body);
-                j["model"] = m.upstream_model;
-                body = j.dump();
-            } catch (...) {
-                size_t pos = body.find("\"model\"");
-                if (pos != std::string::npos) {
-                    auto colon = body.find(':', pos);
-                    auto q1 = body.find('"', colon + 1);
-                    auto q2 = body.find('"', q1 + 1);
-                    if (q1 != std::string::npos && q2 != std::string::npos)
-                        body.replace(q1 + 1, q2 - q1 - 1, m.upstream_model);
-                }
-            }
-            req_model = m.upstream_model;
-            break;
-        }
-    }
+    std::string req_model = apply_model_mapping(db_, ar.route.local_key_id, body);
 
-    // 4. Determine content type
+    // 3. Determine content type
     std::string content_type = req.has_header("Content-Type")
                                    ? req.get_header_value("Content-Type")
                                    : "application/json";
@@ -448,36 +435,34 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     // Embeddings are always non-streaming
     bool is_stream = false;
 
-    // ── Register in-flight request in DB ──
-    int inflight_id = db_.request_start(route_result.local_key_id,
-                                        route_result.account_id,
+    // ── Register in-flight request ──
+    int inflight_id = db_.request_start(ar.route.local_key_id,
+                                        ar.route.account_id,
                                         req_model, is_stream);
     int concurrent_count = db_.get_in_flight_count();
 
     fprintf(stderr, "[Proxy] embedding request from key_id=%d to account=%d model=%s "
                     "(concurrent=%d, inflight_id=%d)\n",
-            route_result.local_key_id, route_result.account_id,
+            ar.route.local_key_id, ar.route.account_id,
             req_model.c_str(), concurrent_count, inflight_id);
 
-    // ── Non-streaming path ──────────────────────────────────────────────
-
+    // ── Forward ──
     auto fwd = forward_with_retry(
         [&]() {
             return upstream_.forward(
-                "POST", route_result.base_url, route_result.upstream_key,
+                "POST", ar.route.base_url, ar.route.upstream_key,
                 "/embeddings", body, content_type, nullptr);
         },
         /*is_streaming=*/false);
 
-    // ── Retry / upstream metadata headers ──
     res.set_header("X-Retry-Count", std::to_string(fwd.retries));
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
-    // Parse usage from JSON response
+    // Parse usage
     auto usage = UsageTracker::parse_usage(fwd.body);
     if (usage.has_value()) {
-        tracker_.log_request(route_result.account_id,
-                             route_result.local_key_id,
+        tracker_.log_request(ar.route.account_id,
+                             ar.route.local_key_id,
                              *usage, false, fwd.status_code,
                              fwd.duration_ms);
     } else {
@@ -486,9 +471,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                         req_model.c_str());
     }
 
-    tracker_.mark_key_used(route_result.local_key_id);
+    tracker_.mark_key_used(ar.route.local_key_id);
 
-    // ── Perf: proxy TTFT (non-streaming = total time) ──
+    // ── Perf ──
     auto t1 = std::chrono::steady_clock::now();
     int proxy_ttft = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
@@ -496,7 +481,6 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                             fwd.status_code, fwd.status_code >= 400,
                             concurrent_count);
 
-    // ── Mark request as completed ──
     db_.request_end(inflight_id);
 
     if (fwd.success) {
