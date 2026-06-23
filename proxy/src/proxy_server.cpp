@@ -349,6 +349,144 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     }
 }
 
+// ── handle_embeddings ────────────────────────────────────────────────────
+
+void ProxyServer::handle_embeddings(const httplib::Request &req,
+                                    httplib::Response &res) {
+    add_cors_headers(res);
+
+    // ── Performance tracking: record start time ──
+    auto t0 = std::chrono::steady_clock::now();
+
+    // 1. Extract Bearer token
+    std::string auth = req.has_header("Authorization")
+                           ? req.get_header_value("Authorization")
+                           : "";
+
+    std::string local_key;
+    if (auth.rfind("Bearer ", 0) == 0) {
+        local_key = auth.substr(7);
+    }
+
+    if (local_key.empty()) {
+        res.status = 401;
+        res.set_content(json_error("Missing API key. Use: Authorization: Bearer <key>", 401),
+                        "application/json");
+        return;
+    }
+
+    // 2. Route — look up local key → upstream account
+    auto route_result = router_.route(local_key);
+    if (!route_result.success) {
+        res.status = 401;
+        res.set_content(json_error(route_result.error, 401),
+                        "application/json");
+        return;
+    }
+
+    // 3. Apply model mapping (template first, then key_model_map fallback)
+    std::string body = req.body;
+    std::string req_model = extract_model(body);
+    std::vector<Database::ModelMapping> mappings;
+    int template_id = db_.get_key_template_id(route_result.local_key_id);
+    if (template_id > 0) {
+        mappings = db_.get_template_entries(template_id);
+    } else {
+        mappings = db_.get_key_model_mappings(route_result.local_key_id);
+    }
+    for (const auto &m : mappings) {
+        if (glob_match(m.pattern, req_model)) {
+            fprintf(stderr, "[Proxy] Model map: %s → %s (pattern: %s)\n",
+                    req_model.c_str(), m.upstream_model.c_str(), m.pattern.c_str());
+            try {
+                json j = json::parse(body);
+                j["model"] = m.upstream_model;
+                body = j.dump();
+            } catch (...) {
+                size_t pos = body.find("\"model\"");
+                if (pos != std::string::npos) {
+                    auto colon = body.find(':', pos);
+                    auto q1 = body.find('"', colon + 1);
+                    auto q2 = body.find('"', q1 + 1);
+                    if (q1 != std::string::npos && q2 != std::string::npos)
+                        body.replace(q1 + 1, q2 - q1 - 1, m.upstream_model);
+                }
+            }
+            req_model = m.upstream_model;
+            break;
+        }
+    }
+
+    // 4. Determine content type
+    std::string content_type = req.has_header("Content-Type")
+                                   ? req.get_header_value("Content-Type")
+                                   : "application/json";
+
+    // Embeddings are always non-streaming
+    bool is_stream = false;
+
+    // ── Register in-flight request in DB ──
+    int inflight_id = db_.request_start(route_result.local_key_id,
+                                        route_result.account_id,
+                                        req_model, is_stream);
+    int concurrent_count = db_.get_in_flight_count();
+
+    fprintf(stderr, "[Proxy] embedding request from key_id=%d to account=%d model=%s "
+                    "(concurrent=%d, inflight_id=%d)\n",
+            route_result.local_key_id, route_result.account_id,
+            req_model.c_str(), concurrent_count, inflight_id);
+
+    // ── Non-streaming path ──────────────────────────────────────────────
+
+    auto fwd = forward_with_retry(
+        [&]() {
+            return upstream_.forward(
+                "POST", route_result.base_url, route_result.upstream_key,
+                "/embeddings", body, content_type, nullptr);
+        },
+        /*is_streaming=*/false);
+
+    // ── Retry / upstream metadata headers ──
+    res.set_header("X-Retry-Count", std::to_string(fwd.retries));
+    res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
+
+    // Parse usage from JSON response
+    auto usage = UsageTracker::parse_usage(fwd.body);
+    if (usage.has_value()) {
+        tracker_.log_request(route_result.account_id,
+                             route_result.local_key_id,
+                             *usage, false, fwd.status_code,
+                             fwd.duration_ms);
+    } else {
+        fprintf(stderr, "[Proxy] Warning: could not parse usage "
+                        "from embedding response, model=%s\n",
+                        req_model.c_str());
+    }
+
+    tracker_.mark_key_used(route_result.local_key_id);
+
+    // ── Perf: proxy TTFT (non-streaming = total time) ──
+    auto t1 = std::chrono::steady_clock::now();
+    int proxy_ttft = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    tracker_.log_perf_event(req_model, fwd.ttft_ms, proxy_ttft,
+                            fwd.status_code, fwd.status_code >= 400,
+                            concurrent_count);
+
+    // ── Mark request as completed ──
+    db_.request_end(inflight_id);
+
+    if (fwd.success) {
+        res.status = fwd.status_code;
+        res.set_content(fwd.body, "application/json");
+    } else {
+        res.status = 502;
+        res.set_content(
+            json_error("Upstream error: " + fwd.error, 502),
+            "application/json");
+    }
+}
+
 // ── setup_routes ─────────────────────────────────────────────────────────
 
 void ProxyServer::setup_routes(httplib::Server &server) {
@@ -358,12 +496,19 @@ void ProxyServer::setup_routes(httplib::Server &server) {
         res.status = 204;
     };
     server.Options("/v1/chat/completions", cors_handler);
+    server.Options("/v1/embeddings", cors_handler);
     server.Options("/v1/models", cors_handler);
 
     // Main proxy endpoint
     server.Post("/v1/chat/completions",
                 [this](const httplib::Request &req, httplib::Response &res) {
                     handle_chat_completions(req, res);
+                });
+
+    // Embedding endpoint
+    server.Post("/v1/embeddings",
+                [this](const httplib::Request &req, httplib::Response &res) {
+                    handle_embeddings(req, res);
                 });
 
     // Model listing
