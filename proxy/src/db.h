@@ -47,6 +47,7 @@ public:
         std::string name;
         std::string upstream_key;
         std::string base_url;
+        std::string api_format;
     };
     std::optional<AccountInfo> get_account(int account_id);
 

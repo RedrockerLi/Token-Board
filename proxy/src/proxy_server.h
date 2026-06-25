@@ -14,7 +14,8 @@ struct Response;
 /// Configures the httplib::Server with route handlers.
 ///
 /// Registers:
-///   POST /v1/chat/completions   — main proxy endpoint
+///   POST /v1/chat/completions   — OpenAI-compatible proxy endpoint
+///   POST /v1/messages           — Anthropic-compatible proxy endpoint
 ///   GET  /health                  — health-check
 ///
 /// All routes include CORS headers (Access-Control-Allow-Origin: *).
@@ -29,6 +30,8 @@ public:
 private:
     void handle_chat_completions(const httplib::Request &req,
                                  httplib::Response &res);
+    void handle_anthropic_messages(const httplib::Request &req,
+                                   httplib::Response &res);
     void handle_list_models(const httplib::Request &req,
                             httplib::Response &res);
     void handle_embeddings(const httplib::Request &req,

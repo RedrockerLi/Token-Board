@@ -48,6 +48,7 @@ Router::RouteResult Router::route(const std::string &local_key) {
     result.success = true;
     result.upstream_key = account->upstream_key;
     result.base_url = account->base_url;
+    result.api_format = account->api_format;
     result.account_id = account->id;
     result.local_key_id = key_info->id;
 

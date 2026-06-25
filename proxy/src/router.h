@@ -21,6 +21,7 @@ public:
         std::string error;       // human-readable when !success
         std::string upstream_key;
         std::string base_url;
+        std::string api_format;  // "openai" or "anthropic"
         int account_id = 0;
         int local_key_id = 0;
     };

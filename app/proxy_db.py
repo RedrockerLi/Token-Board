@@ -204,7 +204,7 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, name, upstream_key, base_url, created_at "
+                "SELECT id, name, upstream_key, base_url, api_format, created_at "
                 "FROM upstream_accounts ORDER BY id"
             ).fetchall()
             return [dict(r) for r in rows]
@@ -215,12 +215,13 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             cursor = conn.execute(
-                "INSERT INTO upstream_accounts (name, upstream_key, base_url) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO upstream_accounts (name, upstream_key, base_url, api_format) "
+                "VALUES (?, ?, ?, ?)",
                 (
                     data["name"],
                     data["upstream_key"],
                     data.get("base_url", ""),
+                    data.get("api_format", "openai"),
                 ),
             )
             conn.commit()
@@ -234,7 +235,7 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("name", "upstream_key", "base_url"):
+            for key in ("name", "upstream_key", "base_url", "api_format"):
                 if key in data:
                     fields.append(f"{key} = ?")
                     values.append(data[key])

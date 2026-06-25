@@ -53,15 +53,25 @@ AI 工具                       代理                      上游 API
 
 ### 配置 AI 工具
 
-代理只转发 `/v1/chat/completions`，要求上游 API **OpenAI 兼容**。在 AI 工具中设置：
+代理支持两种 API 格式：**OpenAI 兼容**（`/v1/chat/completions`）和 **Anthropic 兼容**（`/v1/messages`）。上游账户可配置为任一格式。
+
+### OpenAI 兼容工具
 
 ```
-# 关键：Base URL 必须包含 /v1 路径
 OPENAI_BASE_URL = http://localhost:8800/v1
 OPENAI_API_KEY  = <在仪表板生成的本地密钥>
 ```
 
 > **注意**：Base URL 的路径是 `/v1`，不是 `/v1/chat/completions`。OpenAI SDK 会自动拼接 `/chat/completions`。
+
+### Anthropic 兼容工具（Claude Code 等）
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8800/v1
+export ANTHROPIC_AUTH_TOKEN=<在仪表板生成的本地密钥>
+```
+
+> 上游账户需设置为 **API 格式: Anthropic 兼容**（如 DeepSeek 的 `https://api.deepseek.com/anthropic` 端点）。代理会根据账户配置自动选择正确的上游路径和用量解析方式。
 
 ### 配置流程
 
@@ -75,7 +85,7 @@ OPENAI_API_KEY  = <在仪表板生成的本地密钥>
 不同本地密钥可以路由到不同上游账户，适合：
 - 团队多人共用一台代理服务器，各自使用独立的 API Key
 - 按项目/用途分配不同模型配额
-- 多平台统一接入（只要是 OpenAI 兼容 API）
+- 多平台统一接入（支持 OpenAI 兼容 + Anthropic 兼容 API）
 
 ### 模型映射
 
@@ -211,7 +221,10 @@ Token_Board/
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/v1/chat/completions` | POST | 代理转发（OpenAI 兼容） |
+| `/v1/chat/completions` | POST | OpenAI 兼容代理转发 |
+| `/v1/messages` | POST | Anthropic 兼容代理转发 |
+| `/v1/embeddings` | POST | 嵌入向量代理转发 |
+| `/v1/models` | GET | 模型列表代理 |
 | `/health` | GET | 代理健康检查 |
 
 ---

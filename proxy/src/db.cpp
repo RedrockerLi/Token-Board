@@ -68,6 +68,7 @@ void Database::create_schema() {
             name        TEXT NOT NULL UNIQUE,
             upstream_key TEXT NOT NULL,
             base_url    TEXT NOT NULL DEFAULT '',
+            api_format  TEXT NOT NULL DEFAULT 'openai',
             created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         );
 
@@ -222,6 +223,34 @@ void Database::create_schema() {
         sqlite3_free(err);
     }
 
+    // ── Migrations ─────────────────────────────────────────────────────
+    // v2: add api_format column to upstream_accounts (added 2026-06)
+    {
+        // Check if the column already exists
+        bool has_api_format = false;
+        sqlite3_stmt *stmt = nullptr;
+        sqlite3_prepare_v2(db_,
+            "SELECT api_format FROM upstream_accounts LIMIT 1",
+            -1, &stmt, nullptr);
+        if (stmt) {
+            has_api_format = (sqlite3_step(stmt) == SQLITE_ROW);
+            sqlite3_finalize(stmt);
+        }
+        if (!has_api_format) {
+            sqlite3_exec(db_,
+                "ALTER TABLE upstream_accounts ADD COLUMN api_format "
+                "TEXT NOT NULL DEFAULT 'openai'",
+                nullptr, nullptr, &err);
+            if (err) {
+                fprintf(stderr, "[DB] Migration v2 error: %s\n", err);
+                sqlite3_free(err);
+                err = nullptr;
+            } else {
+                fprintf(stderr, "[DB] Migration v2: added api_format column\n");
+            }
+        }
+    }
+
     // Pricing entries are managed by the web dashboard; no auto-seeding.
 }
 
@@ -240,7 +269,7 @@ void Database::prepare_statements() {
             "WHERE key_value = ?1",
             stmt_lookup_key_);
 
-    PREPARE("SELECT id, name, upstream_key, base_url "
+    PREPARE("SELECT id, name, upstream_key, base_url, api_format "
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
 
@@ -359,6 +388,9 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
             sqlite3_column_text(stmt_get_account_, 2));
         info.base_url = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_get_account_, 3));
+        info.api_format = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_account_, 4));
+        if (info.api_format.empty()) info.api_format = "openai";
         result = std::move(info);
     }
     sqlite3_reset(stmt_get_account_);

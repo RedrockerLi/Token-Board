@@ -110,6 +110,115 @@ UsageTracker::parse_usage_from_sse(const std::string &sse_data) {
     return info;
 }
 
+// ── parse_anthropic_usage ──────────────────────────────────────────────────
+
+std::optional<UsageTracker::UsageInfo>
+UsageTracker::parse_anthropic_usage(const std::string &body) {
+    try {
+        json j = json::parse(body);
+
+        UsageInfo info;
+
+        // Extract model (top-level field, same as OpenAI)
+        if (j.contains("model") && j["model"].is_string())
+            info.model = j["model"].get<std::string>();
+
+        // Anthropic uses input_tokens / output_tokens
+        if (j.contains("usage")) {
+            auto &u = j["usage"];
+            if (u.contains("input_tokens"))
+                info.prompt_tokens = u["input_tokens"].get<int>();
+            if (u.contains("output_tokens"))
+                info.completion_tokens = u["output_tokens"].get<int>();
+            // Also check cache_read_input_tokens and cache_creation_input_tokens
+            // for total accuracy when the API provides them
+            if (u.contains("cache_read_input_tokens"))
+                info.prompt_tokens += u["cache_read_input_tokens"].get<int>();
+            if (u.contains("cache_creation_input_tokens"))
+                info.prompt_tokens += u["cache_creation_input_tokens"].get<int>();
+        }
+
+        // Anthropic returns total tokens in message_delta for streaming,
+        // but non-streaming may also have it
+        info.total_tokens = info.prompt_tokens + info.completion_tokens;
+
+        return info;
+    } catch (const json::parse_error &e) {
+        fprintf(stderr, "[Tracker] Anthropic JSON parse error: %s\n", e.what());
+        return std::nullopt;
+    }
+}
+
+// ── parse_anthropic_usage_from_sse ────────────────────────────────────────
+
+std::optional<UsageTracker::UsageInfo>
+UsageTracker::parse_anthropic_usage_from_sse(const std::string &sse_data) {
+    UsageInfo info;
+    bool found_usage = false;
+
+    // Scan SSE data lines for "data:" prefixed JSON
+    // Anthropic streaming events:
+    //   message_start: contains message.model, optional usage
+    //   content_block_start/delta/stop: content delivery
+    //   message_delta: contains usage.{input_tokens, output_tokens}
+    //   message_stop: end marker
+    std::istringstream stream(sse_data);
+    std::string line;
+
+    while (std::getline(stream, line)) {
+        // Trim trailing \r
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+
+        if (line.empty() || line[0] == ':')
+            continue;
+
+        // Accept both "data: " and "data:"
+        std::string json_str;
+        if (line.rfind("data: ", 0) == 0) {
+            json_str = line.substr(6);
+        } else if (line.rfind("data:", 0) == 0) {
+            json_str = line.substr(5);
+        } else {
+            continue;
+        }
+
+        try {
+            json j = json::parse(json_str);
+
+            // Extract model from message_start event
+            if (info.model.empty() && j.contains("type") &&
+                j["type"] == "message_start" &&
+                j.contains("message") && j["message"].contains("model")) {
+                info.model = j["message"]["model"].get<std::string>();
+            }
+
+            // Extract usage from message_delta event (has the final usage)
+            if (j.contains("type") && j["type"] == "message_delta" &&
+                j.contains("usage")) {
+                auto &u = j["usage"];
+                if (u.contains("input_tokens"))
+                    info.prompt_tokens = u["input_tokens"].get<int>();
+                if (u.contains("output_tokens"))
+                    info.completion_tokens = u["output_tokens"].get<int>();
+                if (u.contains("cache_read_input_tokens"))
+                    info.prompt_tokens += u["cache_read_input_tokens"].get<int>();
+                if (u.contains("cache_creation_input_tokens"))
+                    info.prompt_tokens += u["cache_creation_input_tokens"].get<int>();
+                found_usage = true;
+            }
+        } catch (const json::parse_error &) {
+            // Skip malformed JSON lines silently
+        }
+    }
+
+    if (!found_usage)
+        return std::nullopt;
+
+    info.total_tokens = info.prompt_tokens + info.completion_tokens;
+    return info;
+}
+
 // ── log_request ──────────────────────────────────────────────────────────
 
 void UsageTracker::log_request(int account_id, int local_key_id,

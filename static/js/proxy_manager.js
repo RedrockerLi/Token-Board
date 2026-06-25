@@ -65,11 +65,11 @@ function closeModal(id) {
 async function loadAccountsTable() {
     const tbody = document.querySelector('#accountsTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="5" class="td-loading">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
     try {
         const accounts = await proxyFetch('/api/proxy/accounts');
         if (!accounts.length) {
-            tbody.innerHTML = '<tr><td colspan="5" class="td-empty">暂无账户，请点击"添加账户"</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无账户，请点击"添加账户"</td></tr>';
             return;
         }
         tbody.innerHTML = accounts.map((a) => `
@@ -77,6 +77,7 @@ async function loadAccountsTable() {
                 <td>${esc(a.name)}</td>
                 <td><code>${esc(maskKey(a.upstream_key))}</code></td>
                 <td>${esc(a.base_url)}</td>
+                <td>${esc(a.api_format === 'anthropic' ? 'Anthropic' : 'OpenAI')}</td>
                 <td>${esc(a.created_at || '')}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
@@ -85,7 +86,7 @@ async function loadAccountsTable() {
             </tr>
         `).join('');
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="5" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -98,7 +99,7 @@ async function saveAccount(e) {
         if (id) {
             await proxyFetch(`/api/proxy/accounts/${id}`, {
                 method: 'PUT',
-                body: JSON.stringify({ name: data.name, upstream_key: data.upstream_key, base_url: data.base_url }),
+                body: JSON.stringify({ name: data.name, upstream_key: data.upstream_key, base_url: data.base_url, api_format: data.api_format }),
             });
             showToast('账户已更新');
         } else {
@@ -128,6 +129,7 @@ function editAccount(id) {
         form['name'].value = acc.name;
         form['upstream_key'].value = acc.upstream_key;
         form['base_url'].value = acc.base_url;
+        form['api_format'].value = acc.api_format || 'openai';
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
@@ -168,11 +170,11 @@ function initAccountsPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">上游账户管理</h1>
-            <p class="page-subtitle">仅支持 OpenAI-API-Compatible 的上游服务</p>
+            <p class="page-subtitle">支持 OpenAI 兼容 / Anthropic 兼容 的上游服务</p>
             <button class="btn btn--primary" onclick="openModal('accountModal')">+ 添加账户</button>
         </div>
         <table class="mgmt-table" id="accountsTable">
-            <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>创建时间</th><th>操作</th></tr></thead>
+            <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>创建时间</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
         <div class="modal-overlay" id="accountModal" style="display:none">
@@ -184,7 +186,13 @@ function initAccountsPage() {
                 <form id="accountForm" onsubmit="saveAccount(event)" data-edit-id="">
                     <label>名称 <input name="name" required></label>
                     <label>上游 API Key <input name="upstream_key" required></label>
-                    <label>Base URL（OpenAI 兼容） <input name="base_url" placeholder="https://api.example.com/v1"></label>
+                    <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1"></label>
+                    <label>API 格式
+                        <select name="api_format">
+                            <option value="openai">OpenAI 兼容</option>
+                            <option value="anthropic">Anthropic 兼容</option>
+                        </select>
+                    </label>
                     <div style="display:flex; gap:8px;">
                         <button type="submit" class="btn btn--primary">添加账户</button>
                         <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>

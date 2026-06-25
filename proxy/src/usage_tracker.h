@@ -21,12 +21,20 @@ public:
         int total_tokens = 0;
     };
 
-    /// Parse usage from a non-streaming JSON response body.
+    /// Parse usage from a non-streaming JSON response body (OpenAI format).
     static std::optional<UsageInfo> parse_usage(const std::string &body);
 
-    /// Parse usage from accumulated SSE streaming data.
+    /// Parse usage from accumulated SSE streaming data (OpenAI format).
     /// Scans for the last `data:` chunk containing a "usage" object.
     static std::optional<UsageInfo> parse_usage_from_sse(const std::string &sse_data);
+
+    /// Parse usage from a non-streaming Anthropic JSON response.
+    /// Anthropic uses usage.input_tokens and usage.output_tokens.
+    static std::optional<UsageInfo> parse_anthropic_usage(const std::string &body);
+
+    /// Parse usage from streaming Anthropic SSE data.
+    /// Anthropic emits usage in the message_delta event.
+    static std::optional<UsageInfo> parse_anthropic_usage_from_sse(const std::string &sse_data);
 
     /// Compute cost and write a request-log entry.
     void log_request(int account_id, int local_key_id, const UsageInfo &usage,
