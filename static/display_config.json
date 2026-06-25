@@ -5,13 +5,13 @@
         "cstcloud"
     ],
     "hidden_models": [
+        "ds-v4-flash",
         "Qwen3.5-397B-A17B"
     ],
     "model_aliases": [
         {
-            "name": "CSTCloud",
+            "name": "Minimax-M2.7",
             "models": [
-                "ds-v4-flash",
                 "minimax-m27",
                 "minimax-m27-eic"
             ]
