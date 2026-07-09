@@ -21,15 +21,7 @@ async function loadDisplayConfig() {
     }
 }
 
-// ── Number formatters (used globally by charts.js and dashboard.js) ──
-
-function fmtNum(n) {
-    if (n == null || isNaN(n)) return '--';
-    if (n >= 100_000_000_000) return (n / 1_000_000_000).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' B';
-    if (n >= 100_000_000) return (n / 1_000_000).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' M';
-    if (n >= 100_000) return (n / 1_000).toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + ' K';
-    return n.toLocaleString('en-US');
-}
+// ── Number formatters (defined in utils.js, used globally) ──
 
 function fmtCost(n) {
     if (n == null || isNaN(n)) return '--';

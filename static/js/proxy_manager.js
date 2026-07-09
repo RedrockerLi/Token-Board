@@ -4,7 +4,7 @@
  * Exports: initAccountsPage(), initKeysPage(), initPricingPage()
  */
 
-// ── Shared Helpers ───────────────────────────────────────────────────────
+// ── Shared Helpers (esc defined in utils.js) ──
 
 async function proxyFetch(url, options = {}) {
     const resp = await fetch(url, {
@@ -34,11 +34,6 @@ function showToast(msg, type = 'success') {
         toast.style.transition = 'opacity 0.3s';
         setTimeout(() => toast.remove(), 300);
     }, 3000);
-}
-
-function esc(s) {
-    if (s == null) return '';
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function maskKey(key) {

@@ -93,7 +93,7 @@ function populateKeyNameSelector(keyNames) {
     keySel.innerHTML = '<option value="">总览 (所有用户)</option>';
     var hiddenUsers = displayConfig.hidden_users || [];
     keyNames.forEach(function (name) {
-        if (hiddenUsers.indexOf(name) !== -1) return;
+        if (matchesAny(name, hiddenUsers)) return;
         var opt = document.createElement('option');
         opt.value = name;
         opt.textContent = name;
@@ -121,7 +121,7 @@ function buildDynamicCharts(models) {
     var hiddenModels = (displayConfig.hidden_models || []).map(function (m) { return m.toLowerCase(); });
     var filteredModels = models.filter(function (m) {
         var lower = m.toLowerCase();
-        return lower !== 'unknown' && hiddenModels.indexOf(lower) === -1;
+        return lower !== 'unknown' && !matchesAny(lower, hiddenModels);
     });
     modelsList = filteredModels.slice();
 
@@ -138,7 +138,7 @@ function buildDynamicCharts(models) {
     // Add alias group display names as chart entries (respect hidden_models)
     var chartEntries = filteredModels.slice();  // standalone models
     Object.keys(aliasToModels).forEach(function (aliasName) {
-        if (hiddenModels.indexOf(aliasName.toLowerCase()) === -1) {
+        if (!matchesAny(aliasName.toLowerCase(), hiddenModels)) {
             chartEntries.push(aliasName);
         }
     });
@@ -386,12 +386,12 @@ async function loadModelPie() {
             var modelName = entry[0];
             var tokens = entry[1].total_tokens || 0;
             var lower = modelName.toLowerCase();
-            if (hiddenModels.indexOf(lower) !== -1) return;
+            if (matchesAny(lower, hiddenModels)) return;
             if (lower in modelToAlias) {
                 // This model belongs to an alias group → merge
                 var aliasName = modelToAlias[lower];
                 // Also skip if the alias name itself is hidden
-                if (hiddenModels.indexOf(aliasName.toLowerCase()) !== -1) return;
+                if (matchesAny(aliasName.toLowerCase(), hiddenModels)) return;
                 merged[aliasName] = (merged[aliasName] || 0) + tokens;
             } else {
                 merged[modelName] = (merged[modelName] || 0) + tokens;
