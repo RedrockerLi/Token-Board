@@ -413,6 +413,10 @@ function initKeysPage() {
             <p class="page-subtitle">生成密钥供 AI 工具连接代理使用</p>
             <button class="btn btn--primary" onclick="openModal('keyModal')">+ 生成密钥</button>
         </div>
+        <div style="margin-bottom:16px; padding:12px 16px; background:var(--color-surface, #F8FAFC); border:1px solid var(--color-border); border-radius:8px; font-size:13px; color:var(--color-text-tertiary);">
+            <strong style="color:var(--color-text-secondary);">配置说明</strong>
+            <div style="margin-top:6px;"><code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">OPENAI_BASE_URL = http://localhost:8800/v1</code></div>
+        </div>
         <table class="mgmt-table" id="keysTable">
             <thead><tr><th>密钥</th><th>标签</th><th>关联账户</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>
             <tbody></tbody>
