@@ -291,10 +291,21 @@ def export_data():
 
 @bp_proxy.route("/sync", methods=["POST"])
 def sync_database():
-    from app.sync import sync as do_sync, sync_dashboard
+    from app.sync import sync as do_sync, sync_config_download, sync_dashboard
 
     db_path = current_app.config["PROXY_DB"].db_path
     result = do_sync(db_path)
+
+    # Sync proxy config from cloud (INSERT OR IGNORE: local wins, new rows merged)
+    try:
+        if sync_config_download(db_path):
+            result["config_sync"] = "配置已从云端更新"
+        else:
+            result["config_sync"] = "跳过 (无远程配置或未变化)"
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        result["config_sync"] = f"配置同步失败: {e}"
 
     # Also sync dashboard database
     import os as _os

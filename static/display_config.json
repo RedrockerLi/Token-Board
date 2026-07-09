@@ -2,7 +2,8 @@
     "hidden_users": [
         "PC-AI-chat",
         "PC-Draw.io",
-        "cstcloud"
+        "cstcloud",
+        "sk*"
     ],
     "hidden_models": [
         "ds-v4-flash",

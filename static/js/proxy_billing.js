@@ -186,7 +186,13 @@ async function triggerSync() {
     btn.textContent = '同步中...';
     try {
         const result = await proxyFetch('/api/proxy/sync', { method: 'POST' });
-        showToast(result.message, result.status === 'ok' ? 'success' : 'error');
+        // Aggregate sync results
+        const parts = [];
+        if (result.message) parts.push(result.message);
+        if (result.config_sync) parts.push(result.config_sync);
+        if (result.dashboard_sync) parts.push(result.dashboard_sync);
+        const msg = parts.join(' | ');
+        showToast(msg, result.status === 'ok' ? 'success' : 'error');
         // Refresh stats
         loadBillingStats();
         loadAccountBreakdown();
@@ -194,7 +200,7 @@ async function triggerSync() {
         showToast('同步失败: ' + err.message, 'error');
     }
     btn.disabled = false;
-    btn.textContent = '同步使用记录';
+    btn.textContent = '同步';
 }
 
 async function openSyncConfig() {
@@ -258,7 +264,7 @@ function initBillingPage() {
                 </div>
                 <div class="controls-group">
                     <button class="btn btn--sm" onclick="openSyncConfig()" title="同步设置">⚙</button>
-                    <button class="btn btn--sm" id="btnSync" onclick="triggerSync()">同步使用记录</button>
+                    <button class="btn btn--sm" id="btnSync" onclick="triggerSync()">同步</button>
                 </div>
             </div>
         </div>
