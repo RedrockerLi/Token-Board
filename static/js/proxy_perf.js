@@ -202,12 +202,12 @@ function renderUtilizationChart(domId, data) {
             trigger: 'axis',
             formatter: function(params) {
                 var p = params[0];
-                return p.name + '<br/>峰值并发: ' + p.value + ' / 8';
+                return p.name + '<br/>峰值并发: ' + p.value + ' / 128';
             }
         },
         grid: { left: 50, right: 20, top: 20, bottom: 40 },
         xAxis: { type: 'category', data: labels, axisLabel: { rotate: 45, fontSize: 10 } },
-        yAxis: { type: 'value', name: '并发数', axisLabel: { fontSize: 10 }, min: 0, max: 8, minInterval: 1 },
+        yAxis: { type: 'value', name: '并发数', axisLabel: { fontSize: 10 }, minInterval: 1 },
         series: [{
             name: '峰值并发', type: 'line', data: concurrent,
             smooth: true, symbol: 'circle', symbolSize: 4,
