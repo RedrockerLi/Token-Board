@@ -55,7 +55,7 @@ int main(int argc, char *argv[]) {
     httplib::Server server;
 
     // Multi-threading: use a thread pool for concurrent connections.
-    server.new_task_queue = [] { return new httplib::ThreadPool(32); };
+    server.new_task_queue = [] { return new httplib::ThreadPool(128); };
 
     proxy_server.setup_routes(server);
 
