@@ -202,7 +202,7 @@ function renderUtilizationChart(domId, data) {
             trigger: 'axis',
             formatter: function(params) {
                 var p = params[0];
-                return p.name + '<br/>峰值并发: ' + p.value + ' / 128';
+                return p.name + '<br/>峰值并发: ' + p.value + ' / 512';
             }
         },
         grid: { left: 50, right: 20, top: 20, bottom: 40 },

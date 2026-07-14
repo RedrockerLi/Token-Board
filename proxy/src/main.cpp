@@ -4,15 +4,19 @@
 /// different CSTCloud upstream accounts based on the local API key, and
 /// tracks per-account token usage + billing in SQLite.
 
+// httplib.h MUST come first, with CPPHTTPLIB_OPENSSL_SUPPORT set,
+// so that the SSL-enabled definitions are visible to all later includes
+// (including semaphore_pool.h via its forward references).
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include "httplib.h"
+
 #include "config.h"
 #include "db.h"
 #include "proxy_server.h"
 #include "router.h"
+#include "semaphore_pool.h"
 #include "upstream_client.h"
 #include "usage_tracker.h"
-
-#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include "httplib.h"
 
 #include <csignal>
 #include <cstdio>
@@ -54,8 +58,9 @@ int main(int argc, char *argv[]) {
     // ── Configure httplib server ──────────────────────────────────────
     httplib::Server server;
 
-    // Multi-threading: use a thread pool for concurrent connections.
-    server.new_task_queue = [] { return new httplib::ThreadPool(128); };
+    // Start with 8 threads; doubles on demand up to 512.
+    auto *pool = new SemaphorePool(8, 512);
+    server.new_task_queue = [pool] { return pool; };
 
     proxy_server.setup_routes(server);
 
@@ -71,12 +76,25 @@ int main(int argc, char *argv[]) {
         server.listen(cfg.host.c_str(), cfg.port);
     });
 
-    // Wait for signal, with periodic perf_events cleanup (every 5 min)
+    // Wait for signal, with periodic cleanup + auto-scale
     auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
     while (!g_shutdown) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         auto now = std::chrono::steady_clock::now();
+
+        // ── Auto-scale: double pool when saturated ───────────────────
+        int in_flight = db.get_in_flight_count();
+        size_t cur_size = pool->size();
+        if (in_flight >= static_cast<int>(cur_size) && cur_size < pool->max_size()) {
+            size_t new_size = std::min(cur_size * 2, pool->max_size());
+            fprintf(stderr,
+                    "[Scale] %zu → %zu threads (in_flight=%d, saturated)\n",
+                    cur_size, new_size, in_flight);
+            pool->resize(new_size);
+        }
+
+        // ── Periodic cleanup: every 5 min ────────────────────────────
         if (now >= cleanup_deadline) {
             db.cleanup_old_perf_events(1440);  // keep last 24 hours
             db.cleanup_stale_in_flight(10);     // remove stuck records older than 10 min
