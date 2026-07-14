@@ -58,8 +58,8 @@ int main(int argc, char *argv[]) {
     // ── Configure httplib server ──────────────────────────────────────
     httplib::Server server;
 
-    // Start with 8 threads; doubles on demand up to 512.
-    auto *pool = new SemaphorePool(8, 512);
+    // Start with 8 threads; doubles on demand up to 2048.
+    auto *pool = new SemaphorePool(8, 2048);
     server.new_task_queue = [pool] { return pool; };
 
     proxy_server.setup_routes(server);

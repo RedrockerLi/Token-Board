@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <poll.h>
 #include <thread>
 
 using json = nlohmann::json;
@@ -339,6 +340,21 @@ void ProxyServer::handle_chat_completions(const httplib::Request &req,
             },
             /*is_streaming=*/false);
 
+        // ── Check if client disconnected while waiting for upstream ──
+        if (req.client_socket != INVALID_SOCKET) {
+            struct pollfd pfd;
+            pfd.fd = req.client_socket;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, 0) > 0 &&
+                (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP))) {
+                fprintf(stderr, "[Proxy] Client gone, drop response "
+                        "(inflight=%d, model=%s)\n", inflight_id, req_model.c_str());
+                db_.request_end(inflight_id);
+                return;
+            }
+        }
+
         // ── Retry / upstream metadata headers ──
         res.set_header("X-Retry-Count", std::to_string(fwd.retries));
         res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
@@ -512,6 +528,21 @@ void ProxyServer::handle_anthropic_messages(const httplib::Request &req,
             },
             /*is_streaming=*/false);
 
+        // ── Check if client disconnected while waiting for upstream ──
+        if (req.client_socket != INVALID_SOCKET) {
+            struct pollfd pfd;
+            pfd.fd = req.client_socket;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, 0) > 0 &&
+                (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP))) {
+                fprintf(stderr, "[Proxy] Client gone (Anthropic), drop response "
+                        "(inflight=%d, model=%s)\n", inflight_id, req_model.c_str());
+                db_.request_end(inflight_id);
+                return;
+            }
+        }
+
         // ── Retry / upstream metadata headers ──
         res.set_header("X-Retry-Count", std::to_string(fwd.retries));
         res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
@@ -636,6 +667,21 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                 "/embeddings", body, content_type, nullptr);
         },
         /*is_streaming=*/false);
+
+    // ── Check if client disconnected while waiting for upstream ──
+    if (req.client_socket != INVALID_SOCKET) {
+        struct pollfd pfd;
+        pfd.fd = req.client_socket;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 0) > 0 &&
+            (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP))) {
+            fprintf(stderr, "[Proxy] Client gone (embeddings), drop response "
+                    "(inflight=%d, model=%s)\n", inflight_id, req_model.c_str());
+            db_.request_end(inflight_id);
+            return;
+        }
+    }
 
     res.set_header("X-Retry-Count", std::to_string(fwd.retries));
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
