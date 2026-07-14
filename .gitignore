@@ -15,9 +15,3 @@ data/dashboard.db-shm
 
 # C++ build artifacts
 proxy/build/
-
-# Downloaded third-party headers (re-downloadable)
-proxy/third_party/httplib.h
-proxy/third_party/json.hpp
-proxy/third_party/sqlite3.h
-proxy/third_party/sqlite3.c

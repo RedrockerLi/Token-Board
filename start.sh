@@ -39,9 +39,6 @@ if $START_ALL; then
 
     # ── Build proxy if needed ──────────────────────────────────────────
     if [ ! -f "$PROXY_BIN" ]; then
-        echo "[proxy] 首次运行 — 下载依赖..."
-        bash "$SCRIPT_DIR/proxy/setup_deps.sh"
-
         echo "[proxy] 编译 C++ 代理..."
         cd "$SCRIPT_DIR/proxy"
         cmake -B build -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
