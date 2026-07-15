@@ -271,12 +271,17 @@ def proxy_months():
 
 @bp_proxy.route("/export", methods=["POST"])
 def export_data():
-    """Export all unexported request_log rows to dashboard.db.
+    """Export unexported request_log → dashboard.db, then sync to cloud.
 
-    Accepts optional year/month (frontend still sends them, ignored now
-    that export is incremental via the exported flag).
+    Full pipeline: pull remote dashboard → export local → push back.
     """
-    result = _proxy_db().export_to_dashboard()
+    import os as _os
+    from app.sync import sync_dashboard
+
+    db_path = current_app.config["PROXY_DB"].db_path
+    dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
+
+    result = sync_dashboard(db_path, dash_db_path)
 
     # Trigger dashboard data reload
     ds = current_app.config.get("DATA_STORE")
@@ -285,49 +290,6 @@ def export_data():
 
     return jsonify(result)
 
-
-# ── WebDAV Sync ──────────────────────────────────────────────────────
-
-@bp_proxy.route("/sync", methods=["POST"])
-def sync_database():
-    from app.sync import sync_config_download, sync_dashboard
-
-    db_path = current_app.config["PROXY_DB"].db_path
-    result = {"status": "ok", "message": "同步开始"}
-
-    # Sync proxy config from cloud (INSERT OR IGNORE: local wins, new rows merged)
-    try:
-        if sync_config_download(db_path):
-            result["config_sync"] = "配置已从云端更新"
-        else:
-            result["config_sync"] = "跳过 (无远程配置或未变化)"
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        result["config_sync"] = f"配置同步失败: {e}"
-
-    # Sync dashboard database (pull-export-push)
-    import os as _os
-    dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
-    try:
-        dash_result = sync_dashboard(db_path, dash_db_path)
-        if dash_result.get("status") == "error":
-            print(f"[Sync] Dashboard sync error: {dash_result.get('message')}", flush=True)
-            result["dashboard_sync"] = "失败: " + dash_result.get("message", "")
-        else:
-            result["dashboard_sync"] = dash_result.get("message", "")
-            result["dashboard_records"] = dash_result.get("dashboard_records", 0)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        result["dashboard_sync"] = f"失败: {e}"
-
-    # Reload dashboard data
-    ds = current_app.config.get("DATA_STORE")
-    if ds:
-        ds.load()
-
-    return jsonify(result), 200
 
 
 @bp_proxy.route("/sync/config", methods=["GET"])

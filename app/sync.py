@@ -319,6 +319,45 @@ def sync_config_download(db_path: str) -> bool:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ── Dashboard merge helper ──────────────────────────────────────────────
+
+def _merge_dashboard(remote_path: str, local_path: str):
+    """Copy remote dashboard rows into local via INSERT OR REPLACE.
+
+    Remote data overwrites local — the cloud copy is the authoritative
+    merged state from all machines. Any local data not yet in the remote
+    (because a previous upload failed) will be restored by the subsequent
+    export step, since those request_log rows still have exported=0.
+    """
+
+    TABLES = {
+        "token_usage": ["date", "model", "api_key_name", "token_type", "amount", "cost_group_key"],
+        "request_usage": ["date", "model", "api_key_name", "count"],
+        "cost_entry": ["date", "model", "cost", "cost_group_key"],
+        "model_pricing": ["id", "model_pattern", "input_price", "output_price", "currency"],
+    }
+
+    remote_conn = sqlite3.connect(remote_path)
+    local_conn = sqlite3.connect(local_path, timeout=10)
+    local_conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        for table, cols in TABLES.items():
+            try:
+                cols_s = ", ".join(cols)
+                phs = ", ".join(["?"] * len(cols))
+                rows = remote_conn.execute(f"SELECT {cols_s} FROM {table}").fetchall()
+                for row in rows:
+                    local_conn.execute(
+                        f"INSERT OR REPLACE INTO {table} ({cols_s}) VALUES ({phs})", row
+                    )
+            except sqlite3.OperationalError:
+                pass
+        local_conn.commit()
+    finally:
+        local_conn.close()
+        remote_conn.close()
+
+
 # ── Dashboard DB sync ────────────────────────────────────────────────────
 
 def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
@@ -343,25 +382,34 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
     dash_config = replace(config, filename="dashboard_sync.db")
 
     try:
-        # 1. Download remote dashboard.db → replace local
-        has_remote = _webdav_download(dash_config, dash_db_path)
-        if has_remote:
-            print(f"[Sync] Dashboard: pulled latest from cloud", flush=True)
+        # 1. Download remote dashboard.db to temp file (never overwrite local)
+        remote_path = str(tmp_dir / "dash_remote.db")
+        has_remote = _webdav_download(dash_config, remote_path)
 
-        # 2. Export unexported request_log → dashboard (syncs model_pricing too)
+        # 2. Merge remote → local: INSERT OR IGNORE so local data is never
+        #    overwritten by a stale/different remote copy
+        if has_remote:
+            _merge_dashboard(remote_path, dash_db_path)
+            print(f"[Sync] Dashboard: merged latest from cloud", flush=True)
+
+        # 3. Export unexported request_log → dashboard (syncs model_pricing too)
+        #    Don't mark exported yet — wait until upload succeeds.
         from app.proxy_db import ProxyDatabase
         proxy_db = ProxyDatabase(proxy_db_path)
-        export_result = proxy_db.export_to_dashboard()
+        export_result = proxy_db.export_to_dashboard(mark_exported=False)
 
-        # 3. Cleanup old exported request_log rows
+        # 4. Cleanup old exported request_log rows
         cleaned = proxy_db.cleanup_exported_logs(max_exported=10000)
         if cleaned > 0:
             print(f"[Sync] Cleaned up {cleaned} old exported request_log rows", flush=True)
 
-        # 4. Upload merged dashboard.db to cloud
+        # 5. Upload merged dashboard.db to cloud
         upload_path = str(tmp_dir / "dash_upload.db")
         _safe_copy_db(dash_db_path, upload_path)
         _webdav_upload(dash_config, upload_path)
+
+        # 6. Upload succeeded — confirm: exported 1→2
+        proxy_db.mark_uploaded()
 
         upload_count = _count_dashboard_rows(dash_db_path)
         msg = (

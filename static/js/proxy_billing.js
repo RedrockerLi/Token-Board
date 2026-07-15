@@ -155,21 +155,12 @@ async function populateBillingMonthSelector() {
 }
 
 async function exportData() {
-    const sel = document.getElementById('billingMonthSelector');
-    if (!sel || !sel.value) {
-        alert('请先选择月份');
-        return;
-    }
-    const [year, month] = sel.value.split('-').map(Number);
     const btn = document.getElementById('btnExport');
     btn.disabled = true;
     btn.textContent = '导出中...';
     try {
-        const result = await proxyFetch('/api/proxy/export', {
-            method: 'POST',
-            body: JSON.stringify({ year, month }),
-        });
-        showToast(`导出成功：${result.record_count} 条记录`);
+        const result = await proxyFetch('/api/proxy/export', { method: 'POST' });
+        showToast('导出成功');
         try { await fetchRefresh(); } catch (e) { /* ignore */ }
     } catch (err) {
         showToast('导出失败: ' + err.message, 'error');
@@ -179,29 +170,6 @@ async function exportData() {
 }
 
 // ── Sync ─────────────────────────────────────────────────────────────
-
-async function triggerSync() {
-    const btn = document.getElementById('btnSync');
-    btn.disabled = true;
-    btn.textContent = '同步中...';
-    try {
-        const result = await proxyFetch('/api/proxy/sync', { method: 'POST' });
-        // Aggregate sync results
-        const parts = [];
-        if (result.message) parts.push(result.message);
-        if (result.config_sync) parts.push(result.config_sync);
-        if (result.dashboard_sync) parts.push(result.dashboard_sync);
-        const msg = parts.join(' | ');
-        showToast(msg, result.status === 'ok' ? 'success' : 'error');
-        // Refresh stats
-        loadBillingStats();
-        loadAccountBreakdown();
-    } catch (err) {
-        showToast('同步失败: ' + err.message, 'error');
-    }
-    btn.disabled = false;
-    btn.textContent = '同步';
-}
 
 async function openSyncConfig() {
     try {
@@ -264,7 +232,6 @@ function initBillingPage() {
                 </div>
                 <div class="controls-group">
                     <button class="btn btn--sm" onclick="openSyncConfig()" title="同步设置">⚙</button>
-                    <button class="btn btn--sm" id="btnSync" onclick="triggerSync()">同步</button>
                 </div>
             </div>
         </div>

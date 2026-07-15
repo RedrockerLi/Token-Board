@@ -762,14 +762,17 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    def export_to_dashboard(self) -> dict:
-        """Export unexported request_log rows to dashboard.db.
+    def export_to_dashboard(self, mark_exported: bool = True) -> dict:
+        """Export request_log rows to dashboard.db.
 
-        Only processes rows where exported=0. Writes usage data to
-        token_usage + request_usage, syncs model_pricing to dashboard
-        (triggers auto-compute cost_entry), then marks rows as exported=1.
+        Processes rows where exported IN (0, 1):
+          0 = never exported
+          1 = exported but upload may have failed → re-export to be safe
 
-        Returns {record_count, dashboard_records}.
+        Marks 0→1 after writing. Rows already at 1 stay at 1.
+        Caller should transition 1→2 after confirming cloud upload.
+
+        Always syncs model_pricing from proxy to dashboard.
         """
         import os
 
@@ -786,16 +789,13 @@ class ProxyDatabase:
                     COUNT(*) AS request_count
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON r.account_id = a.id
-                WHERE r.exported = 0
+                WHERE r.exported IN (0, 1)
                   AND LOWER(r.model) != 'unknown'
                   AND r.model != ''
                   AND a.name IS NOT NULL
                 GROUP BY date(r.requested_at), a.name, r.model
                 ORDER BY date(r.requested_at), a.name, r.model
             """).fetchall()
-
-            if not rows:
-                return {"record_count": 0, "dashboard_records": 0}
 
             # Write to dashboard.db (only usage; cost_entry computed by triggers)
             from app.dashboard_db import DashboardDatabase
@@ -820,12 +820,16 @@ class ProxyDatabase:
                     request_count=r["request_count"],
                 )
 
-            # Sync model_pricing from proxy to dashboard → triggers recalculate costs
+            # Always sync model_pricing — triggers recalculate all costs.
+            # Do this even when there are no new rows, so pricing changes
+            # take effect on the next export.
             _sync_pricing_to_dashboard(conn, dash_db_path)
 
-            # Mark exported
-            conn.execute("UPDATE request_log SET exported = 1 WHERE exported = 0")
-            conn.commit()
+            # Mark 0→1 (rows that were just exported). Rows already at 1 stay at 1.
+            # Caller transitions 1→2 after confirming cloud upload.
+            if mark_exported:
+                conn.execute("UPDATE request_log SET exported = 1 WHERE exported = 0")
+                conn.commit()
 
             return {
                 "record_count": len(rows),
@@ -834,19 +838,33 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    def mark_uploaded(self):
+        """Transition exported=1 → exported=2 (confirmed uploaded to cloud).
+
+        Called by sync_dashboard AFTER the cloud upload succeeds.
+        Rows stay at exported=1 if the upload failed, and will be
+        re-exported on the next sync.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("UPDATE request_log SET exported = 2 WHERE exported = 1")
+            conn.commit()
+        finally:
+            conn.close()
+
     # ── Request Log Cleanup ──────────────────────────────────────────
 
     def cleanup_exported_logs(self, max_exported: int = 10000) -> int:
-        """Delete oldest exported request_log rows, keeping at most max_exported.
+        """Delete oldest uploaded (exported=2) request_log rows.
 
-        Unexported rows (exported=0) are never deleted.
-        Returns number of rows deleted.
+        Rows at exported=0 or exported=1 are never deleted — they still
+        need to be exported or confirmed uploaded.
         """
         conn = self._connect()
         try:
             cursor = conn.execute("""
-                DELETE FROM request_log WHERE exported = 1 AND id NOT IN (
-                    SELECT id FROM request_log WHERE exported = 1
+                DELETE FROM request_log WHERE exported = 2 AND id NOT IN (
+                    SELECT id FROM request_log WHERE exported = 2
                     ORDER BY requested_at DESC LIMIT ?
                 )
             """, (max_exported,))
