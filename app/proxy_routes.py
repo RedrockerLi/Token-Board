@@ -271,13 +271,12 @@ def proxy_months():
 
 @bp_proxy.route("/export", methods=["POST"])
 def export_data():
-    data = request.get_json(force=True)
-    year = data.get("year")
-    month = data.get("month")
-    if not year or not month:
-        return jsonify({"error": "year and month are required"}), 400
+    """Export all unexported request_log rows to dashboard.db.
 
-    result = _proxy_db().export_to_dashboard(year, month)
+    Accepts optional year/month (frontend still sends them, ignored now
+    that export is incremental via the exported flag).
+    """
+    result = _proxy_db().export_to_dashboard()
 
     # Trigger dashboard data reload
     ds = current_app.config.get("DATA_STORE")
@@ -291,10 +290,10 @@ def export_data():
 
 @bp_proxy.route("/sync", methods=["POST"])
 def sync_database():
-    from app.sync import sync as do_sync, sync_config_download, sync_dashboard
+    from app.sync import sync_config_download, sync_dashboard
 
     db_path = current_app.config["PROXY_DB"].db_path
-    result = do_sync(db_path)
+    result = {"status": "ok", "message": "同步开始"}
 
     # Sync proxy config from cloud (INSERT OR IGNORE: local wins, new rows merged)
     try:
@@ -307,32 +306,28 @@ def sync_database():
         traceback.print_exc()
         result["config_sync"] = f"配置同步失败: {e}"
 
-    # Also sync dashboard database
+    # Sync dashboard database (pull-export-push)
     import os as _os
     dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
-    if _os.path.exists(dash_db_path):
-        try:
-            dash_result = sync_dashboard(db_path, dash_db_path)
-            if dash_result.get("status") == "error":
-                print(f"[Sync] Dashboard sync error: {dash_result.get('message')}", flush=True)
-                result["dashboard_sync"] = "失败: " + dash_result.get("message", "")
-            else:
-                result["dashboard_sync"] = dash_result.get("message", "")
-                result["dashboard_records"] = dash_result.get("dashboard_records", 0)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            result["dashboard_sync"] = f"失败: {e}"
-    else:
-        result["dashboard_sync"] = "跳过 (dashboard.db 不存在)"
+    try:
+        dash_result = sync_dashboard(db_path, dash_db_path)
+        if dash_result.get("status") == "error":
+            print(f"[Sync] Dashboard sync error: {dash_result.get('message')}", flush=True)
+            result["dashboard_sync"] = "失败: " + dash_result.get("message", "")
+        else:
+            result["dashboard_sync"] = dash_result.get("message", "")
+            result["dashboard_records"] = dash_result.get("dashboard_records", 0)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        result["dashboard_sync"] = f"失败: {e}"
 
     # Reload dashboard data
     ds = current_app.config.get("DATA_STORE")
     if ds:
         ds.load()
 
-    status_code = 200 if result["status"] == "ok" else 400
-    return jsonify(result), status_code
+    return jsonify(result), 200
 
 
 @bp_proxy.route("/sync/config", methods=["GET"])

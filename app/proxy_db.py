@@ -42,19 +42,6 @@ class ProxyDatabase:
         except Exception:
             pass
 
-    def _sync_to_dashboard(self):
-        """Re-export current month to dashboard.db after pricing changes.
-
-        Triggers recalculate proxy.db costs instantly, but dashboard.db
-        holds frozen snapshots from the last export. This keeps them in sync.
-        """
-        from datetime import datetime
-        try:
-            now = datetime.now()
-            self.export_to_dashboard(now.year, now.month)
-        except Exception:
-            pass  # sync failures should never crash the app
-
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -547,7 +534,6 @@ class ProxyDatabase:
             conn.commit()
             # tr_pricing_insert trigger auto-recalculates all costs
             self._schedule_config_sync()
-            self._sync_to_dashboard()
             return cursor.lastrowid
         finally:
             conn.close()
@@ -571,7 +557,6 @@ class ProxyDatabase:
             conn.commit()
             # tr_pricing_update trigger auto-recalculates all costs
             self._schedule_config_sync()
-            self._sync_to_dashboard()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -583,7 +568,6 @@ class ProxyDatabase:
             conn.commit()
             # tr_pricing_delete trigger auto-recalculates all costs
             self._schedule_config_sync()
-            self._sync_to_dashboard()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -608,7 +592,6 @@ class ProxyDatabase:
             conn.commit()
             # tr_pricing_update triggers fire on the ID swap, auto-recalculating all costs
             self._schedule_config_sync()
-            self._sync_to_dashboard()
             return True
         finally:
             conn.close()
@@ -779,8 +762,12 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    def export_to_dashboard(self, year: int, month: int) -> dict:
-        """Export proxy data for a month directly to dashboard.db.
+    def export_to_dashboard(self) -> dict:
+        """Export unexported request_log rows to dashboard.db.
+
+        Only processes rows where exported=0. Writes usage data to
+        token_usage + request_usage, syncs model_pricing to dashboard
+        (triggers auto-compute cost_entry), then marks rows as exported=1.
 
         Returns {record_count, dashboard_records}.
         """
@@ -788,8 +775,7 @@ class ProxyDatabase:
 
         conn = self._connect()
         try:
-            # Layer 3: Exclude "unknown" model and NULL account_name (would become "unknown")
-            # Filter at the SQL level so these never reach the dashboard DB
+            # Query unexported rows, aggregate by date/account/model
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
@@ -797,20 +783,21 @@ class ProxyDatabase:
                     r.model,
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
-                    COUNT(*) AS request_count,
-                    COALESCE(SUM(r.cost), 0) AS cost
+                    COUNT(*) AS request_count
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON r.account_id = a.id
-                WHERE CAST(strftime('%Y', r.requested_at) AS INTEGER) = ?
-                  AND CAST(strftime('%m', r.requested_at) AS INTEGER) = ?
+                WHERE r.exported = 0
                   AND LOWER(r.model) != 'unknown'
                   AND r.model != ''
                   AND a.name IS NOT NULL
                 GROUP BY date(r.requested_at), a.name, r.model
                 ORDER BY date(r.requested_at), a.name, r.model
-            """, (year, month)).fetchall()
+            """).fetchall()
 
-            # Write to dashboard.db
+            if not rows:
+                return {"record_count": 0, "dashboard_records": 0}
+
+            # Write to dashboard.db (only usage; cost_entry computed by triggers)
             from app.dashboard_db import DashboardDatabase
             dash_db_path = os.path.join(
                 os.path.dirname(self.db_path), "dashboard.db"
@@ -820,7 +807,6 @@ class ProxyDatabase:
             for r in rows:
                 name = r["account_name"]
                 model = r["model"]
-                # Layer 3 (belt-and-suspenders): skip any "unknown" model or account
                 if not name or name.lower() == "unknown":
                     continue
                 if not model or model.lower() == "unknown":
@@ -832,13 +818,40 @@ class ProxyDatabase:
                     prompt_tokens=r["prompt_tokens"],
                     completion_tokens=r["completion_tokens"],
                     request_count=r["request_count"],
-                    cost=r["cost"],
                 )
+
+            # Sync model_pricing from proxy to dashboard → triggers recalculate costs
+            _sync_pricing_to_dashboard(conn, dash_db_path)
+
+            # Mark exported
+            conn.execute("UPDATE request_log SET exported = 1 WHERE exported = 0")
+            conn.commit()
 
             return {
                 "record_count": len(rows),
                 "dashboard_records": dash_count,
             }
+        finally:
+            conn.close()
+
+    # ── Request Log Cleanup ──────────────────────────────────────────
+
+    def cleanup_exported_logs(self, max_exported: int = 10000) -> int:
+        """Delete oldest exported request_log rows, keeping at most max_exported.
+
+        Unexported rows (exported=0) are never deleted.
+        Returns number of rows deleted.
+        """
+        conn = self._connect()
+        try:
+            cursor = conn.execute("""
+                DELETE FROM request_log WHERE exported = 1 AND id NOT IN (
+                    SELECT id FROM request_log WHERE exported = 1
+                    ORDER BY requested_at DESC LIMIT ?
+                )
+            """, (max_exported,))
+            conn.commit()
+            return cursor.rowcount
         finally:
             conn.close()
 
@@ -1021,4 +1034,43 @@ class ProxyDatabase:
             }
         finally:
             conn.close()
+
+
+def _sync_pricing_to_dashboard(proxy_conn, dash_db_path: str):
+    """Copy model_pricing from proxy.db to dashboard.db.
+
+    Replaces all pricing rows in dashboard. The model_pricing triggers
+    in dashboard.db automatically recalculate all cost_entry rows after
+    each pricing change.
+    """
+    import sqlite3
+
+    dash_conn = sqlite3.connect(dash_db_path, timeout=5)
+    dash_conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        # Ensure table and triggers exist (dashboard may be freshly downloaded)
+        dash_conn.execute("""CREATE TABLE IF NOT EXISTS model_pricing (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_pattern TEXT NOT NULL UNIQUE,
+            input_price REAL NOT NULL,
+            output_price REAL NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'CNY')""")
+
+        pricing_rows = proxy_conn.execute(
+            "SELECT id, model_pattern, input_price, output_price, currency "
+            "FROM model_pricing ORDER BY id"
+        ).fetchall()
+
+        # Replace all pricing wrapped in a transaction for atomicity
+        dash_conn.execute("BEGIN")
+        dash_conn.execute("DELETE FROM model_pricing")
+        for row in pricing_rows:
+            dash_conn.execute(
+                "INSERT INTO model_pricing (id, model_pattern, input_price, output_price, currency) "
+                "VALUES (?,?,?,?,?)",
+                tuple(row),
+            )
+        dash_conn.commit()
+    finally:
+        dash_conn.close()
 

@@ -1,25 +1,16 @@
 """WebDAV-based database sync for multi-machine proxy usage.
 
-Flow:
-  1. Pull remote DB from WebDAV → tmp/remote.db
-  2. Merge remote request_log into local (one-way, dedup by content hash)
-  3. Create trimmed copy (30 days, usage only — no keys/config)
-  4. Push trimmed copy → WebDAV
-  5. Cleanup tmp/
+Syncs:
+  - Config tables (upstream_accounts, local_keys, model_pricing, etc.)
+  - Dashboard database (token_usage, request_usage, model_pricing, cost_entry)
 
-Local DB is the complete source of truth. Cloud only holds a 30-day
-usage snapshot (request_log + model_pricing, no credentials).
-
-All temp files live in a tmp/ directory under the project root,
-created on demand and removed after sync.
+request_log is NOT synced — it is local-only, with an exported flag to track
+which rows have been exported to the dashboard database.
 """
 
-import hashlib
 import os
 import shutil
 import sqlite3
-import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -204,69 +195,7 @@ def _webdav_test(config: SyncConfig) -> str | None:
         return f"网络错误: {e}"
 
 
-# ── Merge logic ───────────────────────────────────────────────────────────
-
-def _record_key(row: dict) -> str:
-    """Deterministic dedup key for a request_log record."""
-    parts = (
-        str(row.get("account_id", 0)),
-        str(row.get("local_key_id", 0)),
-        str(row.get("model", "")),
-        str(row.get("prompt_tokens", 0)),
-        str(row.get("completion_tokens", 0)),
-        str(row.get("total_tokens", 0)),
-        str(row.get("duration_ms", 0)),
-        str(row.get("status_code", 0)),
-        str(row.get("requested_at", "")),
-    )
-    return hashlib.sha256("|".join(parts).encode()).hexdigest()
-
-
-def _merge_request_log(local_conn: sqlite3.Connection, remote_conn: sqlite3.Connection):
-    """Merge remote request_log into local, deduplicating by content hash."""
-    local_conn.row_factory = sqlite3.Row
-    remote_conn.row_factory = sqlite3.Row
-
-    cutoff = "date('now', '-30 days')"
-
-    # Read existing records from local (within 30 days)
-    local_rows = local_conn.execute(
-        f"SELECT * FROM request_log WHERE date(requested_at) >= {cutoff}"
-    ).fetchall()
-
-    # Build set of local record keys
-    local_keys = {_record_key(dict(r)) for r in local_rows}
-
-    # Read remote records
-    remote_rows = remote_conn.execute(
-        f"SELECT * FROM request_log WHERE date(requested_at) >= {cutoff}"
-    ).fetchall()
-
-    # Insert remote records missing from local (one-way: remote → local).
-    # Deliberately omit cost — the tr_request_log_insert trigger recomputes
-    # it from local model_pricing, which is the single source of truth.
-    new_count = 0
-    for r in remote_rows:
-        rd = dict(r)
-        if _record_key(rd) not in local_keys:
-            local_conn.execute(
-                """INSERT INTO request_log
-                   (account_id, local_key_id, model, prompt_tokens,
-                    completion_tokens, total_tokens, is_streaming,
-                    status_code, duration_ms, requested_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    rd["account_id"], rd["local_key_id"], rd["model"],
-                    rd["prompt_tokens"], rd["completion_tokens"], rd["total_tokens"],
-                    rd["is_streaming"], rd["status_code"],
-                    rd["duration_ms"], rd["requested_at"],
-                ),
-            )
-            new_count += 1
-
-    local_conn.commit()
-    return new_count
-
+# ── DB helpers ────────────────────────────────────────────────────────────
 
 def _safe_copy_db(src: str, dst: str):
     """Copy a SQLite database, including WAL data, using the backup API."""
@@ -281,97 +210,16 @@ def _safe_copy_db(src: str, dst: str):
     src_conn.close()
 
 
-def _trim_old(conn: sqlite3.Connection):
-    """Delete request_log records older than 30 days."""
-    conn.execute("DELETE FROM request_log WHERE date(requested_at) < date('now', '-30 days')")
-    conn.commit()
-
-
-# ── Main sync entry point ─────────────────────────────────────────────────
-
-def sync(db_path: str) -> dict:
-    """Execute a full bidirectional sync.
-
-    Returns:
-        dict with keys: status ('ok'|'error'), message, remote_records (int)
-    """
-    project_root = Path(db_path).resolve().parent
-    tmp_dir = project_root / "tmp"
-    tmp_dir.mkdir(exist_ok=True)
-
-    remote_path = str(tmp_dir / "remote.db")
-    merged_path = str(tmp_dir / "merged.db")
-
-    config = load_sync_config(db_path)
-    if not config:
-        return {"status": "error", "message": "未配置同步服务器，请先点击齿轮图标设置"}
-
+def _count_dashboard_rows(db_path: str) -> int:
+    """Count total rows across all dashboard tables."""
+    conn = sqlite3.connect(db_path)
     try:
-        # 1. Download remote DB (skip merge if first sync)
-        has_remote = _webdav_download(config, remote_path)
-        new_count = 0
-
-        if has_remote:
-            # 2. Ensure remote DB has the correct schema
-            remote_conn = sqlite3.connect(remote_path)
-            _ensure_schema(remote_conn)
-            remote_conn.close()
-
-            # 3. Merge remote request_log into local
-            local_conn = sqlite3.connect(db_path, timeout=10)
-            local_conn.row_factory = sqlite3.Row
-            local_conn.execute("PRAGMA busy_timeout=5000")
-
-            remote_conn = sqlite3.connect(remote_path)
-            remote_conn.row_factory = sqlite3.Row
-            new_count = _merge_request_log(local_conn, remote_conn)
-            remote_conn.close()
-            local_conn.close()
-
-        # 4. Create trimmed copy for upload (request_log only, 30 days, no config/secrets)
-        _safe_copy_db(db_path, merged_path)
-        merged_conn = sqlite3.connect(merged_path)
-        _trim_old(merged_conn)
-        # Strip all config/secrets — only request_log goes to cloud.
-        # Keep model_pricing: it's not a secret, and deleting it triggers
-        # tr_pricing_delete which zeros out all request_log costs, breaking
-        # billing on other machines that sync this data.
-        for tbl in CONFIG_TABLES + ["sync_config", "perf_events"]:
-            if tbl == "model_pricing":
-                continue
-            merged_conn.execute(f"DELETE FROM {tbl}")
-        merged_conn.commit()
-        merged_conn.close()
-
-        # 5. Count and upload
-        upload_conn = sqlite3.connect(merged_path)
-        uploaded_count = upload_conn.execute("SELECT COUNT(*) FROM request_log").fetchone()[0]
-        upload_conn.close()
-
-        _webdav_upload(config, merged_path)
-
-        if has_remote:
-            msg = f"同步成功 — 从远端拉取 {new_count} 条记录，上传 {uploaded_count} 条至云端"
-        else:
-            msg = f"首次同步成功，已上传 {uploaded_count} 条至云端"
-        return {
-            "status": "ok",
-            "message": msg,
-            "remote_records": new_count,
-            "uploaded_records": uploaded_count,
-        }
-
-    except WebDAVError as e:
-        import traceback
-        traceback.print_exc()
-        return {"status": "error", "message": f"WebDAV 错误: {e}"}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"status": "error", "message": f"同步失败: {type(e).__name__}: {e}"}
+        total = conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0]
+        total += conn.execute("SELECT COUNT(*) FROM request_usage").fetchone()[0]
+        total += conn.execute("SELECT COUNT(*) FROM cost_entry").fetchone()[0]
+        return total
     finally:
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        conn.close()
 
 
 # ── Config auto-sync ───────────────────────────────────────────────────────
@@ -404,7 +252,9 @@ def sync_config_upload(db_path: str) -> bool:
         dst.execute("DELETE FROM request_log")
         dst.execute("DELETE FROM perf_events")
         dst.execute("DELETE FROM sync_config")
+        dst.execute("DELETE FROM in_flight_requests")
         dst.commit()
+        dst.execute("VACUUM")
         dst.close()
 
         _webdav_upload(config, config_path, remote_filename="proxy_config.db")
@@ -474,6 +324,9 @@ def sync_config_download(db_path: str) -> bool:
 def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
     """Sync the dashboard database via WebDAV.
 
+    Flow: download remote → export new local data → upload merged result.
+    Multi-machine safe when machines are not concurrent (pull-modify-push).
+
     Args:
         proxy_db_path: Path to proxy.db (contains WebDAV config).
         dash_db_path: Path to dashboard.db (the data to sync).
@@ -486,77 +339,36 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
     if not config:
         return {"status": "error", "message": "未配置同步服务器"}
 
-    db_path = dash_db_path  # use local variable for consistency
-
-    # Same folder as proxy, different filename
     from dataclasses import replace
     dash_config = replace(config, filename="dashboard_sync.db")
 
-    merged_path = str(tmp_dir / "dash_merged.db")
-
     try:
-        # 1. Try download existing remote
-        has_remote = _webdav_download(dash_config, merged_path)
-        dash_count = 0
-
-        if has_remote and os.path.exists(db_path):
-            # Merge remote → local (INSERT OR REPLACE based on unique keys)
-            local_conn = sqlite3.connect(db_path, timeout=10)
-            local_conn.execute("PRAGMA busy_timeout=5000")
-            remote_conn = sqlite3.connect(merged_path)
-            remote_conn.execute("PRAGMA busy_timeout=5000")
-
-            for table in ("token_usage", "request_usage", "cost_entry"):
-                cols = _get_table_columns(remote_conn, table)
-                if not cols:
-                    continue
-                col_list = ", ".join(cols)
-                placeholders = ", ".join(["?"] * len(cols))
-                rows = remote_conn.execute(f"SELECT {col_list} FROM {table}").fetchall()
-                for row in rows:
-                    try:
-                        before = local_conn.total_changes
-                        # INSERT OR IGNORE: local data wins. Cloud is only
-                        # a transport; the local DB is the source of truth.
-                        local_conn.execute(
-                            f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})",
-                            tuple(row),
-                        )
-                        if local_conn.total_changes > before:
-                            dash_count += 1
-                    except sqlite3.Error:
-                        pass
-            local_conn.commit()
-            local_conn.close()
-            remote_conn.close()
-
-            # Layer 2: Delete any "unknown" entries merged from remote
-            cleaned = _cleanup_unknown_entries(db_path)
-            if cleaned > 0:
-                print(f"[Sync] Cleaned up {cleaned} 'unknown' entries from remote merge", flush=True)
-
-        # Layer 2: Clean up any local "unknown" entries before uploading
-        if os.path.exists(db_path):
-            cleaned = _cleanup_unknown_entries(db_path)
-            if cleaned > 0:
-                print(f"[Sync] Cleaned up {cleaned} local 'unknown' entries before upload", flush=True)
-
-        # 2. Upload local copy (always, even if no remote)
-        upload_count = 0
-        if os.path.exists(db_path):
-            _safe_copy_db(db_path, merged_path)
-            uc = sqlite3.connect(merged_path)
-            upload_count = uc.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0]
-            upload_count += uc.execute("SELECT COUNT(*) FROM request_usage").fetchone()[0]
-            upload_count += uc.execute("SELECT COUNT(*) FROM cost_entry").fetchone()[0]
-            uc.close()
-            _webdav_upload(dash_config, merged_path)
-
+        # 1. Download remote dashboard.db → replace local
+        has_remote = _webdav_download(dash_config, dash_db_path)
         if has_remote:
-            msg = f"仪表板：从远端合并 {dash_count} 条，上传 {upload_count} 条"
-        else:
-            msg = f"仪表板：首次上传 {upload_count} 条至云端"
-        return {"status": "ok", "message": msg, "dashboard_records": dash_count}
+            print(f"[Sync] Dashboard: pulled latest from cloud", flush=True)
+
+        # 2. Export unexported request_log → dashboard (syncs model_pricing too)
+        from app.proxy_db import ProxyDatabase
+        proxy_db = ProxyDatabase(proxy_db_path)
+        export_result = proxy_db.export_to_dashboard()
+
+        # 3. Cleanup old exported request_log rows
+        cleaned = proxy_db.cleanup_exported_logs(max_exported=10000)
+        if cleaned > 0:
+            print(f"[Sync] Cleaned up {cleaned} old exported request_log rows", flush=True)
+
+        # 4. Upload merged dashboard.db to cloud
+        upload_path = str(tmp_dir / "dash_upload.db")
+        _safe_copy_db(dash_db_path, upload_path)
+        _webdav_upload(dash_config, upload_path)
+
+        upload_count = _count_dashboard_rows(dash_db_path)
+        msg = (
+            f"仪表板：导出 {export_result.get('record_count', 0)} 条，"
+            f"上传 {upload_count} 条至云端"
+        )
+        return {"status": "ok", "message": msg, "dashboard_records": upload_count}
 
     except WebDAVError as e:
         return {"status": "error", "message": f"WebDAV 错误: {e}"}
@@ -567,117 +379,3 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
     finally:
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def _cleanup_unknown_entries(db_path: str) -> int:
-    """Layer 2: Delete all rows where model or api_key_name is 'unknown'.
-
-    Returns total number of rows deleted.
-    """
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.execute("PRAGMA busy_timeout=5000")
-    total = 0
-    try:
-        for table in ("token_usage", "request_usage", "cost_entry"):
-            # Delete rows with model = 'unknown' (case-insensitive)
-            cursor = conn.execute(
-                f"DELETE FROM {table} WHERE LOWER(model) = 'unknown'"
-            )
-            total += cursor.rowcount
-            # For tables with api_key_name column, also delete those
-            if table != "cost_entry":
-                cursor = conn.execute(
-                    f"DELETE FROM {table} WHERE LOWER(api_key_name) = 'unknown'"
-                )
-                total += cursor.rowcount
-        conn.commit()
-    finally:
-        conn.close()
-    return total
-
-
-def _get_table_columns(conn, table: str) -> list[str]:
-    """Get column names for a table, excluding 'id'."""
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return [r[1] for r in rows if r[1] != "id"]
-
-
-def _ensure_schema(conn: sqlite3.Connection):
-    """Ensure the remote DB has the same tables as local."""
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS upstream_accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            upstream_key TEXT NOT NULL,
-            base_url TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS local_keys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_value TEXT NOT NULL UNIQUE,
-            label TEXT,
-            account_id INTEGER NOT NULL REFERENCES upstream_accounts(id),
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            last_used_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS request_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            local_key_id INTEGER NOT NULL,
-            model TEXT NOT NULL,
-            prompt_tokens INTEGER NOT NULL DEFAULT 0,
-            completion_tokens INTEGER NOT NULL DEFAULT 0,
-            total_tokens INTEGER NOT NULL DEFAULT 0,
-            cost REAL NOT NULL DEFAULT 0.0,
-            is_streaming INTEGER NOT NULL DEFAULT 0,
-            status_code INTEGER NOT NULL,
-            duration_ms INTEGER NOT NULL DEFAULT 0,
-            requested_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_rl_account ON request_log(account_id);
-        CREATE INDEX IF NOT EXISTS idx_rl_time ON request_log(requested_at);
-        CREATE TABLE IF NOT EXISTS model_pricing (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            model_pattern TEXT NOT NULL UNIQUE,
-            input_price REAL NOT NULL,
-            output_price REAL NOT NULL,
-            currency TEXT NOT NULL DEFAULT 'CNY'
-        );
-        CREATE TABLE IF NOT EXISTS proxy_config (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS sync_config (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS account_models (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            model_id TEXT NOT NULL,
-            UNIQUE(account_id, model_id)
-        );
-        CREATE TABLE IF NOT EXISTS key_model_map (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id INTEGER NOT NULL,
-            pattern TEXT NOT NULL,
-            upstream_model TEXT NOT NULL,
-            UNIQUE(key_id, pattern)
-        );
-        CREATE TABLE IF NOT EXISTS model_map_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            sort_order INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS model_map_template_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            template_id INTEGER NOT NULL,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            pattern TEXT NOT NULL,
-            upstream_model TEXT NOT NULL
-        );
-    """)
-    conn.commit()

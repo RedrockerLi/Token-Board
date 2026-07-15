@@ -91,6 +91,7 @@ void Database::create_schema() {
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens     INTEGER NOT NULL DEFAULT 0,
             cost             REAL NOT NULL DEFAULT 0.0,
+            exported         INTEGER NOT NULL DEFAULT 0,
             is_streaming     INTEGER NOT NULL DEFAULT 0,
             status_code      INTEGER NOT NULL,
             duration_ms      INTEGER NOT NULL DEFAULT 0,
@@ -101,6 +102,8 @@ void Database::create_schema() {
             ON request_log(account_id);
         CREATE INDEX IF NOT EXISTS idx_rl_time
             ON request_log(requested_at);
+        CREATE INDEX IF NOT EXISTS idx_rl_exported
+            ON request_log(exported);
 
         CREATE TABLE IF NOT EXISTS model_pricing (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,

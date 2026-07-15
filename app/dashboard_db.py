@@ -75,6 +75,95 @@ class DashboardDatabase:
                     ON cost_entry(date, model, cost_group_key);
                 CREATE INDEX IF NOT EXISTS idx_ce_query
                     ON cost_entry(date, model, cost_group_key);
+
+                CREATE TABLE IF NOT EXISTS model_pricing (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_pattern TEXT NOT NULL UNIQUE,
+                    input_price REAL NOT NULL,
+                    output_price REAL NOT NULL,
+                    currency TEXT NOT NULL DEFAULT 'CNY'
+                );
+
+                -- Trigger: recalculate all cost_entry when pricing is inserted
+                CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_insert
+                AFTER INSERT ON model_pricing
+                BEGIN
+                    DELETE FROM cost_entry;
+                    INSERT INTO cost_entry (date, model, cost, cost_group_key)
+                    SELECT
+                        tu.date, tu.model,
+                        SUM(
+                            CASE tu.token_type
+                                WHEN 'output' THEN
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT mp.output_price FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
+                                ELSE
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT mp.input_price FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
+                            END
+                        ),
+                        tu.cost_group_key
+                    FROM token_usage tu
+                    GROUP BY tu.date, tu.model, tu.cost_group_key;
+                END;
+
+                -- Trigger: recalculate all cost_entry when pricing is updated
+                CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_update
+                AFTER UPDATE ON model_pricing
+                BEGIN
+                    DELETE FROM cost_entry;
+                    INSERT INTO cost_entry (date, model, cost, cost_group_key)
+                    SELECT
+                        tu.date, tu.model,
+                        SUM(
+                            CASE tu.token_type
+                                WHEN 'output' THEN
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT mp.output_price FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
+                                ELSE
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT mp.input_price FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
+                            END
+                        ),
+                        tu.cost_group_key
+                    FROM token_usage tu
+                    GROUP BY tu.date, tu.model, tu.cost_group_key;
+                END;
+
+                -- Trigger: recalculate all cost_entry when pricing is deleted
+                CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_delete
+                AFTER DELETE ON model_pricing
+                BEGIN
+                    DELETE FROM cost_entry;
+                    INSERT INTO cost_entry (date, model, cost, cost_group_key)
+                    SELECT
+                        tu.date, tu.model,
+                        SUM(
+                            CASE tu.token_type
+                                WHEN 'output' THEN
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT mp.output_price FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
+                                ELSE
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT mp.input_price FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
+                            END
+                        ),
+                        tu.cost_group_key
+                    FROM token_usage tu
+                    GROUP BY tu.date, tu.model, tu.cost_group_key;
+                END;
             """)
             conn.commit()
         finally:
@@ -123,9 +212,8 @@ class DashboardDatabase:
 
     def upsert_proxy_data(self, date: str, model: str,
                           account_name: str, prompt_tokens: int,
-                          completion_tokens: int, request_count: int,
-                          cost: float) -> int:
-        """Insert proxy data directly. Returns rows changed."""
+                          completion_tokens: int, request_count: int) -> int:
+        """Insert proxy usage data. cost_entry is maintained by model_pricing triggers."""
         conn = self._connect()
         total = 0
         try:
@@ -151,14 +239,6 @@ class DashboardDatabase:
                        (date, model, api_key_name, count)
                        VALUES (?,?,?,?)""",
                     (date, model, account_name, request_count),
-                )
-                total += 1
-            if cost > 0:
-                conn.execute(
-                    """INSERT OR REPLACE INTO cost_entry
-                       (date, model, cost, cost_group_key)
-                       VALUES (?,?,?,?)""",
-                    (date, model, cost, account_name),
                 )
                 total += 1
             conn.commit()
