@@ -73,7 +73,7 @@ def main():
             try:
                 tus, rus, ces, year, month = adapter.parse(filepath)
                 if year == 0 or month == 0:
-                    print(f"  SKIP {os.path.basename(filepath)} — filename not recognized")
+                    print(f"  SKIP {os.path.basename(filepath)} — could not parse date from content")
                     continue
 
                 # Stamp source metadata
@@ -105,6 +105,16 @@ def main():
     print(f"DB now: {counts['token_usage']} token_usage, "
           f"{counts['request_usage']} request_usage, "
           f"{counts['cost_entry']} cost_entry")
+
+    # Sync to cloud — pull latest, add CSV data, push back
+    if total_files > 0:
+        try:
+            from app.sync import sync_dashboard
+            proxy_db_path = str(Path(str(db_path)).parent / "proxy.db")
+            sync_dashboard(proxy_db_path, str(db_path))
+            print("[CSV import] Dashboard synced to cloud")
+        except Exception as e:
+            print(f"[CSV import] Cloud sync failed: {e}")
 
 
 if __name__ == "__main__":

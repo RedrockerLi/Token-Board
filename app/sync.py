@@ -333,7 +333,7 @@ def _merge_dashboard(remote_path: str, local_path: str):
     TABLES = {
         "token_usage": ["date", "model", "api_key_name", "token_type", "amount", "cost_group_key"],
         "request_usage": ["date", "model", "api_key_name", "count"],
-        "cost_entry": ["date", "model", "cost", "cost_group_key"],
+        "cost_entry": ["date", "model", "cost", "cost_group_key", "source"],
         "model_pricing": ["id", "model_pattern", "input_price", "output_price", "currency"],
     }
 

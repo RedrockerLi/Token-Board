@@ -1,13 +1,11 @@
 {
     "hidden_users": [
         "PC-AI-chat",
-        "PC-Draw.io",
-        "sk*"
+        "PC-Draw.io"
     ],
     "hidden_models": [
         "ds-v4-flash",
-        "Qwen3.5-397B-A17B",
-        "mimo-v2.5"
+        "Qwen3.5-397B-A17B"
     ],
     "model_aliases": [
         {

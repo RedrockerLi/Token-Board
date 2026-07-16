@@ -27,6 +27,16 @@ class DeepSeekAdapter:
 
     platform = "deepseek"
 
+    # ── helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _norm_date(raw: str) -> str:
+        """Normalize a date string to YYYY-MM-DD."""
+        raw = raw.strip()
+        if len(raw) == 8 and raw.isdigit():  # YYYYMMDD
+            return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+        return raw  # already YYYY-MM-DD or unrecognised
+
     # ── public API ──────────────────────────────────────────────────────
 
     def parse(self, filepath: str):
@@ -36,16 +46,15 @@ class DeepSeekAdapter:
         cost_entries: list[CostEntry] = []
         year, month = 0, 0
 
-        # Detect CSV type from content (first column header)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     row = {k.strip().lstrip('﻿'): v.strip() for k, v in row.items()}
+                    date = self._norm_date(row.get("utc_date", ""))
                     # Derive year/month from first data row
                     if year == 0:
-                        date_str = row.get("utc_date", "")
-                        parts = date_str.split("-")
+                        parts = date.split("-")
                         if len(parts) >= 2:
                             try:
                                 year = int(parts[0])
@@ -53,9 +62,9 @@ class DeepSeekAdapter:
                             except ValueError:
                                 pass
                     if "type" in row:
-                        self._parse_amount_row(row, token_usages, request_usages)
+                        self._parse_amount_row(row, date, token_usages, request_usages)
                     elif "wallet_type" in row:
-                        self._parse_cost_row(row, cost_entries)
+                        self._parse_cost_row(row, date, cost_entries)
         except Exception as e:
             print(f"[ERROR] Failed to parse {filepath}: {e}")
             return [], [], [], 0, 0
@@ -64,11 +73,10 @@ class DeepSeekAdapter:
 
     # ── row-level helpers ───────────────────────────────────────────────
 
-    def _parse_amount_row(self, row: dict,
+    def _parse_amount_row(self, row: dict, date: str,
                           token_usages: list, request_usages: list):
         """Convert a single amount-*.csv row into IR record(s)."""
         rtype = row.get("type", "")
-        date = row.get("utc_date", "")
         model = row.get("model", "unknown")
         key_name = row.get("api_key_name", "")
 
@@ -97,11 +105,11 @@ class DeepSeekAdapter:
                 cost_group_key=row.get("user_id", ""),
             ))
 
-    def _parse_cost_row(self, row: dict, cost_entries: list):
+    def _parse_cost_row(self, row: dict, date: str, cost_entries: list):
         """Convert a single cost-*.csv row into a CostEntry."""
         cost_entries.append(CostEntry(
             platform=self.platform,
-            date=row.get("utc_date", ""),
+            date=date,
             model=row.get("model", "unknown"),
             cost=safe_float(row.get("cost", 0)),
             cost_group_key=row.get("user_id", ""),

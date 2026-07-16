@@ -69,10 +69,11 @@ class DashboardDatabase:
                     date TEXT NOT NULL,
                     model TEXT NOT NULL,
                     cost REAL NOT NULL,
-                    cost_group_key TEXT DEFAULT ''
+                    cost_group_key TEXT DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'proxy'
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_ce_unique
-                    ON cost_entry(date, model, cost_group_key);
+                    ON cost_entry(date, model, cost_group_key, source);
                 CREATE INDEX IF NOT EXISTS idx_ce_query
                     ON cost_entry(date, model, cost_group_key);
 
@@ -84,12 +85,13 @@ class DashboardDatabase:
                     currency TEXT NOT NULL DEFAULT 'CNY'
                 );
 
-                -- Trigger: recalculate all cost_entry when pricing is inserted
+                -- Trigger: recalculate proxy cost_entry when pricing is inserted.
+                -- CSV-imported rows (source='csv') are left untouched.
                 CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_insert
                 AFTER INSERT ON model_pricing
                 BEGIN
-                    DELETE FROM cost_entry;
-                    INSERT INTO cost_entry (date, model, cost, cost_group_key)
+                    DELETE FROM cost_entry WHERE source = 'proxy';
+                    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)
                     SELECT
                         tu.date, tu.model,
                         SUM(
@@ -106,17 +108,18 @@ class DashboardDatabase:
                                          ORDER BY mp.id LIMIT 1), 0)
                             END
                         ),
-                        tu.cost_group_key
+                        tu.cost_group_key,
+                        'proxy'
                     FROM token_usage tu
                     GROUP BY tu.date, tu.model, tu.cost_group_key;
                 END;
 
-                -- Trigger: recalculate all cost_entry when pricing is updated
+                -- Trigger: recalculate proxy cost_entry when pricing is updated
                 CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_update
                 AFTER UPDATE ON model_pricing
                 BEGIN
-                    DELETE FROM cost_entry;
-                    INSERT INTO cost_entry (date, model, cost, cost_group_key)
+                    DELETE FROM cost_entry WHERE source = 'proxy';
+                    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)
                     SELECT
                         tu.date, tu.model,
                         SUM(
@@ -133,17 +136,18 @@ class DashboardDatabase:
                                          ORDER BY mp.id LIMIT 1), 0)
                             END
                         ),
-                        tu.cost_group_key
+                        tu.cost_group_key,
+                        'proxy'
                     FROM token_usage tu
                     GROUP BY tu.date, tu.model, tu.cost_group_key;
                 END;
 
-                -- Trigger: recalculate all cost_entry when pricing is deleted
+                -- Trigger: recalculate proxy cost_entry when pricing is deleted
                 CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_delete
                 AFTER DELETE ON model_pricing
                 BEGIN
-                    DELETE FROM cost_entry;
-                    INSERT INTO cost_entry (date, model, cost, cost_group_key)
+                    DELETE FROM cost_entry WHERE source = 'proxy';
+                    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)
                     SELECT
                         tu.date, tu.model,
                         SUM(
@@ -160,7 +164,8 @@ class DashboardDatabase:
                                          ORDER BY mp.id LIMIT 1), 0)
                             END
                         ),
-                        tu.cost_group_key
+                        tu.cost_group_key,
+                        'proxy'
                     FROM token_usage tu
                     GROUP BY tu.date, tu.model, tu.cost_group_key;
                 END;
@@ -199,8 +204,8 @@ class DashboardDatabase:
             for ce in cost_entries:
                 conn.execute(
                     """INSERT OR REPLACE INTO cost_entry
-                       (date, model, cost, cost_group_key)
-                       VALUES (?,?,?,?)""",
+                       (date, model, cost, cost_group_key, source)
+                       VALUES (?,?,?,?,'csv')""",
                     (ce.date, ce.model, ce.cost, ce.cost_group_key),
                 )
                 total += 1
@@ -355,6 +360,8 @@ def _parse_date(date_str: str) -> tuple[int, int]:
         parts = date_str.split("-")
         if len(parts) >= 2:
             return int(parts[0]), int(parts[1])
+        if len(date_str) == 8:  # YYYYMMDD
+            return int(date_str[:4]), int(date_str[4:6])
     except (ValueError, IndexError):
         pass
     return 0, 0
