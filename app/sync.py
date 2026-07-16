@@ -9,9 +9,11 @@ which rows have been exported to the dashboard database.
 """
 
 import os
+import re
 import shutil
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -94,6 +96,56 @@ def load_sync_config(db_path: str) -> SyncConfig | None:
         return None
     finally:
         conn.close()
+
+
+# ── Timestamped file helpers ─────────────────────────────────────────────
+
+def _make_timestamped_name(base: str) -> str:
+    """dashboard_sync.db → dashboard_sync_20260716_143025.db"""
+    name, ext = base.rsplit(".", 1)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{name}_{stamp}.{ext}"
+
+
+def _list_folder_files(config, prefix: str) -> list[str]:
+    """List filenames in the sync folder matching a prefix via PROPFIND.
+
+    Returns sorted list of matching filenames.
+    """
+    folder_url = f"{config.base_url.rstrip('/')}/{config.folder.strip('/')}/"
+    resp = requests.request(
+        "PROPFIND", folder_url,
+        auth=HTTPBasicAuth(config.username, config.password),
+        timeout=15,
+        headers={"Depth": "1"},
+    )
+    if not resp.ok:
+        return []
+
+    # Parse XML to extract hrefs. Minimal parser — just regex the filenames.
+    # WebDAV PROPFIND returns multistatus XML with <D:href> elements.
+    names = []
+    for href in re.findall(r"<[Dd]:href>([^<]+)</[Dd]:href>", resp.text):
+        fn = href.rstrip("/").rsplit("/", 1)[-1]
+        if fn and fn.startswith(prefix):
+            names.append(fn)
+    return sorted(names)
+
+
+def _download_latest(config, dest_path: str, base: str) -> bool:
+    """Find the latest timestamped file matching *base* and download it.
+
+    base = "dashboard_sync" → matches "dashboard_sync_20260716_143025.db"
+    Returns True if a file was found and downloaded, False if no files exist.
+    """
+    prefix = base + "_"
+    files = _list_folder_files(config, prefix)
+    if not files:
+        # Also try the bare name for backward compatibility
+        return _webdav_download(config, dest_path, remote_filename=base + ".db")
+
+    latest = files[-1]  # sorted alphabetically = chronologically
+    return _webdav_download(config, dest_path, remote_filename=latest)
 
 
 # ── Minimal WebDAV client ─────────────────────────────────────────────────
@@ -257,7 +309,7 @@ def sync_config_upload(db_path: str) -> bool:
         dst.execute("VACUUM")
         dst.close()
 
-        _webdav_upload(config, config_path, remote_filename="proxy_config.db")
+        _webdav_upload(config, config_path, remote_filename=_make_timestamped_name("proxy_config.db"))
         return True
     except (WebDAVError, Exception):
         import traceback
@@ -280,7 +332,7 @@ def sync_config_download(db_path: str) -> bool:
     remote_path = str(tmp_dir / "proxy_config_remote.db")
 
     try:
-        has_remote = _webdav_download(config, remote_path, remote_filename="proxy_config.db")
+        has_remote = _download_latest(config, remote_path, base="proxy_config")
         if not has_remote:
             return False
 
@@ -378,22 +430,17 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
     if not config:
         return {"status": "error", "message": "未配置同步服务器"}
 
-    from dataclasses import replace
-    dash_config = replace(config, filename="dashboard_sync.db")
-
     try:
-        # 1. Download remote dashboard.db to temp file (never overwrite local)
+        # 1. Download latest remote dashboard.db to temp (pick most recent by timestamp)
         remote_path = str(tmp_dir / "dash_remote.db")
-        has_remote = _webdav_download(dash_config, remote_path)
+        has_remote = _download_latest(config, remote_path, base="dashboard_sync")
 
-        # 2. Merge remote → local: INSERT OR IGNORE so local data is never
-        #    overwritten by a stale/different remote copy
+        # 2. Merge remote → local
         if has_remote:
             _merge_dashboard(remote_path, dash_db_path)
             print(f"[Sync] Dashboard: merged latest from cloud", flush=True)
 
         # 3. Export unexported request_log → dashboard (syncs model_pricing too)
-        #    Don't mark exported yet — wait until upload succeeds.
         from app.proxy_db import ProxyDatabase
         proxy_db = ProxyDatabase(proxy_db_path)
         export_result = proxy_db.export_to_dashboard(mark_exported=False)
@@ -403,10 +450,11 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
         if cleaned > 0:
             print(f"[Sync] Cleaned up {cleaned} old exported request_log rows", flush=True)
 
-        # 5. Upload merged dashboard.db to cloud
+        # 5. Upload merged dashboard.db to cloud with timestamp
         upload_path = str(tmp_dir / "dash_upload.db")
         _safe_copy_db(dash_db_path, upload_path)
-        _webdav_upload(dash_config, upload_path)
+        _webdav_upload(config, upload_path,
+                       remote_filename=_make_timestamped_name("dashboard_sync.db"))
 
         # 6. Upload succeeded — confirm: exported 1→2
         proxy_db.mark_uploaded()
