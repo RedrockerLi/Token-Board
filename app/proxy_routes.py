@@ -264,6 +264,15 @@ def daily_billing():
     return jsonify(_proxy_db().get_daily_billing(year, month))
 
 
+@bp_proxy.route("/billing/daily-by-model")
+def daily_billing_by_model():
+    year = request.args.get("year", type=int)
+    month = request.args.get("month", type=int)
+    if not year or not month:
+        return jsonify({"error": "year and month are required"}), 400
+    return jsonify(_proxy_db().get_daily_billing_by_model(year, month))
+
+
 @bp_proxy.route("/billing/months")
 def proxy_months():
     return jsonify(_proxy_db().get_available_proxy_months())
@@ -391,6 +400,12 @@ def request_logs():
 def perf_summary():
     minutes = request.args.get("minutes", 15, type=int)
     return jsonify(_proxy_db().get_perf_summary(minutes))
+
+
+@bp_proxy.route("/perf/success-rate-history")
+def perf_success_rate_history():
+    minutes = request.args.get("minutes", 60, type=int)
+    return jsonify(_proxy_db().get_perf_success_rate_history(minutes))
 
 
 @bp_proxy.route("/perf/latency")

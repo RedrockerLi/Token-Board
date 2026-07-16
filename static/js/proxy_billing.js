@@ -70,53 +70,68 @@ async function loadDailyBillingChart(year, month) {
     }
 
     try {
-        const data = await proxyFetch(`/api/proxy/billing/daily?year=${year}&month=${month}`);
-        // Group by date
-        const dateMap = {};
-        data.forEach((d) => {
-            if (!dateMap[d.date]) dateMap[d.date] = { cost: 0, requests: 0, tokens: 0 };
-            dateMap[d.date].cost += d.cost;
-            dateMap[d.date].requests += d.requests;
-            dateMap[d.date].tokens += d.total_tokens;
-        });
+        const data = await proxyFetch(`/api/proxy/billing/daily-by-model?year=${year}&month=${month}`);
 
-        const dates = Object.keys(dateMap).sort();
-        const costs = dates.map((d) => dateMap[d].cost);
-        const requests = dates.map((d) => dateMap[d].requests);
+        if (!data.length) {
+            dom.innerHTML = '<div class="loading" style="display:flex">该月暂无数据</div>';
+            return;
+        }
 
-        if (typeof echarts !== 'undefined' && dates.length > 0) {
+        const dates = data.map(d => d.date);
+        const inputTokens = data.map(d => d.input_tokens);
+        const outputTokens = data.map(d => d.output_tokens);
+        const costs = data.map(d => d.cost);
+
+        if (typeof echarts !== 'undefined') {
             if (billingChart) billingChart.dispose();
             billingChart = echarts.init(dom);
             billingChart.setOption({
-                tooltip: { trigger: 'axis' },
-                legend: { data: ['费用', '请求数'], bottom: 0 },
-                xAxis: { type: 'category', data: dates },
+                tooltip: {
+                    trigger: 'axis',
+                    axisPointer: { type: 'shadow' },
+                    formatter: function(params) {
+                        let html = '<b>' + params[0].axisValue + '</b><br/>';
+                        let total = 0;
+                        params.forEach(p => {
+                            if (p.seriesName !== '费用') {
+                                html += p.marker + ' ' + p.seriesName + ': ' + fmtNum(p.value) + '<br/>';
+                                total += p.value;
+                            }
+                        });
+                        html += '<b>合计: ' + fmtNum(total) + ' tokens</b><br/>';
+                        const cp = params.find(p => p.seriesName === '费用');
+                        if (cp) html += cp.marker + ' 费用: ¥' + cp.value.toFixed(2);
+                        return html;
+                    }
+                },
+                legend: { data: ['输入Token', '输出Token', '费用'], bottom: 0, textStyle: { fontSize: 11 } },
+                grid: { left: 70, right: 70, top: 20, bottom: 50 },
+                xAxis: { type: 'category', data: dates, axisLabel: { rotate: 30, fontSize: 10 } },
                 yAxis: [
-                    { type: 'value', name: '费用 (¥)' },
-                    { type: 'value', name: '请求数' },
+                    { type: 'value', name: 'Tokens', axisLabel: { formatter: v => fmtNum(v), fontSize: 10 } },
+                    { type: 'value', name: '费用 (¥)', axisLabel: { fontSize: 10 } },
                 ],
                 series: [
                     {
-                        name: '费用',
-                        data: costs,
-                        type: 'bar',
-                        barWidth: '50%',
-                        itemStyle: { color: '#0070F3', borderRadius: [4, 4, 0, 0] },
+                        name: '输出Token', type: 'bar', stack: 'tokens',
+                        data: outputTokens, barMaxWidth: 28,
+                        itemStyle: { color: '#0070F3' },
                     },
                     {
-                        name: '请求数',
-                        data: requests,
-                        type: 'line',
-                        yAxisIndex: 1,
-                        lineStyle: { color: '#F59E0B' },
-                        itemStyle: { color: '#F59E0B' },
+                        name: '输入Token', type: 'bar', stack: 'tokens',
+                        data: inputTokens, barMaxWidth: 28,
+                        itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
+                    },
+                    {
+                        name: '费用', type: 'line', yAxisIndex: 1,
+                        data: costs,
+                        lineStyle: { color: '#EF4444', width: 2.5 },
+                        itemStyle: { color: '#EF4444' },
+                        symbol: 'circle', symbolSize: 6,
                     },
                 ],
-                grid: { left: 60, right: 60, top: 20, bottom: 50 },
             });
             new ResizeObserver(() => billingChart.resize()).observe(dom);
-        } else {
-            dom.innerHTML = '<div class="loading" style="display:flex">该月暂无数据</div>';
         }
     } catch (err) {
         console.error('Failed to load daily billing chart:', err);

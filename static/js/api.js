@@ -106,6 +106,10 @@ async function fetchPerfModels(minutes) {
     return fetchJSON(buildParams('/api/proxy/perf/models', { minutes }));
 }
 
+async function fetchPerfSuccessRateHistory(minutes) {
+    return fetchJSON(buildParams('/api/proxy/perf/success-rate-history', { minutes }));
+}
+
 async function fetchPerfRealtime() {
     return fetchJSON('/api/proxy/perf/realtime');
 }

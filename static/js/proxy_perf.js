@@ -38,7 +38,7 @@ function buildPerfPageHTML() {
             <div class="stat-card">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#22C55E;"></span> 成功率</div>
                 <div class="stat-card__value number-lg" id="perfSuccessRate">--</div>
-                <div class="stat-card__sub">最近 15 分钟</div>
+                <div class="stat-card__sub">最近 1 分钟</div>
             </div>
             <div class="stat-card stat-card--cyan">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#F59E0B;"></span> 平均延迟</div>
@@ -73,7 +73,7 @@ function buildPerfPageHTML() {
         <div class="section">
             <div class="charts-grid charts-grid--2col">
                 <div class="chart-card">
-                    <div class="chart-card__title">请求成功率</div>
+                    <div class="chart-card__title">每分钟成功率</div>
                     <div class="chart-container chart-container--sm" id="chartSuccessRate"></div>
                 </div>
                 <div class="chart-card">
@@ -217,32 +217,41 @@ function renderUtilizationChart(domId, data) {
         }],
     });
 }
-function renderSuccessRateChart(domId, summary) {
+function renderSuccessRateChart(domId, data) {
     chartSuccessRate = initChart(domId);
     if (!chartSuccessRate) return;
-    var total = summary.total_requests || 0;
-    var errors = summary.error_count || 0;
-    var success = total - errors;
-    if (total === 0) {
+    if (!data || !data.length) {
         chartSuccessRate.setOption({
             title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
         });
         return;
     }
+    var labels = data.map(function(d) { return d.bucket.substring(11); });
+    var rates = data.map(function(d) { return d.success_rate; });
+
     chartSuccessRate.setOption({
         tooltip: {
-            trigger: 'item',
-            formatter: function(p) { return p.name + ': ' + fmtNum(p.value) + ' (' + p.percent + '%)'; }
+            trigger: 'axis',
+            formatter: function(params) {
+                var p = params[0];
+                var d = data[p.dataIndex];
+                return p.name + '<br/>' + p.marker + ' 成功率: <b>' + p.value + '%</b><br/>'
+                    + '总请求: ' + d.total + ' | 失败: ' + d.errors;
+            }
         },
+        grid: { left: 55, right: 20, top: 20, bottom: 40 },
+        xAxis: { type: 'category', data: labels, axisLabel: { rotate: 45, fontSize: 10 } },
+        yAxis: { type: 'value', name: '成功率 (%)', axisLabel: { fontSize: 10 }, min: 0, max: 100 },
         series: [{
-            type: 'pie',
-            radius: ['50%', '75%'],
-            center: ['50%', '50%'],
-            data: [
-                { name: '成功', value: success, itemStyle: { color: '#22C55E' } },
-                { name: '失败', value: errors, itemStyle: { color: '#EF4444' } },
-            ],
-            label: { show: true, formatter: '{b}', fontSize: 12 },
+            name: '成功率', type: 'line', data: rates,
+            smooth: true, symbol: 'circle', symbolSize: 4,
+            lineStyle: { color: '#22C55E', width: 2 },
+            itemStyle: { color: '#22C55E' },
+            areaStyle: { color: 'rgba(34,197,94,0.08)' },
+            markLine: {
+                silent: true,
+                data: [{ yAxis: 95, label: { formatter: '95%' }, lineStyle: { color: '#F59E0B', type: 'dashed' } }],
+            },
         }],
     });
 }
@@ -282,17 +291,19 @@ function renderModelLatencyChart(domId, models) {
 async function loadAllPerfData() {
     try {
         var results = await Promise.all([
-            fetchPerfSummary(15),
+            fetchPerfSummary(1),
             fetchPerfLatency(60),
             fetchPerfThroughput(60),
             fetchPerfModels(60),
             fetchPerfRealtime(),
+            fetchPerfSuccessRateHistory(60),
         ]);
         var summary = results[0];
         var latency = results[1];
         var throughput = results[2];
         var models = results[3];
         var realtime = results[4];
+        var successRateHistory = results[5];
 
         // Update stat cards
         var elConcurrent = document.getElementById('perfConcurrent');
@@ -309,7 +320,7 @@ async function loadAllPerfData() {
         renderLatencyChart('chartLatency', latency);
         renderRPMChart('chartRPM', throughput);
         renderUtilizationChart('chartUtilization', throughput);
-        renderSuccessRateChart('chartSuccessRate', summary);
+        renderSuccessRateChart('chartSuccessRate', successRateHistory);
         renderModelLatencyChart('chartModelLatency', models);
     } catch (err) {
         console.error('Failed to load perf data:', err);

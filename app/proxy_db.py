@@ -747,6 +747,27 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    def get_daily_billing_by_model(self, year: int, month: int) -> list[dict]:
+        """Daily billing breakdown with input/output token split (for stacked bar chart)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("""
+                SELECT
+                    date(r.requested_at) AS date,
+                    COALESCE(SUM(r.prompt_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(r.completion_tokens), 0) AS output_tokens,
+                    COUNT(*) AS requests,
+                    COALESCE(SUM(r.cost), 0) AS cost
+                FROM request_log r
+                WHERE CAST(strftime('%Y', r.requested_at) AS INTEGER) = ?
+                  AND CAST(strftime('%m', r.requested_at) AS INTEGER) = ?
+                GROUP BY date(r.requested_at)
+                ORDER BY date
+            """, (year, month)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     def get_available_proxy_months(self) -> list[dict]:
         """Return list of {year, month} that have proxy data."""
         conn = self._connect()
@@ -1012,6 +1033,30 @@ class ProxyDatabase:
                 "avg_latency_ms": round(r[2] or 0, 1),
                 "max_latency_ms": r[3] or 0,
                 "success_rate": round(r[4] / max(r[1], 1) * 100, 1),
+            } for r in rows]
+        finally:
+            conn.close()
+
+    def get_perf_success_rate_history(self, window_minutes: int = 60) -> list[dict]:
+        """Per-minute success rate for the last N minutes (for line chart)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
+                "COUNT(*) AS total, "
+                "SUM(is_error) AS errors "
+                "FROM perf_events "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "GROUP BY bucket "
+                "ORDER BY bucket",
+                (str(window_minutes),)
+            ).fetchall()
+
+            return [{
+                "bucket": r[0],
+                "total": r[1],
+                "errors": r[2],
+                "success_rate": round((r[1] - r[2]) / max(r[1], 1) * 100, 1),
             } for r in rows]
         finally:
             conn.close()
