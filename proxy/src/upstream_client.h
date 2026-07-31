@@ -3,6 +3,13 @@
 #include <functional>
 #include <string>
 
+/// Auth scheme + path handling for an upstream forward call.
+struct ForwardOptions {
+    std::string auth_scheme = "bearer";  // "bearer" → Authorization: Bearer <key>
+                                         // "x-api-key" → x-api-key: <key> + anthropic-version
+    bool path_is_full = false;           // true → use `path` verbatim (skip base_url path prepend)
+};
+
 /// Forwards requests to the upstream CSTCloud API.
 ///
 /// Uses httplib::Client internally.  Supports both regular (full-response)
@@ -36,5 +43,6 @@ public:
                           const std::string &path,
                           const std::string &body,
                           const std::string &content_type,
-                          std::function<bool(const char *, size_t)> on_chunk);
+                          std::function<bool(const char *, size_t)> on_chunk,
+                          const ForwardOptions &opts = ForwardOptions{});
 };

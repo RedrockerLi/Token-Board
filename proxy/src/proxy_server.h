@@ -1,5 +1,8 @@
 #pragma once
 
+#include "codec.h"
+#include "router.h"
+
 class Database;
 class Router;
 class UpstreamClient;
@@ -16,22 +19,35 @@ struct Response;
 /// Registers:
 ///   POST /v1/chat/completions   — OpenAI-compatible proxy endpoint
 ///   POST /v1/messages           — Anthropic-compatible proxy endpoint
-///   GET  /health                  — health-check
+///   POST /v1/responses          — OpenAI Responses proxy endpoint
+///   GET  /health                — health-check
 ///
-/// All routes include CORS headers (Access-Control-Allow-Origin: *).
+/// The three chat endpoints share one pipeline: the harness format is taken
+/// from the local key config (explicit harness_format, else the account's
+/// api_format = passthrough), and converted to the account's upstream format
+/// via the codec registry when they differ.
 class ProxyServer {
 public:
     ProxyServer(Database &db, Router &router, UpstreamClient &upstream,
-                UsageTracker &tracker)
-        : db_(db), router_(router), upstream_(upstream), tracker_(tracker) {}
+                UsageTracker &tracker, CodecRegistry &codecs)
+        : db_(db), router_(router), upstream_(upstream), tracker_(tracker),
+          codecs_(codecs) {}
 
     void setup_routes(httplib::Server &server);
 
 private:
-    void handle_chat_completions(const httplib::Request &req,
-                                 httplib::Response &res);
-    void handle_anthropic_messages(const httplib::Request &req,
-                                   httplib::Response &res);
+    void handle_chat_request(const httplib::Request &req,
+                             httplib::Response &res);
+    void handle_passthrough(const Router::RouteResult &route,
+                            ir::ApiFormat upstream,
+                            const httplib::Request &req,
+                            httplib::Response &res,
+                            std::chrono::steady_clock::time_point t0);
+    void handle_converted(const Router::RouteResult &route,
+                          ir::ApiFormat harness, ir::ApiFormat upstream,
+                          const httplib::Request &req,
+                          httplib::Response &res,
+                          std::chrono::steady_clock::time_point t0);
     void handle_list_models(const httplib::Request &req,
                             httplib::Response &res);
     void handle_embeddings(const httplib::Request &req,
@@ -42,4 +58,5 @@ private:
     Router &router_;
     UpstreamClient &upstream_;
     UsageTracker &tracker_;
+    CodecRegistry &codecs_;
 };

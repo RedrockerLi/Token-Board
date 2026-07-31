@@ -22,7 +22,8 @@ UpstreamClient::forward(const std::string &method,
                         const std::string &path,
                         const std::string &body,
                         const std::string &content_type,
-                        std::function<bool(const char *, size_t)> on_chunk) {
+                        std::function<bool(const char *, size_t)> on_chunk,
+                        const ForwardOptions &opts) {
     ForwardResult result;
     auto t0 = std::chrono::steady_clock::now();
 
@@ -47,8 +48,9 @@ UpstreamClient::forward(const std::string &method,
         url_path = base_url.substr(path_start);
     }
 
-    // Build the full upstream path
-    std::string full_path = url_path + path;
+    // Build the full upstream path.  path_is_full bypasses base_url's path
+    // component (used for explicit endpoint_path overrides).
+    std::string full_path = opts.path_is_full ? path : url_path + path;
 
     // Create client
     httplib::Client cli(scheme_host);
@@ -57,11 +59,21 @@ UpstreamClient::forward(const std::string &method,
     cli.set_write_timeout(30, 0);
     cli.enable_server_certificate_verification(true);
 
-    // Build headers
-    httplib::Headers headers = {
-        {"Authorization", "Bearer " + upstream_key},
-        {"Content-Type", content_type},
-    };
+    // Build headers.  Anthropic-native upstreams use x-api-key instead of
+    // Authorization: Bearer.
+    httplib::Headers headers;
+    if (opts.auth_scheme == "x-api-key") {
+        headers = {
+            {"x-api-key", upstream_key},
+            {"anthropic-version", "2023-06-01"},
+            {"Content-Type", content_type},
+        };
+    } else {
+        headers = {
+            {"Authorization", "Bearer " + upstream_key},
+            {"Content-Type", content_type},
+        };
+    }
 
     if (on_chunk) {
         // ── Streaming path: use Request::content_receiver ─────────

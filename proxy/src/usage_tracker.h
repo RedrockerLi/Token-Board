@@ -36,6 +36,19 @@ public:
     /// Anthropic emits usage in the message_delta event.
     static std::optional<UsageInfo> parse_anthropic_usage_from_sse(const std::string &sse_data);
 
+    /// Parse usage from a non-streaming OpenAI Responses JSON response.
+    /// Responses uses usage.input_tokens / usage.output_tokens.
+    static std::optional<UsageInfo> parse_responses_usage(const std::string &body);
+
+    /// Parse usage from streaming Responses SSE data.
+    /// Usage appears in the response.completed / response.incomplete event.
+    static std::optional<UsageInfo> parse_responses_usage_from_sse(const std::string &sse_data);
+
+    /// Dispatch to the matching streaming usage parser by upstream api_format
+    /// ("openai" | "openai_responses" | "anthropic").
+    static std::optional<UsageInfo> parse_stream_usage(const std::string &api_format,
+                                                       const std::string &sse_data);
+
     /// Compute cost and write a request-log entry.
     void log_request(int account_id, int local_key_id, const UsageInfo &usage,
                      bool is_streaming, int status_code, int duration_ms);

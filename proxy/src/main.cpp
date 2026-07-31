@@ -12,6 +12,9 @@
 
 #include "config.h"
 #include "db.h"
+#include "format_anthropic.h"
+#include "format_openai.h"
+#include "format_responses.h"
 #include "proxy_server.h"
 #include "router.h"
 #include "semaphore_pool.h"
@@ -53,7 +56,11 @@ int main(int argc, char *argv[]) {
     Router router(db);
     UpstreamClient upstream;
     UsageTracker tracker(db);
-    ProxyServer proxy_server(db, router, upstream, tracker);
+    CodecRegistry codecs;
+    codecs.add(make_openai_codec());
+    codecs.add(make_anthropic_codec());
+    codecs.add(make_responses_codec());
+    ProxyServer proxy_server(db, router, upstream, tracker, codecs);
 
     // ── Configure httplib server ──────────────────────────────────────
     httplib::Server server;

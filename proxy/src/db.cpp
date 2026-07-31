@@ -61,6 +61,18 @@ void Database::close() {
 
 // ── Schema creation ──────────────────────────────────────────────────────
 
+/// Check whether a column already exists (table/column are internal constants).
+/// SQLite resolves column names at prepare time, so a successful prepare means
+/// the column exists — regardless of whether the table currently has rows.
+static bool column_exists(sqlite3 *db, const char *table, const char *column) {
+    char sql[256];
+    snprintf(sql, sizeof(sql), "SELECT %s FROM %s LIMIT 1", column, table);
+    sqlite3_stmt *stmt = nullptr;
+    bool ok = (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK);
+    if (stmt) sqlite3_finalize(stmt);
+    return ok;
+}
+
 void Database::create_schema() {
     const char *sql = R"SQL(
         CREATE TABLE IF NOT EXISTS upstream_accounts (
@@ -254,6 +266,54 @@ void Database::create_schema() {
         }
     }
 
+    // v3: endpoint_path on upstream_accounts — explicit upstream path override
+    //     (fixes /v1 double-append; empty string = derive from api_format)
+    if (!column_exists(db_, "upstream_accounts", "endpoint_path")) {
+        char *e3 = nullptr;
+        sqlite3_exec(db_,
+            "ALTER TABLE upstream_accounts ADD COLUMN endpoint_path "
+            "TEXT NOT NULL DEFAULT ''",
+            nullptr, nullptr, &e3);
+        if (e3) {
+            fprintf(stderr, "[DB] Migration v3 error: %s\n", e3);
+            sqlite3_free(e3);
+        } else {
+            fprintf(stderr, "[DB] Migration v3: added endpoint_path column\n");
+        }
+    }
+
+    // v4: auth_header on upstream_accounts — auth scheme for the upstream
+    //     ("bearer" → Authorization: Bearer; "x-api-key" → x-api-key + anthropic-version)
+    if (!column_exists(db_, "upstream_accounts", "auth_header")) {
+        char *e4 = nullptr;
+        sqlite3_exec(db_,
+            "ALTER TABLE upstream_accounts ADD COLUMN auth_header "
+            "TEXT NOT NULL DEFAULT 'bearer'",
+            nullptr, nullptr, &e4);
+        if (e4) {
+            fprintf(stderr, "[DB] Migration v4 error: %s\n", e4);
+            sqlite3_free(e4);
+        } else {
+            fprintf(stderr, "[DB] Migration v4: added auth_header column\n");
+        }
+    }
+
+    // v5: harness_format on local_keys — explicit harness (client-side) format;
+    //     empty string = fall back to account api_format (passthrough, legacy behavior)
+    if (!column_exists(db_, "local_keys", "harness_format")) {
+        char *e5 = nullptr;
+        sqlite3_exec(db_,
+            "ALTER TABLE local_keys ADD COLUMN harness_format "
+            "TEXT NOT NULL DEFAULT ''",
+            nullptr, nullptr, &e5);
+        if (e5) {
+            fprintf(stderr, "[DB] Migration v5 error: %s\n", e5);
+            sqlite3_free(e5);
+        } else {
+            fprintf(stderr, "[DB] Migration v5: added harness_format column\n");
+        }
+    }
+
     // Pricing entries are managed by the web dashboard; no auto-seeding.
 }
 
@@ -268,11 +328,12 @@ void Database::prepare_statements() {
         } while (0)
 
     PREPARE("SELECT id, key_value, account_id, "
-            "COALESCE(label,'') FROM local_keys "
-            "WHERE key_value = ?1",
+            "COALESCE(label,''), COALESCE(harness_format,'') "
+            "FROM local_keys WHERE key_value = ?1",
             stmt_lookup_key_);
 
-    PREPARE("SELECT id, name, upstream_key, base_url, api_format "
+    PREPARE("SELECT id, name, upstream_key, base_url, api_format, "
+            "COALESCE(endpoint_path,''), COALESCE(auth_header,'bearer') "
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
 
@@ -367,6 +428,8 @@ std::optional<Database::KeyInfo> Database::lookup_local_key(
         info.account_id = sqlite3_column_int(stmt_lookup_key_, 2);
         info.label = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_lookup_key_, 3));
+        info.harness_format = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_lookup_key_, 4));
         result = std::move(info);
     }
     sqlite3_reset(stmt_lookup_key_);
@@ -394,6 +457,11 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
         info.api_format = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_get_account_, 4));
         if (info.api_format.empty()) info.api_format = "openai";
+        info.endpoint_path = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_account_, 5));
+        info.auth_header = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_account_, 6));
+        if (info.auth_header.empty()) info.auth_header = "bearer";
         result = std::move(info);
     }
     sqlite3_reset(stmt_get_account_);

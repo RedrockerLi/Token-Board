@@ -39,6 +39,7 @@ public:
         std::string key_value;
         int account_id;
         std::string label;
+        std::string harness_format;  // "" = unset → fallback to account api_format (passthrough)
     };
     std::optional<KeyInfo> lookup_local_key(const std::string &key_value);
 
@@ -47,7 +48,9 @@ public:
         std::string name;
         std::string upstream_key;
         std::string base_url;
-        std::string api_format;
+        std::string api_format;      // "openai" | "openai_responses" | "anthropic"
+        std::string endpoint_path;   // "" = derive from api_format
+        std::string auth_header;     // "bearer" | "x-api-key"
     };
     std::optional<AccountInfo> get_account(int account_id);
 

@@ -20,6 +20,23 @@ set(PROXY_SOURCES
     src/upstream_client.cpp
     src/usage_tracker.cpp
     src/proxy_server.cpp
+    src/ir.cpp
+    src/codec.cpp
+    src/format_common.cpp
+    src/format_openai.cpp
+    src/format_anthropic.cpp
+    src/format_responses.cpp
+)
+
+# Format codec sources (no sqlite / http deps) — shared by the proxy and the
+# standalone conversion test.
+set(CODEC_SOURCES
+    src/ir.cpp
+    src/codec.cpp
+    src/format_common.cpp
+    src/format_openai.cpp
+    src/format_anthropic.cpp
+    src/format_responses.cpp
 )
 
 # ── Executable ───────────────────────────────────────────────────────────
@@ -43,6 +60,16 @@ target_link_libraries(token_proxy PRIVATE
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
+
+# ── Standalone format-conversion test ────────────────────────────────────
+add_executable(format_conv_test src/format_conv_test.cpp ${CODEC_SOURCES})
+
+target_include_directories(format_conv_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+)
+
+target_compile_features(format_conv_test PRIVATE cxx_std_17)
 
 # ── Compiler options ─────────────────────────────────────────────────────
 if(CMAKE_BUILD_TYPE STREQUAL "Release")

@@ -53,7 +53,14 @@ AI 工具                       代理                      上游 API
 
 ### 配置 AI 工具
 
-代理支持两种 API 格式：**OpenAI 兼容**（`/v1/chat/completions`）和 **Anthropic 兼容**（`/v1/messages`）。上游账户可配置为任一格式。
+代理支持三种 API 格式：**OpenAI 兼容**（`/v1/chat/completions`）、**OpenAI Responses**（`/v1/responses`）和 **Anthropic 兼容**（`/v1/messages`）。上游账户与 AI 工具（harness）均可配置为任意格式，代理在中间自动完成请求/响应格式转换（含流式与用量解析）。
+
+### 格式配置
+
+- **上游账户**（上游服务端格式）：添加/编辑账户时选择 `API 格式`（OpenAI / OpenAI Responses / Anthropic），并可自定义 `上游路径`（默认按格式自动推导，如 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`）与 `认证方式`（Bearer 或 x-api-key + anthropic-version）。
+- **本地密钥**（harness 客户端格式）：生成/编辑密钥时选择 `客户端格式`，即 AI 工具实际使用的格式；代理会把它转换为上游账户的格式。默认「与账户一致」= 透传。可粘贴示例请求由前端自动识别格式，辅助填写（路由始终以你填写的配置为准）。
+
+同一把密钥绑定 openai 账户时，Claude Code 也能通过它（客户端格式选 Anthropic，代理自动转换为 OpenAI 请求再转发）。
 
 ### OpenAI 兼容工具
 
@@ -107,7 +114,7 @@ export ANTHROPIC_AUTH_TOKEN=<在仪表板生成的本地密钥>
 
 数据来源：
 - **CSV 导入**：支持 DeepSeek、Mimo、BoardProxy 平台
-- **代理导出**：在费用报告页选择月份 → 点击「导出数据」，数据直接写入仪表板数据库，实时显示
+- **代理导出**：在费用报告页点击「导出数据」，未同步的用量自动聚合写入仪表板数据库，实时显示
 
 ### 费用报告
 
@@ -115,20 +122,27 @@ export ANTHROPIC_AUTH_TOKEN=<在仪表板生成的本地密钥>
 - **总 Token / 总请求数 / 总费用** 概览卡片
 - **按月费用趋势** 柱状图
 - **账户费用明细** 表格
-- **导出数据**：按月份将代理用量导出为 CSV，供仪表板展示
-- **同步数据**：通过 WebDAV 在多台电脑间同步用量记录
+- **导出数据**：将未同步的用量聚合写入仪表板数据库，并自动完成 WebDAV 云端同步（拉取 → 合并 → 上传）
+- **同步设置**：点击 **⚙** 配置 WebDAV 服务器，实现在多台电脑间同步配置与用量数据
 
 ### WebDAV 同步
 
-多台电脑使用代理时，可通过 WebDAV 同步用量数据：
+多台电脑共用代理时，可通过 WebDAV 同步配置与用量数据：
 
 1. 费用报告页 → 点击 **⚙** → 填写 WebDAV 服务器信息 → **测试连接** → **保存配置**
-2. 点击 **同步数据** 执行同步
+2. 点击 **导出数据** 执行完整同步（拉取云端最新 → 合并到本地 → 导出本地新用量 → 上传云端）
+
+同步采用**追加模式**：每次上传生成带时间戳的文件（如 `dashboard_sync_20260731_143025.db`），云端旧文件保留不删除；拉取时自动选择时间戳最新的文件。配置修改后约 3 秒自动上传，仪表板启动时自动从云端拉取配置合并到本地（本地已有配置优先）。
+
+同步内容：
+- **配置**：上游账户、本地密钥、模型映射模板、模型定价，跨机器自动同步
+- **用量数据**：按 日期 + 账户 + 模型 聚合后的 Token 用量与费用
 
 同步规则：
-- **本地数据库永远完整**，不做裁剪
-- 云端仅保存 **30 天内** 的 `request_log` + `model_pricing`
-- **上游账户、本地密钥、WebDAV 凭证绝不泄露到云端**
+- `request_log` 明细**仅存本地**，不直接上传；通过三态标记（未导出 / 已导出待上传 / 已确认上传）只导出聚合后的用量，不重不漏，云端上传成功后才确认，失败自动重试
+- 本地 `request_log` 只清理**已确认上传**的旧记录（最多保留 1 万条），未导出 / 待上传的记录绝不删除
+- 云端保留全部历史文件，不做裁剪
+- **绝不上传**：`request_log` 明细、性能指标（perf_events）、在途请求、WebDAV 账号密码
 
 ---
 
@@ -212,8 +226,7 @@ Token_Board/
 | `/api/proxy/billing/months` | GET | 可用月份列表 |
 | `/api/proxy/billing/by-account` | GET | 按账户费用明细 |
 | `/api/proxy/logs` | GET | 分页请求日志 |
-| `/api/proxy/export` | POST | 导出月份数据到 CSV |
-| `/api/proxy/sync` | POST | 触发 WebDAV 同步 |
+| `/api/proxy/export` | POST | 导出未同步用量到仪表板 + WebDAV 云端同步 |
 | `/api/proxy/sync/config` | GET/PUT | WebDAV 配置 |
 | `/api/proxy/sync/test` | POST | 测试 WebDAV 连接 |
 
@@ -222,10 +235,13 @@ Token_Board/
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/v1/chat/completions` | POST | OpenAI 兼容代理转发 |
+| `/v1/responses` | POST | OpenAI Responses 代理转发 |
 | `/v1/messages` | POST | Anthropic 兼容代理转发 |
 | `/v1/embeddings` | POST | 嵌入向量代理转发 |
 | `/v1/models` | GET | 模型列表代理 |
 | `/health` | GET | 代理健康检查 |
+
+> 三个 chat 端点共享同一条管线：客户端格式取密钥配置（未设置时与账户一致=透传），与上游格式不同时由代理自动转换。
 
 ---
 

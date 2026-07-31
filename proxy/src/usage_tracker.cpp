@@ -219,6 +219,95 @@ UsageTracker::parse_anthropic_usage_from_sse(const std::string &sse_data) {
     return info;
 }
 
+// ── parse_responses_usage ─────────────────────────────────────────────────
+
+std::optional<UsageTracker::UsageInfo>
+UsageTracker::parse_responses_usage(const std::string &body) {
+    try {
+        json j = json::parse(body);
+        UsageInfo info;
+        if (j.contains("model") && j["model"].is_string())
+            info.model = j["model"].get<std::string>();
+        if (j.contains("usage")) {
+            auto &u = j["usage"];
+            if (u.contains("input_tokens"))
+                info.prompt_tokens = u["input_tokens"].get<int>();
+            if (u.contains("output_tokens"))
+                info.completion_tokens = u["output_tokens"].get<int>();
+            if (u.contains("total_tokens"))
+                info.total_tokens = u["total_tokens"].get<int>();
+            else
+                info.total_tokens = info.prompt_tokens + info.completion_tokens;
+        }
+        if (info.total_tokens == 0)
+            info.total_tokens = info.prompt_tokens + info.completion_tokens;
+        return info;
+    } catch (const json::parse_error &e) {
+        fprintf(stderr, "[Tracker] Responses JSON parse error: %s\n", e.what());
+        return std::nullopt;
+    }
+}
+
+// ── parse_responses_usage_from_sse ────────────────────────────────────────
+
+std::optional<UsageTracker::UsageInfo>
+UsageTracker::parse_responses_usage_from_sse(const std::string &sse_data) {
+    UsageInfo info;
+    bool found_usage = false;
+    std::istringstream stream(sse_data);
+    std::string line;
+
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == ':') continue;
+        std::string json_str;
+        if (line.rfind("data: ", 0) == 0) json_str = line.substr(6);
+        else if (line.rfind("data:", 0) == 0) json_str = line.substr(5);
+        else continue;
+        try {
+            json j = json::parse(json_str);
+            if (info.model.empty() && j.contains("response") &&
+                j["response"].is_object() && j["response"].contains("model"))
+                info.model = j["response"]["model"].get<std::string>();
+            // Usage lives in response.completed / response.incomplete.
+            if ((j.contains("type") && (j["type"] == "response.completed" ||
+                                        j["type"] == "response.incomplete")) &&
+                j.contains("response") && j["response"].is_object() &&
+                j["response"].contains("usage")) {
+                auto &u = j["response"]["usage"];
+                if (u.contains("input_tokens"))
+                    info.prompt_tokens = u["input_tokens"].get<int>();
+                if (u.contains("output_tokens"))
+                    info.completion_tokens = u["output_tokens"].get<int>();
+                if (u.contains("total_tokens"))
+                    info.total_tokens = u["total_tokens"].get<int>();
+                else
+                    info.total_tokens = info.prompt_tokens + info.completion_tokens;
+                found_usage = true;
+            }
+        } catch (const json::parse_error &) {
+            // Skip malformed JSON lines silently
+        }
+    }
+
+    if (!found_usage) return std::nullopt;
+    if (info.total_tokens == 0)
+        info.total_tokens = info.prompt_tokens + info.completion_tokens;
+    return info;
+}
+
+// ── parse_stream_usage (dispatcher) ───────────────────────────────────────
+
+std::optional<UsageTracker::UsageInfo>
+UsageTracker::parse_stream_usage(const std::string &api_format,
+                                 const std::string &sse_data) {
+    if (api_format == "anthropic")
+        return parse_anthropic_usage_from_sse(sse_data);
+    if (api_format == "openai_responses")
+        return parse_responses_usage_from_sse(sse_data);
+    return parse_usage_from_sse(sse_data);
+}
+
 // ── log_request ──────────────────────────────────────────────────────────
 
 void UsageTracker::log_request(int account_id, int local_key_id,

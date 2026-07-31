@@ -15,3 +15,6 @@ data/dashboard.db-shm
 
 # C++ build artifacts
 proxy/build/
+
+# reference
+ref

@@ -86,6 +86,19 @@ class ProxyDatabase:
             model TEXT NOT NULL,
             is_streaming INTEGER NOT NULL DEFAULT 0,
             started_at TEXT NOT NULL DEFAULT (datetime('now')))""")
+        # ── Defensive column migrations (C++ proxy owns the canonical schema;
+        #    keep the dashboard usable if it connects before the proxy upgraded).
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table, col, ddl in (
+            ("upstream_accounts", "endpoint_path", "TEXT NOT NULL DEFAULT ''"),
+            ("upstream_accounts", "auth_header", "TEXT NOT NULL DEFAULT 'bearer'"),
+            ("local_keys", "harness_format", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if table in tables:
+                cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+        conn.commit()
 
         # ── Triggers: automatic cost computation from model_pricing ──────
         conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_request_log_insert
@@ -191,7 +204,9 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, name, upstream_key, base_url, api_format, created_at "
+                "SELECT id, name, upstream_key, base_url, api_format, "
+                "COALESCE(endpoint_path,'') AS endpoint_path, "
+                "COALESCE(auth_header,'bearer') AS auth_header, created_at "
                 "FROM upstream_accounts ORDER BY id"
             ).fetchall()
             return [dict(r) for r in rows]
@@ -202,13 +217,16 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             cursor = conn.execute(
-                "INSERT INTO upstream_accounts (name, upstream_key, base_url, api_format) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO upstream_accounts "
+                "(name, upstream_key, base_url, api_format, endpoint_path, auth_header) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     data["name"],
                     data["upstream_key"],
                     data.get("base_url", ""),
                     data.get("api_format", "openai"),
+                    data.get("endpoint_path", ""),
+                    data.get("auth_header", "bearer"),
                 ),
             )
             conn.commit()
@@ -222,7 +240,8 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("name", "upstream_key", "base_url", "api_format"):
+            for key in ("name", "upstream_key", "base_url", "api_format",
+                        "endpoint_path", "auth_header"):
                 if key in data:
                     fields.append(f"{key} = ?")
                     values.append(data[key])
@@ -442,7 +461,9 @@ class ProxyDatabase:
         try:
             rows = conn.execute(
                 "SELECT k.id, k.key_value, k.label, k.account_id, k.template_id, "
-                "a.name AS account_name, k.created_at, k.last_used_at "
+                "COALESCE(k.harness_format,'') AS harness_format, "
+                "a.name AS account_name, a.api_format AS account_format, "
+                "k.created_at, k.last_used_at "
                 "FROM local_keys k "
                 "LEFT JOIN upstream_accounts a ON k.account_id = a.id "
                 "ORDER BY k.id"
@@ -457,9 +478,10 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             conn.execute(
-                "INSERT INTO local_keys (key_value, label, account_id) "
-                "VALUES (?, ?, ?)",
-                (key_value, data.get("label", ""), data["account_id"]),
+                "INSERT INTO local_keys (key_value, label, account_id, harness_format) "
+                "VALUES (?, ?, ?, ?)",
+                (key_value, data.get("label", ""), data["account_id"],
+                 data.get("harness_format", "")),
             )
             conn.commit()
             self._schedule_config_sync()
@@ -472,7 +494,7 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("label", "account_id", "template_id"):
+            for key in ("label", "account_id", "template_id", "harness_format"):
                 if key in data:
                     fields.append(f"{key} = ?")
                     values.append(data[key])

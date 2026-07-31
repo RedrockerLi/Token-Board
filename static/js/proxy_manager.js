@@ -72,7 +72,7 @@ async function loadAccountsTable() {
                 <td>${esc(a.name)}</td>
                 <td><code>${esc(maskKey(a.upstream_key))}</code></td>
                 <td>${esc(a.base_url)}</td>
-                <td>${esc(a.api_format === 'anthropic' ? 'Anthropic' : 'OpenAI')}</td>
+                <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
                 <td>${esc(a.created_at || '')}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
@@ -94,7 +94,14 @@ async function saveAccount(e) {
         if (id) {
             await proxyFetch(`/api/proxy/accounts/${id}`, {
                 method: 'PUT',
-                body: JSON.stringify({ name: data.name, upstream_key: data.upstream_key, base_url: data.base_url, api_format: data.api_format }),
+                body: JSON.stringify({
+                    name: data.name,
+                    upstream_key: data.upstream_key,
+                    base_url: data.base_url,
+                    api_format: data.api_format,
+                    endpoint_path: data.endpoint_path || '',
+                    auth_header: data.auth_header || 'bearer',
+                }),
             });
             showToast('账户已更新');
         } else {
@@ -125,6 +132,8 @@ function editAccount(id) {
         form['upstream_key'].value = acc.upstream_key;
         form['base_url'].value = acc.base_url;
         form['api_format'].value = acc.api_format || 'openai';
+        form['endpoint_path'].value = acc.endpoint_path || '';
+        form['auth_header'].value = acc.auth_header || 'bearer';
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
@@ -165,7 +174,7 @@ function initAccountsPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">上游账户管理</h1>
-            <p class="page-subtitle">支持 OpenAI 兼容 / Anthropic 兼容 的上游服务</p>
+            <p class="page-subtitle">支持 OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 的上游服务</p>
             <button class="btn btn--primary" onclick="openModal('accountModal')">+ 添加账户</button>
         </div>
         <table class="mgmt-table" id="accountsTable">
@@ -185,7 +194,17 @@ function initAccountsPage() {
                     <label>API 格式
                         <select name="api_format">
                             <option value="openai">OpenAI 兼容</option>
+                            <option value="openai_responses">OpenAI Responses</option>
                             <option value="anthropic">Anthropic 兼容</option>
+                        </select>
+                    </label>
+                    <label>上游路径（可选）
+                        <input name="endpoint_path" placeholder="留空自动推导，如 /v1/messages 或 /responses">
+                    </label>
+                    <label>认证方式
+                        <select name="auth_header">
+                            <option value="bearer">Authorization: Bearer</option>
+                            <option value="x-api-key">x-api-key + anthropic-version</option>
                         </select>
                     </label>
                     <div style="display:flex; gap:8px;">
@@ -205,18 +224,20 @@ function initAccountsPage() {
 async function loadKeysTable() {
     const tbody = document.querySelector('#keysTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="td-loading">加载中...</td></tr>';
     try {
         const keys = await proxyFetch('/api/proxy/keys');
         if (!keys.length) {
-            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无密钥，请点击"生成密钥"</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="7" class="td-empty">暂无密钥，请点击"生成密钥"</td></tr>';
             return;
         }
+        const fmtNames = {openai: 'OpenAI', openai_responses: 'Responses', anthropic: 'Anthropic'};
         tbody.innerHTML = keys.map((k) => `
             <tr>
                 <td><code class="key-display" title="${esc(k.key_value)}">${esc(k.key_masked)}</code> <button class="btn btn--sm" onclick="copyKey('${esc(k.key_value)}')">复制</button></td>
                 <td>${esc(k.label || '-')}</td>
                 <td>${esc(k.account_name || `ID:${k.account_id}`)}</td>
+                <td>${k.harness_format ? esc(fmtNames[k.harness_format] || k.harness_format) : '与账户一致'}</td>
                 <td>${esc(k.last_used_at || '从未使用')}</td>
                 <td>${esc(k.created_at || '')}</td>
                 <td>
@@ -226,7 +247,7 @@ async function loadKeysTable() {
             </tr>
         `).join('');
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="6" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -287,6 +308,7 @@ async function openEditKeyModal(id) {
         ).join('');
 
         document.getElementById('editKeyId').value = id;
+        document.getElementById('editKeyHarnessFormat').value = key.harness_format || '';
         openModal('editKeyModal');
     } catch (err) {
         showToast(err.message, 'error');
@@ -376,12 +398,14 @@ async function saveKeyEdit(e) {
     const label = form['label'].value;
     const accountId = parseInt(form['account_id'].value);
     const templateId = form['template_id'].value ? parseInt(form['template_id'].value) : null;
+    const harnessFormat = form['harness_format'].value || '';
 
     try {
         const data = {};
         if (label) data.label = label;
         data.account_id = accountId;
         data.template_id = templateId;
+        data.harness_format = harnessFormat;
         await proxyFetch(`/api/proxy/keys/${id}`, { method: 'PUT', body: JSON.stringify(data) });
         showToast('密钥已更新');
         closeModal('editKeyModal');
@@ -391,12 +415,44 @@ async function saveKeyEdit(e) {
     }
 }
 
+/// Inspect a sample request body to guess the harness format (frontend helper
+/// only — routing always uses the user's explicit selection).
+function detectKeyFormat(textareaId, selectId) {
+    const sample = document.getElementById(textareaId).value.trim();
+    if (!sample) { showToast('请先粘贴示例请求', 'error'); return; }
+    let j;
+    try { j = JSON.parse(sample); } catch (e) { showToast('不是合法 JSON', 'error'); return; }
+    let fmt = '';
+    if (j && typeof j === 'object') {
+        if (Array.isArray(j.messages)) fmt = 'openai';
+        else if (typeof j.input === 'string' || Array.isArray(j.input) || typeof j.instructions === 'string') fmt = 'openai_responses';
+        else if (typeof j.system === 'string' || Array.isArray(j.system)) fmt = 'anthropic';
+    }
+    if (!fmt) { showToast('无法识别格式，请手动选择', 'error'); return; }
+    document.getElementById(selectId).value = fmt;
+    showToast(`已识别为 ${({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[fmt]}`);
+}
+
+/// Prefill the generate-key harness format from the selected account when the
+/// user hasn't chosen one manually.
+async function autoHarnessFromAccount() {
+    const sel = document.getElementById('keyAccountSelect');
+    const hsel = document.getElementById('keyHarnessSelect');
+    if (!sel || !hsel) return;
+    try {
+        const accounts = await proxyFetch('/api/proxy/accounts');
+        const acc = accounts.find(a => a.id == sel.value);
+        if (acc && !hsel.value) hsel.value = acc.api_format || '';
+    } catch (e) { /* ignore */ }
+}
+
 async function loadAccountOptions() {
     try {
         const accounts = await proxyFetch('/api/proxy/accounts');
         const sel = document.getElementById('keyAccountSelect');
         if (!sel) return;
         sel.innerHTML = accounts.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
+        await autoHarnessFromAccount();
     } catch (err) {
         console.error('Failed to load accounts:', err);
     }
@@ -418,7 +474,7 @@ function initKeysPage() {
             <div style="margin-top:6px;"><code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">OPENAI_BASE_URL = http://localhost:8800/v1</code></div>
         </div>
         <table class="mgmt-table" id="keysTable">
-            <thead><tr><th>密钥</th><th>标签</th><th>关联账户</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>
+            <thead><tr><th>密钥</th><th>标签</th><th>关联账户</th><th>客户端格式</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
 
@@ -431,7 +487,19 @@ function initKeysPage() {
                 </div>
                 <form id="keyForm" onsubmit="generateKey(event)">
                     <label>标签（可选）<input name="label" placeholder="例如: Claude Code"></label>
-                    <label>关联账户 <select name="account_id" id="keyAccountSelect" required></select></label>
+                    <label>关联账户 <select name="account_id" id="keyAccountSelect" required onchange="autoHarnessFromAccount()"></select></label>
+                    <label>客户端格式（AI 工具使用的格式，代理自动转换为上游格式）
+                        <select name="harness_format" id="keyHarnessSelect">
+                            <option value="">与账户一致（推荐）</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="openai_responses">OpenAI Responses</option>
+                            <option value="anthropic">Anthropic</option>
+                        </select>
+                    </label>
+                    <label>示例请求自动识别（辅助填写）
+                        <textarea id="keySampleBody" placeholder='粘贴一段 AI 工具的示例请求 JSON，例如 {"messages":[...]} 或 {"input":"..."}' style="width:100%; min-height:60px; font-size:12px;"></textarea>
+                    </label>
+                    <button type="button" class="btn btn--sm" onclick="detectKeyFormat('keySampleBody','keyHarnessSelect')">识别格式</button>
                     <button type="submit" class="btn btn--primary">生成密钥</button>
                 </form>
                 <div id="generatedKeyDisplay" style="display:none; margin-top:16px; padding:12px; background:#F0FDF4; border-radius:8px;">
@@ -453,6 +521,14 @@ function initKeysPage() {
                     <input type="hidden" name="id" id="editKeyId">
                     <label>标签 <input name="label" id="editKeyLabel" placeholder="例如: Claude Code"></label>
                     <label>关联账户 <select name="account_id" id="editKeyAccount"></select></label>
+                    <label>客户端格式（AI 工具使用的格式，代理自动转换为上游格式）
+                        <select name="harness_format" id="editKeyHarnessFormat">
+                            <option value="">与账户一致</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="openai_responses">OpenAI Responses</option>
+                            <option value="anthropic">Anthropic</option>
+                        </select>
+                    </label>
                     <label>模型映射模板 <select name="template_id" id="keyTemplateSelect"><option value="">不使用模板</option></select></label>
                     <button type="submit" class="btn btn--primary" style="margin-top:12px;">保存</button>
                 </form>
