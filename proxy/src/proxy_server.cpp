@@ -10,10 +10,12 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <poll.h>
+#include <sys/socket.h>
 #include <thread>
 
 using json = nlohmann::json;
@@ -48,14 +50,41 @@ static std::string json_error(const std::string &msg, int code) {
     return j.dump();
 }
 
-/// Exponential backoff delay for retry attempt N (1-based index).
-/// Attempt 1→2: 500ms, Attempt 2→3: 1500ms.
-static void retry_backoff(int attempt) {
-    if (attempt == 1) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    } else if (attempt >= 2) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    }
+/// Shared state for client-disconnect monitoring: the upstream socket fd is
+/// captured by `UpstreamClient::forward` via `on_socket`; the monitor thread
+/// shutdown()s it to unblock an in-flight upstream read once the client
+/// disconnects, so the pool thread is freed promptly instead of waiting out
+/// the full 300s read timeout.
+struct AbortGuard {
+    std::atomic<bool> running{false};
+    std::atomic<int> upstream_fd{-1};
+};
+
+/// Spawn a monitor thread that polls the client socket every 250ms.  When the
+/// client disconnects (POLLHUP/POLLERR/POLLRDHUP), shutdown() the upstream fd
+/// so the blocked upstream read returns immediately.  Returns a joinable
+/// thread; the caller must set running=false and join() after the upstream
+/// forward returns.
+static std::thread spawn_client_monitor(int client_sock, AbortGuard &g) {
+    g.running.store(true, std::memory_order_release);
+    return std::thread([&g, client_sock] {
+        while (g.running.load(std::memory_order_acquire)) {
+            struct pollfd pfd;
+            pfd.fd = client_sock;
+            // POLLRDHUP must be requested in events: for TCP a peer's FIN only
+            // surfaces as POLLIN (EOF) + POLLRDHUP, never POLLHUP — without it
+            // client disconnects would never be detected.
+            pfd.events = POLLIN | POLLRDHUP;
+            pfd.revents = 0;
+            int r = ::poll(&pfd, 1, 250);   // 250ms interval
+            if (r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP))) {
+                int fd = g.upstream_fd.load(std::memory_order_relaxed);
+                if (fd >= 0 && g.running.load(std::memory_order_acquire))
+                    ::shutdown(fd, SHUT_RDWR);   // unblock the upstream read
+                return;
+            }
+        }
+    });
 }
 
 /// Shell-style glob match: supports * (any chars) and ? (single char).
@@ -80,47 +109,6 @@ static bool glob_match(const std::string &pattern, const std::string &text) {
     }
     while (pi < pattern.size() && pattern[pi] == '*') ++pi;
     return pi == pattern.size();
-}
-
-/// Retry helper: calls `do_forward()` up to 3 times with exponential
-/// backoff and 4xx-aware early termination.  `is_streaming` controls the
-/// log label.  `should_abort` (streaming paths) stops the retry loop when the
-/// client has disconnected — otherwise a client-initiated abort (httplib
-/// "Connection handling canceled") is misread as a retryable 502 and the proxy
-/// re-sends the whole request 3x for a client that is already gone.  Returns
-/// the last ForwardResult with `retries` populated.
-template <typename F>
-static UpstreamClient::ForwardResult
-forward_with_retry(F &&do_forward, bool is_streaming,
-                   const std::function<bool()> &should_abort = {}) {
-    const char *label = is_streaming ? "streaming" : "non-streaming";
-    UpstreamClient::ForwardResult fwd;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0) {
-            fprintf(stderr, "[Proxy] Retry %d/3 for %s request "
-                            "(backoff %dms, last error: %s)\n",
-                    attempt + 1, label,
-                    attempt == 1 ? 500 : 1500,
-                    fwd.error.c_str());
-        }
-        fwd = do_forward();
-        fwd.retries = attempt;
-        if (fwd.success) break;
-        // Client disconnected mid-stream — stop retrying, don't re-send.
-        if (should_abort && should_abort()) {
-            fprintf(stderr, "[Proxy] Client gone, aborting retries for %s request\n",
-                    label);
-            break;
-        }
-        // Don't retry client errors (4xx)
-        if (!UpstreamClient::is_retryable(fwd.status_code)) {
-            fprintf(stderr, "[Proxy] Not retrying: status %d is a client error\n",
-                    fwd.status_code);
-            break;
-        }
-        retry_backoff(attempt);
-    }
-    return fwd;
 }
 
 // ── Auth / routing helpers ───────────────────────────────────────────────
@@ -325,7 +313,9 @@ static bool client_disconnected(const httplib::Request &req, int inflight_id,
     if (req.client_socket == INVALID_SOCKET) return false;
     struct pollfd pfd;
     pfd.fd = req.client_socket;
-    pfd.events = POLLIN;
+    // Same POLLRDHUP caveat as spawn_client_monitor: a peer's FIN surfaces
+    // as POLLIN|POLLRDHUP, never POLLHUP, and POLLRDHUP must be requested.
+    pfd.events = POLLIN | POLLRDHUP;
     pfd.revents = 0;
     if (poll(&pfd, 1, 0) > 0 &&
         (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP))) {
@@ -399,20 +389,18 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, route, target, body, content_type, model_copy, t0,
-             concurrent_count, inflight_id, think_filter, upstream_fmt](
+             concurrent_count, inflight_id, think_filter, upstream_fmt,
+             client_sock = req.client_socket](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
 
                 std::string accumulated;
                 bool first_response = true;
-                bool client_gone = false;  // sink.write failed → client disconnected
                 std::chrono::steady_clock::time_point t_first_resp;
                 ThinkStreamFilter filter;
                 bool has_reasoning = false;
 
                 auto write_to_sink = [&](const char *d, size_t n) -> bool {
-                    bool ok = sink.write(d, n);
-                    if (!ok) client_gone = true;
-                    return ok;
+                    return sink.write(d, n);
                 };
 
                 auto on_chunk = [&](const char *data, size_t len) -> bool {
@@ -431,16 +419,16 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
                     return true;
                 };
 
-                auto fwd = forward_with_retry(
-                    [&]() {
-                        accumulated.clear();
-                        first_response = true;
-                        return upstream_.forward(
-                            "POST", route.base_url, route.upstream_key,
-                            target.path, body, content_type, on_chunk, target.opts);
-                    },
-                    /*is_streaming=*/true,
-                    /*should_abort=*/[&]() { return client_gone; });
+                AbortGuard abort;
+                auto monitor = spawn_client_monitor(client_sock, abort);
+                auto fwd = upstream_.forward(
+                    "POST", route.base_url, route.upstream_key,
+                    target.path, body, content_type, on_chunk, target.opts,
+                    [&](int fd) {
+                        abort.upstream_fd.store(fd, std::memory_order_relaxed);
+                    });
+                abort.running.store(false, std::memory_order_release);
+                if (monitor.joinable()) monitor.join();
 
                 auto usage = UsageTracker::parse_stream_usage(upstream_fmt, fwd.body);
                 if (usage.has_value()) {
@@ -463,6 +451,11 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
                                         concurrent_count);
 
                 db_.request_end(inflight_id);
+                if (fwd.is_timeout) {
+                    fprintf(stderr, "[Proxy] Upstream timeout, disconnecting "
+                                    "client (inflight=%d)\n", inflight_id);
+                    return false;   // truncate SSE stream → connection drops
+                }
                 sink.done();
                 return true;
             },
@@ -471,20 +464,22 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
     }
 
     // ── Non-streaming path ──────────────────────────────────────────
-    auto fwd = forward_with_retry(
-        [&]() {
-            return upstream_.forward(
-                "POST", route.base_url, route.upstream_key,
-                target.path, body, content_type, nullptr, target.opts);
-        },
-        /*is_streaming=*/false);
+    AbortGuard abort;
+    auto monitor = spawn_client_monitor(req.client_socket, abort);
+    auto fwd = upstream_.forward(
+        "POST", route.base_url, route.upstream_key,
+        target.path, body, content_type, nullptr, target.opts,
+        [&](int fd) {
+            abort.upstream_fd.store(fd, std::memory_order_relaxed);
+        });
+    abort.running.store(false, std::memory_order_release);
+    if (monitor.joinable()) monitor.join();
 
     if (client_disconnected(req, inflight_id, req_model)) {
         db_.request_end(inflight_id);
         return;
     }
 
-    res.set_header("X-Retry-Count", std::to_string(fwd.retries));
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
     auto usage = parse_usage_for_format(upstream_fmt, fwd.body);
@@ -515,8 +510,10 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
             res.set_content(fwd.body, "application/json");
         res.status = fwd.status_code;
     } else {
-        res.status = 502;
-        res.set_content(json_error("Upstream error: " + fwd.error, 502),
+        res.status = fwd.status_code;
+        if (fwd.is_timeout) res.set_header("Connection", "close");
+        res.set_content(json_error("Upstream error: " + fwd.error,
+                                   fwd.status_code),
                         "application/json");
     }
 }
@@ -578,7 +575,8 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, route, target, upstream_body, model_copy, upstream_fmt, t0,
-             concurrent_count, inflight_id, harness_codec_ptr, upstream_codec_ptr](
+             concurrent_count, inflight_id, harness_codec_ptr, upstream_codec_ptr,
+             client_sock = req.client_socket](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
 
                 auto parser = upstream_codec_ptr->make_stream_parser();
@@ -586,13 +584,10 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
                 ir::Usage last_usage;
                 std::string accumulated;
                 bool first_response = true;
-                bool client_gone = false;  // sink.write failed → client disconnected
                 std::chrono::steady_clock::time_point t_first_resp;
 
                 auto sink_bridge = [&](const std::string &c) -> bool {
-                    bool ok = sink.write(c.data(), c.size());
-                    if (!ok) client_gone = true;
-                    return ok;
+                    return sink.write(c.data(), c.size());
                 };
                 auto on_event = [&](const ir::StreamEvent &ev) -> bool {
                     if (ev.type == ir::StreamEventType::UsageEvent)
@@ -608,19 +603,19 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
                     return parser->feed(data, len, on_event);
                 };
 
-                auto fwd = forward_with_retry(
-                    [&]() {
-                        accumulated.clear();
-                        first_response = true;
-                        return upstream_.forward(
-                            "POST", route.base_url, route.upstream_key,
-                            target.path, upstream_body, "application/json",
-                            on_chunk, target.opts);
-                    },
-                    /*is_streaming=*/true,
-                    /*should_abort=*/[&]() { return client_gone; });
+                AbortGuard abort;
+                auto monitor = spawn_client_monitor(client_sock, abort);
+                auto fwd = upstream_.forward(
+                    "POST", route.base_url, route.upstream_key,
+                    target.path, upstream_body, "application/json",
+                    on_chunk, target.opts,
+                    [&](int fd) {
+                        abort.upstream_fd.store(fd, std::memory_order_relaxed);
+                    });
+                abort.running.store(false, std::memory_order_release);
+                if (monitor.joinable()) monitor.join();
 
-                if (fwd.status_code >= 400 || !fwd.success) {
+                if ((fwd.status_code >= 400 || !fwd.success) && !fwd.is_timeout) {
                     ir::StreamEvent err_ev;
                     err_ev.type = ir::StreamEventType::ErrorEvent;
                     json normalized;
@@ -664,6 +659,11 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
                                         concurrent_count);
 
                 db_.request_end(inflight_id);
+                if (fwd.is_timeout) {
+                    fprintf(stderr, "[Proxy] Upstream timeout, disconnecting "
+                                    "client (inflight=%d)\n", inflight_id);
+                    return false;   // truncate SSE stream → connection drops
+                }
                 sink.done();
                 return true;
             },
@@ -672,20 +672,22 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
     }
 
     // ── Non-streaming path ──────────────────────────────────────────
-    auto fwd = forward_with_retry(
-        [&]() {
-            return upstream_.forward(
-                "POST", route.base_url, route.upstream_key,
-                target.path, upstream_body, "application/json", nullptr, target.opts);
-        },
-        /*is_streaming=*/false);
+    AbortGuard abort;
+    auto monitor = spawn_client_monitor(req.client_socket, abort);
+    auto fwd = upstream_.forward(
+        "POST", route.base_url, route.upstream_key,
+        target.path, upstream_body, "application/json", nullptr, target.opts,
+        [&](int fd) {
+            abort.upstream_fd.store(fd, std::memory_order_relaxed);
+        });
+    abort.running.store(false, std::memory_order_release);
+    if (monitor.joinable()) monitor.join();
 
     if (client_disconnected(req, inflight_id, model_copy)) {
         db_.request_end(inflight_id);
         return;
     }
 
-    res.set_header("X-Retry-Count", std::to_string(fwd.retries));
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
     if (fwd.success && fwd.status_code >= 200 && fwd.status_code < 300) {
@@ -720,6 +722,7 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
             normalized = json{{"message", fwd.error.empty() ? "upstream error" : fwd.error}};
         }
         res.status = (fwd.status_code >= 400) ? fwd.status_code : 502;
+        if (fwd.is_timeout) res.set_header("Connection", "close");
         res.set_content(harness_codec.serialize_error_body(normalized).dump(),
                         "application/json");
     }
@@ -760,15 +763,10 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         return;
     }
 
-    auto fwd = forward_with_retry(
-        [&]() {
-            return upstream_.forward("GET", ar.route.base_url,
-                                     ar.route.upstream_key,
-                                     "/models", "", "application/json", nullptr);
-        },
-        /*is_streaming=*/false);
+    auto fwd = upstream_.forward("GET", ar.route.base_url,
+                                 ar.route.upstream_key,
+                                 "/models", "", "application/json", nullptr);
 
-    res.set_header("X-Retry-Count", std::to_string(fwd.retries));
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
     if (fwd.success) {
@@ -799,8 +797,10 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
             res.set_content(fwd.body, "application/json");
         }
     } else {
-        res.status = 502;
-        res.set_content(json_error("Upstream error: " + fwd.error, 502),
+        res.status = fwd.status_code;
+        if (fwd.is_timeout) res.set_header("Connection", "close");
+        res.set_content(json_error("Upstream error: " + fwd.error,
+                                   fwd.status_code),
                         "application/json");
     }
 }
@@ -845,13 +845,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
             req_model.c_str(), concurrent_count, inflight_id);
 
     // ── Forward ──
-    auto fwd = forward_with_retry(
-        [&]() {
-            return upstream_.forward(
-                "POST", ar.route.base_url, ar.route.upstream_key,
-                "/embeddings", body, content_type, nullptr);
-        },
-        /*is_streaming=*/false);
+    auto fwd = upstream_.forward(
+        "POST", ar.route.base_url, ar.route.upstream_key,
+        "/embeddings", body, content_type, nullptr);
 
     // ── Check if client disconnected while waiting for upstream ──
     if (req.client_socket != INVALID_SOCKET) {
@@ -868,7 +864,6 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         }
     }
 
-    res.set_header("X-Retry-Count", std::to_string(fwd.retries));
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
     // Parse usage
@@ -900,9 +895,10 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         res.status = fwd.status_code;
         res.set_content(fwd.body, "application/json");
     } else {
-        res.status = 502;
+        res.status = fwd.status_code;
+        if (fwd.is_timeout) res.set_header("Connection", "close");
         res.set_content(
-            json_error("Upstream error: " + fwd.error, 502),
+            json_error("Upstream error: " + fwd.error, fwd.status_code),
             "application/json");
     }
 }

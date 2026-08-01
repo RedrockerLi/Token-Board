@@ -43,6 +43,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG_FILE = "/tmp/mock_upstream.log"
@@ -119,6 +120,12 @@ class Handler(BaseHTTPRequestHandler):
         status = req.get("mock_status", 200)
         if req.get("model") == "trigger-error":
             status = 400  # model-based trigger survives format conversion
+
+        # Hold the connection open before responding — lets tests exercise the
+        # proxy's upstream read timeout / client-disconnect abort.
+        delay = req.get("mock_delay", 0)
+        if delay:
+            time.sleep(delay)
 
         log({
             "path": self.path,

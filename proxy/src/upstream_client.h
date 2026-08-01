@@ -20,16 +20,11 @@ public:
         int status_code = 0;
         std::string body;    // full response body (for non-streaming)
         bool success = false;
+        bool is_timeout = false;  // true: upstream read timed out / stream interrupted
         std::string error;
         int duration_ms = 0;  // total upstream call time (streaming: until stream ends)
         int ttft_ms = 0;      // time-to-first-token (streaming: first chunk; non-streaming: =duration_ms)
-        int retries = 0;      // number of retries performed (0 = first attempt succeeded)
     };
-
-    /// Returns true if the status code is safe to retry.
-    /// 4xx errors are client mistakes — retrying won't help.
-    /// 5xx / network errors / timeouts are candidates for retry.
-    static bool is_retryable(int status_code);
 
     /// Forward a request to the upstream API.
     ///
@@ -37,6 +32,11 @@ public:
     /// to the callback as it arrives (SSE streaming).  The full body is
     /// still accumulated and returned in `ForwardResult::body` for later
     /// usage parsing.
+    ///
+    /// If `on_socket` is provided, it is invoked with the upstream socket fd
+    /// once the connection is established — the caller can `shutdown()` it
+    /// from another thread to unblock an in-flight read (e.g. on client
+    /// disconnect).
     ForwardResult forward(const std::string &method,
                           const std::string &base_url,
                           const std::string &upstream_key,
@@ -44,5 +44,6 @@ public:
                           const std::string &body,
                           const std::string &content_type,
                           std::function<bool(const char *, size_t)> on_chunk,
-                          const ForwardOptions &opts = ForwardOptions{});
+                          const ForwardOptions &opts = ForwardOptions{},
+                          std::function<void(int)> on_socket = {});
 };
