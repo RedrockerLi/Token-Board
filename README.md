@@ -78,8 +78,6 @@ export ANTHROPIC_BASE_URL=http://localhost:8800/v1
 export ANTHROPIC_AUTH_TOKEN=<在仪表板生成的本地密钥>
 ```
 
-> 上游账户需设置为 **API 格式: Anthropic 兼容**（如 DeepSeek 的 `https://api.deepseek.com/anthropic` 端点）。代理会根据账户配置自动选择正确的上游路径和用量解析方式。
-
 ### 配置流程
 
 1. 打开仪表板 → 侧边栏 **代理管理 → 上游账户** → 添加账户（填写上游 API 的 Base URL 和 Key）
@@ -145,54 +143,6 @@ export ANTHROPIC_AUTH_TOKEN=<在仪表板生成的本地密钥>
 - **绝不上传**：`request_log` 明细、性能指标（perf_events）、在途请求、WebDAV 账号密码
 
 ---
-
-## 项目结构
-
-```
-Token_Board/
-├── proxy/                    # C++ 高性能代理
-│   ├── src/                  #   代理源码
-│   │   ├── main.cpp          #     入口
-│   │   ├── proxy_server.cpp  #     HTTP 服务 + 路由
-│   │   ├── upstream_client.cpp #   上游转发
-│   │   ├── router.cpp        #     密钥路由
-│   │   ├── usage_tracker.cpp #     用量记录
-│   │   ├── db.cpp            #     SQLite 访问
-│   │   ├── config.cpp        #     CLI 参数
-│   │   └── model_pricing.cpp #     费用计算
-│   ├── third_party/          #   第三方头文件
-│   └── CMakeLists.txt
-├── app/                      # Python 仪表板后端
-│   ├── ir.py                 #   中间表示 (IR) 数据模型
-│   ├── adapters/             #   平台适配器（CSV → IR）
-│   │   ├── deepseek.py
-│   │   └── mimo.py
-│   ├── data_loader.py        #   数据扫描和加载
-│   ├── cost_allocator.py     #   按比例分摊费用
-│   ├── routes.py             #   仪表板 API
-│   ├── proxy_routes.py       #   代理管理 API
-│   ├── proxy_db.py           #   代理数据库访问
-│   ├── sync.py               #   WebDAV 云端同步
-│   └── config.py
-├── static/                   # 前端
-│   ├── js/
-│   │   ├── app.js            #   SPA 路由 + 侧边栏
-│   │   ├── api.js            #   HTTP 通信
-│   │   ├── charts.js         #   ECharts 渲染
-│   │   ├── dashboard.js      #   仪表板页面
-│   │   ├── proxy_billing.js  #   费用报告 + 日志
-│   │   └── proxy_manager.js  #   账户/密钥/定价管理
-│   └── css/
-│       └── dashboard.css
-├── templates/
-│   └── index.html
-├── data/                     # CSV 数据 + 代理数据库
-│   ├── deepseek/
-│   ├── mimo/
-│   └── proxy.db              #   代理 SQLite 数据库
-├── server.py                 # 仪表板入口
-└── start.sh                  # 一键启动
-```
 
 ## API 端点
 
