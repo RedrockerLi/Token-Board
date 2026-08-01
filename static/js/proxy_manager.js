@@ -100,7 +100,7 @@ async function saveAccount(e) {
                     base_url: data.base_url,
                     api_format: data.api_format,
                     endpoint_path: data.endpoint_path || '',
-                    auth_header: data.auth_header || 'bearer',
+                    auth_header: data.auth_header || 'auto',
                 }),
             });
             showToast('账户已更新');
@@ -133,7 +133,7 @@ function editAccount(id) {
         form['base_url'].value = acc.base_url;
         form['api_format'].value = acc.api_format || 'openai';
         form['endpoint_path'].value = acc.endpoint_path || '';
-        form['auth_header'].value = acc.auth_header || 'bearer';
+        form['auth_header'].value = acc.auth_header || 'auto';
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
@@ -203,6 +203,7 @@ function initAccountsPage() {
                     </label>
                     <label>认证方式
                         <select name="auth_header">
+                            <option value="auto">自动（按 API 格式推导）</option>
                             <option value="bearer">Authorization: Bearer</option>
                             <option value="x-api-key">x-api-key + anthropic-version</option>
                         </select>
@@ -358,8 +359,8 @@ function initKeysPage() {
         </div>
         <div style="margin-bottom:16px; padding:12px 16px; background:var(--color-surface, #F8FAFC); border:1px solid var(--color-border); border-radius:8px; font-size:13px; color:var(--color-text-tertiary);">
             <strong style="color:var(--color-text-secondary);">配置说明</strong>
-            <div style="margin-top:6px;">一把密钥同时支持三种客户端格式，代理根据请求 URL 自动识别并转换为上游格式：<code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">/v1/chat/completions</code>（OpenAI）、<code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">/v1/responses</code>（Responses）、<code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">/v1/messages</code>（Anthropic）。</div>
-            <div style="margin-top:6px;"><code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">OPENAI_BASE_URL = http://localhost:8800/v1</code>　<code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">ANTHROPIC_BASE_URL = http://localhost:8800/v1</code></div>
+            <div style="margin-top:6px;">一把密钥同时支持三种客户端格式，代理根据请求 URL 自动识别并转换为上游格式</div>
+            <div style="margin-top:6px;"><code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">BASE_URL = http://localhost:8800/v1</code></div>
         </div>
         <table class="mgmt-table" id="keysTable">
             <thead><tr><th>密钥</th><th>标签</th><th>关联账户</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>

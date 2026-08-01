@@ -429,6 +429,104 @@ static void test_anthropic_to_openai_tool_result_with_text(const CodecRegistry &
 }
 
 // Bug D: Anthropic tool_choice shapes → OpenAI equivalents.
+// Reasoning-vendor upstreams (DeepSeek/Moonshot/Kimi/Mimo) reject assistant
+// tool_calls messages that lack `reasoning_content` (opencode.ai "Console Go"
+// → 400).  Mirror cc-switch's preserve_reasoning_content: inject the message's
+// thinking text, or the "tool call" placeholder, only for such vendors.
+static void test_anthropic_to_openai_reasoning_content(const CodecRegistry &reg) {
+    printf("--- Anthropic→OpenAI reasoning_content on tool_calls ---\n");
+    const FormatCodec &ac = reg.get(ApiFormat::Anthropic);
+    const FormatCodec &oc = reg.get(ApiFormat::OpenAI);
+
+    const char *body = R"({
+      "model": "deepseek-v4-flash",
+      "max_tokens": 10,
+      "messages": [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": [
+          {"type": "thinking", "thinking": "need to run echo"},
+          {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "echo hi"}}]},
+        {"role": "user", "content": [
+          {"type": "tool_result", "tool_use_id": "toolu_1", "content": "hi"}]}
+      ],
+      "tools": [{"name": "Bash", "input_schema": {"type": "object"}}]
+    })";
+    ir::ChatRequest req;
+    std::string err;
+    if (!ac.parse_request(json::parse(body), req, err)) {
+        check(false, "rc: parse: " + err);
+        return;
+    }
+    json out = oc.serialize_request(req);
+    // Assistant tool_calls message gets the thinking text.
+    bool found_thinking_rc = false;
+    for (const auto &m : out["messages"]) {
+        if (m.value("role", "") == "assistant" && m.contains("tool_calls")) {
+            if (m.contains("reasoning_content") &&
+                m["reasoning_content"].get<std::string>() == "need to run echo")
+                found_thinking_rc = true;
+        }
+    }
+    check(found_thinking_rc, "rc: reasoning_content = thinking text on deepseek assistant");
+
+    // No thinking block → the "tool call" placeholder (deepseek still requires it).
+    const char *body2 = R"({
+      "model": "deepseek-v4-flash",
+      "max_tokens": 10,
+      "messages": [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": [
+          {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "echo hi"}}]},
+        {"role": "user", "content": [
+          {"type": "tool_result", "tool_use_id": "toolu_1", "content": "hi"}]}
+      ],
+      "tools": [{"name": "Bash", "input_schema": {"type": "object"}}]
+    })";
+    ir::ChatRequest req2;
+    if (!ac.parse_request(json::parse(body2), req2, err)) {
+        check(false, "rc2: parse: " + err);
+        return;
+    }
+    json out2 = oc.serialize_request(req2);
+    bool found_placeholder = false;
+    for (const auto &m : out2["messages"]) {
+        if (m.value("role", "") == "assistant" && m.contains("tool_calls")) {
+            if (m.contains("reasoning_content") &&
+                m["reasoning_content"].get<std::string>() == "tool call")
+                found_placeholder = true;
+        }
+    }
+    check(found_placeholder, "rc: reasoning_content = 'tool call' placeholder (no thinking)");
+
+    // Non-reasoning vendor must NOT get the placeholder injected (only thinking
+    // text when present).
+    const char *body3 = R"({
+      "model": "gpt-4o",
+      "max_tokens": 10,
+      "messages": [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": [
+          {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "echo hi"}}]},
+        {"role": "user", "content": [
+          {"type": "tool_result", "tool_use_id": "toolu_1", "content": "hi"}]}
+      ],
+      "tools": [{"name": "Bash", "input_schema": {"type": "object"}}]
+    })";
+    ir::ChatRequest req3;
+    if (!ac.parse_request(json::parse(body3), req3, err)) {
+        check(false, "rc3: parse: " + err);
+        return;
+    }
+    json out3 = oc.serialize_request(req3);
+    bool nonvendor_leaked = false;
+    for (const auto &m : out3["messages"]) {
+        if (m.value("role", "") == "assistant" && m.contains("tool_calls") &&
+            m.contains("reasoning_content"))
+            nonvendor_leaked = true;
+    }
+    check(!nonvendor_leaked, "rc: non-reasoning vendor not injected with placeholder");
+}
+
 static void test_anthropic_to_openai_tool_choice(const CodecRegistry &reg) {
     printf("--- Anthropic→OpenAI tool_choice ---\n");
     const FormatCodec &ac = reg.get(ApiFormat::Anthropic);
@@ -546,6 +644,7 @@ static int self_test() {
     test_openai_to_anthropic_stream_reasoning_then_text(reg);
     test_anthropic_to_openai_request_tool_result(reg);
     test_anthropic_to_openai_tool_result_with_text(reg);
+    test_anthropic_to_openai_reasoning_content(reg);
     test_anthropic_to_openai_tool_choice(reg);
     test_openai_to_anthropic_tool_choice(reg);
     test_strip_one_m_suffix(reg);

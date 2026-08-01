@@ -28,6 +28,15 @@ std::string strip_one_m_suffix_for_upstream(const std::string &model) {
     return model;
 }
 
+bool is_reasoning_vendor(const std::string &model) {
+    static const char *kHints[] = {"deepseek", "kimi", "moonshot", "mimo"};
+    std::string t = model;
+    for (char &c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (const char *h : kHints)
+        if (t.find(h) != std::string::npos) return true;
+    return false;
+}
+
 bool parse_data_uri(const std::string &uri, std::string &media_type,
                     std::string &b64) {
     static const char prefix[] = "data:";

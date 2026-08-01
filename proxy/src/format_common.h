@@ -50,6 +50,12 @@ json filter_keys(const json &src, std::initializer_list<const char *> keep);
 /// mirroring cc-switch's `strip_one_m_suffix_for_upstream`.
 std::string strip_one_m_suffix_for_upstream(const std::string &model);
 
+/// True if the model name suggests a reasoning-vendor upstream (DeepSeek,
+/// Moonshot/Kimi, Mimo, …).  Such upstreams require a `reasoning_content`
+/// field on assistant messages that carry `tool_calls`, otherwise they reject
+/// the request with a 400 — mirroring cc-switch's `preserve_reasoning_content`.
+bool is_reasoning_vendor(const std::string &model);
+
 /// Incremental SSE frame splitter.  Frames are separated by "\n\n" (LF) or
 /// "\r\n\r\n" (CRLF).  Emits complete frame bodies (sans the trailing blank
 /// line).  Safe because SSE payloads never contain a literal blank line.

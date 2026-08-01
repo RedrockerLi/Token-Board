@@ -84,10 +84,15 @@ static bool glob_match(const std::string &pattern, const std::string &text) {
 
 /// Retry helper: calls `do_forward()` up to 3 times with exponential
 /// backoff and 4xx-aware early termination.  `is_streaming` controls the
-/// log label.  Returns the last ForwardResult with `retries` populated.
+/// log label.  `should_abort` (streaming paths) stops the retry loop when the
+/// client has disconnected — otherwise a client-initiated abort (httplib
+/// "Connection handling canceled") is misread as a retryable 502 and the proxy
+/// re-sends the whole request 3x for a client that is already gone.  Returns
+/// the last ForwardResult with `retries` populated.
 template <typename F>
 static UpstreamClient::ForwardResult
-forward_with_retry(F &&do_forward, bool is_streaming) {
+forward_with_retry(F &&do_forward, bool is_streaming,
+                   const std::function<bool()> &should_abort = {}) {
     const char *label = is_streaming ? "streaming" : "non-streaming";
     UpstreamClient::ForwardResult fwd;
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -101,6 +106,12 @@ forward_with_retry(F &&do_forward, bool is_streaming) {
         fwd = do_forward();
         fwd.retries = attempt;
         if (fwd.success) break;
+        // Client disconnected mid-stream — stop retrying, don't re-send.
+        if (should_abort && should_abort()) {
+            fprintf(stderr, "[Proxy] Client gone, aborting retries for %s request\n",
+                    label);
+            break;
+        }
         // Don't retry client errors (4xx)
         if (!UpstreamClient::is_retryable(fwd.status_code)) {
             fprintf(stderr, "[Proxy] Not retrying: status %d is a client error\n",
@@ -165,12 +176,18 @@ static void resolve_upstream_path(const Router::RouteResult &route,
 static AuthResult extract_and_route(const httplib::Request &req,
                                      Router &router) {
     AuthResult ar;
-    std::string auth = req.has_header("Authorization")
-                          ? req.get_header_value("Authorization")
-                          : "";
     std::string local_key;
-    if (auth.rfind("Bearer ", 0) == 0)
-        local_key = auth.substr(7);
+    // Accept both `Authorization: Bearer <key>` (OpenAI clients, cc with
+    // ANTHROPIC_AUTH_TOKEN) and `x-api-key: <key>` (Anthropic SDK clients with
+    // ANTHROPIC_API_KEY).  The inbound scheme is irrelevant to routing — the
+    // key only selects the upstream account.
+    if (req.has_header("Authorization")) {
+        std::string auth = req.get_header_value("Authorization");
+        if (auth.rfind("Bearer ", 0) == 0)
+            local_key = auth.substr(7);
+    }
+    if (local_key.empty() && req.has_header("x-api-key"))
+        local_key = req.get_header_value("x-api-key");
 
     if (local_key.empty()) {
         ar.error_json = json_error("Missing API key. "
@@ -253,9 +270,16 @@ void ProxyServer::add_cors_headers(httplib::Response &res) {
 /// Each chat endpoint has a canonical wire format:
 ///   /v1/chat/completions → OpenAI, /v1/responses → OpenAI Responses,
 ///   /v1/messages → Anthropic.
+///
+/// A client whose base URL already ends in `/v1` (e.g.
+/// `ANTHROPIC_BASE_URL=http://host:8800/v1`) appends the endpoint again,
+/// producing `/v1/v1/messages`.  Tolerate that double `/v1` prefix (mirrors
+/// cc-switch, which registers `/v1/v1/chat/completions` etc.).
 static ir::ApiFormat harness_format_from_path(const std::string &path) {
-    if (path == "/v1/responses") return ir::ApiFormat::OpenAIResponses;
-    if (path == "/v1/messages") return ir::ApiFormat::Anthropic;
+    std::string p = path;
+    if (p.rfind("/v1/v1/", 0) == 0) p = p.substr(3);  // "/v1/v1/…" → "/v1/…"
+    if (p == "/v1/responses") return ir::ApiFormat::OpenAIResponses;
+    if (p == "/v1/messages") return ir::ApiFormat::Anthropic;
     return ir::ApiFormat::OpenAI;  // "/v1/chat/completions" (default)
 }
 
@@ -267,7 +291,15 @@ struct UpstreamTarget {
 static UpstreamTarget resolve_upstream_target(const Router::RouteResult &route) {
     UpstreamTarget t;
     resolve_upstream_path(route, t.path, t.opts.path_is_full);
-    t.opts.auth_scheme = route.auth_header;
+    // Outbound auth scheme: `auto` (the dashboard default) derives from the
+    // upstream wire format — Anthropic-native uses x-api-key + anthropic-version,
+    // everything else uses Authorization: Bearer.  Explicit `bearer` /
+    // `x-api-key` remain as overrides for relays that need them.
+    const std::string &ah = route.auth_header;
+    if (ah == "auto" || ah.empty())
+        t.opts.auth_scheme = (route.api_format == "anthropic") ? "x-api-key" : "bearer";
+    else
+        t.opts.auth_scheme = ah;
     return t;
 }
 
@@ -372,9 +404,16 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
 
                 std::string accumulated;
                 bool first_response = true;
+                bool client_gone = false;  // sink.write failed → client disconnected
                 std::chrono::steady_clock::time_point t_first_resp;
                 ThinkStreamFilter filter;
                 bool has_reasoning = false;
+
+                auto write_to_sink = [&](const char *d, size_t n) -> bool {
+                    bool ok = sink.write(d, n);
+                    if (!ok) client_gone = true;
+                    return ok;
+                };
 
                 auto on_chunk = [&](const char *data, size_t len) -> bool {
                     if (first_response) {
@@ -382,13 +421,13 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
                         first_response = false;
                     }
                     accumulated.append(data, len);
-                    if (!think_filter) return sink.write(data, len);
+                    if (!think_filter) return write_to_sink(data, len);
                     if (!has_reasoning && sse_chunk_has_reasoning(data, len))
                         has_reasoning = true;
-                    if (has_reasoning) return sink.write(data, len);
+                    if (has_reasoning) return write_to_sink(data, len);
                     std::string filtered = filter.feed(data, len);
                     if (!filtered.empty())
-                        return sink.write(filtered.data(), filtered.size());
+                        return write_to_sink(filtered.data(), filtered.size());
                     return true;
                 };
 
@@ -400,7 +439,8 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
                             "POST", route.base_url, route.upstream_key,
                             target.path, body, content_type, on_chunk, target.opts);
                     },
-                    /*is_streaming=*/true);
+                    /*is_streaming=*/true,
+                    /*should_abort=*/[&]() { return client_gone; });
 
                 auto usage = UsageTracker::parse_stream_usage(upstream_fmt, fwd.body);
                 if (usage.has_value()) {
@@ -546,10 +586,13 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
                 ir::Usage last_usage;
                 std::string accumulated;
                 bool first_response = true;
+                bool client_gone = false;  // sink.write failed → client disconnected
                 std::chrono::steady_clock::time_point t_first_resp;
 
                 auto sink_bridge = [&](const std::string &c) -> bool {
-                    return sink.write(c.data(), c.size());
+                    bool ok = sink.write(c.data(), c.size());
+                    if (!ok) client_gone = true;
+                    return ok;
                 };
                 auto on_event = [&](const ir::StreamEvent &ev) -> bool {
                     if (ev.type == ir::StreamEventType::UsageEvent)
@@ -574,7 +617,8 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
                             target.path, upstream_body, "application/json",
                             on_chunk, target.opts);
                     },
-                    /*is_streaming=*/true);
+                    /*is_streaming=*/true,
+                    /*should_abort=*/[&]() { return client_gone; });
 
                 if (fwd.status_code >= 400 || !fwd.success) {
                     ir::StreamEvent err_ev;
@@ -705,6 +749,17 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         return;
     }
 
+    // Claude Code (cc) validates its configured model name against /v1/models
+    // and refuses to start if it can't find it.  Like cc-switch, answer
+    // Anthropic clients with an empty catalog so any model — including the
+    // `[1m]`/`[1M]`-suffixed names the proxy strips before forwarding — is
+    // accepted by the client.
+    if (req.has_header("anthropic-version")) {
+        res.status = 200;
+        res.set_content("{\"models\":[]}", "application/json");
+        return;
+    }
+
     auto fwd = forward_with_retry(
         [&]() {
             return upstream_.forward("GET", ar.route.base_url,
@@ -717,8 +772,32 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
     if (fwd.success) {
-        res.status = fwd.status_code;
-        res.set_content(fwd.body, "application/json");
+        // OpenAI-compatible clients still get the real upstream list, but
+        // augmented with `[1m]`/`[1M]` aliases of every model so the proxy's
+        // supported names (which it strips before forwarding) also pass
+        // client-side validation.
+        try {
+            json j = json::parse(fwd.body);
+            if (j.contains("data") && j["data"].is_array()) {
+                json out = json::array();
+                for (auto &m : j["data"]) {
+                    if (m.is_object() && m.contains("id") && m["id"].is_string()) {
+                        std::string id = m["id"].get<std::string>();
+                        out.push_back(m);
+                        json a1 = m; a1["id"] = id + "[1m]"; out.push_back(a1);
+                        json a2 = m; a2["id"] = id + "[1M]"; out.push_back(a2);
+                    } else {
+                        out.push_back(m);
+                    }
+                }
+                j["data"] = std::move(out);
+            }
+            res.status = fwd.status_code;
+            res.set_content(j.dump(), "application/json");
+        } catch (...) {
+            res.status = fwd.status_code;
+            res.set_content(fwd.body, "application/json");
+        }
     } else {
         res.status = 502;
         res.set_content(json_error("Upstream error: " + fwd.error, 502),
@@ -841,6 +920,14 @@ void ProxyServer::setup_routes(httplib::Server &server) {
     server.Options("/v1/models", cors_handler);
     server.Options("/v1/messages", cors_handler);
     server.Options("/v1/responses", cors_handler);
+    // Double-/v1 aliases: a client whose ANTHROPIC_BASE_URL already ends in
+    // "/v1" appends the endpoint path again (e.g. "/v1/v1/messages"). Serve
+    // them so such clients work without reconfiguring the base URL.
+    server.Options("/v1/v1/chat/completions", cors_handler);
+    server.Options("/v1/v1/embeddings", cors_handler);
+    server.Options("/v1/v1/models", cors_handler);
+    server.Options("/v1/v1/messages", cors_handler);
+    server.Options("/v1/v1/responses", cors_handler);
 
     // The three chat endpoints share one format-agnostic pipeline.
     auto chat_handler = [this](const httplib::Request &req, httplib::Response &res) {
@@ -849,15 +936,26 @@ void ProxyServer::setup_routes(httplib::Server &server) {
     server.Post("/v1/chat/completions", chat_handler);
     server.Post("/v1/messages", chat_handler);
     server.Post("/v1/responses", chat_handler);
+    server.Post("/v1/v1/chat/completions", chat_handler);
+    server.Post("/v1/v1/messages", chat_handler);
+    server.Post("/v1/v1/responses", chat_handler);
 
     // Embedding endpoint
     server.Post("/v1/embeddings",
                 [this](const httplib::Request &req, httplib::Response &res) {
                     handle_embeddings(req, res);
                 });
+    server.Post("/v1/v1/embeddings",
+                [this](const httplib::Request &req, httplib::Response &res) {
+                    handle_embeddings(req, res);
+                });
 
     // Model listing
     server.Get("/v1/models",
+               [this](const httplib::Request &req, httplib::Response &res) {
+                   handle_list_models(req, res);
+               });
+    server.Get("/v1/v1/models",
                [this](const httplib::Request &req, httplib::Response &res) {
                    handle_list_models(req, res);
                });

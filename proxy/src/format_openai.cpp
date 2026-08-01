@@ -446,9 +446,18 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
         } else if (!parts.empty()) {
             jm["content"] = std::move(parts);
         }
-        if (has_tools && !tool_calls.empty())
+        bool has_tool_calls = has_tools && !tool_calls.empty();
+        if (has_tool_calls)
             jm["tool_calls"] = std::move(tool_calls);
-        if (!reasoning_text.empty())
+        // Reasoning-vendor upstreams (DeepSeek/Moonshot/Kimi/Mimo) reject
+        // assistant tool_calls messages that lack `reasoning_content`
+        // (opencode.ai "Console Go" → 400).  Mirror cc-switch's
+        // preserve_reasoning_content: use the message's thinking text when
+        // present, else the "tool call" placeholder.
+        if (m.role == "assistant" && has_tool_calls && fmt::is_reasoning_vendor(in.model))
+            jm["reasoning_content"] = reasoning_text.empty() ? "tool call"
+                                                             : reasoning_text;
+        else if (!reasoning_text.empty())
             jm["reasoning_content"] = reasoning_text;
         if (has_tools && parts.empty())
             jm["content"] = nullptr;  // explicit empty content for tool-only messages

@@ -710,7 +710,12 @@ private:
     bool emit_message_delta(const Sink &sink) {
         delta_emitted_ = true;
         json usage;
-        usage["input_tokens"] = last_usage_.prompt_tokens;
+        // Anthropic's input_tokens excludes cache hits (the three buckets are
+        // mutually exclusive) — mirror cc-switch's build_anthropic_usage_json:
+        // input = prompt - cache_read - cache_creation.
+        int input = last_usage_.prompt_tokens - last_usage_.cache_read_tokens
+                    - last_usage_.cache_creation_tokens;
+        usage["input_tokens"] = input < 0 ? 0 : input;
         usage["output_tokens"] = last_usage_.completion_tokens;
         usage["cache_read_input_tokens"] = last_usage_.cache_read_tokens;
         usage["cache_creation_input_tokens"] = last_usage_.cache_creation_tokens;
