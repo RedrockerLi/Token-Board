@@ -6,15 +6,6 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 
-// ── is_retryable ─────────────────────────────────────────────────────────
-
-bool UpstreamClient::is_retryable(int status_code) {
-    // 4xx: client error — retrying with the same request won't help
-    if (status_code >= 400 && status_code < 500) return false;
-    // 5xx / network errors (status_code == 0 or 502) are retryable
-    return true;
-}
-
 UpstreamClient::ForwardResult
 UpstreamClient::forward(const std::string &method,
                         const std::string &base_url,
@@ -23,7 +14,8 @@ UpstreamClient::forward(const std::string &method,
                         const std::string &body,
                         const std::string &content_type,
                         std::function<bool(const char *, size_t)> on_chunk,
-                        const ForwardOptions &opts) {
+                        const ForwardOptions &opts,
+                        std::function<void(int)> on_socket) {
     ForwardResult result;
     auto t0 = std::chrono::steady_clock::now();
 
@@ -58,6 +50,14 @@ UpstreamClient::forward(const std::string &method,
     cli.set_read_timeout(300, 0);        // 5 min read timeout (for long generations)
     cli.set_write_timeout(30, 0);
     cli.enable_server_certificate_verification(true);
+
+    // Expose the upstream socket fd so the caller can shutdown() it from a
+    // monitor thread to unblock an in-flight read (e.g. client disconnect).
+    if (on_socket) {
+        cli.set_socket_options([on_socket](int sock) {
+            on_socket(sock);
+        });
+    }
 
     // Build headers.  Anthropic-native upstreams use x-api-key instead of
     // Authorization: Bearer.
@@ -124,7 +124,9 @@ UpstreamClient::forward(const std::string &method,
             if (!result.success)
                 result.error = "Upstream returned " + std::to_string(upstream_res.status);
         } else {
-            result.status_code = 502;
+            result.is_timeout = (err == httplib::Error::ConnectionTimeout ||
+                                 err == httplib::Error::Read);
+            result.status_code = result.is_timeout ? 504 : 502;
             result.success = false;
             result.error = "Upstream request failed: " +
                            std::string(httplib::to_string(err));
@@ -150,7 +152,9 @@ UpstreamClient::forward(const std::string &method,
             if (!result.success)
                 result.error = "Upstream returned " + std::to_string(upstream_res->status);
         } else {
-            result.status_code = 502;
+            result.is_timeout = (upstream_res.error() == httplib::Error::ConnectionTimeout ||
+                                 upstream_res.error() == httplib::Error::Read);
+            result.status_code = result.is_timeout ? 504 : 502;
             result.success = false;
             result.error = "Upstream request failed: " +
                            std::string(httplib::to_string(upstream_res.error()));
