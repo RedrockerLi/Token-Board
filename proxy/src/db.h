@@ -39,7 +39,6 @@ public:
         std::string key_value;
         int account_id;
         std::string label;
-        std::string harness_format;  // "" = unset → fallback to account api_format (passthrough)
     };
     std::optional<KeyInfo> lookup_local_key(const std::string &key_value);
 

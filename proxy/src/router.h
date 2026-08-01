@@ -22,7 +22,6 @@ public:
         std::string upstream_key;
         std::string base_url;
         std::string api_format;      // "openai" | "openai_responses" | "anthropic"
-        std::string harness_format;  // "" = unset → fallback to api_format (passthrough)
         std::string endpoint_path;   // "" = derive from api_format
         std::string auth_header;     // "bearer" | "x-api-key"
         int account_id = 0;

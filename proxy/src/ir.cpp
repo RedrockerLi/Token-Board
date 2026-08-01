@@ -17,23 +17,6 @@ std::string to_string(ApiFormat f) {
     return "openai";
 }
 
-HarnessFormat parse_harness_format(const std::string &s) {
-    if (s == "openai") return HarnessFormat::OpenAI;
-    if (s == "openai_responses") return HarnessFormat::OpenAIResponses;
-    if (s == "anthropic") return HarnessFormat::Anthropic;
-    return HarnessFormat::Unset;  // "" or unknown → fall back to account format
-}
-
-std::string to_string(HarnessFormat f) {
-    switch (f) {
-        case HarnessFormat::OpenAI: return "openai";
-        case HarnessFormat::OpenAIResponses: return "openai_responses";
-        case HarnessFormat::Anthropic: return "anthropic";
-        case HarnessFormat::Unset: return "";
-    }
-    return "";
-}
-
 json merge_preserving(const json &extras, const json &generated) {
     json out = extras.is_object() ? extras : json::object();
     if (generated.is_object()) {

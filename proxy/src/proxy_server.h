@@ -22,10 +22,10 @@ struct Response;
 ///   POST /v1/responses          — OpenAI Responses proxy endpoint
 ///   GET  /health                — health-check
 ///
-/// The three chat endpoints share one pipeline: the harness format is taken
-/// from the local key config (explicit harness_format, else the account's
-/// api_format = passthrough), and converted to the account's upstream format
-/// via the codec registry when they differ.
+/// The three chat endpoints share one pipeline: the harness (client) format is
+/// derived from the incoming URL path (/v1/chat/completions → OpenAI,
+/// /v1/responses → Responses, /v1/messages → Anthropic), and converted to the
+/// account's upstream format via the codec registry when they differ.
 class ProxyServer {
 public:
     ProxyServer(Database &db, Router &router, UpstreamClient &upstream,

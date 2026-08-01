@@ -88,7 +88,6 @@ class ProxyDatabase:
         for table, col, ddl in (
             ("upstream_accounts", "endpoint_path", "TEXT NOT NULL DEFAULT ''"),
             ("upstream_accounts", "auth_header", "TEXT NOT NULL DEFAULT 'bearer'"),
-            ("local_keys", "harness_format", "TEXT NOT NULL DEFAULT ''"),
         ):
             if table in tables:
                 cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -409,7 +408,6 @@ class ProxyDatabase:
         try:
             rows = conn.execute(
                 "SELECT k.id, k.key_value, k.label, k.account_id, k.template_id, "
-                "COALESCE(k.harness_format,'') AS harness_format, "
                 "a.name AS account_name, a.api_format AS account_format, "
                 "k.created_at, k.last_used_at "
                 "FROM local_keys k "
@@ -426,10 +424,9 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             conn.execute(
-                "INSERT INTO local_keys (key_value, label, account_id, harness_format) "
-                "VALUES (?, ?, ?, ?)",
-                (key_value, data.get("label", ""), data["account_id"],
-                 data.get("harness_format", "")),
+                "INSERT INTO local_keys (key_value, label, account_id) "
+                "VALUES (?, ?, ?)",
+                (key_value, data.get("label", ""), data["account_id"]),
             )
             conn.commit()
             self._schedule_config_sync()
@@ -442,7 +439,7 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("label", "account_id", "template_id", "harness_format"):
+            for key in ("label", "account_id", "template_id"):
                 if key in data:
                     fields.append(f"{key} = ?")
                     values.append(data[key])

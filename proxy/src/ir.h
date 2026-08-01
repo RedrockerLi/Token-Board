@@ -20,12 +20,6 @@ enum class ApiFormat { OpenAI, OpenAIResponses, Anthropic };
 ApiFormat parse_api_format(const std::string &s);
 std::string to_string(ApiFormat f);
 
-/// Harness (client) side format.  Unset means "fall back to the account's
-/// api_format" (i.e. passthrough, the legacy behavior).
-enum class HarnessFormat { Unset, OpenAI, OpenAIResponses, Anthropic };
-HarnessFormat parse_harness_format(const std::string &s);
-std::string to_string(HarnessFormat f);
-
 enum class ContentKind { Text, Image, ToolUse, ToolResult, Thinking };
 enum class StopReason { Stop, Length, ToolUse, ContentFilter, Unknown };
 

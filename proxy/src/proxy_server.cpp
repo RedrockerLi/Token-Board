@@ -249,24 +249,14 @@ void ProxyServer::add_cors_headers(httplib::Response &res) {
 
 // ── Format resolution helpers ────────────────────────────────────────────
 
-/// Resolve the harness (client-side) format for a route.  Explicit key config
-/// wins (用户填写为准); unset → the account's api_format (passthrough).
-static ir::HarnessFormat resolve_harness_format(const Router::RouteResult &route) {
-    ir::HarnessFormat hf = ir::parse_harness_format(route.harness_format);
-    if (hf != ir::HarnessFormat::Unset) return hf;
-    switch (ir::parse_api_format(route.api_format)) {
-        case ir::ApiFormat::OpenAIResponses: return ir::HarnessFormat::OpenAIResponses;
-        case ir::ApiFormat::Anthropic: return ir::HarnessFormat::Anthropic;
-        default: return ir::HarnessFormat::OpenAI;
-    }
-}
-
-static ir::ApiFormat harness_to_api(ir::HarnessFormat hf) {
-    switch (hf) {
-        case ir::HarnessFormat::OpenAIResponses: return ir::ApiFormat::OpenAIResponses;
-        case ir::HarnessFormat::Anthropic: return ir::ApiFormat::Anthropic;
-        default: return ir::ApiFormat::OpenAI;
-    }
+/// Resolve the harness (client-side) format from the incoming request URL path.
+/// Each chat endpoint has a canonical wire format:
+///   /v1/chat/completions → OpenAI, /v1/responses → OpenAI Responses,
+///   /v1/messages → Anthropic.
+static ir::ApiFormat harness_format_from_path(const std::string &path) {
+    if (path == "/v1/responses") return ir::ApiFormat::OpenAIResponses;
+    if (path == "/v1/messages") return ir::ApiFormat::Anthropic;
+    return ir::ApiFormat::OpenAI;  // "/v1/chat/completions" (default)
 }
 
 /// Resolved upstream target (path + auth/path options) for a route.
@@ -317,8 +307,8 @@ static bool client_disconnected(const httplib::Request &req, int inflight_id,
 // ── handle_chat_request ──────────────────────────────────────────────────
 
 /// Entry point for /v1/chat/completions, /v1/messages and /v1/responses.
-/// The harness format comes from the local key config; when it matches the
-/// account's api_format we use the passthrough fast path, otherwise we
+/// The harness format comes from the incoming request URL path; when it matches
+/// the account's api_format we use the passthrough fast path, otherwise we
 /// convert via the IR codecs.
 void ProxyServer::handle_chat_request(const httplib::Request &req,
                                       httplib::Response &res) {
@@ -332,13 +322,13 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         return;
     }
 
-    ir::HarnessFormat hf = resolve_harness_format(ar.route);
+    ir::ApiFormat harness = harness_format_from_path(req.path);
     ir::ApiFormat upstream = ir::parse_api_format(ar.route.api_format);
 
-    if (harness_to_api(hf) == upstream) {
+    if (harness == upstream) {
         handle_passthrough(ar.route, upstream, req, res, t0);
     } else {
-        handle_converted(ar.route, harness_to_api(hf), upstream, req, res, t0);
+        handle_converted(ar.route, harness, upstream, req, res, t0);
     }
 }
 

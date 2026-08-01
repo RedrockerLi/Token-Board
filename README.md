@@ -58,9 +58,9 @@ AI 工具                       代理                      上游 API
 ### 格式配置
 
 - **上游账户**（上游服务端格式）：添加/编辑账户时选择 `API 格式`（OpenAI / OpenAI Responses / Anthropic），并可自定义 `上游路径`（默认按格式自动推导，如 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`）与 `认证方式`（Bearer 或 x-api-key + anthropic-version）。
-- **本地密钥**（harness 客户端格式）：生成/编辑密钥时选择 `客户端格式`，即 AI 工具实际使用的格式；代理会把它转换为上游账户的格式。默认「与账户一致」= 透传。可粘贴示例请求由前端自动识别格式，辅助填写（路由始终以你填写的配置为准）。
+- **本地密钥**：一把密钥同时支持全部三种客户端格式。客户端格式由请求的 URL 路径自动识别：`/v1/chat/completions` → OpenAI，`/v1/responses` → OpenAI Responses，`/v1/messages` → Anthropic。代理自动将客户端请求转换为上游账户的格式；与上游格式一致时直接透传。
 
-同一把密钥绑定 openai 账户时，Claude Code 也能通过它（客户端格式选 Anthropic，代理自动转换为 OpenAI 请求再转发）。
+同一把密钥绑定 openai 账户时，Claude Code 也能通过它（客户端访问 `/v1/messages`，代理自动转换为 OpenAI 请求再转发）。
 
 ### OpenAI 兼容工具
 
@@ -191,7 +191,7 @@ export ANTHROPIC_AUTH_TOKEN=<在仪表板生成的本地密钥>
 | `/v1/models` | GET | 模型列表代理 |
 | `/health` | GET | 代理健康检查 |
 
-> 三个 chat 端点共享同一条管线：客户端格式取密钥配置（未设置时与账户一致=透传），与上游格式不同时由代理自动转换。
+> 三个 chat 端点共享同一条管线：客户端格式由请求 URL 路径自动识别（`/v1/chat/completions` → OpenAI、`/v1/responses` → Responses、`/v1/messages` → Anthropic），与上游账户格式不同时由代理自动转换。
 
 ---
 

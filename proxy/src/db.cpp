@@ -292,19 +292,19 @@ void Database::create_schema() {
         }
     }
 
-    // v5: harness_format on local_keys — explicit harness (client-side) format;
-    //     empty string = fall back to account api_format (passthrough, legacy behavior)
-    if (!column_exists(db_, "local_keys", "harness_format")) {
-        char *e5 = nullptr;
+    // v6: remove harness_format from local_keys — the harness (client) format
+    //     is now derived from the incoming request URL path; the per-key
+    //     column is gone.  Fresh DBs never create it (migration v5 removed).
+    if (column_exists(db_, "local_keys", "harness_format")) {
+        char *e6 = nullptr;
         sqlite3_exec(db_,
-            "ALTER TABLE local_keys ADD COLUMN harness_format "
-            "TEXT NOT NULL DEFAULT ''",
-            nullptr, nullptr, &e5);
-        if (e5) {
-            fprintf(stderr, "[DB] Migration v5 error: %s\n", e5);
-            sqlite3_free(e5);
+            "ALTER TABLE local_keys DROP COLUMN harness_format",
+            nullptr, nullptr, &e6);
+        if (e6) {
+            fprintf(stderr, "[DB] Migration v6 error: %s\n", e6);
+            sqlite3_free(e6);
         } else {
-            fprintf(stderr, "[DB] Migration v5: added harness_format column\n");
+            fprintf(stderr, "[DB] Migration v6: dropped harness_format column\n");
         }
     }
 
@@ -322,7 +322,7 @@ void Database::prepare_statements() {
         } while (0)
 
     PREPARE("SELECT id, key_value, account_id, "
-            "COALESCE(label,''), COALESCE(harness_format,'') "
+            "COALESCE(label,'') "
             "FROM local_keys WHERE key_value = ?1",
             stmt_lookup_key_);
 
@@ -417,8 +417,6 @@ std::optional<Database::KeyInfo> Database::lookup_local_key(
         info.account_id = sqlite3_column_int(stmt_lookup_key_, 2);
         info.label = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_lookup_key_, 3));
-        info.harness_format = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_lookup_key_, 4));
         result = std::move(info);
     }
     sqlite3_reset(stmt_lookup_key_);
