@@ -94,20 +94,6 @@ def get_account_models(account_id):
     return jsonify(_proxy_db().get_account_models(account_id))
 
 
-# ── Key Model Map ─────────────────────────────────────────────────────
-
-@bp_proxy.route("/keys/<int:key_id>/model-map", methods=["PUT"])
-def update_key_model_map(key_id):
-    data = request.get_json(force=True)
-    count = _proxy_db().update_key_model_map(key_id, data.get("mappings", []))
-    return jsonify({"status": "ok", "count": count})
-
-
-@bp_proxy.route("/keys/<int:key_id>/model-map", methods=["GET"])
-def get_key_model_map(key_id):
-    return jsonify(_proxy_db().get_key_model_map(key_id))
-
-
 # ── Keys CRUD ──────────────────────────────────────────────────────────
 
 @bp_proxy.route("/keys", methods=["GET"])

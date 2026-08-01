@@ -1,5 +1,6 @@
 #include "proxy_server.h"
 #include "db.h"
+#include "format_common.h"
 #include "router.h"
 #include "think_filter.h"
 #include "upstream_client.h"
@@ -10,6 +11,7 @@
 #include "json.hpp"
 
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <poll.h>
 #include <thread>
@@ -57,7 +59,7 @@ static void retry_backoff(int attempt) {
 }
 
 /// Shell-style glob match: supports * (any chars) and ? (single char).
-/// Case-insensitive. Used for key_model_map pattern matching.
+/// Case-insensitive. Used for model-mapping-template pattern matching.
 static bool glob_match(const std::string &pattern, const std::string &text) {
     size_t pi = 0, mi = 0;
     size_t star_pos = std::string::npos;
@@ -188,9 +190,10 @@ static AuthResult extract_and_route(const httplib::Request &req,
 
 // ── Model-mapping helpers ────────────────────────────────────────────────
 
-/// Pure model lookup: template entries first, then per-key map.  Returns the
-/// mapped model or the input unchanged.  Used by the conversion pipeline
-/// (operates on the IR model) and by the passthrough path.
+/// Pure model lookup via the key's mapping template.  Returns the mapped model
+/// or the input unchanged.  Used by the conversion pipeline (operates on the IR
+/// model) and by the passthrough path.  Any `[1m]` context-window marker is
+/// stripped before forwarding (upstreams reject it).
 static std::string resolve_upstream_model(Database &db, int local_key_id,
                                           const std::string &req_model) {
     std::vector<Database::ModelMapping> mappings;
@@ -199,20 +202,16 @@ static std::string resolve_upstream_model(Database &db, int local_key_id,
         mappings = db.get_template_entries(template_id);
         fprintf(stderr, "[Proxy] Using template %d: %zu mapping(s)\n",
                 template_id, mappings.size());
-    } else {
-        mappings = db.get_key_model_mappings(local_key_id);
-        fprintf(stderr, "[Proxy] Got %zu model mappings for key_id=%d\n",
-                mappings.size(), local_key_id);
     }
     for (const auto &m : mappings) {
         if (glob_match(m.pattern, req_model)) {
             fprintf(stderr, "[Proxy] Model map: %s → %s (pattern: %s)\n",
                     req_model.c_str(), m.upstream_model.c_str(),
                     m.pattern.c_str());
-            return m.upstream_model;
+            return fmt::strip_one_m_suffix_for_upstream(m.upstream_model);
         }
     }
-    return req_model;
+    return fmt::strip_one_m_suffix_for_upstream(req_model);
 }
 
 /// Apply model mapping to a raw request body string (passthrough path).

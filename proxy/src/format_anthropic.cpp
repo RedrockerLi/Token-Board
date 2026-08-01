@@ -296,7 +296,7 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in) const {
     if (in.temperature.has_value()) body["temperature"] = *in.temperature;
     if (!in.stop_sequences.empty()) body["stop_sequences"] = in.stop_sequences;
     if (!in.tool_choice.is_null() && !in.tool_choice.empty())
-        body["tool_choice"] = in.tool_choice;
+        body["tool_choice"] = fmt::normalize_tool_choice_to_anthropic(in.tool_choice);
 
     if (!in.tools.empty()) {
         json arr = json::array();
@@ -558,41 +558,57 @@ public:
                 if (!started_) return emit_message_start(sink);
                 return true;
             case StreamEventType::ContentTextDelta:
+                if (ev.text.empty()) return true;  // suppress spurious empty fragments
                 if (!started_ && !emit_message_start(sink)) return false;
-                if (!block_started_.count(ev.index) &&
-                    !emit_block_start(sink, ev.index, "text", json{{"text", ""}})) return false;
+                if (!open_block(sink, ev.index, ContentKind::Text,
+                                json{{"type", "text"}, {"text", ""}})) return false;
                 return sink(frame("content_block_delta", json{
-                    {"type", "content_block_delta"}, {"index", ev.index},
+                    {"type", "content_block_delta"},
+                    {"index", open_blocks_[ev.index].anthro_index},
                     {"delta", {{"type", "text_delta"}, {"text", ev.text}}}}));
             case StreamEventType::ContentThinkingDelta:
+                if (ev.text.empty()) return true;  // suppress spurious empty fragments
                 if (!started_ && !emit_message_start(sink)) return false;
-                if (!block_started_.count(ev.index) &&
-                    !emit_block_start(sink, ev.index, "thinking", json{{"thinking", ""}})) return false;
+                if (!open_block(sink, ev.index, ContentKind::Thinking,
+                                json{{"type", "thinking"}, {"thinking", ""}})) return false;
                 return sink(frame("content_block_delta", json{
-                    {"type", "content_block_delta"}, {"index", ev.index},
+                    {"type", "content_block_delta"},
+                    {"index", open_blocks_[ev.index].anthro_index},
                     {"delta", {{"type", "thinking_delta"}, {"thinking", ev.text}}}}));
-            case StreamEventType::ToolCallStart:
+            case StreamEventType::ToolCallStart: {
                 if (!started_ && !emit_message_start(sink)) return false;
-                open_blocks_.insert(ev.index);
-                block_started_.insert(ev.index);
-                return sink(frame("content_block_start", json{
-                    {"type", "content_block_start"}, {"index", ev.index},
-                    {"content_block", {{"type", "tool_use"}, {"id", ev.text},
-                                       {"name", ev.arguments}, {"input", json::object()}}}}));
-            case StreamEventType::ToolCallArgumentDelta:
+                if (open_blocks_.count(ev.index) &&
+                    open_blocks_[ev.index].kind == ContentKind::ToolUse)
+                    return true;  // some providers repeat id+name — keep open block
+                if (!open_block(sink, ev.index, ContentKind::ToolUse, json{
+                        {"type", "tool_use"}, {"id", ev.text},
+                        {"name", ev.arguments}, {"input", json::object()}}))
+                    return false;
+                return true;
+            }
+            case StreamEventType::ToolCallArgumentDelta: {
+                auto it = open_blocks_.find(ev.index);
+                if (it == open_blocks_.end() || it->second.kind != ContentKind::ToolUse)
+                    return true;  // no open tool block — guard against ordering drift
                 return sink(frame("content_block_delta", json{
-                    {"type", "content_block_delta"}, {"index", ev.index},
-                    {"delta", {{"type", "input_json_delta"}, {"partial_json", ev.arguments}}}}));
+                    {"type", "content_block_delta"},
+                    {"index", it->second.anthro_index},
+                    {"delta", {{"type", "input_json_delta"},
+                               {"partial_json", ev.arguments}}}}));
+            }
             case StreamEventType::ToolCallDone:
-                open_blocks_.erase(ev.index);
-                return sink(frame("content_block_stop", json{
-                    {"type", "content_block_stop"}, {"index", ev.index}}));
+                return stop_block(sink, ev.index);
             case StreamEventType::MessageFinish:
+                seen_finish_ = true;
                 deferred_stop_ = fmt::stop_reason_to_anthropic(ev.stop_reason);
+                if (!started_ && !emit_message_start(sink)) return false;
                 return true;  // message_delta deferred until usage or finish
             case StreamEventType::UsageEvent:
                 last_usage_ = ev.usage;
-                if (!deferred_stop_.empty() && !delta_emitted_) {
+                if (!started_ && !emit_message_start(sink)) return false;
+                // Usage can arrive before finish_reason in the same final chunk;
+                // only emit message_delta once the real stop_reason is known.
+                if (seen_finish_ && !delta_emitted_) {
                     if (!close_open_blocks(sink)) return false;
                     if (!emit_message_delta(sink)) return false;
                 }
@@ -627,8 +643,13 @@ private:
     bool delta_emitted_ = false;
     std::string deferred_stop_ = "end_turn";
     Usage last_usage_;
-    std::set<int> block_started_;
-    std::set<int> open_blocks_;
+    struct OpenBlock {
+        int anthro_index = 0;
+        ContentKind kind = ContentKind::Text;
+    };
+    std::map<int, OpenBlock> open_blocks_;  // source index → open Anthropic block
+    int next_index_ = 0;                    // monotonically increasing Anthropic block index
+    bool seen_finish_ = false;              // a MessageFinish has been seen
 
     std::string frame(const std::string &event, const json &data) {
         return "event: " + event + "\ndata: " + data.dump() + "\n\n";
@@ -646,21 +667,40 @@ private:
         return sink(frame("message_start", json{{"type", "message_start"}, {"message", msg}}));
     }
 
-    bool emit_block_start(const Sink &sink, int index, const std::string &ctype,
-                          const json &extra) {
-        block_started_.insert(index);
-        open_blocks_.insert(index);
-        json cb;
-        cb["type"] = ctype;
-        for (auto it = extra.begin(); it != extra.end(); ++it)
-            cb[it.key()] = it.value();
+    // Open an Anthropic content block for source index `src_index`, assigning a
+    // fresh sequential block index (decoupled from the source event index so
+    // text/thinking/tool blocks sharing a source index don't collide).  If a
+    // block of a *different* kind is already open at that source index, close it
+    // first; a same-kind open block is kept.
+    bool open_block(const Sink &sink, int src_index, ContentKind kind,
+                    const json &content_block) {
+        auto it = open_blocks_.find(src_index);
+        if (it != open_blocks_.end()) {
+            if (it->second.kind == kind) return true;
+            if (!stop_block(sink, src_index)) return false;
+        }
+        int idx = next_index_++;
+        open_blocks_[src_index] = {idx, kind};
         return sink(frame("content_block_start", json{
-            {"type", "content_block_start"}, {"index", index}, {"content_block", cb}}));
+            {"type", "content_block_start"}, {"index", idx},
+            {"content_block", content_block}}));
+    }
+
+    // Close the block open at source index `src_index`, if any.  No-op when the
+    // index has no open block (e.g. a tool call that never emitted a start).
+    bool stop_block(const Sink &sink, int src_index) {
+        auto it = open_blocks_.find(src_index);
+        if (it == open_blocks_.end()) return true;
+        bool ok = sink(frame("content_block_stop", json{
+            {"type", "content_block_stop"}, {"index", it->second.anthro_index}}));
+        open_blocks_.erase(it);
+        return ok;
     }
 
     bool close_open_blocks(const Sink &sink) {
-        for (int idx : open_blocks_) {
-            if (!sink(frame("content_block_stop", json{{"type", "content_block_stop"}, {"index", idx}})))
+        for (auto &kv : open_blocks_) {
+            if (!sink(frame("content_block_stop", json{
+                    {"type", "content_block_stop"}, {"index", kv.second.anthro_index}})))
                 return false;
         }
         open_blocks_.clear();

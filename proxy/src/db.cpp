@@ -132,13 +132,7 @@ void Database::create_schema() {
             UNIQUE(account_id, model_id)
         );
 
-        CREATE TABLE IF NOT EXISTS key_model_map (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id          INTEGER NOT NULL REFERENCES local_keys(id),
-            pattern         TEXT NOT NULL,
-            upstream_model  TEXT NOT NULL,
-            UNIQUE(key_id, pattern)
-        );
+        DROP TABLE IF EXISTS key_model_map;  -- legacy per-key model mapping (removed)
 
         CREATE TABLE IF NOT EXISTS model_map_templates (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -344,10 +338,6 @@ void Database::prepare_statements() {
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             stmt_insert_log_);
 
-    PREPARE("SELECT pattern, upstream_model FROM key_model_map "
-            "WHERE key_id = ?1 ORDER BY id",
-            stmt_get_key_mappings_);
-
     PREPARE("SELECT template_id FROM local_keys WHERE id = ?1",
             stmt_get_key_template_);
 
@@ -395,7 +385,6 @@ void Database::finalize_statements() {
     FINALIZE(stmt_lookup_key_);
     FINALIZE(stmt_get_account_);
     FINALIZE(stmt_insert_log_);
-    FINALIZE(stmt_get_key_mappings_);
     FINALIZE(stmt_get_key_template_);
     FINALIZE(stmt_get_template_entries_);
     FINALIZE(stmt_get_pricing_);
@@ -539,26 +528,6 @@ std::vector<Database::ModelMapping> Database::get_template_entries(int template_
         result.push_back(m);
     }
     sqlite3_reset(stmt_get_template_entries_);
-    return result;
-}
-
-// ── get_key_model_mappings ──────────────────────────────────────────────
-
-std::vector<Database::ModelMapping> Database::get_key_model_mappings(int key_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<ModelMapping> result;
-    sqlite3_reset(stmt_get_key_mappings_);
-    sqlite3_bind_int(stmt_get_key_mappings_, 1, key_id);
-
-    while (sqlite3_step(stmt_get_key_mappings_) == SQLITE_ROW) {
-        ModelMapping m;
-        m.pattern = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_key_mappings_, 0));
-        m.upstream_model = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_key_mappings_, 1));
-        result.push_back(m);
-    }
-    sqlite3_reset(stmt_get_key_mappings_);
     return result;
 }
 

@@ -95,7 +95,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            for c in self._stream_chunks(fmt, model):
+            chunks = self._stream_chunks(fmt, model, req)
+            for c in chunks:
                 if isinstance(c, str):
                     c = c.encode()
                 # Proper HTTP/1.1 chunk framing.
@@ -115,7 +116,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _stream_chunks(self, fmt, model):
+    def _stream_chunks(self, fmt, model, req=None):
+        req = req or {}
+        # Tool-call stream (only for the OpenAI chat format) — used to exercise
+        # the OpenAI→Anthropic tool-conversion path end-to-end.  Triggered by the
+        # request model name "mock-tool" (survives proxy format conversion) or the
+        # "mock_tool" body flag.
+        if (req.get("mock_tool") or model == "mock-tool") and fmt == "openai":
+            return [
+                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n',
+                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}\n\n',
+                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":\\"SF\\"}"}}]},"finish_reason":null}]}\n\n',
+                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n',
+                'data: [DONE]\n\n',
+            ]
         if fmt == "anthropic":
             usage = '{"input_tokens": 11, "output_tokens": 7, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2}'
             return [

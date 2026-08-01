@@ -281,7 +281,6 @@ CONFIG_TABLES = [
     "local_keys",
     "model_pricing",
     "account_models",
-    "key_model_map",
     "model_map_templates",
     "model_map_template_entries",
 ]

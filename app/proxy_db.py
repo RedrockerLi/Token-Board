@@ -53,11 +53,7 @@ class ProxyDatabase:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL, model_id TEXT NOT NULL,
             UNIQUE(account_id, model_id))""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS key_model_map (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id INTEGER NOT NULL, pattern TEXT NOT NULL,
-            upstream_model TEXT NOT NULL,
-            UNIQUE(key_id, pattern))""")
+        conn.execute("DROP TABLE IF EXISTS key_model_map")  # legacy per-key mapping (removed)
         conn.execute("""CREATE TABLE IF NOT EXISTS model_map_templates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
@@ -314,54 +310,6 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    # ── Key Model Map ──────────────────────────────────────────────────
-
-    def update_key_model_map(self, key_id: int, mappings: list[dict]) -> int:
-        """Replace all mappings for a key. Each mapping: {pattern, upstream_model}."""
-        conn = self._connect()
-        try:
-            conn.execute("DELETE FROM key_model_map WHERE key_id = ?", (key_id,))
-            for m in mappings:
-                conn.execute(
-                    "INSERT OR IGNORE INTO key_model_map (key_id, pattern, upstream_model) VALUES (?,?,?)",
-                    (key_id, m["pattern"], m["upstream_model"]),
-                )
-            conn.commit()
-            self._schedule_config_sync()
-            return len(mappings)
-        finally:
-            conn.close()
-
-    def get_key_model_map(self, key_id: int) -> list[dict]:
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT id, pattern, upstream_model FROM key_model_map WHERE key_id = ? ORDER BY id",
-                (key_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
-
-    def lookup_model_map(self, key_id: int, model: str) -> str | None:
-        """Return upstream_model if pattern matches, else None. First match wins."""
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT pattern, upstream_model FROM key_model_map WHERE key_id = ? ORDER BY id",
-                (key_id,),
-            ).fetchall()
-            import re
-            for row in rows:
-                try:
-                    if re.search(row["pattern"], model):
-                        return row["upstream_model"]
-                except re.error:
-                    pass
-            return None
-        finally:
-            conn.close()
-
     # ── Model Map Templates ───────────────────────────────────────────
 
     def get_templates(self) -> list[dict]:
@@ -523,8 +471,7 @@ class ProxyDatabase:
             if refs > 0:
                 raise ValueError(f"无法删除：该密钥有 {refs} 条请求记录，请先清理相关日志")
 
-            # Clean up associated model map entries
-            conn.execute("DELETE FROM key_model_map WHERE key_id = ?", (key_id,))
+            # Clean up associated template link, then delete the key
             conn.execute("DELETE FROM local_keys WHERE id = ?", (key_id,))
             conn.commit()
             self._schedule_config_sync()

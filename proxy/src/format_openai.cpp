@@ -266,7 +266,7 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
     if (in.stream) body["stream_options"]["include_usage"] = true;
 
     if (!in.tool_choice.is_null() && !in.tool_choice.empty())
-        body["tool_choice"] = in.tool_choice;
+        body["tool_choice"] = fmt::normalize_tool_choice_to_openai(in.tool_choice);
     if (in.reasoning.enabled && !in.reasoning.effort.empty())
         body["reasoning_effort"] = in.reasoning.effort;
     else if (in.reasoning.enabled && !in.reasoning.extra.empty() &&
@@ -321,59 +321,126 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
                     ? std::move(body["messages"])
                     : json::array();
 
+    // Append one content block to the OpenAI parts/tool_calls/reasoning outputs.
+    // ToolResult is handled by callers (needs role:"tool" + tool_call_id).
+    auto append_content_part = [](json &parts, json &tool_calls, bool &has_tools,
+                                  std::string &reasoning_text,
+                                  const ContentBlock &b) {
+        switch (b.kind) {
+            case ContentKind::Text: {
+                if (b.extra.contains("raw") && b.extra["raw"].is_object()) {
+                    parts.push_back(b.extra["raw"]);
+                } else {
+                    json p;
+                    p["type"] = "text";
+                    p["text"] = b.text;
+                    parts.push_back(std::move(p));
+                }
+                break;
+            }
+            case ContentKind::Image: {
+                parts.push_back(fmt::image_block_to_openai_part(b));
+                break;
+            }
+            case ContentKind::Thinking: {
+                if (b.extra.contains("raw") && b.extra["raw"].is_object())
+                    parts.push_back(b.extra["raw"]);
+                else
+                    reasoning_text += b.text;
+                break;
+            }
+            case ContentKind::ToolUse: {
+                has_tools = true;
+                json tc;
+                if (!b.tool_call_id.empty()) tc["id"] = b.tool_call_id;
+                tc["type"] = b.extra.contains("type") ? b.extra["type"].get<std::string>()
+                                                       : std::string("function");
+                tc["function"] = json::object();
+                tc["function"]["name"] = b.tool_name;
+                tc["function"]["arguments"] = b.tool_input.dump();
+                tool_calls.push_back(std::move(tc));
+                break;
+            }
+            default:
+                break;  // ToolResult handled by callers
+        }
+    };
+
     for (const auto &m : in.messages) {
         json jm;
         jm["role"] = m.role;
-        // Content parts
-        json parts = json::array();
-        bool has_tools = false;
-        json tool_calls = json::array();
-        std::string reasoning_text;
-        for (const auto &b : m.content) {
-            switch (b.kind) {
-                case ContentKind::Text: {
-                    if (b.extra.contains("raw") && b.extra["raw"].is_object()) {
-                        parts.push_back(b.extra["raw"]);
+
+        bool has_tr = false;
+        for (const auto &b : m.content)
+            if (b.kind == ContentKind::ToolResult) { has_tr = true; break; }
+
+        if (has_tr) {
+            // Anthropic carries tool results in role:"user" messages; OpenAI
+            // requires role:"tool" + tool_call_id so the upstream can correlate
+            // each result to the assistant's earlier tool_call. Split the message
+            // into one role:"tool" message per result id (non-result parts keep
+            // a normal message).
+            json parts = json::array();
+            bool has_tools = false;
+            json tool_calls = json::array();
+            std::string reasoning_text;
+            std::vector<std::pair<std::string, std::string>> tr_by_id;
+            for (const auto &b : m.content) {
+                if (b.kind == ContentKind::ToolResult) {
+                    if (!b.tool_use_id.empty()) {
+                        bool found = false;
+                        for (auto &kv : tr_by_id) {
+                            if (kv.first == b.tool_use_id) {
+                                kv.second += b.text;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) tr_by_id.emplace_back(b.tool_use_id, b.text);
                     } else {
+                        // No id → cannot be a tool message; keep as text part.
                         json p;
                         p["type"] = "text";
                         p["text"] = b.text;
                         parts.push_back(std::move(p));
                     }
-                    break;
+                    continue;
                 }
-                case ContentKind::Image: {
-                    parts.push_back(fmt::image_block_to_openai_part(b));
-                    break;
-                }
-                case ContentKind::Thinking: {
-                    if (b.extra.contains("raw") && b.extra["raw"].is_object())
-                        parts.push_back(b.extra["raw"]);
-                    else
-                        reasoning_text += b.text;
-                    break;
-                }
-                case ContentKind::ToolUse: {
-                    has_tools = true;
-                    json tc;
-                    if (!b.tool_call_id.empty()) tc["id"] = b.tool_call_id;
-                    tc["type"] = b.extra.contains("type") ? b.extra["type"].get<std::string>()
-                                                           : std::string("function");
-                    tc["function"] = json::object();
-                    tc["function"]["name"] = b.tool_name;
-                    tc["function"]["arguments"] = b.tool_input.dump();
-                    tool_calls.push_back(std::move(tc));
-                    break;
-                }
-                case ContentKind::ToolResult: {
-                    json p;
-                    p["type"] = "text";
-                    p["text"] = b.text;
-                    parts.push_back(std::move(p));
-                    break;
-                }
+                append_content_part(parts, tool_calls, has_tools, reasoning_text, b);
             }
+            // Emit role:"tool" messages FIRST so they immediately follow the
+            // assistant message that made the tool calls (OpenAI requires tool
+            // messages to directly succeed the tool_calls assistant message;
+            // interposing a user message → 400 on strict-compatible upstreams).
+            for (const auto &kv : tr_by_id) {
+                json jt;
+                jt["role"] = "tool";
+                jt["tool_call_id"] = kv.first;
+                jt["content"] = kv.second;
+                msgs.push_back(std::move(jt));
+            }
+            // Non-tool parts become a normal user message after the tool results.
+            if (parts.size() == 1 && parts[0].value("type", "") == "text")
+                jm["content"] = parts[0]["text"];
+            else if (!parts.empty())
+                jm["content"] = std::move(parts);
+            if (has_tools && !tool_calls.empty())
+                jm["tool_calls"] = std::move(tool_calls);
+            if (!reasoning_text.empty())
+                jm["reasoning_content"] = reasoning_text;
+            if (jm.contains("content") || jm.contains("tool_calls") ||
+                jm.contains("reasoning_content"))
+                msgs.push_back(std::move(jm));
+            continue;
         }
+
+        // Content parts (no tool results in this message).
+        json parts = json::array();
+        bool has_tools = false;
+        json tool_calls = json::array();
+        std::string reasoning_text;
+        for (const auto &b : m.content)
+            append_content_part(parts, tool_calls, has_tools, reasoning_text, b);
         if (parts.size() == 1 && parts[0].value("type", "") == "text") {
             jm["content"] = parts[0]["text"];
         } else if (!parts.empty()) {
@@ -383,16 +450,8 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
             jm["tool_calls"] = std::move(tool_calls);
         if (!reasoning_text.empty())
             jm["reasoning_content"] = reasoning_text;
-        if (m.role == "tool") {
-            // ToolResult content → OpenAI tool message shape.
-            std::string text;
-            for (const auto &b : m.content)
-                if (b.kind == ContentKind::ToolResult) text = b.text;
-            jm["content"] = text;
-            if (!m.content.empty() && m.content[0].kind == ContentKind::ToolResult &&
-                !m.content[0].tool_use_id.empty())
-                jm["tool_call_id"] = m.content[0].tool_use_id;
-        }
+        if (has_tools && parts.empty())
+            jm["content"] = nullptr;  // explicit empty content for tool-only messages
         msgs.push_back(std::move(jm));
     }
 
@@ -662,6 +721,26 @@ private:
         tool_calls_.clear();
     }
 
+    // Extract text from a delta content field that may be a plain string or an
+    // array of parts ({"type":"text","text":...}) sent by some OpenAI-compatible
+    // gateways. Returns empty if nothing textual.
+    static std::string delta_text(const json &v) {
+        if (v.is_string()) return v.get<std::string>();
+        if (v.is_array()) {
+            std::string out;
+            for (const auto &p : v) {
+                if (p.is_string()) {
+                    out += p.get<std::string>();
+                } else if (p.is_object() && p.value("type", "") == "text" &&
+                           p.contains("text") && p["text"].is_string()) {
+                    out += p["text"].get<std::string>();
+                }
+            }
+            return out;
+        }
+        return std::string();
+    }
+
     void handle_frame(const json &j, const EmitFn &emit) {
         if (j.contains("id") && j["id"].is_string())
             id_ = j["id"].get<std::string>();
@@ -707,6 +786,15 @@ private:
                 ev.index = index;
                 ev.text = d["content"].get<std::string>();
                 if (!emit(ev)) return;
+            } else if (d.contains("content") && d["content"].is_array()) {
+                std::string txt = delta_text(d["content"]);
+                if (!txt.empty()) {
+                    StreamEvent ev;
+                    ev.type = StreamEventType::ContentTextDelta;
+                    ev.index = index;
+                    ev.text = std::move(txt);
+                    if (!emit(ev)) return;
+                }
             }
             if (d.contains("reasoning_content") && d["reasoning_content"].is_string()) {
                 StreamEvent ev;
@@ -714,28 +802,29 @@ private:
                 ev.index = index;
                 ev.text = d["reasoning_content"].get<std::string>();
                 if (!emit(ev)) return;
+            } else if (d.contains("reasoning_content") && d["reasoning_content"].is_array()) {
+                std::string txt = delta_text(d["reasoning_content"]);
+                if (!txt.empty()) {
+                    StreamEvent ev;
+                    ev.type = StreamEventType::ContentThinkingDelta;
+                    ev.index = index;
+                    ev.text = std::move(txt);
+                    if (!emit(ev)) return;
+                }
             }
             if (d.contains("tool_calls") && d["tool_calls"].is_array()) {
                 for (const auto &tc : d["tool_calls"]) {
                     if (!tc.is_object()) continue;
                     int tindex = tc.value("index", 0);
                     auto &at = tool_calls_[tindex];
+                    // 1. identity
                     if (tc.contains("id") && tc["id"].is_string())
                         at.id = tc["id"].get<std::string>();
-                    if (tc.contains("function") && tc["function"].is_object()) {
-                        const json &fn = tc["function"];
-                        if (fn.contains("name") && fn["name"].is_string())
-                            at.name = fn["name"].get<std::string>();
-                        if (fn.contains("arguments") && fn["arguments"].is_string()) {
-                            std::string args = fn["arguments"].get<std::string>();
-                            at.arguments += args;
-                            StreamEvent ev;
-                            ev.type = StreamEventType::ToolCallArgumentDelta;
-                            ev.index = tindex;
-                            ev.arguments = args;
-                            if (!emit(ev)) return;
-                        }
-                    }
+                    if (tc.contains("function") && tc["function"].is_object() &&
+                        tc["function"].contains("name") && tc["function"]["name"].is_string())
+                        at.name = tc["function"]["name"].get<std::string>();
+                    // 2. ToolCallStart first — Anthropic requires
+                    //    content_block_start before any delta for that block.
                     if (!at.id.empty() && !at.start_emitted) {
                         at.start_emitted = true;
                         StreamEvent ev;
@@ -744,6 +833,29 @@ private:
                         ev.text = at.id;
                         ev.arguments = at.name;
                         if (!emit(ev)) return;
+                        // Flush fragments buffered before the id arrived.
+                        if (!at.arguments.empty()) {
+                            StreamEvent de;
+                            de.type = StreamEventType::ToolCallArgumentDelta;
+                            de.index = tindex;
+                            de.arguments = at.arguments;
+                            if (!emit(de)) return;
+                        }
+                    }
+                    // 3. argument deltas (non-empty only, and only after start)
+                    if (tc.contains("function") && tc["function"].is_object() &&
+                        tc["function"].contains("arguments")) {
+                        const json &af = tc["function"]["arguments"];
+                        std::string args = af.is_string() ? af.get<std::string>()
+                                                          : af.dump();
+                        at.arguments += args;  // full accumulation for ToolCallDone
+                        if (at.start_emitted && !args.empty()) {
+                            StreamEvent ev;
+                            ev.type = StreamEventType::ToolCallArgumentDelta;
+                            ev.index = tindex;
+                            ev.arguments = args;
+                            if (!emit(ev)) return;
+                        }
                     }
                 }
             }

@@ -77,7 +77,6 @@ public:
     };
     int get_key_template_id(int key_id);
     std::vector<ModelMapping> get_template_entries(int template_id);
-    std::vector<ModelMapping> get_key_model_mappings(int key_id);
 
     std::vector<PricingEntry> get_all_pricing();
 
@@ -118,7 +117,6 @@ private:
     sqlite3_stmt *stmt_lookup_key_ = nullptr;
     sqlite3_stmt *stmt_get_account_ = nullptr;
     sqlite3_stmt *stmt_insert_log_ = nullptr;
-    sqlite3_stmt *stmt_get_key_mappings_ = nullptr;
     sqlite3_stmt *stmt_get_key_template_ = nullptr;
     sqlite3_stmt *stmt_get_template_entries_ = nullptr;
     sqlite3_stmt *stmt_get_pricing_ = nullptr;

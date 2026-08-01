@@ -26,12 +26,29 @@ ir::StopReason openai_finish_reason_to_stop(const std::string &fr);
 ir::StopReason anthropic_stop_reason_to_stop(const std::string &sr);
 ir::StopReason responses_status_to_stop(const std::string &st);
 
+/// Normalize an IR tool_choice (raw, may be either format's shape) into the
+/// OpenAI chat-completions tool_choice shape:
+///   "auto"/"required"/"none" string, or {"type":"function","function":{...}}.
+/// Anthropic shapes are translated; anything already OpenAI-shaped passes through.
+json normalize_tool_choice_to_openai(const json &tc);
+
+/// Normalize an IR tool_choice into the Anthropic tool_choice shape:
+///   {"type":"auto"|"any"|"none"} or {"type":"tool","name":...}.
+/// OpenAI shapes are translated; anything already Anthropic-shaped passes through.
+json normalize_tool_choice_to_anthropic(const json &tc);
+
 /// Normalize an arbitrary error object to {message, type, code} (json object).
 json normalize_error_body(const json &body);
 
 /// Copy only the listed keys from `src` into a new object (preserves order).
 /// Used to forward format-specific extra params when serializing.
 json filter_keys(const json &src, std::initializer_list<const char *> keep);
+
+/// Claude Code appends a `[1m]`/`[1M]` context-window marker to model names
+/// (e.g. `deepseek-v4-flash[1m]`).  Upstream APIs don't accept this local
+/// capability marker, so strip it (case-insensitively) before forwarding —
+/// mirroring cc-switch's `strip_one_m_suffix_for_upstream`.
+std::string strip_one_m_suffix_for_upstream(const std::string &model);
 
 /// Incremental SSE frame splitter.  Frames are separated by "\n\n" (LF) or
 /// "\r\n\r\n" (CRLF).  Emits complete frame bodies (sans the trailing blank

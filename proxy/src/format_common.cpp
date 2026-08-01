@@ -1,8 +1,32 @@
 #include "format_common.h"
 
+#include <cctype>
 #include <cstring>
 
 namespace fmt {
+
+std::string strip_one_m_suffix_for_upstream(const std::string &model) {
+    static const char kMarker[] = "[1m]";
+    static const size_t kLen = 4;
+    std::string t = model;
+    auto end = t.find_last_not_of(" \t\r\n");
+    if (end == std::string::npos) return model;
+    t.erase(end + 1);
+    if (t.size() >= kLen) {
+        bool eq = true;
+        for (size_t i = 0; i < kLen; i++) {
+            if (std::tolower(static_cast<unsigned char>(t[t.size() - kLen + i])) !=
+                kMarker[i]) { eq = false; break; }
+        }
+        if (eq) {
+            t.erase(t.size() - kLen);
+            auto e2 = t.find_last_not_of(" \t\r\n");
+            t.erase(e2 == std::string::npos ? 0 : e2 + 1);
+            return t;
+        }
+    }
+    return model;
+}
 
 bool parse_data_uri(const std::string &uri, std::string &media_type,
                     std::string &b64) {
@@ -105,6 +129,42 @@ ir::StopReason responses_status_to_stop(const std::string &st) {
     if (st == "incomplete") return ir::StopReason::Length;
     if (st == "failed") return ir::StopReason::Unknown;
     return ir::StopReason::Unknown;
+}
+
+json normalize_tool_choice_to_openai(const json &tc) {
+    if (!tc.is_object()) return tc;  // strings ("auto"/"required"/"none") are already valid
+    std::string type = tc.value("type", "");
+    if (type == "tool") {
+        // Anthropic: {"type":"tool","name":"foo"} → OpenAI function shape.
+        json out;
+        out["type"] = "function";
+        out["function"] = {{"name", tc.value("name", "")}};
+        return out;
+    }
+    if (type == "any") return json("required");  // Anthropic "any" → OpenAI "required"
+    if (type == "auto") return json("auto");
+    if (type == "none") return json("none");
+    return tc;  // already OpenAI-shaped ({"type":"function",...}) or unknown → pass through
+}
+
+json normalize_tool_choice_to_anthropic(const json &tc) {
+    if (tc.is_string()) {
+        std::string s = tc.get<std::string>();
+        if (s == "required") return json{{"type", "any"}};
+        if (s == "none") return json{{"type", "none"}};
+        return json{{"type", "auto"}};  // "auto" and anything else
+    }
+    if (tc.is_object() && tc.value("type", "") == "function") {
+        // OpenAI: {"type":"function","function":{"name":"foo"}} → Anthropic tool shape.
+        std::string name;
+        if (tc.contains("function") && tc["function"].is_object())
+            name = tc["function"].value("name", "");
+        json out;
+        out["type"] = "tool";
+        if (!name.empty()) out["name"] = name;
+        return out;
+    }
+    return tc;  // already Anthropic-shaped or unknown → pass through
 }
 
 json normalize_error_body(const json &body) {
