@@ -15,6 +15,40 @@ const char *kConsumed[] = {
     "max_completion_tokens", "temperature", "stop",
 };
 
+// MiniMax requires `role=system` only in the first slot; DeepSeek/other
+// strict OpenAI layers reject mid-conversation system messages. Codex emits
+// a system message from `instructions` plus one `developer` message per turn
+// (mapped to `system` above), so merge them all into a single leading
+// `system` message. Semantically lossless for lenient upstreams too —
+// mirroring cc-switch's `collapse_system_messages_to_head`.
+void collapse_system_messages_to_head(json &messages) {
+    if (!messages.is_array()) return;
+    std::vector<std::string> sys_texts;
+    json rest = json::array();
+    for (auto &m : messages) {
+        if (m.is_object() && m.value("role", "") == "system") {
+            std::string t;
+            if (m.contains("content")) {
+                const json &c = m["content"];
+                t = c.is_string() ? c.get<std::string>() : c.dump();
+            }
+            if (!t.empty()) sys_texts.push_back(std::move(t));
+        } else {
+            rest.push_back(std::move(m));
+        }
+    }
+    messages = json::array();
+    if (!sys_texts.empty()) {
+        std::string joined;
+        for (size_t i = 0; i < sys_texts.size(); ++i) {
+            if (i) joined += "\n\n";
+            joined += sys_texts[i];
+        }
+        messages.push_back(json{{"role", "system"}, {"content", joined}});
+    }
+    for (auto &m : rest) messages.push_back(std::move(m));
+}
+
 // Extra keys this format can forward through (not regenerated).
 
 class OpenAICodec : public FormatCodec {
@@ -285,16 +319,54 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
     if (!in.tools.empty()) {
         json arr = json::array();
         for (const auto &t : in.tools) {
-            json j;
-            if (t.extra.contains("type") && t.extra["type"].is_string())
-                j["type"] = t.extra["type"];
-            else
+            std::string type =
+                t.extra.contains("type") && t.extra["type"].is_string()
+                    ? t.extra["type"].get<std::string>()
+                    : std::string("function");
+            if (type == "custom") {
+                // Codex custom tool (apply_patch) → regular function with a
+                // raw-string input parameter (mirror cc-switch
+                // transform_codex_chat.rs add_custom_tool). The original tool
+                // definition is embedded in the description so the model can
+                // reproduce the freeform payload.
+                json j;
                 j["type"] = "function";
-            j["function"] = json::object();
-            if (!t.name.empty()) j["function"]["name"] = t.name;
-            if (!t.description.empty()) j["function"]["description"] = t.description;
-            if (t.input_schema.is_object()) j["function"]["parameters"] = t.input_schema;
-            arr.push_back(std::move(j));
+                j["function"]["name"] = t.name;
+                std::string desc = t.description;
+                if (t.extra.contains("raw") && t.extra["raw"].is_object()) {
+                    desc += "\n\nOriginal tool definition:\n```json\n" +
+                            t.extra["raw"].dump() + "\n```";
+                }
+                j["function"]["description"] = desc;
+                j["function"]["parameters"] = json{
+                    {"type", "object"},
+                    {"properties",
+                     json{{"input",
+                           json{{"type", "string"},
+                                {"description",
+                                 "Raw string input for the original custom "
+                                 "tool. Preserve formatting exactly and follow "
+                                 "the original tool definition embedded in the "
+                                 "description."}}}}},
+                    {"required", json::array({"input"})}};
+                arr.push_back(std::move(j));
+            } else if (type != "function") {
+                // namespace / web_search / tool_search are not representable
+                // in OpenAI chat completions; drop them (cc-switch drops
+                // web_search; namespace children are not preserved by the IR).
+                continue;
+            } else {
+                json j;
+                j["type"] = "function";
+                j["function"] = json::object();
+                if (!t.name.empty()) j["function"]["name"] = t.name;
+                if (!t.description.empty())
+                    j["function"]["description"] = t.description;
+                if (t.input_schema.is_object())
+                    j["function"]["parameters"] =
+                        fmt::normalize_function_parameters(t.input_schema);
+                arr.push_back(std::move(j));
+            }
         }
         body["tools"] = std::move(arr);
     }
@@ -368,7 +440,11 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
 
     for (const auto &m : in.messages) {
         json jm;
-        jm["role"] = m.role;
+        // OpenAI chat completions has no `developer` role; Codex sends
+        // `role:"developer"` instruction messages that strict upstreams
+        // (opencode.ai Console Go) reject with 400. Map to `system` exactly
+        // like cc-switch's `responses_role_to_chat_role`.
+        jm["role"] = m.role == "developer" ? "system" : m.role;
 
         bool has_tr = false;
         for (const auto &b : m.content)
@@ -465,6 +541,13 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
     }
 
     body["messages"] = std::move(msgs);
+
+    // OpenAI-compatible upstreams (MiniMax/DeepSeek/…) reject `system`
+    // messages anywhere but the first slot; Codex produces several
+    // (instructions + one per `developer` turn).  Merge every system message
+    // into a single leading one — mirroring cc-switch's
+    // `collapse_system_messages_to_head`.
+    collapse_system_messages_to_head(body["messages"]);
     return body;
 }
 

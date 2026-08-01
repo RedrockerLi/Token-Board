@@ -44,6 +44,11 @@ json normalize_error_body(const json &body);
 /// Used to forward format-specific extra params when serializing.
 json filter_keys(const json &src, std::initializer_list<const char *> keep);
 
+/// Ensure a function-tool JSON Schema carries `"type": "object"` and a
+/// `properties` object (OpenAI Chat Completions requirement).  See
+/// format_common.cpp.
+json normalize_function_parameters(const json &params);
+
 /// Claude Code appends a `[1m]`/`[1M]` context-window marker to model names
 /// (e.g. `deepseek-v4-flash[1m]`).  Upstream APIs don't accept this local
 /// capability marker, so strip it (case-insensitively) before forwarding —

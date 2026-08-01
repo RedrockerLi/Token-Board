@@ -210,6 +210,25 @@ json filter_keys(const json &src, std::initializer_list<const char *> keep) {
     return out;
 }
 
+/// Ensure a function-tool JSON Schema carries `"type": "object"` and a
+/// `properties` object.  OpenAI Chat Completions strictly requires these;
+/// some Responses tools carry `parameters: null` or an empty object, which
+/// strict-compatible upstreams (opencode.ai Console Go) reject with 400
+/// (mirror cc-switch `normalize_function_parameters`).
+json normalize_function_parameters(const json &params) {
+    if (params.is_object() && params.value("type", "") == "object")
+        return params;
+    json out = json::object();
+    out["type"] = "object";
+    if (params.is_object()) {
+        for (auto it = params.begin(); it != params.end(); ++it) {
+            if (it.key() != "type") out[it.key()] = it.value();
+        }
+    }
+    if (!out.contains("properties")) out["properties"] = json::object();
+    return out;
+}
+
 bool parse_sse_frame(const std::string &frame, std::string *event_name,
                      std::string *data) {
     if (event_name) event_name->clear();
