@@ -6,16 +6,39 @@ Anthropic Messages).  Logs every request (path, headers, body) to
 `request_log.txt` next to this script so tests can assert on what the proxy
 actually sent upstream.
 
-Usage:
-    python3 scripts/mock_upstream.py --port 9100 [--log /tmp/mock.log]
+Behaviour models the real opencode.ai "Console Go" upstream (verified against
+https://opencode.ai/zen/go/v1 on 2026-08):
+
+- The OpenAI *chat completions* endpoint enforces three strict rules and
+  returns HTTP 400 with the real upstream error body when violated:
+    1. `role:"developer"` messages are rejected (only system/user/assistant/
+       tool are accepted).
+    2. Tools with a non-`function` type (custom/namespace/web_search/...) are
+       rejected — they are a Responses-format concept, not representable in
+       chat completions.
+    3. A `function` tool whose `parameters` is present but is not a JSON
+       Schema with `"type":"object"` (e.g. `{}`, `null`, or a bare
+       `"type":"string"`) is rejected.
+  These rules are format-specific: the Responses/Messages endpoints stay
+  lenient (developer/tool types are native there).
+
+- Streaming for the chat completions endpoint mimics the real DeepSeek-family
+  backend: a role-start chunk, several `reasoning_content` deltas, then
+  `content` deltas, a `finish_reason:"stop"` chunk, an opencode-specific
+  `x-opencode-type: inference-cost` usage frame, then `[DONE]`.
 
 Response selection:
   - By default the format is inferred from the URL path
     (/v1/chat/completions, /v1/responses, /v1/messages).
   - If the request body contains "mock_format": "<fmt>", that wins.
   - If the request body contains "mock_status": <code>, that HTTP status is
-    returned instead (error-path testing).
+    returned instead (error-path testing; bypasses strict validation).
+  - "mock_simple_stream": true returns the plain content-only stream (no
+    reasoning_content / cost frames).
   - Streaming: request body "stream": true returns an SSE stream.
+
+Usage:
+    python3 scripts/mock_upstream.py --port 9100 [--log /tmp/mock.log]
 """
 import argparse
 import json
@@ -24,10 +47,44 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG_FILE = "/tmp/mock_upstream.log"
 
+# Exact error body returned by the real opencode.ai "Console Go" backend for
+# request-validation failures (observed 2026-08).
+REAL_ERROR_BODY = {
+    "error": {
+        "message": "Error from provider (Console Go): Upstream request failed",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "invalid_request_error",
+    }
+}
+
 
 def log(req):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(req, ensure_ascii=False) + "\n")
+
+
+def validate_chat_completions(req):
+    """Mirror the strict OpenAI chat-completions validation of opencode.ai.
+
+    Returns (ok, reason); on !ok the server answers 400 with REAL_ERROR_BODY.
+    """
+    for m in req.get("messages", []):
+        if isinstance(m, dict) and m.get("role") == "developer":
+            return False, "role 'developer' is not valid for chat completions"
+    for t in req.get("tools", []):
+        if not isinstance(t, dict):
+            continue
+        ttype = t.get("type", "function")
+        if ttype != "function":
+            return False, "tool type %r is not representable in chat completions" % ttype
+        fn = t.get("function", {})
+        params = fn.get("parameters") if isinstance(fn, dict) else None
+        if params is not None and (
+            not isinstance(params, dict) or params.get("type") != "object"
+        ):
+            return False, "tool parameters must be a JSON Schema with type:\"object\""
+    return True, None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -76,6 +133,8 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(req.get("stream")) and status == 200
         model = req.get("model", "mock-model")
 
+        # Explicit status override (error-path testing) wins; otherwise the
+        # strict chat-completions validation behaves like the real upstream.
         if status != 200:
             body = {
                 "error": {"message": "mock error", "type": "mock_error", "code": status},
@@ -87,6 +146,17 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+
+        if fmt == "openai":
+            ok, reason = validate_chat_completions(req)
+            if not ok:
+                payload = json.dumps(REAL_ERROR_BODY).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
 
         if stream:
             self.send_response(200)
@@ -116,21 +186,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _openai_chunk(self, cid, model, delta, finish_reason=None):
+        return {
+            "id": cid, "object": "chat.completion.chunk", "created": 1,
+            "model": model,
+            "choices": [{
+                "index": 0, "finish_reason": finish_reason, "logprobs": None,
+                "delta": delta,
+            }],
+            "usage": None,
+        }
+
     def _stream_chunks(self, fmt, model, req=None):
         req = req or {}
-        # Tool-call stream (only for the OpenAI chat format) — used to exercise
-        # the OpenAI→Anthropic tool-conversion path end-to-end.  Triggered by the
-        # request model name "mock-tool" (survives proxy format conversion) or the
-        # "mock_tool" body flag.
-        if (req.get("mock_tool") or model == "mock-tool") and fmt == "openai":
-            return [
-                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n\n',
-                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}\n\n',
-                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":\\"SF\\"}"}}]},"finish_reason":null}]}\n\n',
-                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
-                'data: {"id":"c2","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n',
-                'data: [DONE]\n\n',
-            ]
         if fmt == "anthropic":
             usage = '{"input_tokens": 11, "output_tokens": 7, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2}'
             return [
@@ -154,14 +222,74 @@ class Handler(BaseHTTPRequestHandler):
                 'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"i1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[]}]}}\n\n',
                 'data: {"type":"response.completed","response":{"id":"resp1","object":"response","status":"completed","model":"' + model + '","output":[{"id":"i1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18,"input_tokens_details":{"cached_tokens":3}}}}\n\n',
             ]
-        # openai chat
-        return [
-            'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\n\n',
-            'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}\n\n',
-            'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
-            'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n',
-            'data: [DONE]\n\n',
+
+        # ── OpenAI chat completions ──────────────────────────────────────
+        cid = "chatcmpl-mock1"
+        # Tool-call stream — used to exercise the OpenAI→Anthropic
+        # tool-conversion path end-to-end.  Triggered by the request model
+        # name "mock-tool" (survives proxy format conversion) or the
+        # "mock_tool" body flag.  Prefixed with reasoning deltas, matching the
+        # real DeepSeek-family backend's thinking-before-tool pattern.
+        if req.get("mock_tool") or model == "mock-tool":
+            chunks = [
+                json.dumps(self._openai_chunk(
+                    cid, model,
+                    {"role": "assistant", "content": None, "reasoning_content": ""})),
+                json.dumps(self._openai_chunk(
+                    cid, model,
+                    {"content": None, "reasoning_content": "Need to fetch weather."})),
+                json.dumps(self._openai_chunk(
+                    cid, model,
+                    {"content": None, "reasoning_content": "Calling get_weather."})),
+                json.dumps(self._openai_chunk(
+                    cid, model,
+                    {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                     "function": {"name": "get_weather",
+                                                  "arguments": ""}}]})),
+                json.dumps(self._openai_chunk(
+                    cid, model,
+                    {"tool_calls": [{"index": 0,
+                                     "function": {"arguments": "{\"city\":\"SF\"}"}}]})),
+                json.dumps(self._openai_chunk(cid, model, {}, "tool_calls")),
+                json.dumps({"id": cid, "object": "chat.completion.chunk",
+                            "created": 1, "model": model, "choices": [],
+                            "usage": {"prompt_tokens": 11, "completion_tokens": 7,
+                                      "total_tokens": 18}}),
+            ]
+            return ["data: " + c + "\n\n" for c in chunks] + ["data: [DONE]\n\n"]
+
+        if req.get("mock_simple_stream"):
+            return [
+                'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\n\n',
+                'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}\n\n',
+                'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+                'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n',
+                'data: [DONE]\n\n',
+            ]
+
+        # Realistic DeepSeek-family stream (as observed from opencode.ai):
+        # role-start → reasoning_content deltas → content deltas →
+        # finish:"stop" → x-opencode cost frame → [DONE].
+        chunks = [
+            self._openai_chunk(cid, model,
+                               {"role": "assistant", "content": None,
+                                "reasoning_content": ""}),
         ]
+        for r in ("We need to answer simply.", "User just says hi."):
+            chunks.append(self._openai_chunk(
+                cid, model, {"content": None, "reasoning_content": r}))
+        for t in ("Hel", "lo"):
+            chunks.append(self._openai_chunk(
+                cid, model, {"content": t, "reasoning_content": None}))
+        chunks.append(self._openai_chunk(cid, model, {"content": ""}, "stop"))
+        frames = ["data: " + json.dumps(c) + "\n\n" for c in chunks]
+        # opencode.ai-specific inference-cost usage frame (non-standard).
+        frames.append('data: {"choices":[],"x-opencode-type":"inference-cost",'
+                      '"cost":"0.00000123","normalizedUsage":{"inputTokens":11,'
+                      '"outputTokens":7,"reasoningTokens":5,"cacheReadTokens":0,'
+                      '"cacheWrite5mTokens":0,"cacheWrite1hTokens":0}}\n\n')
+        frames.append('data: [DONE]\n\n')
+        return frames
 
     def _nonstream_body(self, fmt, model, req):
         usage_extra = req.get("mock_usage_extra", {})
@@ -191,6 +319,7 @@ class Handler(BaseHTTPRequestHandler):
                     "input_tokens_details": {"cached_tokens": 3}, **usage_extra,
                 },
             }
+        # OpenAI chat completions, non-streaming.
         return {
             "id": "chatcmpl-1", "object": "chat.completion", "created": 1,
             "model": model,
