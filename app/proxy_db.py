@@ -49,7 +49,6 @@ class ProxyDatabase:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         # Ensure auxiliary tables exist (the C++ proxy creates the canonical
-        # tables; existing databases are migrated by scripts/migrate_proxy_db.py).
         conn.execute("""CREATE TABLE IF NOT EXISTS account_models (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL, model_id TEXT NOT NULL,

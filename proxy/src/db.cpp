@@ -62,7 +62,6 @@ void Database::close() {
 // ── Schema creation ──────────────────────────────────────────────────────
 
 void Database::create_schema() {
-    // NOTE: existing databases are migrated by `scripts/migrate_proxy_db.py`
     // (run once when merging); this code only creates the current schema.
     const char *sql = R"SQL(
         CREATE TABLE IF NOT EXISTS upstream_accounts (
