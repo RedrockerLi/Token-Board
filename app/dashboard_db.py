@@ -82,11 +82,15 @@ class DashboardDatabase:
                     model_pattern TEXT NOT NULL UNIQUE,
                     input_price REAL NOT NULL,
                     output_price REAL NOT NULL,
+                    cache_read_price REAL,
                     currency TEXT NOT NULL DEFAULT 'CNY'
                 );
 
                 -- Trigger: recalculate proxy cost_entry when pricing is inserted.
                 -- CSV-imported rows (source='csv') are left untouched.
+                -- Token buckets: output → output_price; input_cache_hit →
+                -- cache_read_price (falls back to input_price); the rest →
+                -- input_price.
                 CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_insert
                 AFTER INSERT ON model_pricing
                 BEGIN
@@ -99,6 +103,11 @@ class DashboardDatabase:
                                 WHEN 'output' THEN
                                     (tu.amount / 1000000.0) * COALESCE(
                                         (SELECT mp.output_price FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
+                                WHEN 'input_cache_hit' THEN
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT COALESCE(mp.cache_read_price, mp.input_price) FROM model_pricing mp
                                          WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
                                          ORDER BY mp.id LIMIT 1), 0)
                                 ELSE
@@ -129,6 +138,11 @@ class DashboardDatabase:
                                         (SELECT mp.output_price FROM model_pricing mp
                                          WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
                                          ORDER BY mp.id LIMIT 1), 0)
+                                WHEN 'input_cache_hit' THEN
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT COALESCE(mp.cache_read_price, mp.input_price) FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
                                 ELSE
                                     (tu.amount / 1000000.0) * COALESCE(
                                         (SELECT mp.input_price FROM model_pricing mp
@@ -155,6 +169,11 @@ class DashboardDatabase:
                                 WHEN 'output' THEN
                                     (tu.amount / 1000000.0) * COALESCE(
                                         (SELECT mp.output_price FROM model_pricing mp
+                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                                         ORDER BY mp.id LIMIT 1), 0)
+                                WHEN 'input_cache_hit' THEN
+                                    (tu.amount / 1000000.0) * COALESCE(
+                                        (SELECT COALESCE(mp.cache_read_price, mp.input_price) FROM model_pricing mp
                                          WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
                                          ORDER BY mp.id LIMIT 1), 0)
                                 ELSE
@@ -217,8 +236,14 @@ class DashboardDatabase:
 
     def upsert_proxy_data(self, date: str, model: str,
                           account_name: str, prompt_tokens: int,
-                          completion_tokens: int, request_count: int) -> int:
-        """Insert proxy usage data. cost_entry is maintained by model_pricing triggers."""
+                          completion_tokens: int, cache_read_tokens: int,
+                          request_count: int) -> int:
+        """Insert proxy usage data. cost_entry is maintained by model_pricing triggers.
+
+        prompt_tokens is the total input (including cache hits), so the miss
+        bucket is prompt_tokens - cache_read_tokens and the hit bucket is
+        cache_read_tokens — the sum stays equal to the upstream input count.
+        """
         conn = self._connect()
         total = 0
         try:
@@ -230,12 +255,21 @@ class DashboardDatabase:
                     (date, model, account_name, completion_tokens, account_name),
                 )
                 total += 1
-            if prompt_tokens > 0:
+            if cache_read_tokens > 0:
+                conn.execute(
+                    """INSERT OR REPLACE INTO token_usage
+                       (date, model, api_key_name, token_type, amount, cost_group_key)
+                       VALUES (?,?,?,'input_cache_hit',?,?)""",
+                    (date, model, account_name, cache_read_tokens, account_name),
+                )
+                total += 1
+            miss = max(prompt_tokens - cache_read_tokens, 0)
+            if miss > 0:
                 conn.execute(
                     """INSERT OR REPLACE INTO token_usage
                        (date, model, api_key_name, token_type, amount, cost_group_key)
                        VALUES (?,?,?,'input_cache_miss',?,?)""",
-                    (date, model, account_name, prompt_tokens, account_name),
+                    (date, model, account_name, miss, account_name),
                 )
                 total += 1
             if request_count > 0:

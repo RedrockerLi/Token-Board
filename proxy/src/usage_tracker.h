@@ -19,6 +19,12 @@ public:
         int prompt_tokens = 0;
         int completion_tokens = 0;
         int total_tokens = 0;
+        // Cache-aware billing. `prompt_tokens` keeps the upstream semantics
+        // (Anthropic parsers add cache_read/cache_creation into it; OpenAI
+        // prompt_tokens already includes cached tokens), so
+        // prompt_tokens - cache_read_tokens = uncached (miss) input.
+        int cache_read_tokens = 0;       // cached prompt tokens (cheap rate)
+        int cache_creation_tokens = 0;   // cache-write tokens (input rate)
     };
 
     /// Parse usage from a non-streaming JSON response body (OpenAI format).

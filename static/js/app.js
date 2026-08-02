@@ -84,17 +84,17 @@ const PAGES = [
         destroyFn: null,
     },
     {
+        hash: '#/proxy/aggregates',
+        container: 'page-proxy-aggregates',
+        title: '上游账户聚合 · Token Board',
+        initFn: 'initAggregatesPage',
+        destroyFn: null,
+    },
+    {
         hash: '#/proxy/keys',
         container: 'page-proxy-keys',
         title: '本地密钥 · Token Board',
         initFn: 'initKeysPage',
-        destroyFn: null,
-    },
-    {
-        hash: '#/proxy/templates',
-        container: 'page-proxy-templates',
-        title: '模型映射 · Token Board',
-        initFn: 'initTemplatesPage',
         destroyFn: null,
     },
     {

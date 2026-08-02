@@ -26,6 +26,7 @@ public:
         std::string auth_header;     // "bearer" | "x-api-key"
         int account_id = 0;
         int local_key_id = 0;
+        bool is_aggregate = false;   // aggregate account — resolve per model
     };
 
     RouteResult route(const std::string &local_key);

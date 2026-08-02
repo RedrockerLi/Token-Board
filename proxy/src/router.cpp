@@ -53,6 +53,7 @@ Router::RouteResult Router::route(const std::string &local_key) {
     result.auth_header = account->auth_header;
     result.account_id = account->id;
     result.local_key_id = key_info->id;
+    result.is_aggregate = account->is_aggregate;
 
     // Cache the successful result
     {

@@ -50,13 +50,30 @@ public:
         std::string api_format;      // "openai" | "openai_responses" | "anthropic"
         std::string endpoint_path;   // "" = derive from api_format
         std::string auth_header;     // "bearer" | "x-api-key"
+        bool is_aggregate = false;   // aggregate account (routes by model)
     };
     std::optional<AccountInfo> get_account(int account_id);
+
+    // ── Aggregate accounts ─────────────────────────────────────────────
+
+    /// One model-mapping entry of an aggregate account.
+    struct AggregateEntry {
+        std::string pattern;          // glob, matched against the request model
+        int upstream_account_id = 0;  // real upstream account
+        std::string upstream_model;   // model name forwarded upstream
+    };
+    /// Resolve the real upstream target for `model` on an aggregate account.
+    /// Returns nullopt when no entry matches.
+    std::optional<AggregateEntry> resolve_aggregate(int account_id,
+                                                    const std::string &model);
+    /// All model patterns of an aggregate account (used by /v1/models).
+    std::vector<std::string> get_aggregate_model_patterns(int account_id);
 
     // ── Usage logging ───────────────────────────────────────────────────
 
     void log_request(int account_id, int local_key_id, const std::string &model,
-                     int prompt_tokens, int completion_tokens, int total_tokens,
+                     int prompt_tokens, int completion_tokens,
+                     int cache_read_tokens, int total_tokens,
                      double cost, bool is_streaming, int status_code,
                      int duration_ms);
 
@@ -70,12 +87,6 @@ public:
         double input_price;
         double output_price;
     };
-    struct ModelMapping {
-        std::string pattern;
-        std::string upstream_model;
-    };
-    int get_key_template_id(int key_id);
-    std::vector<ModelMapping> get_template_entries(int template_id);
 
     std::vector<PricingEntry> get_all_pricing();
 
@@ -116,8 +127,7 @@ private:
     sqlite3_stmt *stmt_lookup_key_ = nullptr;
     sqlite3_stmt *stmt_get_account_ = nullptr;
     sqlite3_stmt *stmt_insert_log_ = nullptr;
-    sqlite3_stmt *stmt_get_key_template_ = nullptr;
-    sqlite3_stmt *stmt_get_template_entries_ = nullptr;
+    sqlite3_stmt *stmt_get_aggregate_entries_ = nullptr;
     sqlite3_stmt *stmt_get_pricing_ = nullptr;
     sqlite3_stmt *stmt_update_last_used_ = nullptr;
     sqlite3_stmt *stmt_insert_perf_event_ = nullptr;

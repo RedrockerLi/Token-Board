@@ -1,7 +1,8 @@
 /**
- * proxy_manager.js — Account, Key, and Pricing management pages.
+ * proxy_manager.js — Account, Aggregate, Key, and Pricing management pages.
  *
- * Exports: initAccountsPage(), initKeysPage(), initPricingPage()
+ * Exports: initAccountsPage(), initAggregatesPage(), initKeysPage(),
+ *          initPricingPage()
  */
 
 // ── Shared Helpers (esc defined in utils.js) ──
@@ -63,11 +64,12 @@ async function loadAccountsTable() {
     tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
     try {
         const accounts = await proxyFetch('/api/proxy/accounts');
-        if (!accounts.length) {
-            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无账户，请点击"添加账户"</td></tr>';
+        const real = accounts.filter(a => !a.is_aggregate);
+        if (!real.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无账户，请点击"添加账户"（聚合账户请到"上游账户聚合"管理）</td></tr>';
             return;
         }
-        tbody.innerHTML = accounts.map((a) => `
+        tbody.innerHTML = real.map((a) => `
             <tr>
                 <td>${esc(a.name)}</td>
                 <td><code>${esc(maskKey(a.upstream_key))}</code></td>
@@ -299,13 +301,6 @@ async function openEditKeyModal(id) {
             `<option value="${a.id}" ${a.id === key.account_id ? 'selected' : ''}>${esc(a.name)}</option>`
         ).join('');
 
-        // Load template selector
-        const templates = await proxyFetch('/api/proxy/templates');
-        const tsel = document.getElementById('keyTemplateSelect');
-        tsel.innerHTML = '<option value="">不使用模板</option>' + templates.map(t =>
-            `<option value="${t.id}" ${key.template_id === t.id ? 'selected' : ''}>${esc(t.name)} (${t.entries ? t.entries.length : 0} 条)</option>`
-        ).join('');
-
         document.getElementById('editKeyId').value = id;
         openModal('editKeyModal');
     } catch (err) {
@@ -319,13 +314,11 @@ async function saveKeyEdit(e) {
     const id = form['id'].value;
     const label = form['label'].value;
     const accountId = parseInt(form['account_id'].value);
-    const templateId = form['template_id'].value ? parseInt(form['template_id'].value) : null;
 
     try {
         const data = {};
         if (label) data.label = label;
         data.account_id = accountId;
-        data.template_id = templateId;
         await proxyFetch(`/api/proxy/keys/${id}`, { method: 'PUT', body: JSON.stringify(data) });
         showToast('密钥已更新');
         closeModal('editKeyModal');
@@ -398,7 +391,6 @@ function initKeysPage() {
                     <input type="hidden" name="id" id="editKeyId">
                     <label>标签 <input name="label" id="editKeyLabel" placeholder="例如: Claude Code"></label>
                     <label>关联账户 <select name="account_id" id="editKeyAccount"></select></label>
-                    <label>模型映射模板 <select name="template_id" id="keyTemplateSelect"><option value="">不使用模板</option></select></label>
                     <button type="submit" class="btn btn--primary" style="margin-top:12px;">保存</button>
                 </form>
             </div>
@@ -409,26 +401,30 @@ function initKeysPage() {
     loadKeysTable();
 }
 
-// ── Templates Page ──────────────────────────────────────────────────
+// ── Aggregates Page ─────────────────────────────────────────────────────
 
-async function loadTemplatesTable() {
-    const tbody = document.querySelector('#templatesTable tbody');
+let aggAccountsCache = null;  // real upstream accounts for entry dropdowns
+
+async function loadAggregatesTable() {
+    const tbody = document.querySelector('#aggregatesTable tbody');
     if (!tbody) return;
     tbody.innerHTML = '<tr><td colspan="4" class="td-loading">加载中...</td></tr>';
     try {
-        const templates = await proxyFetch('/api/proxy/templates');
-        if (!templates.length) {
-            tbody.innerHTML = '<tr><td colspan="4" class="td-empty">暂无模板，请点击"新建模板"</td></tr>';
+        const aggregates = await proxyFetch('/api/proxy/aggregates');
+        if (!aggregates.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="td-empty">暂无聚合账户，请点击"新建聚合账户"</td></tr>';
             return;
         }
-        tbody.innerHTML = templates.map((t) => `
+        tbody.innerHTML = aggregates.map((a) => `
             <tr>
-                <td>${esc(t.name)}</td>
-                <td>${t.entries ? t.entries.length : 0} 条映射</td>
-                <td>${t.entries ? t.entries.map(e => `<code>${esc(e.pattern)} → ${esc(e.upstream_model)}</code>`).join('<br>') : ''}</td>
+                <td>${esc(a.name)}</td>
+                <td>${a.entries ? a.entries.length : 0} 条映射</td>
+                <td>${a.entries ? a.entries.map(e =>
+                    `<code>${esc(e.pattern)} → ${esc(e.upstream_account_name || `账户${e.upstream_account_id}`)} / ${esc(e.upstream_model)}</code>`
+                ).join('<br>') : ''}</td>
                 <td>
-                    <button class="btn btn--sm" onclick="editTemplate(${t.id})">编辑</button>
-                    <button class="btn btn--sm" onclick="deleteTemplate(${t.id}, '${esc(t.name)}')" style="color:#EF4444;">删除</button>
+                    <button class="btn btn--sm" onclick="openAggregateModal(${a.id})">编辑</button>
+                    <button class="btn btn--sm" onclick="deleteAggregate(${a.id}, '${esc(a.name)}')" style="color:#EF4444;">删除</button>
                 </td>
             </tr>
         `).join('');
@@ -437,56 +433,29 @@ async function loadTemplatesTable() {
     }
 }
 
-async function openTemplateModal(id) {
-    document.getElementById('templateForm').dataset.editId = id || '';
-    document.getElementById('templateForm').querySelector('[type=submit]').textContent = id ? '保存' : '创建';
-    document.getElementById('templateMappings').innerHTML = '';
-
-    if (id) {
-        const templates = await proxyFetch('/api/proxy/templates');
-        const t = templates.find(t => t.id === id);
-        if (!t) return;
-        document.getElementById('templateName').value = t.name;
-        if (t.entries) {
-            document.getElementById('templateMappings').innerHTML = t.entries.map((e, i) => mappingRow(e.pattern, e.upstream_model)).join('');
-        }
-    }
-    openModal('templateModal');
-    populateTemplateAcctSelect();
-    addMappingRow();
-}
-
-function mappingRow(pattern, upstream) {
+function aggRow(pattern, accountId, accountName, upstreamModel) {
+    const accountOpts = aggAccountsCache && aggAccountsCache.length
+        ? aggAccountsCache.map(a =>
+            `<option value="${a.id}" ${a.id === accountId ? 'selected' : ''}>${esc(a.name)}</option>`).join('')
+        : `<option value="${accountId || ''}">${esc(accountName || '加载中...')}</option>`;
     return `<div class="map-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-        <input value="${esc(pattern||'')}" placeholder="正则" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
+        <input value="${esc(pattern||'')}" placeholder="模型名称" title="精确模型名，将作为该聚合账户的模型列表返回给客户端" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
         <span style="color:var(--color-text-tertiary);">→</span>
-        <select style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onfocus="loadUpstreamModels(this)"><option value="${esc(upstream||'')}">${esc(upstream||'点击获取模型')}</option></select>
-        <button class="btn btn--sm" onclick="moveMapping(this, 'up')" title="上移">▲</button>
-        <button class="btn btn--sm" onclick="moveMapping(this, 'down')" title="下移">▼</button>
+        <select class="agg-acct" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onchange="resetAggModel(this)">${accountOpts}</select>
+        <select class="agg-model" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onfocus="loadAggModels(this)"><option value="${esc(upstreamModel||'')}">${esc(upstreamModel||'点击获取模型')}</option></select>
+        <button class="btn btn--sm" onclick="moveAggRow(this, 'up')" title="上移">▲</button>
+        <button class="btn btn--sm" onclick="moveAggRow(this, 'down')" title="下移">▼</button>
         <button class="btn btn--sm" onclick="this.parentElement.remove()" style="color:#EF4444;">✕</button>
     </div>`;
 }
 
-function refreshAllModelDropdowns() {
-    document.querySelectorAll('#templateMappings select').forEach(s => { s.innerHTML = '<option value="">点击获取模型</option>'; });
-}
-
-async function populateTemplateAcctSelect() {
-    try {
-        const accounts = await proxyFetch('/api/proxy/accounts');
-        const sel = document.getElementById('templateAcctSelect');
-        if (!sel) return;
-        sel.innerHTML = '<option value="">-- 选择账户 --</option>' + accounts.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
-    } catch (e) {}
-}
-
-function addMappingRow() {
+function addAggRow() {
     const div = document.createElement('div');
-    div.innerHTML = mappingRow('', '');
-    document.getElementById('templateMappings').appendChild(div.firstElementChild);
+    div.innerHTML = aggRow('', '', '', '');
+    document.getElementById('aggMappings').appendChild(div.firstElementChild);
 }
 
-function moveMapping(btn, dir) {
+function moveAggRow(btn, dir) {
     const row = btn.parentElement;
     if (dir === 'up' && row.previousElementSibling) {
         row.parentElement.insertBefore(row, row.previousElementSibling);
@@ -495,10 +464,17 @@ function moveMapping(btn, dir) {
     }
 }
 
-async function loadUpstreamModels(sel) {
+function resetAggModel(sel) {
+    const row = sel.closest('.map-row');
+    const modelSel = row.querySelector('.agg-model');
+    modelSel.innerHTML = '<option value="">点击获取模型</option>';
+}
+
+async function loadAggModels(sel) {
     if (sel.options.length > 1) return;
-    const acctId = document.getElementById('templateAcctSelect')?.value;
-    if (!acctId) { sel.innerHTML = '<option value="">请先选择上游账户</option>'; return; }
+    const row = sel.closest('.map-row');
+    const acctId = row.querySelector('.agg-acct').value;
+    if (!acctId) { sel.innerHTML = '<option value="">请先选择账户</option>'; return; }
     try {
         const models = await proxyFetch(`/api/proxy/accounts/${acctId}/models`);
         if (!models.length) { sel.innerHTML = '<option value="">该账户暂无模型</option>'; return; }
@@ -509,71 +485,114 @@ async function loadUpstreamModels(sel) {
     }
 }
 
-async function saveTemplate(e) {
+async function loadAggAccountCache() {
+    if (aggAccountsCache) return;
+    const accounts = await proxyFetch('/api/proxy/accounts');
+    aggAccountsCache = accounts.filter(a => !a.is_aggregate);
+}
+
+async function openAggregateModal(id) {
+    document.getElementById('aggregateForm').dataset.editId = id || '';
+    document.getElementById('aggregateForm').querySelector('[type=submit]').textContent = id ? '保存' : '创建';
+    document.getElementById('aggMappings').innerHTML = '';
+    document.getElementById('aggregateName').value = '';
+
+    try {
+        await loadAggAccountCache();
+    } catch (e) {
+        aggAccountsCache = [];
+    }
+
+    if (id) {
+        const aggregates = await proxyFetch('/api/proxy/aggregates');
+        const agg = aggregates.find(a => a.id === id);
+        if (!agg) return;
+        document.getElementById('aggregateName').value = agg.name;
+        if (agg.entries) {
+            document.getElementById('aggMappings').innerHTML = agg.entries.map((e) =>
+                aggRow(e.pattern, e.upstream_account_id, e.upstream_account_name, e.upstream_model)
+            ).join('');
+        }
+    }
+    openModal('aggregateModal');
+    if (!document.querySelector('#aggMappings .map-row')) addAggRow();
+}
+
+async function saveAggregate(e) {
     e.preventDefault();
     const form = e.target;
     const id = form.dataset.editId;
-    const name = document.getElementById('templateName').value;
-    const rows = document.querySelectorAll('#templateMappings .map-row');
+    const name = document.getElementById('aggregateName').value;
+    const rows = document.querySelectorAll('#aggMappings .map-row');
     const entries = [];
-    rows.forEach(row => {
-        const inputs = row.querySelectorAll('input, select');
-        const pattern = inputs[0].value.trim();
-        const upstream = inputs[1].value.trim();
-        if (pattern && upstream) entries.push({ pattern, upstream_model: upstream });
-    });
+    for (const row of rows) {
+        const pattern = row.querySelector('input').value.trim();
+        const accountId = row.querySelector('.agg-acct').value;
+        const upstream = row.querySelector('.agg-model').value.trim();
+        if (pattern && accountId && upstream) {
+            if (/[*?]/.test(pattern)) {
+                showToast(`模型名称 "${pattern}" 不能包含通配符（* ?），请填写精确模型名`, 'error');
+                return;
+            }
+            entries.push({ pattern, account_id: parseInt(accountId), upstream_model: upstream });
+        }
+    }
+    if (!entries.length) {
+        showToast('请至少添加一条模型映射', 'error');
+        return;
+    }
     try {
         if (id) {
-            await proxyFetch(`/api/proxy/templates/${id}`, { method: 'PUT', body: JSON.stringify({ name, entries }) });
-            showToast('模板已更新');
+            await proxyFetch(`/api/proxy/aggregates/${id}`, { method: 'PUT', body: JSON.stringify({ name, entries }) });
+            showToast('聚合账户已更新');
         } else {
-            await proxyFetch('/api/proxy/templates', { method: 'POST', body: JSON.stringify({ name, entries }) });
-            showToast('模板已创建');
+            await proxyFetch('/api/proxy/aggregates', { method: 'POST', body: JSON.stringify({ name, entries }) });
+            showToast('聚合账户已创建');
         }
-        closeModal('templateModal');
-        loadTemplatesTable();
+        closeModal('aggregateModal');
+        loadAggregatesTable();
     } catch (err) { showToast(err.message, 'error'); }
 }
 
-async function deleteTemplate(id, name) {
-    if (!confirm(`删除模板 "${name}"？`)) return;
+async function deleteAggregate(id, name) {
+    if (!confirm(`删除聚合账户 "${name}"？\n\n关联此聚合账户的本地密钥将失效。`)) return;
     try {
-        await proxyFetch(`/api/proxy/templates/${id}`, { method: 'DELETE' });
-        showToast('模板已删除');
-        loadTemplatesTable();
+        await proxyFetch(`/api/proxy/aggregates/${id}`, { method: 'DELETE' });
+        showToast('聚合账户已删除');
+        loadAggregatesTable();
     } catch (err) { showToast(err.message, 'error'); }
 }
 
-function editTemplate(id) { openTemplateModal(id); }
-
-function initTemplatesPage() {
-    const el = document.getElementById('page-proxy-templates');
+function initAggregatesPage() {
+    const el = document.getElementById('page-proxy-aggregates');
     if (!el || el.dataset.initialized) return;
     el.dataset.initialized = '1';
     el.innerHTML = `
         <div class="page-header">
-            <h1 class="page-title">模型映射模板</h1>
-            <p class="page-subtitle">创建可复用的模型映射模板，在密钥管理中引用</p>
-            <button class="btn btn--primary" onclick="openTemplateModal()">+ 新建模板</button>
+            <h1 class="page-title">上游账户聚合</h1>
+            <p class="page-subtitle">聚合多个上游账户为一个账户：模型列表即此聚合账户暴露给客户端的全部模型，请求按精确模型名分发到对应上游</p>
+            <button class="btn btn--primary" onclick="openAggregateModal()">+ 新建聚合账户</button>
         </div>
-        <table class="mgmt-table" id="templatesTable">
+        <table class="mgmt-table" id="aggregatesTable">
             <thead><tr><th>名称</th><th>条目数</th><th>映射预览</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
-        <div class="modal-overlay" id="templateModal" style="display:none">
-            <div class="modal" style="max-width:640px;">
-                <div class="modal__header"><h3>编辑模板</h3><button class="modal__close" onclick="closeModal('templateModal')">&times;</button></div>
-                <form id="templateForm" onsubmit="saveTemplate(event)" data-edit-id="">
-                    <label>模板名称 <input id="templateName" name="name" required></label>
-                    <label>获取模型列表的上游账户 <select id="templateAcctSelect" onchange="refreshAllModelDropdowns()"></select></label>
-                    <label>映射条目 <button type="button" class="btn btn--sm" onclick="addMappingRow()">+ 添加</button></label>
-                    <div id="templateMappings" style="max-height:350px;overflow-y:auto;"></div>
+        <div class="modal-overlay" id="aggregateModal" style="display:none">
+            <div class="modal" style="max-width:720px;">
+                <div class="modal__header">
+                    <h3>聚合账户</h3>
+                    <button class="modal__close" onclick="closeModal('aggregateModal')">&times;</button>
+                </div>
+                <form id="aggregateForm" onsubmit="saveAggregate(event)" data-edit-id="">
+                    <label>聚合账户名称 <input id="aggregateName" name="name" required placeholder="例如: 全部模型聚合"></label>
+                    <label>模型映射 <button type="button" class="btn btn--sm" onclick="addAggRow()">+ 添加</button></label>
+                    <div id="aggMappings" style="max-height:350px;overflow-y:auto;"></div>
                     <button type="submit" class="btn btn--primary">创建</button>
                 </form>
             </div>
         </div>
     `;
-    loadTemplatesTable();
+    loadAggregatesTable();
 }
 
 // ── Pricing Page ─────────────────────────────────────────────────────────
@@ -581,11 +600,11 @@ function initTemplatesPage() {
 async function loadPricingTable() {
     const tbody = document.querySelector('#pricingTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="5" class="td-loading">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
     try {
         const pricing = await proxyFetch('/api/proxy/pricing');
         if (!pricing.length) {
-            tbody.innerHTML = '<tr><td colspan="5" class="td-empty">暂无定价</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无定价</td></tr>';
             return;
         }
         tbody.innerHTML = pricing.map((p) => `
@@ -593,17 +612,18 @@ async function loadPricingTable() {
                 <td><code>${esc(p.model_pattern)}</code></td>
                 <td>¥${p.input_price.toFixed(2)} / 1M tokens</td>
                 <td>¥${p.output_price.toFixed(2)} / 1M tokens</td>
+                <td>${p.cache_read_price != null ? '¥' + p.cache_read_price.toFixed(2) + ' / 1M tokens' : '<span style="color:var(--color-text-tertiary);">同输入价</span>'}</td>
                 <td>${esc(p.currency)}</td>
                 <td>
                     <button class="btn btn--sm" onclick="reorderPricing(${p.id},'up')">▲</button>
                     <button class="btn btn--sm" onclick="reorderPricing(${p.id},'down')">▼</button>
-                    <button class="btn btn--sm" onclick="editPricing(${p.id}, '${esc(p.model_pattern)}', ${p.input_price}, ${p.output_price})">编辑</button>
+                    <button class="btn btn--sm" onclick="editPricing(${p.id}, '${esc(p.model_pattern)}', ${p.input_price}, ${p.output_price}, ${p.cache_read_price == null ? 'null' : p.cache_read_price})">编辑</button>
                     <button class="btn btn--sm" onclick="deletePricing(${p.id})">删除</button>
                 </td>
             </tr>
         `).join('');
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="5" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -612,7 +632,8 @@ async function savePricing(e) {
     const form = e.target;
     const data = Object.fromEntries(new FormData(form));
     const id = form.dataset.editId;
-    const payload = { model_pattern: data.model_pattern, input_price: parseFloat(data.input_price), output_price: parseFloat(data.output_price) };
+    const cacheRead = data.cache_read_price !== '' ? parseFloat(data.cache_read_price) : null;
+    const payload = { model_pattern: data.model_pattern, input_price: parseFloat(data.input_price), output_price: parseFloat(data.output_price), cache_read_price: cacheRead };
     try {
         if (id) {
             await proxyFetch(`/api/proxy/pricing/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
@@ -631,11 +652,12 @@ async function savePricing(e) {
     }
 }
 
-function editPricing(id, pattern, inputPrice, outputPrice) {
+function editPricing(id, pattern, inputPrice, outputPrice, cacheReadPrice) {
     const form = document.querySelector('#pricingForm');
     form['model_pattern'].value = pattern;
     form['input_price'].value = inputPrice;
     form['output_price'].value = outputPrice;
+    form['cache_read_price'].value = cacheReadPrice == null ? '' : cacheReadPrice;
     form.dataset.editId = id;
     form.querySelector('[type=submit]').textContent = '更新';
     openModal('pricingModal');
@@ -670,7 +692,7 @@ function initPricingPage() {
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
         <table class="mgmt-table" id="pricingTable">
-            <thead><tr><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>货币</th><th>操作</th></tr></thead>
+            <thead><tr><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>货币</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
         <div class="modal-overlay" id="pricingModal" style="display:none">
@@ -683,6 +705,7 @@ function initPricingPage() {
                     <label>模型匹配模式 <input name="model_pattern" required placeholder="例如: deepseek-v4*"></label>
                     <label>输入价格 (¥/1M tokens) <input name="input_price" type="number" step="0.01" required></label>
                     <label>输出价格 (¥/1M tokens) <input name="output_price" type="number" step="0.01" required></label>
+                    <label>缓存命中价格 (¥/1M tokens，可选) <input name="cache_read_price" type="number" step="0.01" placeholder="留空 = 与输入价格相同"></label>
                     <button type="submit" class="btn btn--primary">添加</button>
                 </form>
             </div>

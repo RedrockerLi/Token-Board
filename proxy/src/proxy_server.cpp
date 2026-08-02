@@ -87,30 +87,6 @@ static std::thread spawn_client_monitor(int client_sock, AbortGuard &g) {
     });
 }
 
-/// Shell-style glob match: supports * (any chars) and ? (single char).
-/// Case-insensitive. Used for model-mapping-template pattern matching.
-static bool glob_match(const std::string &pattern, const std::string &text) {
-    size_t pi = 0, mi = 0;
-    size_t star_pos = std::string::npos;
-    size_t match_pos = 0;
-
-    while (mi < text.size()) {
-        if (pi < pattern.size() &&
-            (pattern[pi] == '?' ||
-             tolower(pattern[pi]) == tolower(text[mi]))) {
-            ++pi; ++mi;
-        } else if (pi < pattern.size() && pattern[pi] == '*') {
-            star_pos = pi; match_pos = mi; ++pi;
-        } else if (star_pos != std::string::npos) {
-            pi = star_pos + 1; match_pos++; mi = match_pos;
-        } else {
-            return false;
-        }
-    }
-    while (pi < pattern.size() && pattern[pi] == '*') ++pi;
-    return pi == pattern.size();
-}
-
 // ── Auth / routing helpers ───────────────────────────────────────────────
 
 /// Result of extracting Bearer token + looking up route.
@@ -193,43 +169,18 @@ static AuthResult extract_and_route(const httplib::Request &req,
     return ar;
 }
 
-// ── Model-mapping helpers ────────────────────────────────────────────────
+// ── Model helpers ────────────────────────────────────────────────────────
 
-/// Pure model lookup via the key's mapping template.  Returns the mapped model
-/// or the input unchanged.  Used by the conversion pipeline (operates on the IR
-/// model) and by the passthrough path.  Any `[1m]` context-window marker is
-/// stripped before forwarding (upstreams reject it).
-static std::string resolve_upstream_model(Database &db, int local_key_id,
-                                          const std::string &req_model) {
-    std::vector<Database::ModelMapping> mappings;
-    int template_id = db.get_key_template_id(local_key_id);
-    if (template_id > 0) {
-        mappings = db.get_template_entries(template_id);
-        fprintf(stderr, "[Proxy] Using template %d: %zu mapping(s)\n",
-                template_id, mappings.size());
-    }
-    for (const auto &m : mappings) {
-        if (glob_match(m.pattern, req_model)) {
-            fprintf(stderr, "[Proxy] Model map: %s → %s (pattern: %s)\n",
-                    req_model.c_str(), m.upstream_model.c_str(),
-                    m.pattern.c_str());
-            return fmt::strip_one_m_suffix_for_upstream(m.upstream_model);
-        }
-    }
-    return fmt::strip_one_m_suffix_for_upstream(req_model);
-}
-
-/// Apply model mapping to a raw request body string (passthrough path).
-/// Returns the resolved upstream model name; `body` is modified in-place.
-static std::string apply_model_mapping(Database &db, int local_key_id,
-                                       std::string &body) {
-    std::string req_model = extract_model(body);
-    std::string mapped = resolve_upstream_model(db, local_key_id, req_model);
-    if (mapped == req_model) return req_model;
+/// Apply the effective upstream model to a raw request body in place
+/// (best-effort: JSON rewrite first, substring fallback otherwise).
+static void apply_body_model(std::string &body, const std::string &model) {
     try {
         json j = json::parse(body);
-        j["model"] = mapped;
-        body = j.dump();
+        if (j.contains("model") && j["model"].is_string() &&
+            j["model"].get<std::string>() != model) {
+            j["model"] = model;
+            body = j.dump();
+        }
     } catch (...) {
         size_t pos = body.find("\"model\"");
         if (pos != std::string::npos) {
@@ -237,10 +188,47 @@ static std::string apply_model_mapping(Database &db, int local_key_id,
             auto q1 = body.find('"', colon + 1);
             auto q2 = body.find('"', q1 + 1);
             if (q1 != std::string::npos && q2 != std::string::npos)
-                body.replace(q1 + 1, q2 - q1 - 1, mapped);
+                body.replace(q1 + 1, q2 - q1 - 1, model);
         }
     }
-    return mapped;
+}
+
+/// Resolve the effective upstream model for a request: strip the Claude Code
+/// `[1m]`/`[1M]` context-window marker (upstreams reject it) and, for
+/// aggregate accounts, resolve the real upstream account + model via the
+/// account's entry list.  On aggregate resolution the route is overwritten
+/// with the real account's connection details so billing is attributed to
+/// the real upstream account.  Returns false when an aggregate account has
+/// no entry matching the model.
+static bool resolve_upstream_model(Database &db, Router::RouteResult &route,
+                                   std::string &model) {
+    model = fmt::strip_one_m_suffix_for_upstream(model);
+    if (!route.is_aggregate) return true;
+
+    auto target = db.resolve_aggregate(route.account_id, model);
+    if (!target.has_value()) {
+        fprintf(stderr, "[Proxy] aggregate account %d: no entry for model %s\n",
+                route.account_id, model.c_str());
+        return false;
+    }
+    auto real = db.get_account(target->upstream_account_id);
+    if (!real.has_value()) {
+        fprintf(stderr, "[Proxy] aggregate account %d: upstream account %d missing\n",
+                route.account_id, target->upstream_account_id);
+        return false;
+    }
+    fprintf(stderr, "[Proxy] aggregate %d: %s → account %d (%s) model %s\n",
+            route.account_id, model.c_str(), real->id, real->name.c_str(),
+            target->upstream_model.c_str());
+    route.upstream_key = real->upstream_key;
+    route.base_url = real->base_url;
+    route.api_format = real->api_format;
+    route.endpoint_path = real->endpoint_path;
+    route.auth_header = real->auth_header;
+    route.account_id = real->id;
+    route.is_aggregate = false;  // resolved — treat as a plain account below
+    model = target->upstream_model;
+    return true;
 }
 
 // ── add_cors_headers ─────────────────────────────────────────────────────
@@ -299,10 +287,20 @@ parse_usage_for_format(const std::string &api_format, const std::string &body) {
     return UsageTracker::parse_usage(body);
 }
 
-static UsageTracker::UsageInfo usage_from_ir(const ir::Usage &u) {
+/// Convert IR usage into UsageInfo. Anthropic codecs keep cache tokens
+/// separate from input_tokens, while OpenAI/Responses prompt_tokens already
+/// include cache hits — so for Anthropic upstreams the cache tokens are
+/// folded into prompt_tokens (matching parse_anthropic_usage semantics),
+/// making `prompt - cache_read` the uncached input for every path.
+static UsageTracker::UsageInfo usage_from_ir(const ir::Usage &u,
+                                             ir::ApiFormat upstream_fmt) {
     UsageTracker::UsageInfo info;
     info.prompt_tokens = u.prompt_tokens;
     info.completion_tokens = u.completion_tokens;
+    info.cache_read_tokens = u.cache_read_tokens;
+    info.cache_creation_tokens = u.cache_creation_tokens;
+    if (upstream_fmt == ir::ApiFormat::Anthropic)
+        info.prompt_tokens += u.cache_read_tokens + u.cache_creation_tokens;
     info.total_tokens = u.total_tokens;
     return info;
 }
@@ -344,25 +342,40 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         return;
     }
 
+    // Aggregate accounts need the request model to pick the real upstream
+    // account, so resolution happens here — before the passthrough/converted
+    // split, which depends on the real account's api_format.  For plain
+    // accounts this only strips the `[1m]`/`[1M]` marker (no-op otherwise).
+    std::string model = extract_model(req.body);
+    if (!resolve_upstream_model(db_, ar.route, model)) {
+        res.status = 400;
+        res.set_content(json_error("Model '" + model +
+                                   "' is not available on this account", 400),
+                        "application/json");
+        return;
+    }
+
     ir::ApiFormat harness = harness_format_from_path(req.path);
     ir::ApiFormat upstream = ir::parse_api_format(ar.route.api_format);
 
     if (harness == upstream) {
-        handle_passthrough(ar.route, upstream, req, res, t0);
+        handle_passthrough(ar.route, upstream, model, req, res, t0);
     } else {
-        handle_converted(ar.route, harness, upstream, req, res, t0);
+        handle_converted(ar.route, harness, upstream, model, req, res, t0);
     }
 }
 
 // ── handle_passthrough ───────────────────────────────────────────────────
 
-void ProxyServer::handle_passthrough(const Router::RouteResult &route,
+void ProxyServer::handle_passthrough(Router::RouteResult &route,
                                      ir::ApiFormat upstream,
+                                     const std::string &resolved_model,
                                      const httplib::Request &req,
                                      httplib::Response &res,
                                      std::chrono::steady_clock::time_point t0) {
     std::string body = req.body;
-    std::string req_model = apply_model_mapping(db_, route.local_key_id, body);
+    std::string req_model = resolved_model;
+    apply_body_model(body, req_model);
 
     std::string content_type = req.has_header("Content-Type")
                                    ? req.get_header_value("Content-Type")
@@ -520,8 +533,9 @@ void ProxyServer::handle_passthrough(const Router::RouteResult &route,
 
 // ── handle_converted ─────────────────────────────────────────────────────
 
-void ProxyServer::handle_converted(const Router::RouteResult &route,
+void ProxyServer::handle_converted(Router::RouteResult &route,
                                    ir::ApiFormat harness, ir::ApiFormat upstream,
+                                   const std::string &resolved_model,
                                    const httplib::Request &req,
                                    httplib::Response &res,
                                    std::chrono::steady_clock::time_point t0) {
@@ -550,7 +564,7 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
         return;
     }
 
-    cReq.model = resolve_upstream_model(db_, route.local_key_id, cReq.model);
+    cReq.model = resolved_model;
     std::string upstream_body = upstream_codec.serialize_request(cReq).dump();
 
     auto target = resolve_upstream_target(route);
@@ -574,7 +588,7 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
         // ── Streaming path ──────────────────────────────────────────
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, route, target, upstream_body, model_copy, upstream_fmt, t0,
+            [this, route, target, upstream_body, model_copy, upstream_fmt, upstream, t0,
              concurrent_count, inflight_id, harness_codec_ptr, upstream_codec_ptr,
              client_sock = req.client_socket](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
@@ -639,10 +653,12 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
                     if (fb.has_value()) {
                         last_usage.prompt_tokens = fb->prompt_tokens;
                         last_usage.completion_tokens = fb->completion_tokens;
+                        last_usage.cache_read_tokens = fb->cache_read_tokens;
+                        last_usage.cache_creation_tokens = fb->cache_creation_tokens;
                         last_usage.total_tokens = fb->total_tokens;
                     }
                 }
-                auto usage_info = usage_from_ir(last_usage);
+                auto usage_info = usage_from_ir(last_usage, upstream);
                 usage_info.model = model_copy;
                 tracker_.log_request(route.account_id, route.local_key_id,
                                      usage_info, true, fwd.status_code,
@@ -699,8 +715,10 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
             parsed = false;
         }
         if (parsed) {
+            auto usage_info = usage_from_ir(cResp.usage, upstream);
+            usage_info.model = model_copy;
             tracker_.log_request(route.account_id, route.local_key_id,
-                                 usage_from_ir(cResp.usage), false,
+                                 usage_info, false,
                                  fwd.status_code, fwd.duration_ms);
             res.status = fwd.status_code;
             res.set_content(harness_codec.serialize_response(cResp).dump(),
@@ -708,6 +726,7 @@ void ProxyServer::handle_converted(const Router::RouteResult &route,
         } else {
             auto fb = parse_usage_for_format(upstream_fmt, fwd.body);
             if (fb.has_value()) {
+                if (fb->model.empty()) fb->model = model_copy;
                 tracker_.log_request(route.account_id, route.local_key_id,
                                      *fb, false, fwd.status_code, fwd.duration_ms);
             }
@@ -760,6 +779,24 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     if (req.has_header("anthropic-version")) {
         res.status = 200;
         res.set_content("{\"models\":[]}", "application/json");
+        return;
+    }
+
+    // Aggregate accounts expose their entry patterns as the model catalog
+    // (plus the [1m]/[1M] aliases the proxy strips before forwarding).
+    if (ar.route.is_aggregate) {
+        auto patterns = db_.get_aggregate_model_patterns(ar.route.account_id);
+        json out = json::array();
+        for (const auto &p : patterns) {
+            json m = {{"id", p}, {"object", "model"}, {"created", 1},
+                      {"owned_by", "token-board"}};
+            out.push_back(m);
+            json a1 = m; a1["id"] = p + "[1m]"; out.push_back(a1);
+            json a2 = m; a2["id"] = p + "[1M]"; out.push_back(a2);
+        }
+        res.status = 200;
+        res.set_content(json{{"object", "list"}, {"data", std::move(out)}}.dump(),
+                        "application/json");
         return;
     }
 
@@ -821,9 +858,17 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         return;
     }
 
-    // 2. Apply model mapping
+    // 2. Resolve effective upstream model (strip [1m] marker; aggregate routing)
     std::string body = req.body;
-    std::string req_model = apply_model_mapping(db_, ar.route.local_key_id, body);
+    std::string req_model = extract_model(body);
+    if (!resolve_upstream_model(db_, ar.route, req_model)) {
+        res.status = 400;
+        res.set_content(json_error("Model '" + req_model +
+                                   "' is not available on this account", 400),
+                        "application/json");
+        return;
+    }
+    apply_body_model(body, req_model);
 
     // 3. Determine content type
     std::string content_type = req.has_header("Content-Type")

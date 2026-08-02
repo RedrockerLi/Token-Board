@@ -48,21 +48,19 @@ class ProxyDatabase:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
-        # Ensure new tables exist (C++ proxy also creates them, but Flask may connect first)
+        # Ensure auxiliary tables exist (the C++ proxy creates the canonical
+        # tables; existing databases are migrated by scripts/migrate_proxy_db.py).
         conn.execute("""CREATE TABLE IF NOT EXISTS account_models (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL, model_id TEXT NOT NULL,
             UNIQUE(account_id, model_id))""")
         conn.execute("DROP TABLE IF EXISTS key_model_map")  # legacy per-key mapping (removed)
-        conn.execute("""CREATE TABLE IF NOT EXISTS model_map_templates (
+        conn.execute("""CREATE TABLE IF NOT EXISTS aggregate_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            sort_order INTEGER NOT NULL DEFAULT 0)""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS model_map_template_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            template_id INTEGER NOT NULL REFERENCES model_map_templates(id) ON DELETE CASCADE,
+            account_id INTEGER NOT NULL,
             sort_order INTEGER NOT NULL DEFAULT 0,
             pattern TEXT NOT NULL,
+            upstream_account_id INTEGER NOT NULL,
             upstream_model TEXT NOT NULL)""")
         # Performance metrics (local-only, not synced)
         conn.execute("""CREATE TABLE IF NOT EXISTS perf_events (
@@ -82,25 +80,17 @@ class ProxyDatabase:
             model TEXT NOT NULL,
             is_streaming INTEGER NOT NULL DEFAULT 0,
             started_at TEXT NOT NULL DEFAULT (datetime('now')))""")
-        # ── Defensive column migrations (C++ proxy owns the canonical schema;
-        #    keep the dashboard usable if it connects before the proxy upgraded).
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for table, col, ddl in (
-            ("upstream_accounts", "endpoint_path", "TEXT NOT NULL DEFAULT ''"),
-            ("upstream_accounts", "auth_header", "TEXT NOT NULL DEFAULT 'bearer'"),
-        ):
-            if table in tables:
-                cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-                if col not in cols:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
         conn.commit()
 
         # ── Triggers: automatic cost computation from model_pricing ──────
+        # Cost = cache-miss input at input_price + cache-hit input at
+        # COALESCE(cache_read_price, input_price) + output at output_price.
         conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_request_log_insert
             AFTER INSERT ON request_log
             BEGIN
                 UPDATE request_log SET cost = COALESCE((
-                    SELECT (NEW.prompt_tokens / 1000000.0) * mp.input_price
+                    SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                         + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
                          + (NEW.completion_tokens / 1000000.0) * mp.output_price
                     FROM model_pricing mp
                     WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
@@ -111,7 +101,8 @@ class ProxyDatabase:
             AFTER INSERT ON model_pricing
             BEGIN
                 UPDATE request_log SET cost = COALESCE((
-                    SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                    SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                         + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
                          + (request_log.completion_tokens / 1000000.0) * mp.output_price
                     FROM model_pricing mp
                     WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
@@ -122,7 +113,8 @@ class ProxyDatabase:
             AFTER UPDATE ON model_pricing
             BEGIN
                 UPDATE request_log SET cost = COALESCE((
-                    SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                    SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                         + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
                          + (request_log.completion_tokens / 1000000.0) * mp.output_price
                     FROM model_pricing mp
                     WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
@@ -133,7 +125,8 @@ class ProxyDatabase:
             AFTER DELETE ON model_pricing
             BEGIN
                 UPDATE request_log SET cost = COALESCE((
-                    SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                    SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                         + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
                          + (request_log.completion_tokens / 1000000.0) * mp.output_price
                     FROM model_pricing mp
                     WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
@@ -201,7 +194,8 @@ class ProxyDatabase:
             rows = conn.execute(
                 "SELECT id, name, upstream_key, base_url, api_format, "
                 "COALESCE(endpoint_path,'') AS endpoint_path, "
-                "COALESCE(auth_header,'bearer') AS auth_header, created_at "
+                "COALESCE(auth_header,'bearer') AS auth_header, "
+                "COALESCE(is_aggregate,0) AS is_aggregate, created_at "
                 "FROM upstream_accounts ORDER BY id"
             ).fetchall()
             return [dict(r) for r in rows]
@@ -309,95 +303,90 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    # ── Model Map Templates ───────────────────────────────────────────
+    # ── Aggregate Accounts ─────────────────────────────────────────────
 
-    def get_templates(self) -> list[dict]:
+    def get_aggregates(self) -> list[dict]:
+        """Aggregate accounts (is_aggregate=1) with their model entries."""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, name, sort_order FROM model_map_templates ORDER BY sort_order, id"
+                "SELECT id, name, created_at FROM upstream_accounts "
+                "WHERE is_aggregate = 1 ORDER BY id"
             ).fetchall()
             result = []
             for r in rows:
                 entries = conn.execute(
-                    "SELECT id, pattern, upstream_model, sort_order FROM model_map_template_entries WHERE template_id = ? ORDER BY sort_order, id",
+                    "SELECT e.id, e.pattern, e.upstream_account_id, "
+                    "a.name AS upstream_account_name, e.upstream_model "
+                    "FROM aggregate_entries e "
+                    "LEFT JOIN upstream_accounts a ON e.upstream_account_id = a.id "
+                    "WHERE e.account_id = ? ORDER BY e.sort_order, e.id",
                     (r["id"],),
                 ).fetchall()
-                result.append({"id": r["id"], "name": r["name"], "sort_order": r["sort_order"],
-                               "entries": [dict(e) for e in entries]})
+                result.append({**dict(r), "entries": [dict(e) for e in entries]})
             return result
         finally:
             conn.close()
 
-    def create_template(self, data: dict) -> int:
+    def create_aggregate(self, data: dict) -> int:
+        """Create an aggregate account (is_aggregate=1) + its model entries."""
         conn = self._connect()
         try:
             cursor = conn.execute(
-                "INSERT INTO model_map_templates (name) VALUES (?)", (data["name"],))
-            tid = cursor.lastrowid
+                "INSERT INTO upstream_accounts "
+                "(name, upstream_key, base_url, api_format, is_aggregate) "
+                "VALUES (?, '', '', 'openai', 1)",
+                (data["name"],),
+            )
+            agg_id = cursor.lastrowid
             for i, e in enumerate(data.get("entries", [])):
                 conn.execute(
-                    "INSERT INTO model_map_template_entries (template_id, sort_order, pattern, upstream_model) VALUES (?,?,?,?)",
-                    (tid, i, e["pattern"], e["upstream_model"]))
+                    "INSERT INTO aggregate_entries "
+                    "(account_id, sort_order, pattern, upstream_account_id, upstream_model) "
+                    "VALUES (?,?,?,?,?)",
+                    (agg_id, i, e["pattern"], e["account_id"], e["upstream_model"]),
+                )
             conn.commit()
             self._schedule_config_sync()
-            return tid
+            return agg_id
         finally:
             conn.close()
 
-    def update_template(self, tid: int, data: dict) -> bool:
+    def update_aggregate(self, agg_id: int, data: dict) -> bool:
         conn = self._connect()
         try:
             if "name" in data:
-                conn.execute("UPDATE model_map_templates SET name=? WHERE id=?", (data["name"], tid))
+                conn.execute(
+                    "UPDATE upstream_accounts SET name=? WHERE id=? AND is_aggregate=1",
+                    (data["name"], agg_id),
+                )
             if "entries" in data:
-                conn.execute("DELETE FROM model_map_template_entries WHERE template_id=?", (tid,))
+                conn.execute(
+                    "DELETE FROM aggregate_entries WHERE account_id=?", (agg_id,))
                 for i, e in enumerate(data["entries"]):
                     conn.execute(
-                        "INSERT INTO model_map_template_entries (template_id, sort_order, pattern, upstream_model) VALUES (?,?,?,?)",
-                        (tid, i, e["pattern"], e["upstream_model"]))
-            if "sort_order" in data:
-                conn.execute("UPDATE model_map_templates SET sort_order=? WHERE id=?", (data["sort_order"], tid))
+                        "INSERT INTO aggregate_entries "
+                        "(account_id, sort_order, pattern, upstream_account_id, upstream_model) "
+                        "VALUES (?,?,?,?,?)",
+                        (agg_id, i, e["pattern"], e["account_id"], e["upstream_model"]),
+                    )
             conn.commit()
             self._schedule_config_sync()
             return True
         finally:
             conn.close()
 
-    def delete_template(self, tid: int) -> bool:
+    def delete_aggregate(self, agg_id: int) -> bool:
+        """Delete an aggregate account. Entries cascade via FK."""
         conn = self._connect()
         try:
-            # Auto-detach any keys referencing this template
             conn.execute(
-                "UPDATE local_keys SET template_id = NULL WHERE template_id = ?",
-                (tid,),
+                "DELETE FROM upstream_accounts WHERE id=? AND is_aggregate=1",
+                (agg_id,),
             )
-            conn.execute("DELETE FROM model_map_templates WHERE id=?", (tid,))
             conn.commit()
             self._schedule_config_sync()
             return conn.total_changes > 0
-        finally:
-            conn.close()
-
-    def reorder_template_entries(self, tid: int, entry_id: int, direction: str) -> bool:
-        conn = self._connect()
-        try:
-            entries = conn.execute(
-                "SELECT id, sort_order FROM model_map_template_entries WHERE template_id=? ORDER BY sort_order, id",
-                (tid,)).fetchall()
-            idx = next((i for i, e in enumerate(entries) if e["id"] == entry_id), None)
-            if idx is None: return False
-            if direction == "up" and idx > 0:
-                a, b = entries[idx - 1], entries[idx]
-                conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (b["sort_order"], a["id"]))
-                conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (a["sort_order"], b["id"]))
-            elif direction == "down" and idx < len(entries) - 1:
-                a, b = entries[idx], entries[idx + 1]
-                conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (b["sort_order"], a["id"]))
-                conn.execute("UPDATE model_map_template_entries SET sort_order=? WHERE id=?", (a["sort_order"], b["id"]))
-            conn.commit()
-            self._schedule_config_sync()
-            return True
         finally:
             conn.close()
 
@@ -407,7 +396,7 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT k.id, k.key_value, k.label, k.account_id, k.template_id, "
+                "SELECT k.id, k.key_value, k.label, k.account_id, "
                 "a.name AS account_name, a.api_format AS account_format, "
                 "k.created_at, k.last_used_at "
                 "FROM local_keys k "
@@ -439,7 +428,7 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("label", "account_id", "template_id"):
+            for key in ("label", "account_id"):
                 if key in data:
                     fields.append(f"{key} = ?")
                     values.append(data[key])
@@ -457,18 +446,11 @@ class ProxyDatabase:
             conn.close()
 
     def delete_key(self, key_id: int) -> bool:
-        """Hard-delete a local key and its model mappings."""
+        """Hard-delete a local key. Its request_log rows are kept and their
+        local_key_id is set to NULL via the ON DELETE SET NULL foreign key,
+        so usage/billing data is preserved."""
         conn = self._connect()
         try:
-            # Check for request_log references (FK constraint)
-            refs = conn.execute(
-                "SELECT COUNT(*) FROM request_log WHERE local_key_id = ?",
-                (key_id,),
-            ).fetchone()[0]
-            if refs > 0:
-                raise ValueError(f"无法删除：该密钥有 {refs} 条请求记录，请先清理相关日志")
-
-            # Clean up associated template link, then delete the key
             conn.execute("DELETE FROM local_keys WHERE id = ?", (key_id,))
             conn.commit()
             self._schedule_config_sync()
@@ -482,7 +464,8 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, model_pattern, input_price, output_price, currency "
+                "SELECT id, model_pattern, input_price, output_price, "
+                "cache_read_price, currency "
                 "FROM model_pricing ORDER BY id"
             ).fetchall()
             return [dict(r) for r in rows]
@@ -493,9 +476,10 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             cursor = conn.execute(
-                "INSERT INTO model_pricing (model_pattern, input_price, output_price) "
-                "VALUES (?, ?, ?)",
-                (data["model_pattern"], data["input_price"], data["output_price"]),
+                "INSERT INTO model_pricing (model_pattern, input_price, output_price, cache_read_price) "
+                "VALUES (?, ?, ?, ?)",
+                (data["model_pattern"], data["input_price"], data["output_price"],
+                 data.get("cache_read_price")),
             )
             conn.commit()
             # tr_pricing_insert trigger auto-recalculates all costs
@@ -509,7 +493,7 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("model_pattern", "input_price", "output_price"):
+            for key in ("model_pattern", "input_price", "output_price", "cache_read_price"):
                 if key in data:
                     fields.append(f"{key} = ?")
                     values.append(data[key])
@@ -773,6 +757,7 @@ class ProxyDatabase:
                     r.model,
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
+                    COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
                     COUNT(*) AS request_count
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON r.account_id = a.id
@@ -804,6 +789,7 @@ class ProxyDatabase:
                     account_name=name,
                     prompt_tokens=r["prompt_tokens"],
                     completion_tokens=r["completion_tokens"],
+                    cache_read_tokens=r["cache_read_tokens"],
                     request_count=r["request_count"],
                 )
 
@@ -1083,10 +1069,12 @@ def _sync_pricing_to_dashboard(proxy_conn, dash_db_path: str):
             model_pattern TEXT NOT NULL UNIQUE,
             input_price REAL NOT NULL,
             output_price REAL NOT NULL,
+            cache_read_price REAL,
             currency TEXT NOT NULL DEFAULT 'CNY')""")
 
         pricing_rows = proxy_conn.execute(
-            "SELECT id, model_pattern, input_price, output_price, currency "
+            "SELECT id, model_pattern, input_price, output_price, "
+            "cache_read_price, currency "
             "FROM model_pricing ORDER BY id"
         ).fetchall()
 
@@ -1095,8 +1083,8 @@ def _sync_pricing_to_dashboard(proxy_conn, dash_db_path: str):
         dash_conn.execute("DELETE FROM model_pricing")
         for row in pricing_rows:
             dash_conn.execute(
-                "INSERT INTO model_pricing (id, model_pattern, input_price, output_price, currency) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT INTO model_pricing (id, model_pattern, input_price, output_price, cache_read_price, currency) "
+                "VALUES (?,?,?,?,?,?)",
                 tuple(row),
             )
         dash_conn.commit()

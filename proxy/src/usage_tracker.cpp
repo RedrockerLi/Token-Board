@@ -31,6 +31,16 @@ UsageTracker::parse_usage(const std::string &body) {
             if (u.contains("total_tokens"))
                 info.total_tokens = u["total_tokens"].get<int>();
 
+            // Cached prompt tokens (OpenAI chat: usage.prompt_tokens_details).
+            // prompt_tokens already includes these, so the cache miss count is
+            // prompt_tokens - cache_read_tokens.
+            if (u.contains("prompt_tokens_details") &&
+                u["prompt_tokens_details"].is_object() &&
+                u["prompt_tokens_details"].contains("cached_tokens") &&
+                u["prompt_tokens_details"]["cached_tokens"].is_number_integer())
+                info.cache_read_tokens =
+                    u["prompt_tokens_details"]["cached_tokens"].get<int>();
+
             // If total_tokens is 0 but we have prompt + completion, sum them
             if (info.total_tokens == 0)
                 info.total_tokens = info.prompt_tokens + info.completion_tokens;
@@ -94,6 +104,42 @@ UsageTracker::parse_usage_from_sse(const std::string &sse_data) {
                     info.completion_tokens = u["completion_tokens"].get<int>();
                 if (u.contains("total_tokens"))
                     info.total_tokens = u["total_tokens"].get<int>();
+
+                // Cached prompt tokens (OpenAI chat: prompt_tokens_details).
+                if (u.contains("prompt_tokens_details") &&
+                    u["prompt_tokens_details"].is_object() &&
+                    u["prompt_tokens_details"].contains("cached_tokens") &&
+                    u["prompt_tokens_details"]["cached_tokens"].is_number_integer())
+                    info.cache_read_tokens =
+                        u["prompt_tokens_details"]["cached_tokens"].get<int>();
+
+                found_usage = true;
+            }
+
+            // opencode.ai-specific usage frame (non-standard, mirrors the real
+            // opencode.ai stream): `{"choices":[],"x-opencode-type":
+            // "inference-cost","normalizedUsage":{inputTokens, outputTokens,
+            // cacheReadTokens, cacheWrite5mTokens, cacheWrite1hTokens,...}}`.
+            // It is the last usage-bearing frame, so it takes precedence.
+            if (j.contains("x-opencode-type") &&
+                j["x-opencode-type"] == "inference-cost" &&
+                j.contains("normalizedUsage") &&
+                j["normalizedUsage"].is_object()) {
+                auto &nu = j["normalizedUsage"];
+                if (nu.contains("inputTokens") && nu["inputTokens"].is_number_integer())
+                    info.prompt_tokens = nu["inputTokens"].get<int>();
+                if (nu.contains("outputTokens") && nu["outputTokens"].is_number_integer())
+                    info.completion_tokens = nu["outputTokens"].get<int>();
+                if (nu.contains("cacheReadTokens") && nu["cacheReadTokens"].is_number_integer())
+                    info.cache_read_tokens = nu["cacheReadTokens"].get<int>();
+                // Cache writes are billed at the input rate, matching the
+                // Anthropic cache_creation semantics.
+                if (nu.contains("cacheWrite5mTokens") && nu["cacheWrite5mTokens"].is_number_integer())
+                    info.cache_creation_tokens += nu["cacheWrite5mTokens"].get<int>();
+                if (nu.contains("cacheWrite1hTokens") && nu["cacheWrite1hTokens"].is_number_integer())
+                    info.cache_creation_tokens += nu["cacheWrite1hTokens"].get<int>();
+                if (nu.contains("totalTokens") && nu["totalTokens"].is_number_integer())
+                    info.total_tokens = nu["totalTokens"].get<int>();
                 found_usage = true;
             }
         } catch (const json::parse_error &) {
@@ -131,11 +177,14 @@ UsageTracker::parse_anthropic_usage(const std::string &body) {
             if (u.contains("output_tokens"))
                 info.completion_tokens = u["output_tokens"].get<int>();
             // Also check cache_read_input_tokens and cache_creation_input_tokens
-            // for total accuracy when the API provides them
+            // for total accuracy when the API provides them.  They are kept in
+            // prompt_tokens (input_tokens does not include them) and tracked
+            // separately for cache-aware billing.
             if (u.contains("cache_read_input_tokens"))
-                info.prompt_tokens += u["cache_read_input_tokens"].get<int>();
+                info.cache_read_tokens = u["cache_read_input_tokens"].get<int>();
             if (u.contains("cache_creation_input_tokens"))
-                info.prompt_tokens += u["cache_creation_input_tokens"].get<int>();
+                info.cache_creation_tokens = u["cache_creation_input_tokens"].get<int>();
+            info.prompt_tokens += info.cache_read_tokens + info.cache_creation_tokens;
         }
 
         // Anthropic returns total tokens in message_delta for streaming,
@@ -202,9 +251,10 @@ UsageTracker::parse_anthropic_usage_from_sse(const std::string &sse_data) {
                 if (u.contains("output_tokens"))
                     info.completion_tokens = u["output_tokens"].get<int>();
                 if (u.contains("cache_read_input_tokens"))
-                    info.prompt_tokens += u["cache_read_input_tokens"].get<int>();
+                    info.cache_read_tokens = u["cache_read_input_tokens"].get<int>();
                 if (u.contains("cache_creation_input_tokens"))
-                    info.prompt_tokens += u["cache_creation_input_tokens"].get<int>();
+                    info.cache_creation_tokens = u["cache_creation_input_tokens"].get<int>();
+                info.prompt_tokens += info.cache_read_tokens + info.cache_creation_tokens;
                 found_usage = true;
             }
         } catch (const json::parse_error &) {
@@ -238,6 +288,13 @@ UsageTracker::parse_responses_usage(const std::string &body) {
                 info.total_tokens = u["total_tokens"].get<int>();
             else
                 info.total_tokens = info.prompt_tokens + info.completion_tokens;
+            // Cached prompt tokens (Responses: usage.input_tokens_details).
+            if (u.contains("input_tokens_details") &&
+                u["input_tokens_details"].is_object() &&
+                u["input_tokens_details"].contains("cached_tokens") &&
+                u["input_tokens_details"]["cached_tokens"].is_number_integer())
+                info.cache_read_tokens =
+                    u["input_tokens_details"]["cached_tokens"].get<int>();
         }
         if (info.total_tokens == 0)
             info.total_tokens = info.prompt_tokens + info.completion_tokens;
@@ -283,6 +340,13 @@ UsageTracker::parse_responses_usage_from_sse(const std::string &sse_data) {
                     info.total_tokens = u["total_tokens"].get<int>();
                 else
                     info.total_tokens = info.prompt_tokens + info.completion_tokens;
+                // Cached prompt tokens (Responses: usage.input_tokens_details).
+                if (u.contains("input_tokens_details") &&
+                    u["input_tokens_details"].is_object() &&
+                    u["input_tokens_details"].contains("cached_tokens") &&
+                    u["input_tokens_details"]["cached_tokens"].is_number_integer())
+                    info.cache_read_tokens =
+                        u["input_tokens_details"]["cached_tokens"].get<int>();
                 found_usage = true;
             }
         } catch (const json::parse_error &) {
@@ -321,14 +385,15 @@ void UsageTracker::log_request(int account_id, int local_key_id,
 
     db_.log_request(account_id, local_key_id, usage.model,
                     usage.prompt_tokens, usage.completion_tokens,
-                    usage.total_tokens, cost,
+                    usage.cache_read_tokens, usage.total_tokens, cost,
                     is_streaming, status_code, duration_ms);
 
     fprintf(stderr,
-            "[Tracker] account=%d model=%s prompt=%d comp=%d total=%d "
-            "cost=%.6f stream=%d status=%d dur=%dms\n",
+            "[Tracker] account=%d model=%s prompt=%d comp=%d cache_read=%d "
+            "total=%d cost=%.6f stream=%d status=%d dur=%dms\n",
             account_id, usage.model.c_str(),
             usage.prompt_tokens, usage.completion_tokens,
+            usage.cache_read_tokens,
             usage.total_tokens, cost,
             is_streaming ? 1 : 0, status_code, duration_ms);
 }

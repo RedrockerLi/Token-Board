@@ -38,13 +38,15 @@ public:
 private:
     void handle_chat_request(const httplib::Request &req,
                              httplib::Response &res);
-    void handle_passthrough(const Router::RouteResult &route,
+    void handle_passthrough(Router::RouteResult &route,
                             ir::ApiFormat upstream,
+                            const std::string &resolved_model,
                             const httplib::Request &req,
                             httplib::Response &res,
                             std::chrono::steady_clock::time_point t0);
-    void handle_converted(const Router::RouteResult &route,
+    void handle_converted(Router::RouteResult &route,
                           ir::ApiFormat harness, ir::ApiFormat upstream,
+                          const std::string &resolved_model,
                           const httplib::Request &req,
                           httplib::Response &res,
                           std::chrono::steady_clock::time_point t0);

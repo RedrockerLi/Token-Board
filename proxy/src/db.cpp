@@ -61,19 +61,9 @@ void Database::close() {
 
 // ── Schema creation ──────────────────────────────────────────────────────
 
-/// Check whether a column already exists (table/column are internal constants).
-/// SQLite resolves column names at prepare time, so a successful prepare means
-/// the column exists — regardless of whether the table currently has rows.
-static bool column_exists(sqlite3 *db, const char *table, const char *column) {
-    char sql[256];
-    snprintf(sql, sizeof(sql), "SELECT %s FROM %s LIMIT 1", column, table);
-    sqlite3_stmt *stmt = nullptr;
-    bool ok = (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK);
-    if (stmt) sqlite3_finalize(stmt);
-    return ok;
-}
-
 void Database::create_schema() {
+    // NOTE: existing databases are migrated by `scripts/migrate_proxy_db.py`
+    // (run once when merging); this code only creates the current schema.
     const char *sql = R"SQL(
         CREATE TABLE IF NOT EXISTS upstream_accounts (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +71,9 @@ void Database::create_schema() {
             upstream_key TEXT NOT NULL,
             base_url    TEXT NOT NULL DEFAULT '',
             api_format  TEXT NOT NULL DEFAULT 'openai',
+            is_aggregate INTEGER NOT NULL DEFAULT 0,
+            endpoint_path TEXT NOT NULL DEFAULT '',
+            auth_header TEXT NOT NULL DEFAULT 'bearer',
             created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         );
 
@@ -89,7 +82,6 @@ void Database::create_schema() {
             key_value   TEXT NOT NULL UNIQUE,
             label       TEXT,
             account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id),
-            template_id INTEGER REFERENCES model_map_templates(id),
             created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
             last_used_at TEXT
         );
@@ -97,10 +89,11 @@ void Database::create_schema() {
         CREATE TABLE IF NOT EXISTS request_log (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id       INTEGER NOT NULL REFERENCES upstream_accounts(id),
-            local_key_id     INTEGER NOT NULL REFERENCES local_keys(id),
+            local_key_id     INTEGER REFERENCES local_keys(id) ON DELETE SET NULL,
             model            TEXT NOT NULL,
             prompt_tokens    INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens     INTEGER NOT NULL DEFAULT 0,
             cost             REAL NOT NULL DEFAULT 0.0,
             exported         INTEGER NOT NULL DEFAULT 0,
@@ -122,6 +115,7 @@ void Database::create_schema() {
             model_pattern  TEXT NOT NULL UNIQUE,
             input_price    REAL NOT NULL,
             output_price   REAL NOT NULL,
+            cache_read_price REAL,
             currency       TEXT NOT NULL DEFAULT 'CNY'
         );
 
@@ -134,18 +128,15 @@ void Database::create_schema() {
 
         DROP TABLE IF EXISTS key_model_map;  -- legacy per-key model mapping (removed)
 
-        CREATE TABLE IF NOT EXISTS model_map_templates (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL UNIQUE,
-            sort_order   INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS model_map_template_entries (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            template_id     INTEGER NOT NULL REFERENCES model_map_templates(id) ON DELETE CASCADE,
-            sort_order       INTEGER NOT NULL DEFAULT 0,
-            pattern         TEXT NOT NULL,
-            upstream_model  TEXT NOT NULL
+        -- Aggregate account model routing: one entry per exposed model,
+        -- mapping to a real upstream account + upstream model name.
+        CREATE TABLE IF NOT EXISTS aggregate_entries (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id           INTEGER NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+            sort_order           INTEGER NOT NULL DEFAULT 0,
+            pattern              TEXT NOT NULL,
+            upstream_account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
+            upstream_model       TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS perf_events (
@@ -172,12 +163,14 @@ void Database::create_schema() {
         );
 
         -- Trigger: auto-compute cost from model_pricing when a request is logged.
-        -- Removes the need for application-level cost computation.
+        -- Cost = cache-miss input at the input rate + cache-hit input at the
+        -- (optional, cheaper) cache_read rate + output at the output rate.
         CREATE TRIGGER IF NOT EXISTS tr_request_log_insert
         AFTER INSERT ON request_log
         BEGIN
             UPDATE request_log SET cost = COALESCE((
-                SELECT (NEW.prompt_tokens / 1000000.0) * mp.input_price
+                SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                     + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
                      + (NEW.completion_tokens / 1000000.0) * mp.output_price
                 FROM model_pricing mp
                 WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
@@ -190,7 +183,8 @@ void Database::create_schema() {
         AFTER INSERT ON model_pricing
         BEGIN
             UPDATE request_log SET cost = COALESCE((
-                SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                     + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
                      + (request_log.completion_tokens / 1000000.0) * mp.output_price
                 FROM model_pricing mp
                 WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
@@ -203,7 +197,8 @@ void Database::create_schema() {
         AFTER UPDATE ON model_pricing
         BEGIN
             UPDATE request_log SET cost = COALESCE((
-                SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                     + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
                      + (request_log.completion_tokens / 1000000.0) * mp.output_price
                 FROM model_pricing mp
                 WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
@@ -216,7 +211,8 @@ void Database::create_schema() {
         AFTER DELETE ON model_pricing
         BEGIN
             UPDATE request_log SET cost = COALESCE((
-                SELECT (request_log.prompt_tokens / 1000000.0) * mp.input_price
+                SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                     + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
                      + (request_log.completion_tokens / 1000000.0) * mp.output_price
                 FROM model_pricing mp
                 WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
@@ -230,82 +226,6 @@ void Database::create_schema() {
     if (rc != SQLITE_OK) {
         fprintf(stderr, "[DB] Schema creation error: %s\n", err);
         sqlite3_free(err);
-    }
-
-    // ── Migrations ─────────────────────────────────────────────────────
-    // v2: add api_format column to upstream_accounts (added 2026-06)
-    {
-        // Check if the column already exists
-        bool has_api_format = false;
-        sqlite3_stmt *stmt = nullptr;
-        sqlite3_prepare_v2(db_,
-            "SELECT api_format FROM upstream_accounts LIMIT 1",
-            -1, &stmt, nullptr);
-        if (stmt) {
-            has_api_format = (sqlite3_step(stmt) == SQLITE_ROW);
-            sqlite3_finalize(stmt);
-        }
-        if (!has_api_format) {
-            sqlite3_exec(db_,
-                "ALTER TABLE upstream_accounts ADD COLUMN api_format "
-                "TEXT NOT NULL DEFAULT 'openai'",
-                nullptr, nullptr, &err);
-            if (err) {
-                fprintf(stderr, "[DB] Migration v2 error: %s\n", err);
-                sqlite3_free(err);
-                err = nullptr;
-            } else {
-                fprintf(stderr, "[DB] Migration v2: added api_format column\n");
-            }
-        }
-    }
-
-    // v3: endpoint_path on upstream_accounts — explicit upstream path override
-    //     (fixes /v1 double-append; empty string = derive from api_format)
-    if (!column_exists(db_, "upstream_accounts", "endpoint_path")) {
-        char *e3 = nullptr;
-        sqlite3_exec(db_,
-            "ALTER TABLE upstream_accounts ADD COLUMN endpoint_path "
-            "TEXT NOT NULL DEFAULT ''",
-            nullptr, nullptr, &e3);
-        if (e3) {
-            fprintf(stderr, "[DB] Migration v3 error: %s\n", e3);
-            sqlite3_free(e3);
-        } else {
-            fprintf(stderr, "[DB] Migration v3: added endpoint_path column\n");
-        }
-    }
-
-    // v4: auth_header on upstream_accounts — auth scheme for the upstream
-    //     ("bearer" → Authorization: Bearer; "x-api-key" → x-api-key + anthropic-version)
-    if (!column_exists(db_, "upstream_accounts", "auth_header")) {
-        char *e4 = nullptr;
-        sqlite3_exec(db_,
-            "ALTER TABLE upstream_accounts ADD COLUMN auth_header "
-            "TEXT NOT NULL DEFAULT 'bearer'",
-            nullptr, nullptr, &e4);
-        if (e4) {
-            fprintf(stderr, "[DB] Migration v4 error: %s\n", e4);
-            sqlite3_free(e4);
-        } else {
-            fprintf(stderr, "[DB] Migration v4: added auth_header column\n");
-        }
-    }
-
-    // v6: remove harness_format from local_keys — the harness (client) format
-    //     is now derived from the incoming request URL path; the per-key
-    //     column is gone.  Fresh DBs never create it (migration v5 removed).
-    if (column_exists(db_, "local_keys", "harness_format")) {
-        char *e6 = nullptr;
-        sqlite3_exec(db_,
-            "ALTER TABLE local_keys DROP COLUMN harness_format",
-            nullptr, nullptr, &e6);
-        if (e6) {
-            fprintf(stderr, "[DB] Migration v6 error: %s\n", e6);
-            sqlite3_free(e6);
-        } else {
-            fprintf(stderr, "[DB] Migration v6: dropped harness_format column\n");
-        }
     }
 
     // Pricing entries are managed by the web dashboard; no auto-seeding.
@@ -327,23 +247,21 @@ void Database::prepare_statements() {
             stmt_lookup_key_);
 
     PREPARE("SELECT id, name, upstream_key, base_url, api_format, "
-            "COALESCE(endpoint_path,''), COALESCE(auth_header,'bearer') "
+            "COALESCE(endpoint_path,''), COALESCE(auth_header,'bearer'), "
+            "COALESCE(is_aggregate,0) "
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
 
     PREPARE("INSERT INTO request_log "
             "(account_id, local_key_id, model, prompt_tokens, "
-            " completion_tokens, total_tokens, cost, is_streaming, "
-            " status_code, duration_ms) "
-            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            " completion_tokens, cache_read_tokens, total_tokens, cost, "
+            " is_streaming, status_code, duration_ms) "
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             stmt_insert_log_);
 
-    PREPARE("SELECT template_id FROM local_keys WHERE id = ?1",
-            stmt_get_key_template_);
-
-    PREPARE("SELECT pattern, upstream_model FROM model_map_template_entries "
-            "WHERE template_id = ?1 ORDER BY sort_order, id",
-            stmt_get_template_entries_);
+    PREPARE("SELECT pattern, upstream_account_id, upstream_model "
+            "FROM aggregate_entries WHERE account_id = ?1 ORDER BY sort_order, id",
+            stmt_get_aggregate_entries_);
 
     PREPARE("SELECT id, model_pattern, input_price, output_price "
             "FROM model_pricing ORDER BY id",
@@ -385,8 +303,7 @@ void Database::finalize_statements() {
     FINALIZE(stmt_lookup_key_);
     FINALIZE(stmt_get_account_);
     FINALIZE(stmt_insert_log_);
-    FINALIZE(stmt_get_key_template_);
-    FINALIZE(stmt_get_template_entries_);
+    FINALIZE(stmt_get_aggregate_entries_);
     FINALIZE(stmt_get_pricing_);
     FINALIZE(stmt_update_last_used_);
     FINALIZE(stmt_insert_perf_event_);
@@ -449,6 +366,7 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
         info.auth_header = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_get_account_, 6));
         if (info.auth_header.empty()) info.auth_header = "bearer";
+        info.is_aggregate = sqlite3_column_int(stmt_get_account_, 7) != 0;
         result = std::move(info);
     }
     sqlite3_reset(stmt_get_account_);
@@ -460,7 +378,8 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
 void Database::log_request(int account_id, int local_key_id,
                            const std::string &model,
                            int prompt_tokens, int completion_tokens,
-                           int total_tokens, double cost,
+                           int cache_read_tokens, int total_tokens,
+                           double cost,
                            bool is_streaming, int status_code,
                            int duration_ms) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -472,11 +391,12 @@ void Database::log_request(int account_id, int local_key_id,
                       model.c_str(), model.size(), SQLITE_STATIC);
     sqlite3_bind_int(stmt_insert_log_, 4, prompt_tokens);
     sqlite3_bind_int(stmt_insert_log_, 5, completion_tokens);
-    sqlite3_bind_int(stmt_insert_log_, 6, total_tokens);
-    sqlite3_bind_double(stmt_insert_log_, 7, cost);
-    sqlite3_bind_int(stmt_insert_log_, 8, is_streaming ? 1 : 0);
-    sqlite3_bind_int(stmt_insert_log_, 9, status_code);
-    sqlite3_bind_int(stmt_insert_log_, 10, duration_ms);
+    sqlite3_bind_int(stmt_insert_log_, 6, cache_read_tokens);
+    sqlite3_bind_int(stmt_insert_log_, 7, total_tokens);
+    sqlite3_bind_double(stmt_insert_log_, 8, cost);
+    sqlite3_bind_int(stmt_insert_log_, 9, is_streaming ? 1 : 0);
+    sqlite3_bind_int(stmt_insert_log_, 10, status_code);
+    sqlite3_bind_int(stmt_insert_log_, 11, duration_ms);
 
     int rc = sqlite3_step(stmt_insert_log_);
     if (rc != SQLITE_DONE)
@@ -496,36 +416,46 @@ void Database::update_key_last_used(int local_key_id) {
     sqlite3_reset(stmt_update_last_used_);
 }
 
-// ── get_key_template_id ──────────────────────────────────────────────────
+// ── resolve_aggregate ────────────────────────────────────────────────────
 
-int Database::get_key_template_id(int key_id) {
+std::optional<Database::AggregateEntry>
+Database::resolve_aggregate(int account_id, const std::string &model) {
     std::lock_guard<std::mutex> lock(mutex_);
-    sqlite3_reset(stmt_get_key_template_);
-    sqlite3_bind_int(stmt_get_key_template_, 1, key_id);
-    int tid = 0;
-    if (sqlite3_step(stmt_get_key_template_) == SQLITE_ROW)
-        tid = sqlite3_column_type(stmt_get_key_template_, 0) != SQLITE_NULL
-                  ? sqlite3_column_int(stmt_get_key_template_, 0) : 0;
-    sqlite3_reset(stmt_get_key_template_);
-    return tid;
+    std::optional<AggregateEntry> result;
+    sqlite3_reset(stmt_get_aggregate_entries_);
+    sqlite3_bind_int(stmt_get_aggregate_entries_, 1, account_id);
+    while (sqlite3_step(stmt_get_aggregate_entries_) == SQLITE_ROW) {
+        std::string pattern = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_aggregate_entries_, 0));
+        // Exact (case-sensitive) match: entries are concrete model names —
+        // the aggregate's model catalog, not wildcard patterns.
+        if (pattern == model) {
+            AggregateEntry e;
+            e.pattern = pattern;
+            e.upstream_account_id = sqlite3_column_int(stmt_get_aggregate_entries_, 1);
+            e.upstream_model = reinterpret_cast<const char *>(
+                sqlite3_column_text(stmt_get_aggregate_entries_, 2));
+            result = std::move(e);
+            break;
+        }
+    }
+    sqlite3_reset(stmt_get_aggregate_entries_);
+    return result;
 }
 
-// ── get_template_entries ─────────────────────────────────────────────────
+// ── get_aggregate_model_patterns ─────────────────────────────────────────
 
-std::vector<Database::ModelMapping> Database::get_template_entries(int template_id) {
+std::vector<std::string>
+Database::get_aggregate_model_patterns(int account_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<ModelMapping> result;
-    sqlite3_reset(stmt_get_template_entries_);
-    sqlite3_bind_int(stmt_get_template_entries_, 1, template_id);
-    while (sqlite3_step(stmt_get_template_entries_) == SQLITE_ROW) {
-        ModelMapping m;
-        m.pattern = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_template_entries_, 0));
-        m.upstream_model = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_template_entries_, 1));
-        result.push_back(m);
+    std::vector<std::string> result;
+    sqlite3_reset(stmt_get_aggregate_entries_);
+    sqlite3_bind_int(stmt_get_aggregate_entries_, 1, account_id);
+    while (sqlite3_step(stmt_get_aggregate_entries_) == SQLITE_ROW) {
+        result.emplace_back(reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_aggregate_entries_, 0)));
     }
-    sqlite3_reset(stmt_get_template_entries_);
+    sqlite3_reset(stmt_get_aggregate_entries_);
     return result;
 }
 

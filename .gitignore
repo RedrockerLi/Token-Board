@@ -1,4 +1,5 @@
 .vscode
+.zcode
 __pycache__
 
 # CSV data files — not tracked, imported into DB on startup

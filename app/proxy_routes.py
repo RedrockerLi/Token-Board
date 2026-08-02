@@ -141,41 +141,58 @@ def delete_key(key_id):
     return jsonify({"status": "ok"})
 
 
-# ── Model Map Templates CRUD ──────────────────────────────────────
+# ── Aggregate Accounts ────────────────────────────────────────────────
 
-@bp_proxy.route("/templates", methods=["GET"])
-def list_templates():
-    return jsonify(_proxy_db().get_templates())
+def _validate_aggregate_entries(entries):
+    """Each entry is a concrete model name (no wildcards) → the aggregate's
+    catalog, plus the real upstream account + model it routes to."""
+    if not isinstance(entries, list) or not entries:
+        return "至少需要一条模型映射"
+    for e in entries:
+        if not e.get("pattern") or not e.get("account_id") or not e.get("upstream_model"):
+            return "每条映射需要填写模型名称、目标账户和目标模型"
+        if any(ch in e["pattern"] for ch in "*?"):
+            return f"模型名称 '{e['pattern']}' 不能包含通配符（* ?）——聚合账户的模型列表为精确模型名"
+    return None
 
-@bp_proxy.route("/templates", methods=["POST"])
-def create_template():
+
+@bp_proxy.route("/aggregates", methods=["GET"])
+def list_aggregates():
+    return jsonify(_proxy_db().get_aggregates())
+
+
+@bp_proxy.route("/aggregates", methods=["POST"])
+def create_aggregate():
     data = request.get_json(force=True)
     if not data.get("name"):
         return jsonify({"error": "name is required"}), 400
-    tid = _proxy_db().create_template(data)
-    return jsonify({"id": tid}), 201
-
-@bp_proxy.route("/templates/<int:tid>", methods=["PUT"])
-def update_template(tid):
-    data = request.get_json(force=True)
-    ok = _proxy_db().update_template(tid, data)
-    if not ok: return jsonify({"error": "Template not found"}), 404
-    return jsonify({"status": "ok"})
-
-@bp_proxy.route("/templates/<int:tid>", methods=["DELETE"])
-def delete_template(tid):
+    err = _validate_aggregate_entries(data.get("entries"))
+    if err:
+        return jsonify({"error": err}), 400
     try:
-        ok = _proxy_db().delete_template(tid)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 409
-    if not ok: return jsonify({"error": "Template not found"}), 404
+        agg_id = _proxy_db().create_aggregate(data)
+        return jsonify({"id": agg_id}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@bp_proxy.route("/aggregates/<int:agg_id>", methods=["PUT"])
+def update_aggregate(agg_id):
+    data = request.get_json(force=True)
+    err = _validate_aggregate_entries(data.get("entries"))
+    if err:
+        return jsonify({"error": err}), 400
+    ok = _proxy_db().update_aggregate(agg_id, data)
+    if not ok:
+        return jsonify({"error": "Aggregate account not found"}), 404
     return jsonify({"status": "ok"})
 
-@bp_proxy.route("/templates/<int:tid>/entries/reorder", methods=["POST"])
-def reorder_template_entries(tid):
-    data = request.get_json(force=True)
-    ok = _proxy_db().reorder_template_entries(tid, data["entry_id"], data["direction"])
-    if not ok: return jsonify({"error": "Entry not found"}), 404
+
+@bp_proxy.route("/aggregates/<int:agg_id>", methods=["DELETE"])
+def delete_aggregate(agg_id):
+    ok = _proxy_db().delete_aggregate(agg_id)
+    if not ok:
+        return jsonify({"error": "Aggregate account not found"}), 404
     return jsonify({"status": "ok"})
 
 

@@ -281,8 +281,7 @@ CONFIG_TABLES = [
     "local_keys",
     "model_pricing",
     "account_models",
-    "model_map_templates",
-    "model_map_template_entries",
+    "aggregate_entries",
 ]
 
 
@@ -385,7 +384,8 @@ def _merge_dashboard(remote_path: str, local_path: str):
         "token_usage": ["date", "model", "api_key_name", "token_type", "amount", "cost_group_key"],
         "request_usage": ["date", "model", "api_key_name", "count"],
         "cost_entry": ["date", "model", "cost", "cost_group_key", "source"],
-        "model_pricing": ["id", "model_pattern", "input_price", "output_price", "currency"],
+        "model_pricing": ["id", "model_pattern", "input_price", "output_price",
+                          "cache_read_price", "currency"],
     }
 
     remote_conn = sqlite3.connect(remote_path)
