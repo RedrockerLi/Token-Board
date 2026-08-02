@@ -244,7 +244,7 @@ function initBillingPage() {
             <div class="stat-card stat-card--cyan">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 总消费（实际）</div>
                 <div class="stat-card__value number-lg" id="billTotalCost">--</div>
-                <div class="stat-card__sub">今日消费（理论）: <span id="billTodayCost">--</span> · <span id="billActiveKeys">0</span> 个活跃密钥</div>
+                <div class="stat-card__sub">今日消费（含plan订阅）: <span id="billTodayCost">--</span> · <span id="billActiveKeys">0</span> 个活跃密钥</div>
             </div>
         </div>
 

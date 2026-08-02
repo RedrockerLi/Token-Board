@@ -476,9 +476,9 @@ function aggRow(pattern, accountId, accountName, upstreamModel) {
         <span style="color:var(--color-text-tertiary);">→</span>
         <select class="agg-acct" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onchange="resetAggModel(this)">${accountOpts}</select>
         <select class="agg-model" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onfocus="loadAggModels(this)"><option value="${esc(upstreamModel||'')}">${esc(upstreamModel||'点击获取模型')}</option></select>
-        <button class="btn btn--sm" onclick="moveAggRow(this, 'up')" title="上移">▲</button>
-        <button class="btn btn--sm" onclick="moveAggRow(this, 'down')" title="下移">▼</button>
-        <button class="btn btn--sm" onclick="this.parentElement.remove()" style="color:#EF4444;">✕</button>
+        <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'up')" title="上移">▲</button>
+        <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'down')" title="下移">▼</button>
+        <button type="button" class="btn btn--sm" onclick="this.parentElement.remove()" style="color:#EF4444;">✕</button>
     </div>`;
 }
 
@@ -643,9 +643,9 @@ async function loadPricingTable() {
         tbody.innerHTML = pricing.map((p) => `
             <tr>
                 <td><code>${esc(p.model_pattern)}</code></td>
-                <td>¥${p.input_price.toFixed(2)} / 1M tokens</td>
-                <td>¥${p.output_price.toFixed(2)} / 1M tokens</td>
-                <td>${p.cache_read_price != null ? '¥' + p.cache_read_price.toFixed(2) + ' / 1M tokens' : '<span style="color:var(--color-text-tertiary);">同输入价</span>'}</td>
+                <td>¥${p.input_price.toFixed(4)} / 1M tokens</td>
+                <td>¥${p.output_price.toFixed(4)} / 1M tokens</td>
+                <td>${p.cache_read_price != null ? '¥' + p.cache_read_price.toFixed(4) + ' / 1M tokens' : '<span style="color:var(--color-text-tertiary);">同输入价</span>'}</td>
                 <td>${esc(p.currency)}</td>
                 <td>
                     <button class="btn btn--sm" onclick="reorderPricing(${p.id},'up')">▲</button>
@@ -736,9 +736,9 @@ function initPricingPage() {
                 </div>
                 <form id="pricingForm" onsubmit="savePricing(event)" data-edit-id="">
                     <label>模型匹配模式 <input name="model_pattern" required placeholder="例如: deepseek-v4*"></label>
-                    <label>输入价格 (¥/1M tokens) <input name="input_price" type="number" step="0.01" required></label>
-                    <label>输出价格 (¥/1M tokens) <input name="output_price" type="number" step="0.01" required></label>
-                    <label>缓存命中价格 (¥/1M tokens，可选) <input name="cache_read_price" type="number" step="0.01" placeholder="留空 = 与输入价格相同"></label>
+                    <label>输入价格 (¥/1M tokens) <input name="input_price" type="number" step="0.0001" required></label>
+                    <label>输出价格 (¥/1M tokens) <input name="output_price" type="number" step="0.0001" required></label>
+                    <label>缓存命中价格 (¥/1M tokens，可选) <input name="cache_read_price" type="number" step="0.0001" placeholder="留空 = 与输入价格相同"></label>
                     <button type="submit" class="btn btn--primary">添加</button>
                 </form>
             </div>

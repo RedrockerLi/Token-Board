@@ -230,6 +230,11 @@ body {
 .select-styled:hover { border-color: var(--color-primary); }
 .select-styled:focus { outline: none; border-color: var(--color-primary); box-shadow: 0 0 0 3px rgba(0,112,243,0.1); }
 
+/* 下拉选框固定长度，不随内容变长变短 */
+.select-styled { width: 170px; }
+#keyNameSelector { width: 220px; }
+.map-row > * { min-width: 0; }
+
 .btn {
     display: inline-flex;
     align-items: center;
