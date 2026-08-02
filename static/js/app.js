@@ -71,7 +71,7 @@ const PAGES = [
     {
         hash: '#/proxy/billing',
         container: 'page-billing',
-        title: '费用报告 · Token Board',
+        title: '消费报告 · Token Board',
         module: '/static/js/proxy_billing.js',
         initFn: 'initBillingPage',
         destroyFn: null,

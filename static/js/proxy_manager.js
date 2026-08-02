@@ -58,15 +58,22 @@ function closeModal(id) {
 
 // ── Accounts Page ────────────────────────────────────────────────────────
 
+/// Show/hide the plan monthly-price field based on the account type.
+function togglePlanFields(sel) {
+    const field = document.getElementById('planPriceField');
+    if (!field) return;
+    field.style.display = (sel && sel.value === 'plan') ? '' : 'none';
+}
+
 async function loadAccountsTable() {
     const tbody = document.querySelector('#accountsTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
     try {
         const accounts = await proxyFetch('/api/proxy/accounts');
         const real = accounts.filter(a => !a.is_aggregate);
         if (!real.length) {
-            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无账户，请点击"添加账户"（聚合账户请到"上游账户聚合"管理）</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="td-empty">暂无账户，请点击"添加账户"（聚合账户请到"上游账户聚合"管理）</td></tr>';
             return;
         }
         tbody.innerHTML = real.map((a) => `
@@ -75,7 +82,9 @@ async function loadAccountsTable() {
                 <td><code>${esc(maskKey(a.upstream_key))}</code></td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
-                <td>${esc(a.created_at || '')}</td>
+                <td>${a.account_type === 'plan' ? '<span class="badge badge--active">plan</span>' : '<span class="badge">api</span>'}</td>
+                <td>${a.account_type === 'plan' ? '¥' + (+(a.monthly_price || 0)).toFixed(2) + '/月' : '-'}</td>
+                <td>${a.max_concurrency ? a.max_concurrency + ' 并发' : '无限制'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
                     <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${esc(a.name)}')">更新模型</button>
@@ -83,7 +92,7 @@ async function loadAccountsTable() {
             </tr>
         `).join('');
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="6" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -103,13 +112,21 @@ async function saveAccount(e) {
                     api_format: data.api_format,
                     endpoint_path: data.endpoint_path || '',
                     auth_header: data.auth_header || 'auto',
+                    account_type: data.account_type || 'api',
+                    monthly_price: data.monthly_price || 0,
+                    max_concurrency: data.max_concurrency || null,
                 }),
             });
             showToast('账户已更新');
         } else {
             await proxyFetch('/api/proxy/accounts', {
                 method: 'POST',
-                body: JSON.stringify(data),
+                body: JSON.stringify({
+                    ...data,
+                    account_type: data.account_type || 'api',
+                    monthly_price: data.monthly_price || 0,
+                    max_concurrency: data.max_concurrency || null,
+                }),
             });
             showToast('账户已创建');
         }
@@ -136,6 +153,10 @@ function editAccount(id) {
         form['api_format'].value = acc.api_format || 'openai';
         form['endpoint_path'].value = acc.endpoint_path || '';
         form['auth_header'].value = acc.auth_header || 'auto';
+        form['account_type'].value = acc.account_type || 'api';
+        form['monthly_price'].value = acc.account_type === 'plan' ? (acc.monthly_price || 0) : '';
+        form['max_concurrency'].value = acc.max_concurrency || '';
+        togglePlanFields(form['account_type']);
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
@@ -180,7 +201,7 @@ function initAccountsPage() {
             <button class="btn btn--primary" onclick="openModal('accountModal')">+ 添加账户</button>
         </div>
         <table class="mgmt-table" id="accountsTable">
-            <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>创建时间</th><th>操作</th></tr></thead>
+            <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>类型</th><th>plan 月费</th><th>并发限额</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
         <div class="modal-overlay" id="accountModal" style="display:none">
@@ -209,6 +230,18 @@ function initAccountsPage() {
                             <option value="bearer">Authorization: Bearer</option>
                             <option value="x-api-key">x-api-key + anthropic-version</option>
                         </select>
+                    </label>
+                    <label>账户类型
+                        <select name="account_type" onchange="togglePlanFields(this)">
+                            <option value="api">api — 按调用量计费</option>
+                            <option value="plan">plan — 订阅套餐，调用免费</option>
+                        </select>
+                    </label>
+                    <label id="planPriceField" style="display:none;">plan 每月价格 (¥)
+                        <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 99">
+                    </label>
+                    <label>并发限额（可选，留空 = 无限制）
+                        <input name="max_concurrency" type="number" step="1" min="1" placeholder="如 3">
                     </label>
                     <div style="display:flex; gap:8px;">
                         <button type="submit" class="btn btn--primary">添加账户</button>
@@ -439,7 +472,7 @@ function aggRow(pattern, accountId, accountName, upstreamModel) {
             `<option value="${a.id}" ${a.id === accountId ? 'selected' : ''}>${esc(a.name)}</option>`).join('')
         : `<option value="${accountId || ''}">${esc(accountName || '加载中...')}</option>`;
     return `<div class="map-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-        <input value="${esc(pattern||'')}" placeholder="模型名称" title="精确模型名，将作为该聚合账户的模型列表返回给客户端" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
+        <input value="${esc(pattern||'')}" placeholder="模型名称" title="精确模型名；同一模型可配多行（多上游账户），按顺序依次使用" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
         <span style="color:var(--color-text-tertiary);">→</span>
         <select class="agg-acct" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onchange="resetAggModel(this)">${accountOpts}</select>
         <select class="agg-model" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onfocus="loadAggModels(this)"><option value="${esc(upstreamModel||'')}">${esc(upstreamModel||'点击获取模型')}</option></select>
@@ -570,7 +603,7 @@ function initAggregatesPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">上游账户聚合</h1>
-            <p class="page-subtitle">聚合多个上游账户为一个账户：模型列表即此聚合账户暴露给客户端的全部模型，请求按精确模型名分发到对应上游</p>
+            <p class="page-subtitle">聚合多个上游账户为一个账户：模型列表即此聚合账户暴露给客户端的全部模型。同一模型可配置多个上游账户，请求从上到下依次使用——当前账户达到并发限额或处于冷却期时自动使用下一个</p>
             <button class="btn btn--primary" onclick="openAggregateModal()">+ 新建聚合账户</button>
         </div>
         <table class="mgmt-table" id="aggregatesTable">

@@ -51,6 +51,7 @@ class DataStore:
         self.token_usages: list[TokenUsage] = []
         self.request_usages: list[RequestUsage] = []
         self.cost_entries: list[CostEntry] = []
+        self.plan_summary: list[dict] = []     # proxy plan monthly economics
         self.available_months: list[dict] = []     # [{"year", "month", "label"}]
         self.api_key_names: list[str] = []
         self.platforms: list[str] = []             # discovered platform names
@@ -71,7 +72,7 @@ class DataStore:
         # Fallback: scan CSV files (legacy path)
         if not data_dir.exists():
             print(f"[WARN] Data directory not found: {data_dir}")
-            self._commit([], [], [], [], [], [], [])
+            self._commit([], [], [], [], [], [], [], [])
             return
 
         token_usages: list[TokenUsage] = []
@@ -143,6 +144,7 @@ class DataStore:
             sorted(api_key_names_set),
             [],  # platforms no longer tracked
             _sort_models(models_set),
+            [],  # plan_summary — CSV fallback has no proxy plan data
         )
 
     # ── helpers ─────────────────────────────────────────────────────────
@@ -160,6 +162,7 @@ class DataStore:
             api_key_names,
             platforms,
             models,
+            plan_summary,
         ) = db.load_to_ir()
 
         self._commit(
@@ -170,10 +173,12 @@ class DataStore:
             api_key_names,
             platforms,
             models,
+            plan_summary,
         )
 
     def _commit(self, token_usages, request_usages, cost_entries,
-                available_months, api_key_names, platforms, models):
+                available_months, api_key_names, platforms, models,
+                plan_summary=None):
         self.token_usages = token_usages
         self.request_usages = request_usages
         self.cost_entries = cost_entries
@@ -181,3 +186,5 @@ class DataStore:
         self.api_key_names = api_key_names
         self.platforms = platforms
         self.models = models
+        if plan_summary is not None:
+            self.plan_summary = plan_summary

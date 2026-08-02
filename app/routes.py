@@ -127,6 +127,24 @@ def api_summary():
             model_cost[ce.model] += ce.cost
         total_cost = round(total_cost, 4)
 
+    # Plan economics (proxy-exported data). When a specific user is selected,
+    # only that user's plan rows count (so a plan account shows its own
+    # subscription + virtual cost; api / CSV users get 0). In the overview all
+    # plan rows count. Frontend adds these on top of total_cost:
+    #   subscription_cost = real: plan monthly prices, one per used month
+    #   virtual_cost      = theoretical: api-billed amount the plan covered
+    if api_key_name:
+        plan_rows = [
+            ps for ps in _store().plan_summary
+            if ps.get("account_name") == api_key_name
+        ]
+    else:
+        plan_rows = _store().plan_summary
+    plan_subscription_cost = sum(ps.get("subscription_cost", 0) for ps in plan_rows)
+    plan_virtual_cost = sum(ps.get("virtual_cost", 0) for ps in plan_rows)
+    plan_subscription_cost = round(plan_subscription_cost, 4)
+    plan_virtual_cost = round(plan_virtual_cost, 4)
+
     # Build model breakdown
     all_models = set(model_tokens.keys()) | set(model_cost.keys())
     model_breakdown = {}
@@ -149,6 +167,8 @@ def api_summary():
         "total_tokens": total_tokens,
         "total_requests": total_requests,
         "total_cost": total_cost,
+        "plan_subscription_cost": plan_subscription_cost,
+        "plan_virtual_cost": plan_virtual_cost,
         "model_breakdown": model_breakdown,
         "available_months": _store().available_months,
         "api_key_names": _store().api_key_names,

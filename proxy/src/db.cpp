@@ -62,7 +62,8 @@ void Database::close() {
 // ── Schema creation ──────────────────────────────────────────────────────
 
 void Database::create_schema() {
-    // (run once when merging); this code only creates the current schema.
+    // CREATE TABLE IF NOT EXISTS defines the full current schema (including
+    // account_type / monthly_price / max_concurrency / virtual_cost).
     const char *sql = R"SQL(
         CREATE TABLE IF NOT EXISTS upstream_accounts (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +74,9 @@ void Database::create_schema() {
             is_aggregate INTEGER NOT NULL DEFAULT 0,
             endpoint_path TEXT NOT NULL DEFAULT '',
             auth_header TEXT NOT NULL DEFAULT 'bearer',
+            account_type TEXT NOT NULL DEFAULT 'api',
+            monthly_price REAL NOT NULL DEFAULT 0,
+            max_concurrency INTEGER,
             created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         );
 
@@ -95,6 +99,7 @@ void Database::create_schema() {
             cache_read_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens     INTEGER NOT NULL DEFAULT 0,
             cost             REAL NOT NULL DEFAULT 0.0,
+            virtual_cost     REAL NOT NULL DEFAULT 0.0,
             exported         INTEGER NOT NULL DEFAULT 0,
             is_streaming     INTEGER NOT NULL DEFAULT 0,
             status_code      INTEGER NOT NULL,
@@ -164,59 +169,127 @@ void Database::create_schema() {
         -- Trigger: auto-compute cost from model_pricing when a request is logged.
         -- Cost = cache-miss input at the input rate + cache-hit input at the
         -- (optional, cheaper) cache_read rate + output at the output rate.
-        CREATE TRIGGER IF NOT EXISTS tr_request_log_insert
+        -- plan accounts: real cost = 0 (subscription covers usage), the
+        -- api-billed amount goes to virtual_cost (to gauge plan economics).
+        -- api accounts: real cost = api-billed amount, virtual_cost = 0.
+        DROP TRIGGER IF EXISTS tr_request_log_insert;
+        CREATE TRIGGER tr_request_log_insert
         AFTER INSERT ON request_log
         BEGIN
-            UPDATE request_log SET cost = COALESCE((
-                SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                     + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                     + (NEW.completion_tokens / 1000000.0) * mp.output_price
-                FROM model_pricing mp
-                WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
-                ORDER BY mp.id LIMIT 1
-            ), 0.0) WHERE id = NEW.id AND NEW.prompt_tokens + NEW.completion_tokens > 0;
+            UPDATE request_log SET
+                cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE id = NEW.account_id) = 'plan'
+                    THEN 0.0
+                    ELSE COALESCE((
+                        SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                             + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                             + (NEW.completion_tokens / 1000000.0) * mp.output_price
+                        FROM model_pricing mp
+                        WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
+                        ORDER BY mp.id LIMIT 1
+                    ), 0.0)
+                END,
+                virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE id = NEW.account_id) = 'plan'
+                    THEN COALESCE((
+                        SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                             + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                             + (NEW.completion_tokens / 1000000.0) * mp.output_price
+                        FROM model_pricing mp
+                        WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
+                        ORDER BY mp.id LIMIT 1
+                    ), 0.0)
+                    ELSE 0.0
+                END
+            WHERE id = NEW.id AND NEW.prompt_tokens + NEW.completion_tokens > 0;
         END;
 
         -- Trigger: recalculate all costs when a pricing entry is inserted.
-        CREATE TRIGGER IF NOT EXISTS tr_pricing_insert
+        DROP TRIGGER IF EXISTS tr_pricing_insert;
+        CREATE TRIGGER tr_pricing_insert
         AFTER INSERT ON model_pricing
         BEGIN
-            UPDATE request_log SET cost = COALESCE((
-                SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                     + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                     + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                FROM model_pricing mp
-                WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                ORDER BY mp.id LIMIT 1
-            ), 0.0);
+            UPDATE request_log SET
+                cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                    THEN 0.0
+                    ELSE COALESCE((
+                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                        FROM model_pricing mp
+                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                        ORDER BY mp.id LIMIT 1
+                    ), 0.0)
+                END,
+                virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                    THEN COALESCE((
+                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                        FROM model_pricing mp
+                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                        ORDER BY mp.id LIMIT 1
+                    ), 0.0)
+                    ELSE 0.0
+                END;
         END;
 
         -- Trigger: recalculate all costs when a pricing entry is updated.
-        CREATE TRIGGER IF NOT EXISTS tr_pricing_update
+        DROP TRIGGER IF EXISTS tr_pricing_update;
+        CREATE TRIGGER tr_pricing_update
         AFTER UPDATE ON model_pricing
         BEGIN
-            UPDATE request_log SET cost = COALESCE((
-                SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                     + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                     + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                FROM model_pricing mp
-                WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                ORDER BY mp.id LIMIT 1
-            ), 0.0);
+            UPDATE request_log SET
+                cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                    THEN 0.0
+                    ELSE COALESCE((
+                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                        FROM model_pricing mp
+                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                        ORDER BY mp.id LIMIT 1
+                    ), 0.0)
+                END,
+                virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                    THEN COALESCE((
+                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                        FROM model_pricing mp
+                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                        ORDER BY mp.id LIMIT 1
+                    ), 0.0)
+                    ELSE 0.0
+                END;
         END;
 
         -- Trigger: recalculate all costs when a pricing entry is deleted.
-        CREATE TRIGGER IF NOT EXISTS tr_pricing_delete
+        DROP TRIGGER IF EXISTS tr_pricing_delete;
+        CREATE TRIGGER tr_pricing_delete
         AFTER DELETE ON model_pricing
         BEGIN
-            UPDATE request_log SET cost = COALESCE((
-                SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                     + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                     + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                FROM model_pricing mp
-                WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                ORDER BY mp.id LIMIT 1
-            ), 0.0);
+            UPDATE request_log SET
+                cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                    THEN 0.0
+                    ELSE COALESCE((
+                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                        FROM model_pricing mp
+                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                        ORDER BY mp.id LIMIT 1
+                    ), 0.0)
+                END,
+                virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                    THEN COALESCE((
+                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                        FROM model_pricing mp
+                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                        ORDER BY mp.id LIMIT 1
+                    ), 0.0)
+                    ELSE 0.0
+                END;
         END;
     )SQL";
 
@@ -247,7 +320,8 @@ void Database::prepare_statements() {
 
     PREPARE("SELECT id, name, upstream_key, base_url, api_format, "
             "COALESCE(endpoint_path,''), COALESCE(auth_header,'bearer'), "
-            "COALESCE(is_aggregate,0) "
+            "COALESCE(is_aggregate,0), COALESCE(account_type,'api'), "
+            "COALESCE(monthly_price,0), COALESCE(max_concurrency,0) "
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
 
@@ -366,6 +440,12 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
             sqlite3_column_text(stmt_get_account_, 6));
         if (info.auth_header.empty()) info.auth_header = "bearer";
         info.is_aggregate = sqlite3_column_int(stmt_get_account_, 7) != 0;
+        const char *atype = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_account_, 8));
+        info.account_type = atype ? atype : "api";
+        if (info.account_type.empty()) info.account_type = "api";
+        info.monthly_price = sqlite3_column_double(stmt_get_account_, 9);
+        info.max_concurrency = sqlite3_column_int(stmt_get_account_, 10);
         result = std::move(info);
     }
     sqlite3_reset(stmt_get_account_);
@@ -417,25 +497,27 @@ void Database::update_key_last_used(int local_key_id) {
 
 // ── resolve_aggregate ────────────────────────────────────────────────────
 
-std::optional<Database::AggregateEntry>
+std::vector<Database::AggregateEntry>
 Database::resolve_aggregate(int account_id, const std::string &model) {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::optional<AggregateEntry> result;
+    std::vector<AggregateEntry> result;
     sqlite3_reset(stmt_get_aggregate_entries_);
     sqlite3_bind_int(stmt_get_aggregate_entries_, 1, account_id);
     while (sqlite3_step(stmt_get_aggregate_entries_) == SQLITE_ROW) {
         std::string pattern = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_get_aggregate_entries_, 0));
         // Exact (case-sensitive) match: entries are concrete model names —
-        // the aggregate's model catalog, not wildcard patterns.
+        // the aggregate's model catalog, not wildcard patterns.  One model
+        // may map to several upstream accounts (priority = sort_order, id,
+        // already applied by the query); collect ALL matches so the caller
+        // can try them in order, skipping busy / cooling-down accounts.
         if (pattern == model) {
             AggregateEntry e;
             e.pattern = pattern;
             e.upstream_account_id = sqlite3_column_int(stmt_get_aggregate_entries_, 1);
             e.upstream_model = reinterpret_cast<const char *>(
                 sqlite3_column_text(stmt_get_aggregate_entries_, 2));
-            result = std::move(e);
-            break;
+            result.push_back(std::move(e));
         }
     }
     sqlite3_reset(stmt_get_aggregate_entries_);

@@ -24,11 +24,22 @@ MODEL_ORDER = {
 # cache-aware pricing: output → output_price; input_cache_hit →
 # cache_read_price (falls back to input_price); the rest → input_price.
 # Used both inside the model_pricing triggers and for the one-off recompute
-# when upgrading legacy databases.
+# when upgrading legacy databases.  Accounts registered in account_types as
+# 'plan' get cost 0 (subscription covers usage — see proxy_plan_summary for
+# the real subscription cost and the api-billed virtual cost).
+#
+# CSV-imported groups are EXCLUDED: those rows already carry the price from
+# the CSV file (cost_entry.source='csv'), so recomputing them from
+# model_pricing would double-count (imported price + model price).
 _MP_COST_SELECT = """
     SELECT
         tu.date, tu.model,
         SUM(
+            CASE WHEN COALESCE(
+                (SELECT at.account_type FROM account_types at
+                 WHERE at.account_name = tu.cost_group_key), 'api') = 'plan'
+            THEN 0
+            ELSE
             CASE tu.token_type
                 WHEN 'output' THEN
                     (tu.amount / 1000000.0) * COALESCE(
@@ -46,10 +57,18 @@ _MP_COST_SELECT = """
                          WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
                          ORDER BY mp.id LIMIT 1), 0)
             END
+            END
         ),
         tu.cost_group_key,
         'proxy'
     FROM token_usage tu
+    WHERE NOT EXISTS (
+        SELECT 1 FROM cost_entry ce
+        WHERE ce.source = 'csv'
+          AND ce.date = tu.date
+          AND ce.model = tu.model
+          AND ce.cost_group_key = tu.cost_group_key
+    )
     GROUP BY tu.date, tu.model, tu.cost_group_key
 """
 
@@ -151,47 +170,33 @@ class DashboardDatabase:
                     currency TEXT NOT NULL DEFAULT 'CNY'
                 );
 
+                -- Account type registry (mirrors upstream_accounts.account_type
+                -- for proxy-exported data; plan accounts get cost 0 in
+                -- cost_entry, their subscription + virtual costs live in
+                -- proxy_plan_summary).
+                CREATE TABLE IF NOT EXISTS account_types (
+                    account_name TEXT PRIMARY KEY,
+                    account_type TEXT NOT NULL DEFAULT 'api'
+                );
+
+                -- Per-month plan economics, written on export:
+                -- subscription_cost = monthly price (only for months with usage)
+                -- virtual_cost = api-billed amount of all plan usage that month
+                CREATE TABLE IF NOT EXISTS proxy_plan_summary (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    month TEXT NOT NULL,
+                    account_name TEXT NOT NULL,
+                    subscription_cost REAL NOT NULL DEFAULT 0,
+                    virtual_cost REAL NOT NULL DEFAULT 0,
+                    UNIQUE(month, account_name)
+                );
+
                 """
                 + _TR_MP_INSERT + _TR_MP_UPDATE + _TR_MP_DELETE
             )
-            # Legacy dashboard DBs (pre cache_read_price) keep the old
-            # tr_mp_refresh_* triggers (bill input_cache_hit at the input
-            # price); CREATE TRIGGER IF NOT EXISTS won't replace them, so
-            # detect and recreate them cache-aware, then recompute costs.
-            self._upgrade_triggers(conn)
             conn.commit()
         finally:
             conn.close()
-
-    def _upgrade_triggers(self, conn):
-        """Replace legacy tr_mp_refresh_* triggers with the cache-aware ones
-        and recompute the proxy cost_entry.
-
-        Databases created before cache_read_price existed keep the old
-        triggers (which bill input_cache_hit tokens at the input price);
-        CREATE TRIGGER IF NOT EXISTS does not replace an existing trigger, so
-        we detect the legacy version by inspecting its SQL and recreate it.
-        """
-        row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' "
-            "AND name='tr_mp_refresh_insert'"
-        ).fetchone()
-        if row and row[0] and "cache_read_price" in row[0]:
-            return  # already current
-
-        conn.execute("DROP TRIGGER IF EXISTS tr_mp_refresh_insert")
-        conn.execute("DROP TRIGGER IF EXISTS tr_mp_refresh_update")
-        conn.execute("DROP TRIGGER IF EXISTS tr_mp_refresh_delete")
-        conn.execute(_TR_MP_INSERT)
-        conn.execute(_TR_MP_UPDATE)
-        conn.execute(_TR_MP_DELETE)
-
-        # Recompute proxy cost_entry with the cache-aware pricing.
-        conn.execute("DELETE FROM cost_entry WHERE source = 'proxy'")
-        conn.execute(
-            "INSERT INTO cost_entry (date, model, cost, cost_group_key, source) "
-            + _MP_COST_SELECT
-        )
 
     # ── Upsert from parsed IR records ───────────────────────────────────
 
@@ -237,16 +242,26 @@ class DashboardDatabase:
     def upsert_proxy_data(self, date: str, model: str,
                           account_name: str, prompt_tokens: int,
                           completion_tokens: int, cache_read_tokens: int,
-                          request_count: int) -> int:
+                          request_count: int,
+                          account_type: str = "api") -> int:
         """Insert proxy usage data. cost_entry is maintained by model_pricing triggers.
 
         prompt_tokens is the total input (including cache hits), so the miss
         bucket is prompt_tokens - cache_read_tokens and the hit bucket is
         cache_read_tokens — the sum stays equal to the upstream input count.
+        account_type ('api'|'plan') is mirrored into account_types so the
+        cost triggers can zero out real cost for plan accounts.
         """
         conn = self._connect()
         total = 0
         try:
+            if account_type not in ("api", "plan"):
+                account_type = "api"
+            conn.execute(
+                "INSERT OR REPLACE INTO account_types (account_name, account_type) "
+                "VALUES (?,?)",
+                (account_name, account_type),
+            )
             if completion_tokens > 0:
                 conn.execute(
                     """INSERT OR REPLACE INTO token_usage
@@ -285,6 +300,35 @@ class DashboardDatabase:
             conn.close()
         return total
 
+    def upsert_plan_summary(self, month: str, account_name: str,
+                            subscription_cost: float, virtual_cost: float):
+        """Record one plan account's monthly economics (used on export).
+
+        month is 'YYYY-MM'. subscription_cost is the plan's monthly price
+        (present only for months that actually used the plan); virtual_cost
+        is the api-billed amount of that usage.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO proxy_plan_summary "
+                "(month, account_name, subscription_cost, virtual_cost) "
+                "VALUES (?,?,?,?)",
+                (month, account_name, subscription_cost, virtual_cost),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_plan_summary(self):
+        """Remove all plan summary rows (called before a full rewrite)."""
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM proxy_plan_summary")
+            conn.commit()
+        finally:
+            conn.close()
+
     # ── Load to IR lists ──────────────────────────────────────────────
 
     def load_to_ir(self):
@@ -293,6 +337,7 @@ class DashboardDatabase:
             token_usages: list[TokenUsage] = []
             request_usages: list[RequestUsage] = []
             cost_entries: list[CostEntry] = []
+            plan_summary: list[dict] = []
             months_set: set[tuple[int, int]] = set()
             api_key_names_set: set[str] = set()
             models_set: set[str] = set()
@@ -355,6 +400,17 @@ class DashboardDatabase:
                 months_set.add((y, m))
                 models_set.add(row["model"])
 
+            for row in conn.execute(
+                "SELECT month, account_name, subscription_cost, virtual_cost "
+                "FROM proxy_plan_summary ORDER BY month, account_name"
+            ):
+                plan_summary.append({
+                    "month": row["month"],
+                    "account_name": row["account_name"],
+                    "subscription_cost": row["subscription_cost"],
+                    "virtual_cost": row["virtual_cost"],
+                })
+
             sorted_months = sorted(months_set, key=lambda x: (x[0], x[1]))
             available_months = [
                 {"year": y, "month": m, "label": f"{y}-{m:02d}"}
@@ -369,6 +425,7 @@ class DashboardDatabase:
                 sorted(api_key_names_set),
                 [],  # platforms — no longer tracked
                 _sort_models(models_set),
+                plan_summary,
             )
         finally:
             conn.close()

@@ -60,12 +60,12 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 html += '输出Token: <b>' + fmtNum(d.output_tokens) + '</b> (' + pct(d.output_tokens) + '%)<br/>';
                 html += '输入缓存命中: <b>' + fmtNum(d.input_cache_hit_tokens) + '</b> (' + pct(d.input_cache_hit_tokens) + '%)<br/>';
                 html += '输入缓存未命中: <b>' + fmtNum(d.input_cache_miss_tokens) + '</b> (' + pct(d.input_cache_miss_tokens) + '%)<br/>';
-                html += '费用: <b>' + fmtCost(d.cost) + '</b><br/>';
+                html += '消费: <b>' + fmtCost(d.cost) + '</b><br/>';
                 return html;
             }
         },
         legend: {
-            data: ['输出Token', '输入Token', '费用'],
+            data: ['输出Token', '输入Token', '消费'],
             bottom: 0,
             textStyle: { fontSize: 12, color: '#6B7194' }
         },
@@ -91,7 +91,7 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
             },
             {
                 type: 'value',
-                name: '费用 (CNY)',
+                name: '消费 (CNY)',
                 nameTextStyle: { color: '#9094A2', fontSize: 11 },
                 axisLabel: { color: '#9094A2', fontSize: 11, formatter: function (v) { return fmtCost(v); } },
                 splitLine: { show: false }
@@ -117,7 +117,7 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 barMaxWidth: 28
             },
             {
-                name: '费用',
+                name: '消费',
                 type: 'line',
                 yAxisIndex: 1,
                 data: cost,

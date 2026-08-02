@@ -78,16 +78,16 @@ async function loadDailyBillingChart(year, month) {
                         html += '输出Token: <b>' + fmtNum(d.output_tokens || 0) + '</b> (' + pct(d.output_tokens || 0) + '%)<br/>';
                         html += '输入缓存命中: <b>' + fmtNum(hit) + '</b> (' + pct(hit) + '%)<br/>';
                         html += '输入缓存未命中: <b>' + fmtNum(miss) + '</b> (' + pct(miss) + '%)<br/>';
-                        html += '费用: <b>¥' + (d.cost || 0).toFixed(2) + '</b>';
+                        html += '消费: <b>¥' + (d.cost || 0).toFixed(2) + '</b>';
                         return html;
                     }
                 },
-                legend: { data: ['输入Token', '输出Token', '费用'], bottom: 0, textStyle: { fontSize: 11 } },
+                legend: { data: ['输入Token', '输出Token', '消费'], bottom: 0, textStyle: { fontSize: 11 } },
                 grid: { left: 70, right: 70, top: 20, bottom: 50 },
                 xAxis: { type: 'category', data: dates, axisLabel: { rotate: 30, fontSize: 10 } },
                 yAxis: [
                     { type: 'value', name: 'Tokens', axisLabel: { formatter: v => fmtNum(v), fontSize: 10 } },
-                    { type: 'value', name: '费用 (¥)', axisLabel: { fontSize: 10 } },
+                    { type: 'value', name: '消费 (¥)', axisLabel: { fontSize: 10 } },
                 ],
                 series: [
                     {
@@ -101,7 +101,7 @@ async function loadDailyBillingChart(year, month) {
                         itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
                     },
                     {
-                        name: '费用', type: 'line', yAxisIndex: 1,
+                        name: '消费', type: 'line', yAxisIndex: 1,
                         data: costs,
                         lineStyle: { color: '#EF4444', width: 2.5 },
                         itemStyle: { color: '#EF4444' },
@@ -220,8 +220,8 @@ function initBillingPage() {
         <div class="page-header">
             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                 <div>
-                    <h1 class="page-title">费用报告</h1>
-                    <p class="page-subtitle">代理转发请求的计费概况</p>
+                    <h1 class="page-title">消费报告</h1>
+                    <p class="page-subtitle">代理转发请求的消费概况</p>
                 </div>
                 <div class="controls-group">
                     <button class="btn btn--sm" onclick="openSyncConfig()" title="同步设置">⚙</button>
@@ -242,9 +242,9 @@ function initBillingPage() {
                 <div class="stat-card__sub">今日: <span id="billTodayRequests">--</span></div>
             </div>
             <div class="stat-card stat-card--cyan">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 总费用</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 总消费（实际）</div>
                 <div class="stat-card__value number-lg" id="billTotalCost">--</div>
-                <div class="stat-card__sub">今日: <span id="billTodayCost">--</span> · <span id="billActiveKeys">0</span> 个活跃密钥</div>
+                <div class="stat-card__sub">今日消费（理论）: <span id="billTodayCost">--</span> · <span id="billActiveKeys">0</span> 个活跃密钥</div>
             </div>
         </div>
 
@@ -382,7 +382,7 @@ function initLogsPage() {
 
         <!-- Log Table -->
         <table class="mgmt-table" id="logsTable">
-            <thead><tr><th>时间</th><th>账户</th><th>模型</th><th>Tokens (输入/命中/输出/总计)</th><th>费用</th><th>延迟</th><th>模式</th><th>状态</th></tr></thead>
+            <thead><tr><th>时间</th><th>账户</th><th>模型</th><th>Tokens (输入/命中/输出/总计)</th><th>消费</th><th>延迟</th><th>模式</th><th>状态</th></tr></thead>
             <tbody></tbody>
         </table>
 

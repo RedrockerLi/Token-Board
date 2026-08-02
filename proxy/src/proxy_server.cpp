@@ -141,11 +141,13 @@ struct AuthResult {
 ///   bypassing the base_url path component — fixes the /v1 double-append.
 /// - Otherwise the path is derived from api_format and appended to the
 ///   base_url path (legacy behavior preserved).
-static void resolve_upstream_path(const Router::RouteResult &route,
+static void resolve_upstream_path(const std::string &api_format,
+                                  const std::string &base_url,
+                                  const std::string &endpoint_path,
                                   std::string &out_path,
                                   bool &out_path_is_full) {
-    if (!route.endpoint_path.empty()) {
-        out_path = route.endpoint_path;
+    if (!endpoint_path.empty()) {
+        out_path = endpoint_path;
         out_path_is_full = true;
         return;
     }
@@ -154,21 +156,21 @@ static void resolve_upstream_path(const Router::RouteResult &route,
     // Extract the base_url path component to detect a trailing "/v1"
     // (OpenAI-style base URLs) and avoid "/v1/v1/messages" double-append.
     std::string base_path;
-    size_t scheme_end = route.base_url.find("://");
+    size_t scheme_end = base_url.find("://");
     if (scheme_end != std::string::npos) {
         scheme_end += 3;
-        size_t path_start = route.base_url.find('/', scheme_end);
+        size_t path_start = base_url.find('/', scheme_end);
         if (path_start != std::string::npos)
-            base_path = route.base_url.substr(path_start);
+            base_path = base_url.substr(path_start);
     }
 
-    if (route.api_format == "anthropic") {
+    if (api_format == "anthropic") {
         if (base_path.size() >= 3 &&
             base_path.compare(base_path.size() - 3, 3, "/v1") == 0)
             out_path = "/messages";
         else
             out_path = "/v1/messages";
-    } else if (route.api_format == "openai_responses") {
+    } else if (api_format == "openai_responses") {
         out_path = "/responses";
     } else {
         out_path = "/chat/completions";
@@ -233,42 +235,65 @@ static void apply_body_model(std::string &body, const std::string &model) {
     }
 }
 
-/// Resolve the effective upstream model for a request: strip the Claude Code
-/// `[1m]`/`[1M]` context-window marker (upstreams reject it) and, for
-/// aggregate accounts, resolve the real upstream account + model via the
-/// account's entry list.  On aggregate resolution the route is overwritten
-/// with the real account's connection details so billing is attributed to
-/// the real upstream account.  Returns false when an aggregate account has
-/// no entry matching the model.
-static bool resolve_upstream_model(Database &db, Router::RouteResult &route,
-                                   std::string &model) {
+/// Resolve the effective upstream targets for a request: strip the Claude
+/// Code `[1m]`/`[1M]` context-window marker (upstreams reject it), then —
+/// for aggregate accounts — collect every entry matching the model as a
+/// candidate (priority = sort_order, id).  Plain accounts yield one
+/// candidate.  Returns an empty list when an aggregate has no match.
+static std::vector<UpstreamCandidate>
+resolve_candidates(Database &db, const Router::RouteResult &route,
+                   std::string &model) {
     model = fmt::strip_one_m_suffix_for_upstream(model);
-    if (!route.is_aggregate) return true;
+    std::vector<UpstreamCandidate> cands;
+    if (route.is_aggregate) {
+        auto entries = db.resolve_aggregate(route.account_id, model);
+        for (const auto &e : entries) {
+            auto acct = db.get_account(e.upstream_account_id);
+            if (!acct.has_value()) {
+                fprintf(stderr, "[Proxy] aggregate account %d: upstream account %d missing\n",
+                        route.account_id, e.upstream_account_id);
+                continue;
+            }
+            fprintf(stderr, "[Proxy] aggregate %d: %s → account %d (%s) model %s\n",
+                    route.account_id, model.c_str(), acct->id, acct->name.c_str(),
+                    e.upstream_model.c_str());
+            UpstreamCandidate c;
+            c.account = std::move(*acct);
+            c.upstream_model = e.upstream_model;
+            cands.push_back(std::move(c));
+        }
+    } else {
+        auto acct = db.get_account(route.account_id);
+        if (!acct.has_value()) return cands;
+        UpstreamCandidate c;
+        c.account = std::move(*acct);
+        c.upstream_model = model;
+        cands.push_back(std::move(c));
+    }
+    return cands;
+}
 
-    auto target = db.resolve_aggregate(route.account_id, model);
-    if (!target.has_value()) {
-        fprintf(stderr, "[Proxy] aggregate account %d: no entry for model %s\n",
-                route.account_id, model.c_str());
-        return false;
+/// Pick the first candidate from `idx` onward whose account is not cooling
+/// down and has a free concurrency slot (occupying it).  `idx` is advanced
+/// past rejected candidates.  Returns true when a candidate was picked.
+static bool pick_candidate(AccountGate &gate,
+                           const std::vector<UpstreamCandidate> &cands,
+                           size_t &idx) {
+    for (; idx < cands.size(); ++idx) {
+        const auto &acct = cands[idx].account;
+        if (gate.in_cooldown(acct.id)) {
+            fprintf(stderr, "[Proxy] account %d (%s) cooling down, skip\n",
+                    acct.id, acct.name.c_str());
+            continue;
+        }
+        if (!gate.acquire(acct.id, acct.max_concurrency)) {
+            fprintf(stderr, "[Proxy] account %d (%s) at concurrency limit (%d), try next\n",
+                    acct.id, acct.name.c_str(), acct.max_concurrency);
+            continue;
+        }
+        return true;
     }
-    auto real = db.get_account(target->upstream_account_id);
-    if (!real.has_value()) {
-        fprintf(stderr, "[Proxy] aggregate account %d: upstream account %d missing\n",
-                route.account_id, target->upstream_account_id);
-        return false;
-    }
-    fprintf(stderr, "[Proxy] aggregate %d: %s → account %d (%s) model %s\n",
-            route.account_id, model.c_str(), real->id, real->name.c_str(),
-            target->upstream_model.c_str());
-    route.upstream_key = real->upstream_key;
-    route.base_url = real->base_url;
-    route.api_format = real->api_format;
-    route.endpoint_path = real->endpoint_path;
-    route.auth_header = real->auth_header;
-    route.account_id = real->id;
-    route.is_aggregate = false;  // resolved — treat as a plain account below
-    model = target->upstream_model;
-    return true;
+    return false;
 }
 
 // ── add_cors_headers ─────────────────────────────────────────────────────
@@ -304,18 +329,21 @@ struct UpstreamTarget {
     std::string path;
     ForwardOptions opts;
 };
-static UpstreamTarget resolve_upstream_target(const Router::RouteResult &route) {
+static UpstreamTarget resolve_upstream_target(const std::string &api_format,
+                                              const std::string &base_url,
+                                              const std::string &endpoint_path,
+                                              const std::string &auth_header) {
     UpstreamTarget t;
-    resolve_upstream_path(route, t.path, t.opts.path_is_full);
+    resolve_upstream_path(api_format, base_url, endpoint_path, t.path,
+                          t.opts.path_is_full);
     // Outbound auth scheme: `auto` (the dashboard default) derives from the
     // upstream wire format — Anthropic-native uses x-api-key + anthropic-version,
     // everything else uses Authorization: Bearer.  Explicit `bearer` /
     // `x-api-key` remain as overrides for relays that need them.
-    const std::string &ah = route.auth_header;
-    if (ah == "auto" || ah.empty())
-        t.opts.auth_scheme = (route.api_format == "anthropic") ? "x-api-key" : "bearer";
+    if (auth_header == "auto" || auth_header.empty())
+        t.opts.auth_scheme = (api_format == "anthropic") ? "x-api-key" : "bearer";
     else
-        t.opts.auth_scheme = ah;
+        t.opts.auth_scheme = auth_header;
     return t;
 }
 
@@ -378,12 +406,38 @@ static bool client_socket_gone(int sock) {
            (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP));
 }
 
+/// Synchronous non-streaming forward with client-disconnect monitoring.
+static UpstreamClient::ForwardResult
+forward_once(UpstreamClient &upstream, const std::string &body,
+             const std::string &content_type, const UpstreamCandidate &c,
+             const UpstreamTarget &target, int client_sock) {
+    AbortGuard abort;
+    auto monitor = spawn_client_monitor(client_sock, abort);
+    auto fwd = upstream.forward(
+        "POST", c.account.base_url, c.account.upstream_key,
+        target.path, body, content_type, nullptr, target.opts,
+        [&](int fd) {
+            abort.upstream_fd.store(fd, std::memory_order_relaxed);
+        });
+    abort.running.store(false, std::memory_order_release);
+    if (monitor.joinable()) monitor.join();
+    return fwd;
+}
+
 // ── handle_chat_request ──────────────────────────────────────────────────
 
 /// Entry point for /v1/chat/completions, /v1/messages and /v1/responses.
 /// The harness format comes from the incoming request URL path; when it matches
 /// the account's api_format we use the passthrough fast path, otherwise we
 /// convert via the IR codecs.
+///
+/// Candidate handling: plain accounts have one candidate; aggregate accounts
+/// may have several (same model → several upstreams, priority order).  The
+/// first candidate that is not cooling down and has a free concurrency slot
+/// wins.  Non-streaming requests fall back to the next candidate when the
+/// upstream answers 429 (plan accounts then cool down for 5h) or 5xx before
+/// anything was sent to the client.  Streaming requests are one-shot: once
+/// the chunked provider starts, headers are committed, so no fallback.
 void ProxyServer::handle_chat_request(const httplib::Request &req,
                                       httplib::Response &res) {
     add_cors_headers(res);
@@ -398,10 +452,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
 
     // Aggregate accounts need the request model to pick the real upstream
     // account, so resolution happens here — before the passthrough/converted
-    // split, which depends on the real account's api_format.  For plain
-    // accounts this only strips the `[1m]`/`[1M]` marker (no-op otherwise).
+    // split.  For plain accounts this only strips the `[1m]`/`[1M]` marker.
     std::string model = extract_model(req.body);
-    if (!resolve_upstream_model(db_, ar.route, model)) {
+    auto cands = resolve_candidates(db_, ar.route, model);
+    if (cands.empty()) {
         res.status = 400;
         res.set_content(json_error("Model '" + model +
                                    "' is not available on this account", 400),
@@ -410,201 +464,400 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     }
 
     ir::ApiFormat harness = harness_format_from_path(req.path);
-    ir::ApiFormat upstream = ir::parse_api_format(ar.route.api_format);
+    bool is_stream = is_streaming_request(req.body);
 
-    if (harness == upstream) {
-        handle_passthrough(ar.route, upstream, model, req, res, t0);
-    } else {
-        handle_converted(ar.route, harness, upstream, model, req, res, t0);
+    // ── Streaming: pick one candidate, forward, done ──────────────────
+    if (is_stream) {
+        // Validate the harness request BEFORE acquiring a gate slot: a
+        // 400 early-return must not leak the concurrency slot.
+        const FormatCodec &hc = codecs_.get(harness);
+        ir::ChatRequest cReqCheck;
+        std::string perr;
+        json req_json;
+        try {
+            req_json = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            res.set_content(hc.serialize_error_body(
+                json{{"message", "invalid JSON body"}, {"type", "parse_error"}}).dump(),
+                "application/json");
+            return;
+        }
+        if (!hc.parse_request(req_json, cReqCheck, perr)) {
+            res.status = 400;
+            res.set_content(hc.serialize_error_body(
+                json{{"message", perr}, {"type", "parse_error"}}).dump(),
+                "application/json");
+            return;
+        }
+
+        size_t idx = 0;
+        if (!pick_candidate(gate_, cands, idx)) {
+            res.status = 429;
+            res.set_content(json_error("All upstream accounts are busy or cooling down", 429),
+                            "application/json");
+            return;
+        }
+        ir::ApiFormat upstream =
+            ir::parse_api_format(cands[idx].account.api_format);
+        if (harness == upstream)
+            handle_passthrough(cands[idx], ar.route.local_key_id, upstream,
+                               model, req, res, t0);
+        else
+            handle_converted(cands[idx], ar.route.local_key_id, harness,
+                             upstream, model, req, res, t0);
+        return;
     }
+
+    // ── Non-streaming: candidate loop with fallback ────────────────────
+    std::string content_type = req.has_header("Content-Type")
+                                   ? req.get_header_value("Content-Type")
+                                   : "application/json";
+
+    // Parse the harness request once, up front (converted path needs it).
+    const FormatCodec &harness_codec = codecs_.get(harness);
+    ir::ChatRequest cReq;
+    std::string perr;
+    json req_json;
+    try {
+        req_json = json::parse(req.body);
+    } catch (...) {
+        res.status = 400;
+        res.set_content(harness_codec.serialize_error_body(
+            json{{"message", "invalid JSON body"}, {"type", "parse_error"}}).dump(),
+            "application/json");
+        return;
+    }
+    if (!harness_codec.parse_request(req_json, cReq, perr)) {
+        res.status = 400;
+        res.set_content(harness_codec.serialize_error_body(
+            json{{"message", perr}, {"type", "parse_error"}}).dump(),
+            "application/json");
+        return;
+    }
+
+    int inflight_id = -1;
+    int concurrent_count = 0;
+    UpstreamClient::ForwardResult fwd;
+    const UpstreamCandidate *used = nullptr;
+    bool think_filter = false;
+    ir::ApiFormat used_upstream_fmt = harness;
+    const FormatCodec *upstream_codec = nullptr;
+
+    for (size_t i = 0; i < cands.size(); ++i) {
+        const UpstreamCandidate &c = cands[i];
+        if (gate_.in_cooldown(c.account.id)) continue;
+        if (!gate_.acquire(c.account.id, c.account.max_concurrency)) continue;
+
+        if (inflight_id < 0) {
+            inflight_id = db_.request_start(ar.route.local_key_id, c.account.id,
+                                            c.upstream_model, false);
+            concurrent_count = db_.get_in_flight_count();
+        }
+
+        ir::ApiFormat upstream = ir::parse_api_format(c.account.api_format);
+        auto target = resolve_upstream_target(
+            c.account.api_format, c.account.base_url,
+            c.account.endpoint_path, c.account.auth_header);
+
+        fprintf(stderr, "[Proxy] %s %s request from key_id=%d to account=%d "
+                        "model=%s (concurrent=%d, inflight_id=%d)\n",
+                ir::to_string(harness).c_str(),
+                (harness == upstream) ? "passthrough" : "convert",
+                ar.route.local_key_id, c.account.id,
+                c.upstream_model.c_str(), concurrent_count, inflight_id);
+
+        if (harness == upstream) {
+            std::string body = req.body;
+            apply_body_model(body, c.upstream_model);
+            fwd = forward_once(upstream_, body, content_type, c, target,
+                               req.client_socket);
+            think_filter = (upstream == ir::ApiFormat::OpenAI);
+        } else {
+            cReq.model = c.upstream_model;
+            upstream_codec = &codecs_.get(upstream);
+            std::string body = upstream_codec->serialize_request(cReq).dump();
+            fwd = forward_once(upstream_, body, "application/json", c, target,
+                               req.client_socket);
+            think_filter = false;
+        }
+        used_upstream_fmt = upstream;
+
+        // plan accounts cool down for 5h when the upstream rate-limits them.
+        if (fwd.status_code == 429 && c.account.account_type == "plan") {
+            fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited (429), "
+                            "cooling down 5h\n",
+                    c.account.id, c.account.name.c_str());
+            gate_.mark_cooldown(c.account.id);
+        }
+
+        // Fall back to the next candidate on 429/5xx, as long as nothing was
+        // sent to the client yet (non-streaming: nothing was).
+        bool retryable = (fwd.status_code == 429 || fwd.status_code >= 500) &&
+                         !fwd.is_timeout && i + 1 < cands.size();
+        if (retryable) {
+            fprintf(stderr, "[Proxy] upstream %d (%s) failed (%d), trying "
+                            "next candidate\n",
+                    c.account.id, c.account.name.c_str(), fwd.status_code);
+            gate_.release(c.account.id);
+            continue;
+        }
+        used = &c;
+        break;
+    }
+
+    if (!used) {
+        if (inflight_id >= 0) db_.request_end(inflight_id);
+        res.status = 429;
+        res.set_content(json_error("All upstream accounts are busy, cooling "
+                                   "down, or failed", 429),
+                        "application/json");
+        return;
+    }
+
+    if (client_disconnected(req, inflight_id, model)) {
+        db_.request_end(inflight_id);
+        gate_.release(used->account.id);
+        return;
+    }
+
+    res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
+
+    // ── Non-streaming response handling (passthrough vs converted) ──
+    if (used_upstream_fmt == harness) {
+        auto usage = parse_usage_for_format(ir::to_string(used_upstream_fmt),
+                                            fwd.body);
+        if (usage.has_value()) {
+            tracker_.log_request(used->account.id, ar.route.local_key_id,
+                                 *usage, false, fwd.status_code,
+                                 fwd.duration_ms);
+        } else {
+            fprintf(stderr, "[Proxy] Warning: could not parse usage "
+                            "from non-streaming response, model=%s\n",
+                    model.c_str());
+        }
+
+        if (fwd.success) {
+            if (think_filter)
+                res.set_content(sanitize_response_body(fwd.body),
+                                "application/json");
+            else
+                res.set_content(fwd.body, "application/json");
+            res.status = fwd.status_code;
+        } else {
+            res.status = fwd.status_code;
+            if (fwd.is_timeout) {
+                res.set_header("Connection", "close");
+                res.set_content(json{{"error", timeout_error_body()}}.dump(),
+                                "application/json");
+            } else {
+                res.set_content(json_error("Upstream error: " + fwd.error,
+                                           fwd.status_code),
+                                "application/json");
+            }
+        }
+    } else {
+        if (fwd.success && fwd.status_code >= 200 && fwd.status_code < 300) {
+            ir::ChatResponse cResp;
+            bool parsed = false;
+            try {
+                parsed = upstream_codec->parse_response(json::parse(fwd.body),
+                                                        cResp, perr);
+            } catch (...) {
+                parsed = false;
+            }
+            if (parsed) {
+                auto usage_info = usage_from_ir(cResp.usage, used_upstream_fmt);
+                usage_info.model = model;
+                tracker_.log_request(used->account.id, ar.route.local_key_id,
+                                     usage_info, false,
+                                     fwd.status_code, fwd.duration_ms);
+                res.status = fwd.status_code;
+                res.set_content(harness_codec.serialize_response(cResp).dump(),
+                                "application/json");
+            } else {
+                auto fb = parse_usage_for_format(ir::to_string(used_upstream_fmt),
+                                                 fwd.body);
+                if (fb.has_value()) {
+                    if (fb->model.empty()) fb->model = model;
+                    tracker_.log_request(used->account.id, ar.route.local_key_id,
+                                         *fb, false, fwd.status_code,
+                                         fwd.duration_ms);
+                }
+                res.status = fwd.status_code;
+                res.set_content(fwd.body, "application/json");
+            }
+        } else {
+            json normalized;
+            if (fwd.is_timeout) {
+                normalized = timeout_error_body();
+            } else {
+                try {
+                    normalized = upstream_codec->parse_error_body(
+                        json::parse(fwd.body));
+                } catch (...) {
+                    normalized = json{{"message", fwd.error.empty()
+                                                      ? "upstream error"
+                                                      : fwd.error}};
+                }
+            }
+            res.status = (fwd.status_code >= 400) ? fwd.status_code : 502;
+            if (fwd.is_timeout) res.set_header("Connection", "close");
+            res.set_content(harness_codec.serialize_error_body(normalized).dump(),
+                            "application/json");
+        }
+    }
+
+    tracker_.mark_key_used(ar.route.local_key_id);
+
+    auto t1 = std::chrono::steady_clock::now();
+    int proxy_ttft = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    tracker_.log_perf_event(model, fwd.ttft_ms, proxy_ttft,
+                            fwd.status_code, fwd.status_code >= 400,
+                            concurrent_count);
+
+    db_.request_end(inflight_id);
+    gate_.release(used->account.id);
 }
 
-// ── handle_passthrough ───────────────────────────────────────────────────
+// ── handle_passthrough (streaming only) ─────────────────────────────────
 
-void ProxyServer::handle_passthrough(Router::RouteResult &route,
+/// Streaming passthrough for one already-picked candidate.  Non-streaming
+/// requests are handled by handle_chat_request's candidate loop instead.
+void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
+                                     int local_key_id,
                                      ir::ApiFormat upstream,
                                      const std::string &resolved_model,
                                      const httplib::Request &req,
                                      httplib::Response &res,
                                      std::chrono::steady_clock::time_point t0) {
     std::string body = req.body;
-    std::string req_model = resolved_model;
-    apply_body_model(body, req_model);
+    apply_body_model(body, cand.upstream_model);
 
     std::string content_type = req.has_header("Content-Type")
                                    ? req.get_header_value("Content-Type")
                                    : "application/json";
-    bool is_stream = is_streaming_request(body);
 
-    int inflight_id = db_.request_start(route.local_key_id, route.account_id,
-                                        req_model, is_stream);
+    int inflight_id = db_.request_start(local_key_id, cand.account.id,
+                                        cand.upstream_model, true);
     int concurrent_count = db_.get_in_flight_count();
 
-    fprintf(stderr, "[Proxy] passthrough(%s) %s request from key_id=%d to account=%d "
-                    "model=%s (concurrent=%d, inflight_id=%d)\n",
-            ir::to_string(upstream).c_str(), is_stream ? "streaming" : "non-streaming",
-            route.local_key_id, route.account_id, req_model.c_str(),
-            concurrent_count, inflight_id);
+    fprintf(stderr, "[Proxy] passthrough(%s) streaming request from key_id=%d "
+                    "to account=%d model=%s (concurrent=%d, inflight_id=%d)\n",
+            ir::to_string(upstream).c_str(), local_key_id, cand.account.id,
+            cand.upstream_model.c_str(), concurrent_count, inflight_id);
 
-    auto model_copy = req_model;
-    auto target = resolve_upstream_target(route);
+    auto target = resolve_upstream_target(
+        cand.account.api_format, cand.account.base_url,
+        cand.account.endpoint_path, cand.account.auth_header);
     bool think_filter = (upstream == ir::ApiFormat::OpenAI);
     std::string upstream_fmt = ir::to_string(upstream);
 
-    if (is_stream) {
-        // ── Streaming path ──────────────────────────────────────────
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [this, route, target, body, content_type, model_copy, upstream, t0,
-             concurrent_count, inflight_id, think_filter, upstream_fmt,
-             client_sock = req.client_socket](
-                size_t /*offset*/, httplib::DataSink &sink) -> bool {
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [this, cand, target, body, content_type, resolved_model, upstream, t0,
+         concurrent_count, inflight_id, think_filter, upstream_fmt,
+         local_key_id, client_sock = req.client_socket](
+            size_t /*offset*/, httplib::DataSink &sink) -> bool {
 
-                std::string accumulated;
-                bool first_response = true;
-                std::chrono::steady_clock::time_point t_first_resp;
-                ThinkStreamFilter filter;
-                bool has_reasoning = false;
+            std::string accumulated;
+            bool first_response = true;
+            std::chrono::steady_clock::time_point t_first_resp;
+            ThinkStreamFilter filter;
+            bool has_reasoning = false;
 
-                auto write_to_sink = [&](const char *d, size_t n) -> bool {
-                    return sink.write(d, n);
-                };
+            auto write_to_sink = [&](const char *d, size_t n) -> bool {
+                return sink.write(d, n);
+            };
 
-                auto on_chunk = [&](const char *data, size_t len) -> bool {
-                    if (first_response) {
-                        t_first_resp = std::chrono::steady_clock::now();
-                        first_response = false;
-                    }
-                    accumulated.append(data, len);
-                    if (!think_filter) return write_to_sink(data, len);
-                    if (!has_reasoning && sse_chunk_has_reasoning(data, len))
-                        has_reasoning = true;
-                    if (has_reasoning) return write_to_sink(data, len);
-                    std::string filtered = filter.feed(data, len);
-                    if (!filtered.empty())
-                        return write_to_sink(filtered.data(), filtered.size());
-                    return true;
-                };
-
-                AbortGuard abort;
-                auto monitor = spawn_client_monitor(client_sock, abort);
-                auto fwd = upstream_.forward(
-                    "POST", route.base_url, route.upstream_key,
-                    target.path, body, content_type, on_chunk, target.opts,
-                    [&](int fd) {
-                        abort.upstream_fd.store(fd, std::memory_order_relaxed);
-                    });
-                abort.running.store(false, std::memory_order_release);
-                if (monitor.joinable()) monitor.join();
-
-                auto usage = UsageTracker::parse_stream_usage(upstream_fmt, fwd.body);
-                if (usage.has_value()) {
-                    tracker_.log_request(route.account_id, route.local_key_id,
-                                         *usage, true, fwd.status_code,
-                                         fwd.duration_ms);
-                } else {
-                    fprintf(stderr, "[Proxy] Warning: could not parse usage "
-                                    "from streaming response\n");
+            auto on_chunk = [&](const char *data, size_t len) -> bool {
+                if (first_response) {
+                    t_first_resp = std::chrono::steady_clock::now();
+                    first_response = false;
                 }
+                accumulated.append(data, len);
+                if (!think_filter) return write_to_sink(data, len);
+                if (!has_reasoning && sse_chunk_has_reasoning(data, len))
+                    has_reasoning = true;
+                if (has_reasoning) return write_to_sink(data, len);
+                std::string filtered = filter.feed(data, len);
+                if (!filtered.empty())
+                    return write_to_sink(filtered.data(), filtered.size());
+                return true;
+            };
 
-                tracker_.mark_key_used(route.local_key_id);
+            AbortGuard abort;
+            auto monitor = spawn_client_monitor(client_sock, abort);
+            auto fwd = upstream_.forward(
+                "POST", cand.account.base_url, cand.account.upstream_key,
+                target.path, body, content_type, on_chunk, target.opts,
+                [&](int fd) {
+                    abort.upstream_fd.store(fd, std::memory_order_relaxed);
+                });
+            abort.running.store(false, std::memory_order_release);
+            if (monitor.joinable()) monitor.join();
 
-                int proxy_ttft = static_cast<int>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        first_response ? std::chrono::steady_clock::now() - t0
-                                       : t_first_resp - t0).count());
-                tracker_.log_perf_event(model_copy, fwd.ttft_ms, proxy_ttft,
-                                        fwd.status_code, fwd.status_code >= 400,
-                                        concurrent_count);
+            // plan accounts cool down for 5h when the upstream rate-limits them.
+            if (fwd.status_code == 429 && cand.account.account_type == "plan") {
+                fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited "
+                                "(429), cooling down 5h\n",
+                        cand.account.id, cand.account.name.c_str());
+                gate_.mark_cooldown(cand.account.id);
+            }
 
-                db_.request_end(inflight_id);
-                if (fwd.is_timeout) {
-                    // The monitor thread shutdown()s the upstream socket when
-                    // the client disconnects, which surfaces as a read error
-                    // (is_timeout) — the client is already gone, no error frame
-                    // needed.
-                    if (client_socket_gone(client_sock)) return false;
-                    // Don't drop the connection silently — emit a terminal
-                    // error event so the client sees "upstream timeout" and
-                    // can prompt the user to retry.
-                    fprintf(stderr, "[Proxy] Upstream timeout, sending error "
-                                    "event to client (inflight=%d)\n", inflight_id);
-                    std::string frame = timeout_sse_frame(upstream);
-                    write_to_sink(frame.data(), frame.size());
-                    sink.done();
-                    return true;
-                }
+            auto usage = UsageTracker::parse_stream_usage(upstream_fmt, fwd.body);
+            if (usage.has_value()) {
+                tracker_.log_request(cand.account.id, local_key_id,
+                                     *usage, true, fwd.status_code,
+                                     fwd.duration_ms);
+            } else {
+                fprintf(stderr, "[Proxy] Warning: could not parse usage "
+                                "from streaming response\n");
+            }
+
+            tracker_.mark_key_used(local_key_id);
+
+            int proxy_ttft = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    first_response ? std::chrono::steady_clock::now() - t0
+                                   : t_first_resp - t0).count());
+            tracker_.log_perf_event(resolved_model, fwd.ttft_ms, proxy_ttft,
+                                    fwd.status_code, fwd.status_code >= 400,
+                                    concurrent_count);
+
+            db_.request_end(inflight_id);
+            gate_.release(cand.account.id);
+            if (fwd.is_timeout) {
+                // The monitor thread shutdown()s the upstream socket when
+                // the client disconnects, which surfaces as a read error
+                // (is_timeout) — the client is already gone, no error frame
+                // needed.
+                if (client_socket_gone(client_sock)) return false;
+                // Don't drop the connection silently — emit a terminal
+                // error event so the client sees "upstream timeout" and
+                // can prompt the user to retry.
+                fprintf(stderr, "[Proxy] Upstream timeout, sending error "
+                                "event to client (inflight=%d)\n", inflight_id);
+                std::string frame = timeout_sse_frame(upstream);
+                write_to_sink(frame.data(), frame.size());
                 sink.done();
                 return true;
-            },
-            /* user_data */ nullptr);
-        return;
-    }
-
-    // ── Non-streaming path ──────────────────────────────────────────
-    AbortGuard abort;
-    auto monitor = spawn_client_monitor(req.client_socket, abort);
-    auto fwd = upstream_.forward(
-        "POST", route.base_url, route.upstream_key,
-        target.path, body, content_type, nullptr, target.opts,
-        [&](int fd) {
-            abort.upstream_fd.store(fd, std::memory_order_relaxed);
-        });
-    abort.running.store(false, std::memory_order_release);
-    if (monitor.joinable()) monitor.join();
-
-    if (client_disconnected(req, inflight_id, req_model)) {
-        db_.request_end(inflight_id);
-        return;
-    }
-
-    res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
-
-    auto usage = parse_usage_for_format(upstream_fmt, fwd.body);
-    if (usage.has_value()) {
-        tracker_.log_request(route.account_id, route.local_key_id,
-                             *usage, false, fwd.status_code, fwd.duration_ms);
-    } else {
-        fprintf(stderr, "[Proxy] Warning: could not parse usage "
-                        "from non-streaming response, model=%s\n",
-                req_model.c_str());
-    }
-
-    tracker_.mark_key_used(route.local_key_id);
-
-    auto t1 = std::chrono::steady_clock::now();
-    int proxy_ttft = static_cast<int>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
-    tracker_.log_perf_event(req_model, fwd.ttft_ms, proxy_ttft,
-                            fwd.status_code, fwd.status_code >= 400,
-                            concurrent_count);
-
-    db_.request_end(inflight_id);
-
-    if (fwd.success) {
-        if (think_filter)
-            res.set_content(sanitize_response_body(fwd.body), "application/json");
-        else
-            res.set_content(fwd.body, "application/json");
-        res.status = fwd.status_code;
-    } else {
-        res.status = fwd.status_code;
-        if (fwd.is_timeout) {
-            // Explicit, retryable timeout error instead of a generic error.
-            res.set_header("Connection", "close");
-            res.set_content(json{{"error", timeout_error_body()}}.dump(),
-                            "application/json");
-        } else {
-            res.set_content(json_error("Upstream error: " + fwd.error,
-                                       fwd.status_code),
-                            "application/json");
-        }
-    }
+            }
+            sink.done();
+            return true;
+        },
+        /* user_data */ nullptr);
 }
 
 // ── handle_converted ─────────────────────────────────────────────────────
+// ── handle_converted (streaming only) ────────────────────────────────────
 
-void ProxyServer::handle_converted(Router::RouteResult &route,
+/// Streaming format-conversion path for one already-picked candidate.
+/// Non-streaming requests are handled by handle_chat_request's candidate
+/// loop instead (the request is parsed there once, up front).
+void ProxyServer::handle_converted(const UpstreamCandidate &cand,
+                                   int local_key_id,
                                    ir::ApiFormat harness, ir::ApiFormat upstream,
                                    const std::string &resolved_model,
                                    const httplib::Request &req,
@@ -638,215 +891,146 @@ void ProxyServer::handle_converted(Router::RouteResult &route,
     cReq.model = resolved_model;
     std::string upstream_body = upstream_codec.serialize_request(cReq).dump();
 
-    auto target = resolve_upstream_target(route);
-    bool is_stream = cReq.stream;
+    auto target = resolve_upstream_target(
+        cand.account.api_format, cand.account.base_url,
+        cand.account.endpoint_path, cand.account.auth_header);
 
-    int inflight_id = db_.request_start(route.local_key_id, route.account_id,
-                                        cReq.model, is_stream);
+    int inflight_id = db_.request_start(local_key_id, cand.account.id,
+                                        cReq.model, true);
     int concurrent_count = db_.get_in_flight_count();
 
-    fprintf(stderr, "[Proxy] convert %s→%s %s request from key_id=%d to account=%d "
-                    "model=%s (concurrent=%d, inflight_id=%d)\n",
+    fprintf(stderr, "[Proxy] convert %s→%s streaming request from key_id=%d "
+                    "to account=%d model=%s (concurrent=%d, inflight_id=%d)\n",
             ir::to_string(harness).c_str(), ir::to_string(upstream).c_str(),
-            is_stream ? "streaming" : "non-streaming",
-            route.local_key_id, route.account_id, cReq.model.c_str(),
+            local_key_id, cand.account.id, cReq.model.c_str(),
             concurrent_count, inflight_id);
 
     auto model_copy = cReq.model;
     std::string upstream_fmt = ir::to_string(upstream);
 
-    if (is_stream) {
-        // ── Streaming path ──────────────────────────────────────────
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [this, route, target, upstream_body, model_copy, upstream_fmt, harness, upstream, t0,
-             concurrent_count, inflight_id, harness_codec_ptr, upstream_codec_ptr,
-             client_sock = req.client_socket](
-                size_t /*offset*/, httplib::DataSink &sink) -> bool {
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [this, cand, target, upstream_body, model_copy, upstream_fmt, harness,
+         upstream, t0, concurrent_count, inflight_id, harness_codec_ptr,
+         upstream_codec_ptr, local_key_id, client_sock = req.client_socket](
+            size_t /*offset*/, httplib::DataSink &sink) -> bool {
 
-                auto parser = upstream_codec_ptr->make_stream_parser();
-                auto emitter = harness_codec_ptr->make_stream_emitter();
-                ir::Usage last_usage;
-                std::string accumulated;
-                bool first_response = true;
-                std::chrono::steady_clock::time_point t_first_resp;
+            auto parser = upstream_codec_ptr->make_stream_parser();
+            auto emitter = harness_codec_ptr->make_stream_emitter();
+            ir::Usage last_usage;
+            std::string accumulated;
+            bool first_response = true;
+            std::chrono::steady_clock::time_point t_first_resp;
 
-                auto sink_bridge = [&](const std::string &c) -> bool {
-                    return sink.write(c.data(), c.size());
-                };
-                auto on_event = [&](const ir::StreamEvent &ev) -> bool {
-                    if (ev.type == ir::StreamEventType::UsageEvent)
-                        last_usage = ev.usage;
-                    return emitter->emit(ev, sink_bridge);
-                };
-                auto on_chunk = [&](const char *data, size_t len) -> bool {
-                    if (first_response) {
-                        t_first_resp = std::chrono::steady_clock::now();
-                        first_response = false;
-                    }
-                    accumulated.append(data, len);
-                    return parser->feed(data, len, on_event);
-                };
-
-                AbortGuard abort;
-                auto monitor = spawn_client_monitor(client_sock, abort);
-                auto fwd = upstream_.forward(
-                    "POST", route.base_url, route.upstream_key,
-                    target.path, upstream_body, "application/json",
-                    on_chunk, target.opts,
-                    [&](int fd) {
-                        abort.upstream_fd.store(fd, std::memory_order_relaxed);
-                    });
-                abort.running.store(false, std::memory_order_release);
-                if (monitor.joinable()) monitor.join();
-
-                if ((fwd.status_code >= 400 || !fwd.success) && !fwd.is_timeout) {
-                    ir::StreamEvent err_ev;
-                    err_ev.type = ir::StreamEventType::ErrorEvent;
-                    json normalized;
-                    try {
-                        normalized = upstream_codec_ptr->parse_error_body(
-                            json::parse(fwd.body));
-                    } catch (...) {
-                        normalized = json{{"message", fwd.error}};
-                    }
-                    err_ev.extra["error"] = normalized;
-                    emitter->emit(err_ev, sink_bridge);
-                    emitter->finish(sink_bridge);
-                } else {
-                    parser->finish(on_event);
-                    emitter->finish(sink_bridge);
+            auto sink_bridge = [&](const std::string &c) -> bool {
+                return sink.write(c.data(), c.size());
+            };
+            auto on_event = [&](const ir::StreamEvent &ev) -> bool {
+                if (ev.type == ir::StreamEventType::UsageEvent)
+                    last_usage = ev.usage;
+                return emitter->emit(ev, sink_bridge);
+            };
+            auto on_chunk = [&](const char *data, size_t len) -> bool {
+                if (first_response) {
+                    t_first_resp = std::chrono::steady_clock::now();
+                    first_response = false;
                 }
+                accumulated.append(data, len);
+                return parser->feed(data, len, on_event);
+            };
 
-                // Log usage (stream events; fall back to accumulated-body parse).
-                if (last_usage.prompt_tokens == 0 && last_usage.completion_tokens == 0) {
-                    auto fb = UsageTracker::parse_stream_usage(upstream_fmt, accumulated);
-                    if (fb.has_value()) {
-                        last_usage.prompt_tokens = fb->prompt_tokens;
-                        last_usage.completion_tokens = fb->completion_tokens;
-                        last_usage.cache_read_tokens = fb->cache_read_tokens;
-                        last_usage.cache_creation_tokens = fb->cache_creation_tokens;
-                        last_usage.total_tokens = fb->total_tokens;
-                    }
+            AbortGuard abort;
+            auto monitor = spawn_client_monitor(client_sock, abort);
+            auto fwd = upstream_.forward(
+                "POST", cand.account.base_url, cand.account.upstream_key,
+                target.path, upstream_body, "application/json",
+                on_chunk, target.opts,
+                [&](int fd) {
+                    abort.upstream_fd.store(fd, std::memory_order_relaxed);
+                });
+            abort.running.store(false, std::memory_order_release);
+            if (monitor.joinable()) monitor.join();
+
+            // plan accounts cool down for 5h when the upstream rate-limits them.
+            if (fwd.status_code == 429 && cand.account.account_type == "plan") {
+                fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited "
+                                "(429), cooling down 5h\n",
+                        cand.account.id, cand.account.name.c_str());
+                gate_.mark_cooldown(cand.account.id);
+            }
+
+            if ((fwd.status_code >= 400 || !fwd.success) && !fwd.is_timeout) {
+                ir::StreamEvent err_ev;
+                err_ev.type = ir::StreamEventType::ErrorEvent;
+                json normalized;
+                try {
+                    normalized = upstream_codec_ptr->parse_error_body(
+                        json::parse(fwd.body));
+                } catch (...) {
+                    normalized = json{{"message", fwd.error}};
                 }
-                auto usage_info = usage_from_ir(last_usage, upstream);
-                usage_info.model = model_copy;
-                tracker_.log_request(route.account_id, route.local_key_id,
-                                     usage_info, true, fwd.status_code,
-                                     fwd.duration_ms);
+                err_ev.extra["error"] = normalized;
+                emitter->emit(err_ev, sink_bridge);
+                emitter->finish(sink_bridge);
+            } else {
+                parser->finish(on_event);
+                emitter->finish(sink_bridge);
+            }
 
-                tracker_.mark_key_used(route.local_key_id);
-
-                int proxy_ttft = static_cast<int>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        first_response ? std::chrono::steady_clock::now() - t0
-                                       : t_first_resp - t0).count());
-                tracker_.log_perf_event(model_copy, fwd.ttft_ms, proxy_ttft,
-                                        fwd.status_code, fwd.status_code >= 400,
-                                        concurrent_count);
-
-                db_.request_end(inflight_id);
-                if (fwd.is_timeout) {
-                    // The monitor thread shutdown()s the upstream socket when
-                    // the client disconnects, which surfaces as a read error
-                    // (is_timeout) — the client is already gone, no error frame
-                    // needed.
-                    if (client_socket_gone(client_sock)) return false;
-                    // Don't drop the connection silently — emit a terminal
-                    // error event (in the harness wire format) so the client
-                    // sees "upstream timeout" and can prompt the user to retry.
-                    fprintf(stderr, "[Proxy] Upstream timeout, sending error "
-                                    "event to client (inflight=%d)\n", inflight_id);
-                    ir::StreamEvent err_ev;
-                    err_ev.type = ir::StreamEventType::ErrorEvent;
-                    err_ev.extra["error"] = timeout_error_body();
-                    emitter->emit(err_ev, sink_bridge);
-                    if (harness == ir::ApiFormat::OpenAI)
-                        sink_bridge("data: [DONE]\n\n");
-                    emitter->finish(sink_bridge);
-                    sink.done();
-                    return true;
+            // Log usage (stream events; fall back to accumulated-body parse).
+            if (last_usage.prompt_tokens == 0 && last_usage.completion_tokens == 0) {
+                auto fb = UsageTracker::parse_stream_usage(upstream_fmt, accumulated);
+                if (fb.has_value()) {
+                    last_usage.prompt_tokens = fb->prompt_tokens;
+                    last_usage.completion_tokens = fb->completion_tokens;
+                    last_usage.cache_read_tokens = fb->cache_read_tokens;
+                    last_usage.cache_creation_tokens = fb->cache_creation_tokens;
+                    last_usage.total_tokens = fb->total_tokens;
                 }
+            }
+            auto usage_info = usage_from_ir(last_usage, upstream);
+            usage_info.model = model_copy;
+            tracker_.log_request(cand.account.id, local_key_id,
+                                 usage_info, true, fwd.status_code,
+                                 fwd.duration_ms);
+
+            tracker_.mark_key_used(local_key_id);
+
+            int proxy_ttft = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    first_response ? std::chrono::steady_clock::now() - t0
+                                   : t_first_resp - t0).count());
+            tracker_.log_perf_event(model_copy, fwd.ttft_ms, proxy_ttft,
+                                    fwd.status_code, fwd.status_code >= 400,
+                                    concurrent_count);
+
+            db_.request_end(inflight_id);
+            gate_.release(cand.account.id);
+            if (fwd.is_timeout) {
+                // The monitor thread shutdown()s the upstream socket when
+                // the client disconnects, which surfaces as a read error
+                // (is_timeout) — the client is already gone, no error frame
+                // needed.
+                if (client_socket_gone(client_sock)) return false;
+                // Don't drop the connection silently — emit a terminal
+                // error event (in the harness wire format) so the client
+                // sees "upstream timeout" and can prompt the user to retry.
+                fprintf(stderr, "[Proxy] Upstream timeout, sending error "
+                                "event to client (inflight=%d)\n", inflight_id);
+                ir::StreamEvent err_ev;
+                err_ev.type = ir::StreamEventType::ErrorEvent;
+                err_ev.extra["error"] = timeout_error_body();
+                emitter->emit(err_ev, sink_bridge);
+                if (harness == ir::ApiFormat::OpenAI)
+                    sink_bridge("data: [DONE]\n\n");
+                emitter->finish(sink_bridge);
                 sink.done();
                 return true;
-            },
-            /* user_data */ nullptr);
-        return;
-    }
-
-    // ── Non-streaming path ──────────────────────────────────────────
-    AbortGuard abort;
-    auto monitor = spawn_client_monitor(req.client_socket, abort);
-    auto fwd = upstream_.forward(
-        "POST", route.base_url, route.upstream_key,
-        target.path, upstream_body, "application/json", nullptr, target.opts,
-        [&](int fd) {
-            abort.upstream_fd.store(fd, std::memory_order_relaxed);
-        });
-    abort.running.store(false, std::memory_order_release);
-    if (monitor.joinable()) monitor.join();
-
-    if (client_disconnected(req, inflight_id, model_copy)) {
-        db_.request_end(inflight_id);
-        return;
-    }
-
-    res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
-
-    if (fwd.success && fwd.status_code >= 200 && fwd.status_code < 300) {
-        ir::ChatResponse cResp;
-        bool parsed = false;
-        try {
-            parsed = upstream_codec.parse_response(json::parse(fwd.body), cResp, perr);
-        } catch (...) {
-            parsed = false;
-        }
-        if (parsed) {
-            auto usage_info = usage_from_ir(cResp.usage, upstream);
-            usage_info.model = model_copy;
-            tracker_.log_request(route.account_id, route.local_key_id,
-                                 usage_info, false,
-                                 fwd.status_code, fwd.duration_ms);
-            res.status = fwd.status_code;
-            res.set_content(harness_codec.serialize_response(cResp).dump(),
-                            "application/json");
-        } else {
-            auto fb = parse_usage_for_format(upstream_fmt, fwd.body);
-            if (fb.has_value()) {
-                if (fb->model.empty()) fb->model = model_copy;
-                tracker_.log_request(route.account_id, route.local_key_id,
-                                     *fb, false, fwd.status_code, fwd.duration_ms);
             }
-            res.status = fwd.status_code;
-            res.set_content(fwd.body, "application/json");
-        }
-    } else {
-        json normalized;
-        if (fwd.is_timeout) {
-            normalized = timeout_error_body();
-        } else {
-            try {
-                normalized = upstream_codec.parse_error_body(json::parse(fwd.body));
-            } catch (...) {
-                normalized = json{{"message", fwd.error.empty() ? "upstream error" : fwd.error}};
-            }
-        }
-        res.status = (fwd.status_code >= 400) ? fwd.status_code : 502;
-        if (fwd.is_timeout) res.set_header("Connection", "close");
-        res.set_content(harness_codec.serialize_error_body(normalized).dump(),
-                        "application/json");
-    }
-
-    tracker_.mark_key_used(route.local_key_id);
-
-    auto t1 = std::chrono::steady_clock::now();
-    int proxy_ttft = static_cast<int>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
-    tracker_.log_perf_event(model_copy, fwd.ttft_ms, proxy_ttft,
-                            fwd.status_code, fwd.status_code >= 400,
-                            concurrent_count);
-
-    db_.request_end(inflight_id);
+            sink.done();
+            return true;
+        },
+        /* user_data */ nullptr);
 }
 
 // ── handle_list_models ─────────────────────────────────────────────────
@@ -955,41 +1139,82 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         return;
     }
 
-    // 2. Resolve effective upstream model (strip [1m] marker; aggregate routing)
+    // 2. Resolve effective upstream targets (strip [1m] marker; aggregate
+    //    routing yields multiple candidates in priority order).
     std::string body = req.body;
     std::string req_model = extract_model(body);
-    if (!resolve_upstream_model(db_, ar.route, req_model)) {
+    auto cands = resolve_candidates(db_, ar.route, req_model);
+    if (cands.empty()) {
         res.status = 400;
         res.set_content(json_error("Model '" + req_model +
                                    "' is not available on this account", 400),
                         "application/json");
         return;
     }
-    apply_body_model(body, req_model);
 
     // 3. Determine content type
     std::string content_type = req.has_header("Content-Type")
                                    ? req.get_header_value("Content-Type")
                                    : "application/json";
 
-    // Embeddings are always non-streaming
-    bool is_stream = false;
+    // Embeddings are always non-streaming: try candidates in order, falling
+    // back on 429/5xx (nothing has been sent to the client yet).
+    int inflight_id = -1;
+    int concurrent_count = 0;
+    UpstreamClient::ForwardResult fwd;
+    const UpstreamCandidate *used = nullptr;
 
-    // ── Register in-flight request ──
-    int inflight_id = db_.request_start(ar.route.local_key_id,
-                                        ar.route.account_id,
-                                        req_model, is_stream);
-    int concurrent_count = db_.get_in_flight_count();
+    for (size_t i = 0; i < cands.size(); ++i) {
+        const UpstreamCandidate &c = cands[i];
+        if (gate_.in_cooldown(c.account.id)) continue;
+        if (!gate_.acquire(c.account.id, c.account.max_concurrency)) continue;
 
-    fprintf(stderr, "[Proxy] embedding request from key_id=%d to account=%d model=%s "
-                    "(concurrent=%d, inflight_id=%d)\n",
-            ar.route.local_key_id, ar.route.account_id,
-            req_model.c_str(), concurrent_count, inflight_id);
+        if (inflight_id < 0) {
+            inflight_id = db_.request_start(ar.route.local_key_id,
+                                            c.account.id,
+                                            c.upstream_model, false);
+            concurrent_count = db_.get_in_flight_count();
+        }
 
-    // ── Forward ──
-    auto fwd = upstream_.forward(
-        "POST", ar.route.base_url, ar.route.upstream_key,
-        "/embeddings", body, content_type, nullptr);
+        fprintf(stderr, "[Proxy] embedding request from key_id=%d to account=%d "
+                        "model=%s (concurrent=%d, inflight_id=%d)\n",
+                ar.route.local_key_id, c.account.id,
+                c.upstream_model.c_str(), concurrent_count, inflight_id);
+
+        std::string eb = req.body;
+        apply_body_model(eb, c.upstream_model);
+        fwd = upstream_.forward(
+            "POST", c.account.base_url, c.account.upstream_key,
+            "/embeddings", eb, content_type, nullptr);
+
+        if (fwd.status_code == 429 && c.account.account_type == "plan") {
+            fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited (429), "
+                            "cooling down 5h\n",
+                    c.account.id, c.account.name.c_str());
+            gate_.mark_cooldown(c.account.id);
+        }
+
+        bool retryable = (fwd.status_code == 429 || fwd.status_code >= 500) &&
+                         !fwd.is_timeout && i + 1 < cands.size();
+        if (retryable) {
+            fprintf(stderr, "[Proxy] upstream %d (%s) failed (%d), trying "
+                            "next candidate\n",
+                    c.account.id, c.account.name.c_str(), fwd.status_code);
+            gate_.release(c.account.id);
+            continue;
+        }
+        used = &c;
+        break;
+    }
+
+    if (!used) {
+        if (inflight_id >= 0) db_.request_end(inflight_id);
+        res.status = 429;
+        res.set_content(json_error("All upstream accounts are busy, cooling "
+                                   "down, or failed", 429),
+                        "application/json");
+        return;
+    }
 
     // ── Check if client disconnected while waiting for upstream ──
     if (req.client_socket != INVALID_SOCKET) {
@@ -1002,6 +1227,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
             fprintf(stderr, "[Proxy] Client gone (embeddings), drop response "
                     "(inflight=%d, model=%s)\n", inflight_id, req_model.c_str());
             db_.request_end(inflight_id);
+            gate_.release(used->account.id);
             return;
         }
     }
@@ -1011,7 +1237,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     // Parse usage
     auto usage = UsageTracker::parse_usage(fwd.body);
     if (usage.has_value()) {
-        tracker_.log_request(ar.route.account_id,
+        tracker_.log_request(used->account.id,
                              ar.route.local_key_id,
                              *usage, false, fwd.status_code,
                              fwd.duration_ms);
@@ -1032,6 +1258,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                             concurrent_count);
 
     db_.request_end(inflight_id);
+    gate_.release(used->account.id);
 
     if (fwd.success) {
         res.status = fwd.status_code;

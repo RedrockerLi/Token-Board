@@ -62,7 +62,7 @@ function updateSubtitle() {
     var parts = [];
     if (currentKeyName) {
         parts.push('筛选: ' + currentKeyName);
-        parts.push('费用按Token比例分摊');
+        parts.push('消费按Token比例分摊');
     } else {
         parts.push('总览 (所有用户)');
     }
@@ -205,7 +205,18 @@ async function loadSummary() {
     if (elStatInputTokens) elStatInputTokens.textContent = fmtNum(data.total_input_tokens);
     if (elStatCacheHitTokens) elStatCacheHitTokens.textContent = fmtNum(data.total_input_cache_hit_tokens);
     if (elStatRequests) elStatRequests.textContent = fmtNum(data.total_requests);
-    if (elStatCost) elStatCost.textContent = fmtCost(data.total_cost);
+
+    // Real consumption = api/platform costs + plan subscriptions (a plan
+    // account's own subscription is included even when filtered by user).
+    // Theoretical consumption (api costs + plan virtual cost) is shown in
+    // the card subtitle — for plan, api and imported (CSV) users alike.
+    var planSub = data.plan_subscription_cost || 0;
+    var planVirt = data.plan_virtual_cost || 0;
+    if (elStatCost) elStatCost.textContent = fmtCost(data.total_cost + planSub);
+    var statCostSub = document.getElementById('statCostSub');
+    if (statCostSub) {
+        statCostSub.textContent = '理论消费 ' + fmtCost(data.total_cost + planVirt);
+    }
 
     var months = data.available_months || [];
     var keyNames = data.api_key_names || [];

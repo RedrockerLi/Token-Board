@@ -386,6 +386,8 @@ def _merge_dashboard(remote_path: str, local_path: str):
         "cost_entry": ["date", "model", "cost", "cost_group_key", "source"],
         "model_pricing": ["id", "model_pattern", "input_price", "output_price",
                           "cache_read_price", "currency"],
+        "account_types": ["account_name", "account_type"],
+        "proxy_plan_summary": ["month", "account_name", "subscription_cost", "virtual_cost"],
     }
 
     remote_conn = sqlite3.connect(remote_path)

@@ -120,6 +120,8 @@ class Handler(BaseHTTPRequestHandler):
         status = req.get("mock_status", 200)
         if req.get("model") == "trigger-error":
             status = 400  # model-based trigger survives format conversion
+        if req.get("model") == "trigger-429":
+            status = 429  # model-based 429 trigger (plan cooldown testing)
 
         # Hold the connection open before responding — lets tests exercise the
         # proxy's upstream read timeout / client-disconnect abort.

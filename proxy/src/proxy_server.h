@@ -1,7 +1,11 @@
 #pragma once
 
+#include "account_gate.h"
 #include "codec.h"
+#include "db.h"
 #include "router.h"
+
+#include <vector>
 
 class Database;
 class Router;
@@ -13,6 +17,14 @@ class Server;
 struct Request;
 struct Response;
 } // namespace httplib
+
+/// One real upstream target a request may be forwarded to.  Plain accounts
+/// yield exactly one candidate; aggregate accounts yield one candidate per
+/// matching model entry, in priority order (sort_order, id).
+struct UpstreamCandidate {
+    Database::AccountInfo account;  // real account (complete type from db.h)
+    std::string upstream_model;     // model name forwarded upstream
+};
 
 /// Configures the httplib::Server with route handlers.
 ///
@@ -38,13 +50,15 @@ public:
 private:
     void handle_chat_request(const httplib::Request &req,
                              httplib::Response &res);
-    void handle_passthrough(Router::RouteResult &route,
+    /// Streaming-only passthrough for one already-picked candidate.
+    void handle_passthrough(const UpstreamCandidate &cand, int local_key_id,
                             ir::ApiFormat upstream,
                             const std::string &resolved_model,
                             const httplib::Request &req,
                             httplib::Response &res,
                             std::chrono::steady_clock::time_point t0);
-    void handle_converted(Router::RouteResult &route,
+    /// Streaming-only converted path for one already-picked candidate.
+    void handle_converted(const UpstreamCandidate &cand, int local_key_id,
                           ir::ApiFormat harness, ir::ApiFormat upstream,
                           const std::string &resolved_model,
                           const httplib::Request &req,
@@ -61,4 +75,5 @@ private:
     UpstreamClient &upstream_;
     UsageTracker &tracker_;
     CodecRegistry &codecs_;
+    AccountGate gate_;   // per-account concurrency + plan cooldown (in-memory)
 };

@@ -51,6 +51,9 @@ public:
         std::string endpoint_path;   // "" = derive from api_format
         std::string auth_header;     // "bearer" | "x-api-key"
         bool is_aggregate = false;   // aggregate account (routes by model)
+        std::string account_type;    // "api" | "plan"
+        double monthly_price = 0;    // plan monthly price
+        int max_concurrency = 0;     // 0 = unlimited
     };
     std::optional<AccountInfo> get_account(int account_id);
 
@@ -62,10 +65,12 @@ public:
         int upstream_account_id = 0;  // real upstream account
         std::string upstream_model;   // model name forwarded upstream
     };
-    /// Resolve the real upstream target for `model` on an aggregate account.
-    /// Returns nullopt when no entry matches.
-    std::optional<AggregateEntry> resolve_aggregate(int account_id,
-                                                    const std::string &model);
+    /// Resolve the real upstream targets for `model` on an aggregate account.
+    /// Returns ALL matching entries in priority order (sort_order, id) — one
+    /// model may map to several upstream accounts; the caller tries them in
+    /// order (skipping full / cooling-down accounts).
+    std::vector<AggregateEntry> resolve_aggregate(int account_id,
+                                                  const std::string &model);
     /// All model patterns of an aggregate account (used by /v1/models).
     std::vector<std::string> get_aggregate_model_patterns(int account_id);
 

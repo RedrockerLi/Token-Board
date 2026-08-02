@@ -84,53 +84,123 @@ class ProxyDatabase:
         # ── Triggers: automatic cost computation from model_pricing ──────
         # Cost = cache-miss input at input_price + cache-hit input at
         # COALESCE(cache_read_price, input_price) + output at output_price.
-        conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_request_log_insert
+        # plan accounts: real cost = 0 (subscription covers usage), the
+        # api-billed amount goes to virtual_cost (plan economics gauge).
+        # api accounts: real cost = api-billed amount, virtual_cost = 0.
+        # DROP + CREATE (not IF NOT EXISTS) so old databases pick up the
+        # new definitions on first connect.
+        conn.execute("DROP TRIGGER IF EXISTS tr_request_log_insert")
+        conn.execute("""CREATE TRIGGER tr_request_log_insert
             AFTER INSERT ON request_log
             BEGIN
-                UPDATE request_log SET cost = COALESCE((
-                    SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                         + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                         + (NEW.completion_tokens / 1000000.0) * mp.output_price
-                    FROM model_pricing mp
-                    WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
-                    ORDER BY mp.id LIMIT 1
-                ), 0.0) WHERE id = NEW.id AND NEW.prompt_tokens + NEW.completion_tokens > 0;
+                UPDATE request_log SET
+                    cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE id = NEW.account_id) = 'plan'
+                        THEN 0.0
+                        ELSE COALESCE((
+                            SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                                 + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                                 + (NEW.completion_tokens / 1000000.0) * mp.output_price
+                            FROM model_pricing mp
+                            WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
+                            ORDER BY mp.id LIMIT 1
+                        ), 0.0)
+                    END,
+                    virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE id = NEW.account_id) = 'plan'
+                        THEN COALESCE((
+                            SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                                 + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                                 + (NEW.completion_tokens / 1000000.0) * mp.output_price
+                            FROM model_pricing mp
+                            WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
+                            ORDER BY mp.id LIMIT 1
+                        ), 0.0)
+                        ELSE 0.0
+                    END
+                WHERE id = NEW.id AND NEW.prompt_tokens + NEW.completion_tokens > 0;
             END""")
-        conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_pricing_insert
+        conn.execute("DROP TRIGGER IF EXISTS tr_pricing_insert")
+        conn.execute("""CREATE TRIGGER tr_pricing_insert
             AFTER INSERT ON model_pricing
             BEGIN
-                UPDATE request_log SET cost = COALESCE((
-                    SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                         + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                         + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                    FROM model_pricing mp
-                    WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                    ORDER BY mp.id LIMIT 1
-                ), 0.0);
+                UPDATE request_log SET
+                    cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                        THEN 0.0
+                        ELSE COALESCE((
+                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                            FROM model_pricing mp
+                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                            ORDER BY mp.id LIMIT 1
+                        ), 0.0)
+                    END,
+                    virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                        THEN COALESCE((
+                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                            FROM model_pricing mp
+                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                            ORDER BY mp.id LIMIT 1
+                        ), 0.0)
+                        ELSE 0.0
+                    END;
             END""")
-        conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_pricing_update
+        conn.execute("DROP TRIGGER IF EXISTS tr_pricing_update")
+        conn.execute("""CREATE TRIGGER tr_pricing_update
             AFTER UPDATE ON model_pricing
             BEGIN
-                UPDATE request_log SET cost = COALESCE((
-                    SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                         + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                         + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                    FROM model_pricing mp
-                    WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                    ORDER BY mp.id LIMIT 1
-                ), 0.0);
+                UPDATE request_log SET
+                    cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                        THEN 0.0
+                        ELSE COALESCE((
+                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                            FROM model_pricing mp
+                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                            ORDER BY mp.id LIMIT 1
+                        ), 0.0)
+                    END,
+                    virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                        THEN COALESCE((
+                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                            FROM model_pricing mp
+                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                            ORDER BY mp.id LIMIT 1
+                        ), 0.0)
+                        ELSE 0.0
+                    END;
             END""")
-        conn.execute("""CREATE TRIGGER IF NOT EXISTS tr_pricing_delete
+        conn.execute("DROP TRIGGER IF EXISTS tr_pricing_delete")
+        conn.execute("""CREATE TRIGGER tr_pricing_delete
             AFTER DELETE ON model_pricing
             BEGIN
-                UPDATE request_log SET cost = COALESCE((
-                    SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                         + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                         + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                    FROM model_pricing mp
-                    WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                    ORDER BY mp.id LIMIT 1
-                ), 0.0);
+                UPDATE request_log SET
+                    cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                        THEN 0.0
+                        ELSE COALESCE((
+                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                            FROM model_pricing mp
+                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                            ORDER BY mp.id LIMIT 1
+                        ), 0.0)
+                    END,
+                    virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
+                        THEN COALESCE((
+                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
+                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
+                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
+                            FROM model_pricing mp
+                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
+                            ORDER BY mp.id LIMIT 1
+                        ), 0.0)
+                        ELSE 0.0
+                    END;
             END""")
         conn.commit()
         return conn
@@ -156,8 +226,26 @@ class ProxyDatabase:
                 "SELECT COALESCE(SUM(cost), 0) FROM request_log"
             ).fetchone()[0]
 
+            # Real consumption includes plan subscriptions: for every month
+            # a plan account was actually used, one monthly price is added.
+            plan_subscription = conn.execute("""
+                SELECT COALESCE(SUM(ua.monthly_price), 0)
+                FROM (
+                    SELECT DISTINCT r.account_id,
+                           strftime('%Y-%m', r.requested_at) AS m
+                    FROM request_log r
+                    JOIN upstream_accounts ua2 ON r.account_id = ua2.id
+                    WHERE COALESCE(ua2.account_type, 'api') = 'plan'
+                ) t
+                JOIN upstream_accounts ua ON ua.id = t.account_id
+            """).fetchone()[0]
+            total_cost += plan_subscription
+
+            # Today's consumption = api billed today + plan virtual cost
+            # today (the api-billed amount that the plan covered).
             today_cost = conn.execute(
-                "SELECT COALESCE(SUM(cost), 0) FROM request_log WHERE date(requested_at) = ?",
+                "SELECT COALESCE(SUM(cost + virtual_cost), 0) FROM request_log "
+                "WHERE date(requested_at) = ?",
                 (today,),
             ).fetchone()[0]
 
@@ -194,7 +282,10 @@ class ProxyDatabase:
                 "SELECT id, name, upstream_key, base_url, api_format, "
                 "COALESCE(endpoint_path,'') AS endpoint_path, "
                 "COALESCE(auth_header,'bearer') AS auth_header, "
-                "COALESCE(is_aggregate,0) AS is_aggregate, created_at "
+                "COALESCE(is_aggregate,0) AS is_aggregate, "
+                "COALESCE(account_type,'api') AS account_type, "
+                "COALESCE(monthly_price,0) AS monthly_price, "
+                "max_concurrency, created_at "
                 "FROM upstream_accounts ORDER BY id"
             ).fetchall()
             return [dict(r) for r in rows]
@@ -206,8 +297,9 @@ class ProxyDatabase:
         try:
             cursor = conn.execute(
                 "INSERT INTO upstream_accounts "
-                "(name, upstream_key, base_url, api_format, endpoint_path, auth_header) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(name, upstream_key, base_url, api_format, endpoint_path, auth_header, "
+                " account_type, monthly_price, max_concurrency) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     data["name"],
                     data["upstream_key"],
@@ -215,6 +307,9 @@ class ProxyDatabase:
                     data.get("api_format", "openai"),
                     data.get("endpoint_path", ""),
                     data.get("auth_header", "bearer"),
+                    data.get("account_type", "api"),
+                    float(data.get("monthly_price", 0) or 0),
+                    data.get("max_concurrency"),
                 ),
             )
             conn.commit()
@@ -229,10 +324,17 @@ class ProxyDatabase:
             fields = []
             values = []
             for key in ("name", "upstream_key", "base_url", "api_format",
-                        "endpoint_path", "auth_header"):
+                        "endpoint_path", "auth_header", "account_type",
+                        "monthly_price", "max_concurrency"):
                 if key in data:
+                    if key == "monthly_price":
+                        val = float(data[key] or 0)
+                    elif key == "max_concurrency":
+                        val = data[key] if data[key] not in (None, "") else None
+                    else:
+                        val = data[key]
                     fields.append(f"{key} = ?")
-                    values.append(data[key])
+                    values.append(val)
             if not fields:
                 return False
             values.append(account_id)
@@ -738,6 +840,7 @@ class ProxyDatabase:
                 SELECT
                     date(r.requested_at) AS date,
                     a.name AS account_name,
+                    COALESCE(a.account_type, 'api') AS account_type,
                     r.model,
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
@@ -775,12 +878,38 @@ class ProxyDatabase:
                     completion_tokens=r["completion_tokens"],
                     cache_read_tokens=r["cache_read_tokens"],
                     request_count=r["request_count"],
+                    account_type=r["account_type"],
                 )
 
             # Always sync model_pricing — triggers recalculate all costs.
             # Do this even when there are no new rows, so pricing changes
             # take effect on the next export.
             _sync_pricing_to_dashboard(conn, dash_db_path)
+
+            # ── Plan economics: full rewrite of per-month plan summary ──
+            # subscription_cost = monthly price for each month the plan was
+            # actually used; virtual_cost = api-billed amount of that usage.
+            dash_db.clear_plan_summary()
+            plan_rows = conn.execute("""
+                SELECT
+                    a.name AS account_name,
+                    strftime('%Y-%m', r.requested_at) AS month,
+                    COALESCE(a.monthly_price, 0) AS monthly_price,
+                    COALESCE(SUM(r.virtual_cost), 0) AS virtual_cost
+                FROM request_log r
+                JOIN upstream_accounts a ON r.account_id = a.id
+                WHERE COALESCE(a.account_type, 'api') = 'plan'
+                  AND a.name IS NOT NULL
+                GROUP BY a.name, month
+                ORDER BY month, a.name
+            """).fetchall()
+            for pr in plan_rows:
+                dash_db.upsert_plan_summary(
+                    month=pr["month"],
+                    account_name=pr["account_name"],
+                    subscription_cost=float(pr["monthly_price"] or 0),
+                    virtual_cost=float(pr["virtual_cost"] or 0),
+                )
 
             # Mark 0→1 (rows that were just exported). Rows already at 1 stay at 1.
             # Caller transitions 1→2 after confirming cloud upload.
