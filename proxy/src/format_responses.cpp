@@ -390,10 +390,8 @@ bool ResponsesCodec::parse_response(const json &in, ir::ChatResponse &out,
             out.usage.total_tokens = u["total_tokens"].get<int>();
         else
             out.usage.total_tokens = out.usage.prompt_tokens + out.usage.completion_tokens;
-        if (u.contains("input_tokens_details") && u["input_tokens_details"].is_object() &&
-            u["input_tokens_details"].contains("cached_tokens") &&
-            u["input_tokens_details"]["cached_tokens"].is_number_integer())
-            out.usage.cache_read_tokens = u["input_tokens_details"]["cached_tokens"].get<int>();
+        out.usage.cache_read_tokens =
+            fmt::read_cache_hit_tokens(u, out.usage.prompt_tokens).value_or(0);
     }
     out.extras["created_at"] = in.contains("created_at") ? in["created_at"] : json(nullptr);
     out.extras["object"] = in.value("object", "response");

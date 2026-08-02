@@ -19,6 +19,71 @@ MODEL_ORDER = {
 }
 
 
+# ── Cost recalculation SQL ──────────────────────────────────────────────────
+# Shared SELECT that recomputes proxy cost_entry from token_usage with
+# cache-aware pricing: output → output_price; input_cache_hit →
+# cache_read_price (falls back to input_price); the rest → input_price.
+# Used both inside the model_pricing triggers and for the one-off recompute
+# when upgrading legacy databases.
+_MP_COST_SELECT = """
+    SELECT
+        tu.date, tu.model,
+        SUM(
+            CASE tu.token_type
+                WHEN 'output' THEN
+                    (tu.amount / 1000000.0) * COALESCE(
+                        (SELECT mp.output_price FROM model_pricing mp
+                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                         ORDER BY mp.id LIMIT 1), 0)
+                WHEN 'input_cache_hit' THEN
+                    (tu.amount / 1000000.0) * COALESCE(
+                        (SELECT COALESCE(mp.cache_read_price, mp.input_price) FROM model_pricing mp
+                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                         ORDER BY mp.id LIMIT 1), 0)
+                ELSE
+                    (tu.amount / 1000000.0) * COALESCE(
+                        (SELECT mp.input_price FROM model_pricing mp
+                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
+                         ORDER BY mp.id LIMIT 1), 0)
+            END
+        ),
+        tu.cost_group_key,
+        'proxy'
+    FROM token_usage tu
+    GROUP BY tu.date, tu.model, tu.cost_group_key
+"""
+
+_TR_MP_INSERT = (
+    "CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_insert\n"
+    "AFTER INSERT ON model_pricing\n"
+    "BEGIN\n"
+    "    DELETE FROM cost_entry WHERE source = 'proxy';\n"
+    "    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)\n"
+    + _MP_COST_SELECT + ";\n"
+    "END;\n"
+)
+
+_TR_MP_UPDATE = (
+    "CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_update\n"
+    "AFTER UPDATE ON model_pricing\n"
+    "BEGIN\n"
+    "    DELETE FROM cost_entry WHERE source = 'proxy';\n"
+    "    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)\n"
+    + _MP_COST_SELECT + ";\n"
+    "END;\n"
+)
+
+_TR_MP_DELETE = (
+    "CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_delete\n"
+    "AFTER DELETE ON model_pricing\n"
+    "BEGIN\n"
+    "    DELETE FROM cost_entry WHERE source = 'proxy';\n"
+    "    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)\n"
+    + _MP_COST_SELECT + ";\n"
+    "END;\n"
+)
+
+
 class DashboardDatabase:
     """SQLite-backed storage for dashboard visualization data."""
 
@@ -86,112 +151,47 @@ class DashboardDatabase:
                     currency TEXT NOT NULL DEFAULT 'CNY'
                 );
 
-                -- Trigger: recalculate proxy cost_entry when pricing is inserted.
-                -- CSV-imported rows (source='csv') are left untouched.
-                -- Token buckets: output → output_price; input_cache_hit →
-                -- cache_read_price (falls back to input_price); the rest →
-                -- input_price.
-                CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_insert
-                AFTER INSERT ON model_pricing
-                BEGIN
-                    DELETE FROM cost_entry WHERE source = 'proxy';
-                    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)
-                    SELECT
-                        tu.date, tu.model,
-                        SUM(
-                            CASE tu.token_type
-                                WHEN 'output' THEN
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT mp.output_price FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                                WHEN 'input_cache_hit' THEN
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT COALESCE(mp.cache_read_price, mp.input_price) FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                                ELSE
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT mp.input_price FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                            END
-                        ),
-                        tu.cost_group_key,
-                        'proxy'
-                    FROM token_usage tu
-                    GROUP BY tu.date, tu.model, tu.cost_group_key;
-                END;
-
-                -- Trigger: recalculate proxy cost_entry when pricing is updated
-                CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_update
-                AFTER UPDATE ON model_pricing
-                BEGIN
-                    DELETE FROM cost_entry WHERE source = 'proxy';
-                    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)
-                    SELECT
-                        tu.date, tu.model,
-                        SUM(
-                            CASE tu.token_type
-                                WHEN 'output' THEN
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT mp.output_price FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                                WHEN 'input_cache_hit' THEN
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT COALESCE(mp.cache_read_price, mp.input_price) FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                                ELSE
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT mp.input_price FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                            END
-                        ),
-                        tu.cost_group_key,
-                        'proxy'
-                    FROM token_usage tu
-                    GROUP BY tu.date, tu.model, tu.cost_group_key;
-                END;
-
-                -- Trigger: recalculate proxy cost_entry when pricing is deleted
-                CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_delete
-                AFTER DELETE ON model_pricing
-                BEGIN
-                    DELETE FROM cost_entry WHERE source = 'proxy';
-                    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)
-                    SELECT
-                        tu.date, tu.model,
-                        SUM(
-                            CASE tu.token_type
-                                WHEN 'output' THEN
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT mp.output_price FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                                WHEN 'input_cache_hit' THEN
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT COALESCE(mp.cache_read_price, mp.input_price) FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                                ELSE
-                                    (tu.amount / 1000000.0) * COALESCE(
-                                        (SELECT mp.input_price FROM model_pricing mp
-                                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                                         ORDER BY mp.id LIMIT 1), 0)
-                            END
-                        ),
-                        tu.cost_group_key,
-                        'proxy'
-                    FROM token_usage tu
-                    GROUP BY tu.date, tu.model, tu.cost_group_key;
-                END;
-            """)
+                """
+                + _TR_MP_INSERT + _TR_MP_UPDATE + _TR_MP_DELETE
+            )
+            # Legacy dashboard DBs (pre cache_read_price) keep the old
+            # tr_mp_refresh_* triggers (bill input_cache_hit at the input
+            # price); CREATE TRIGGER IF NOT EXISTS won't replace them, so
+            # detect and recreate them cache-aware, then recompute costs.
+            self._upgrade_triggers(conn)
             conn.commit()
         finally:
             conn.close()
+
+    def _upgrade_triggers(self, conn):
+        """Replace legacy tr_mp_refresh_* triggers with the cache-aware ones
+        and recompute the proxy cost_entry.
+
+        Databases created before cache_read_price existed keep the old
+        triggers (which bill input_cache_hit tokens at the input price);
+        CREATE TRIGGER IF NOT EXISTS does not replace an existing trigger, so
+        we detect the legacy version by inspecting its SQL and recreate it.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='tr_mp_refresh_insert'"
+        ).fetchone()
+        if row and row[0] and "cache_read_price" in row[0]:
+            return  # already current
+
+        conn.execute("DROP TRIGGER IF EXISTS tr_mp_refresh_insert")
+        conn.execute("DROP TRIGGER IF EXISTS tr_mp_refresh_update")
+        conn.execute("DROP TRIGGER IF EXISTS tr_mp_refresh_delete")
+        conn.execute(_TR_MP_INSERT)
+        conn.execute(_TR_MP_UPDATE)
+        conn.execute(_TR_MP_DELETE)
+
+        # Recompute proxy cost_entry with the cache-aware pricing.
+        conn.execute("DELETE FROM cost_entry WHERE source = 'proxy'")
+        conn.execute(
+            "INSERT INTO cost_entry (date, model, cost, cost_group_key, source) "
+            + _MP_COST_SELECT
+        )
 
     # ── Upsert from parsed IR records ───────────────────────────────────
 

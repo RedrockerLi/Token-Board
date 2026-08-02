@@ -171,7 +171,7 @@ class ProxyDatabase:
             ).fetchone()[0]
 
             total_accounts = conn.execute(
-                "SELECT COUNT(*) FROM upstream_accounts"
+                "SELECT COUNT(*) FROM upstream_accounts WHERE is_aggregate = 0"
             ).fetchone()[0]
 
             return {
@@ -570,7 +570,7 @@ class ProxyDatabase:
                     COALESCE(SUM(r.cost), 0) AS cost
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON r.account_id = a.id
-                WHERE 1=1
+                WHERE COALESCE(a.is_aggregate, 0) = 0
             """
             params = []
             if account_id:
@@ -633,7 +633,8 @@ class ProxyDatabase:
             rows = conn.execute(
                 f"""SELECT
                     r.id, r.account_id, a.name AS account_name,
-                    r.model, r.prompt_tokens, r.completion_tokens,
+                    r.model, r.prompt_tokens, r.cache_read_tokens,
+                    r.completion_tokens,
                     r.total_tokens, r.cost, r.is_streaming,
                     r.status_code, r.duration_ms, r.requested_at
                 FROM request_log r
@@ -654,27 +655,6 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    def get_billing_by_account(self) -> list[dict]:
-        """Per-account cost summary."""
-        conn = self._connect()
-        try:
-            rows = conn.execute("""
-                SELECT
-                    a.id AS account_id,
-                    a.name AS account_name,
-                    COUNT(*) AS total_requests,
-                    COALESCE(SUM(r.total_tokens), 0) AS total_tokens,
-                    COALESCE(SUM(r.cost), 0) AS total_cost,
-                    MAX(r.requested_at) AS last_used
-                FROM upstream_accounts a
-                LEFT JOIN request_log r ON a.id = r.account_id
-                GROUP BY a.id, a.name
-                ORDER BY total_cost DESC
-            """).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
-
     def get_daily_billing(self, year: int, month: int) -> list[dict]:
         """Daily billing breakdown for a specific month."""
         conn = self._connect()
@@ -688,7 +668,8 @@ class ProxyDatabase:
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON r.account_id = a.id
-                WHERE CAST(strftime('%Y', r.requested_at) AS INTEGER) = ?
+                WHERE COALESCE(a.is_aggregate, 0) = 0
+                  AND CAST(strftime('%Y', r.requested_at) AS INTEGER) = ?
                   AND CAST(strftime('%m', r.requested_at) AS INTEGER) = ?
                 GROUP BY date(r.requested_at), r.account_id
                 ORDER BY date, r.account_id
@@ -706,10 +687,14 @@ class ProxyDatabase:
                     date(r.requested_at) AS date,
                     COALESCE(SUM(r.prompt_tokens), 0) AS input_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(r.cache_read_tokens), 0) AS cache_hit_tokens,
+                    MAX(COALESCE(SUM(r.prompt_tokens), 0) - COALESCE(SUM(r.cache_read_tokens), 0), 0) AS cache_miss_tokens,
                     COUNT(*) AS requests,
                     COALESCE(SUM(r.cost), 0) AS cost
                 FROM request_log r
-                WHERE CAST(strftime('%Y', r.requested_at) AS INTEGER) = ?
+                LEFT JOIN upstream_accounts a ON r.account_id = a.id
+                WHERE COALESCE(a.is_aggregate, 0) = 0
+                  AND CAST(strftime('%Y', r.requested_at) AS INTEGER) = ?
                   AND CAST(strftime('%m', r.requested_at) AS INTEGER) = ?
                 GROUP BY date(r.requested_at)
                 ORDER BY date

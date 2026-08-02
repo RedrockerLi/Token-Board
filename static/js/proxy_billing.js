@@ -35,29 +35,6 @@ async function loadBillingStats() {
     }
 }
 
-async function loadAccountBreakdown() {
-    const tbody = document.querySelector('#accountBreakdownTable tbody');
-    if (!tbody) return;
-    try {
-        const data = await proxyFetch('/api/proxy/billing/by-account');
-        if (!data.length) {
-            tbody.innerHTML = '<tr><td colspan="5" class="td-empty">暂无数据</td></tr>';
-            return;
-        }
-        tbody.innerHTML = data.map((a) => `
-            <tr>
-                <td>${esc(a.account_name || `ID ${a.account_id}`)}</td>
-                <td>${fmtNum(a.total_requests)}</td>
-                <td>${fmtNum(a.total_tokens)}</td>
-                <td>¥${(a.total_cost || 0).toFixed(2)}</td>
-                <td>${esc(a.last_used || '从未使用')}</td>
-            </tr>
-        `).join('');
-    } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="5" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
-    }
-}
-
 let billingChart = null;
 
 async function loadDailyBillingChart(year, month) {
@@ -90,17 +67,18 @@ async function loadDailyBillingChart(year, month) {
                     trigger: 'axis',
                     axisPointer: { type: 'shadow' },
                     formatter: function(params) {
-                        let html = '<b>' + params[0].axisValue + '</b><br/>';
-                        let total = 0;
-                        params.forEach(p => {
-                            if (p.seriesName !== '费用') {
-                                html += p.marker + ' ' + p.seriesName + ': ' + fmtNum(p.value) + '<br/>';
-                                total += p.value;
-                            }
-                        });
-                        html += '<b>合计: ' + fmtNum(total) + ' tokens</b><br/>';
-                        const cp = params.find(p => p.seriesName === '费用');
-                        if (cp) html += cp.marker + ' 费用: ¥' + cp.value.toFixed(2);
+                        const idx = params[0] && params[0].dataIndex;
+                        if (idx == null) return '';
+                        const d = data[idx];
+                        const total = ((d.input_tokens || 0) + (d.output_tokens || 0)) || 1;
+                        const pct = (v) => (v / total * 100).toFixed(1);
+                        const hit = d.cache_hit_tokens || 0;
+                        const miss = d.cache_miss_tokens || 0;
+                        let html = '<b>' + d.date + '</b><br/>';
+                        html += '输出Token: <b>' + fmtNum(d.output_tokens || 0) + '</b> (' + pct(d.output_tokens || 0) + '%)<br/>';
+                        html += '输入缓存命中: <b>' + fmtNum(hit) + '</b> (' + pct(hit) + '%)<br/>';
+                        html += '输入缓存未命中: <b>' + fmtNum(miss) + '</b> (' + pct(miss) + '%)<br/>';
+                        html += '费用: <b>¥' + (d.cost || 0).toFixed(2) + '</b>';
                         return html;
                     }
                 },
@@ -285,21 +263,9 @@ function initBillingPage() {
                 <div class="chart-container chart-container--lg" id="chartBillingDaily"></div>
             </div>
         </div>
-
-        <!-- Account Breakdown -->
-        <div class="section">
-            <div class="section-header">
-                <span class="section-title">账户费用明细</span>
-            </div>
-            <table class="mgmt-table" id="accountBreakdownTable">
-                <thead><tr><th>账户</th><th>请求数</th><th>Token 数</th><th>费用</th><th>最后使用</th></tr></thead>
-                <tbody></tbody>
-            </table>
-        </div>
     `;
 
     loadBillingStats();
-    loadAccountBreakdown();
     populateBillingMonthSelector();
 
     // Append sync modal to body (shared, outside page container)
@@ -361,7 +327,7 @@ async function loadLogsTable() {
                 <td>${esc(fmtTime(r.requested_at))}</td>
                 <td>${esc(r.account_name || `ID:${r.account_id}`)}</td>
                 <td><code>${esc(r.model)}</code></td>
-                <td>${fmtNum(r.prompt_tokens)} / ${fmtNum(r.completion_tokens)} / ${fmtNum(r.total_tokens)}</td>
+                <td>${fmtNum(r.prompt_tokens)} / ${fmtNum(r.cache_read_tokens || 0)} / ${fmtNum(r.completion_tokens)} / ${fmtNum(r.total_tokens)}</td>
                 <td>¥${(r.cost || 0).toFixed(4)}</td>
                 <td>${r.duration_ms}ms</td>
                 <td>${r.is_streaming ? 'SSE' : 'REST'}</td>
@@ -416,7 +382,7 @@ function initLogsPage() {
 
         <!-- Log Table -->
         <table class="mgmt-table" id="logsTable">
-            <thead><tr><th>时间</th><th>账户</th><th>模型</th><th>Tokens (输入/输出/总计)</th><th>费用</th><th>延迟</th><th>模式</th><th>状态</th></tr></thead>
+            <thead><tr><th>时间</th><th>账户</th><th>模型</th><th>Tokens (输入/命中/输出/总计)</th><th>费用</th><th>延迟</th><th>模式</th><th>状态</th></tr></thead>
             <tbody></tbody>
         </table>
 

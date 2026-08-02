@@ -649,10 +649,8 @@ bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
             out.usage.total_tokens = u["total_tokens"].get<int>();
         else
             out.usage.total_tokens = out.usage.prompt_tokens + out.usage.completion_tokens;
-        if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object() &&
-            u["prompt_tokens_details"].contains("cached_tokens") &&
-            u["prompt_tokens_details"]["cached_tokens"].is_number_integer())
-            out.usage.cache_read_tokens = u["prompt_tokens_details"]["cached_tokens"].get<int>();
+        out.usage.cache_read_tokens =
+            fmt::read_cache_hit_tokens(u, out.usage.prompt_tokens).value_or(0);
         if (u.contains("completion_tokens_details") && u["completion_tokens_details"].is_object())
             out.usage.extra["completion_tokens_details"] = u["completion_tokens_details"];
     }

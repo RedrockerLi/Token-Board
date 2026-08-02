@@ -174,7 +174,6 @@ export ANTHROPIC_AUTH_TOKEN=<在仪表板生成的本地密钥>
 | `/api/proxy/billing` | GET | 聚合费用数据 |
 | `/api/proxy/billing/monthly-trend` | GET | 按月费用趋势 |
 | `/api/proxy/billing/months` | GET | 可用月份列表 |
-| `/api/proxy/billing/by-account` | GET | 按账户费用明细 |
 | `/api/proxy/logs` | GET | 分页请求日志 |
 | `/api/proxy/export` | POST | 导出未同步用量到仪表板 + WebDAV 云端同步 |
 | `/api/proxy/sync/config` | GET/PUT | WebDAV 配置 |

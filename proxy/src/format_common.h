@@ -2,6 +2,8 @@
 
 #include "ir.h"
 
+#include <optional>
+
 /// Shared helpers for the three wire-format codecs.
 namespace fmt {
 
@@ -105,5 +107,22 @@ bool parse_sse_frame(const std::string &frame, std::string *event_name,
 
 /// Parse a wire `usage` object (OpenAI/Responses or Anthropic shape) into IR.
 ir::Usage parse_usage_json(const json &u);
+
+/// Best-effort read of the cache-hit input-token count from an OpenAI-family
+/// `usage` object.  Upstreams report it in several ways (see mock/real
+/// upstreams):
+///   1. `prompt_cache_hit_tokens` (e.g. deepseek) — used verbatim;
+///   2. `prompt_tokens_details.cached_tokens` (OpenAI chat);
+///   3. `input_tokens_details.cached_tokens` (Responses format);
+///   4. only `prompt_cache_miss_tokens` — derive hit = max(0, prompt − miss);
+///   5. no cache fields at all (e.g. minimax, `prompt_tokens_details: null`)
+///      → nullopt, meaning "no OpenAI-family signal, leave caller's value".
+///
+/// `prompt_tokens` is the total input count (cache hits included), so
+/// miss = prompt_tokens − hit.  Returns nullopt when no OpenAI-family cache
+/// field is present, so callers that also handle Anthropic's
+/// `cache_read_input_tokens` (whose input_tokens exclude cache reads) are not
+/// clobbered by a default of 0.
+std::optional<int> read_cache_hit_tokens(const json &u, int prompt_tokens);
 
 }  // namespace fmt

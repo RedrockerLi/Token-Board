@@ -1,5 +1,6 @@
 #include "format_common.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 
@@ -259,6 +260,34 @@ bool parse_sse_frame(const std::string &frame, std::string *event_name,
     return has_data;
 }
 
+std::optional<int> read_cache_hit_tokens(const json &u, int prompt_tokens) {
+    if (!u.is_object()) return std::nullopt;
+    // deepseek-style: prompt_cache_hit_tokens (+ prompt_cache_miss_tokens).
+    if (u.contains("prompt_cache_hit_tokens") &&
+        u["prompt_cache_hit_tokens"].is_number_integer())
+        return u["prompt_cache_hit_tokens"].get<int>();
+    // OpenAI chat: usage.prompt_tokens_details.cached_tokens.
+    if (u.contains("prompt_tokens_details") &&
+        u["prompt_tokens_details"].is_object() &&
+        u["prompt_tokens_details"].contains("cached_tokens") &&
+        u["prompt_tokens_details"]["cached_tokens"].is_number_integer())
+        return u["prompt_tokens_details"]["cached_tokens"].get<int>();
+    // Responses: usage.input_tokens_details.cached_tokens.
+    if (u.contains("input_tokens_details") &&
+        u["input_tokens_details"].is_object() &&
+        u["input_tokens_details"].contains("cached_tokens") &&
+        u["input_tokens_details"]["cached_tokens"].is_number_integer())
+        return u["input_tokens_details"]["cached_tokens"].get<int>();
+    // deepseek-style without explicit hit: derive hit = prompt − miss.
+    if (u.contains("prompt_cache_miss_tokens") &&
+        u["prompt_cache_miss_tokens"].is_number_integer()) {
+        int miss = u["prompt_cache_miss_tokens"].get<int>();
+        return std::max(0, prompt_tokens - miss);
+    }
+    // No OpenAI-family cache field (e.g. minimax, prompt_tokens_details:null).
+    return std::nullopt;
+}
+
 ir::Usage parse_usage_json(const json &u) {
     ir::Usage out;
     if (!u.is_object()) return out;
@@ -278,14 +307,12 @@ ir::Usage parse_usage_json(const json &u) {
         out.total_tokens = u["total_tokens"].get<int>();
     else
         out.total_tokens = out.prompt_tokens + out.completion_tokens;
-    if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object() &&
-        u["prompt_tokens_details"].contains("cached_tokens") &&
-        u["prompt_tokens_details"]["cached_tokens"].is_number_integer())
-        out.cache_read_tokens = u["prompt_tokens_details"]["cached_tokens"].get<int>();
-    if (u.contains("input_tokens_details") && u["input_tokens_details"].is_object() &&
-        u["input_tokens_details"].contains("cached_tokens") &&
-        u["input_tokens_details"]["cached_tokens"].is_number_integer())
-        out.cache_read_tokens = u["input_tokens_details"]["cached_tokens"].get<int>();
+    // OpenAI-family cache hits (prompt_cache_hit_tokens / details.cached_tokens
+    // / miss-derived).  Only overwrite when the upstream actually reported an
+    // OpenAI-family field, so the Anthropic cache_read_input_tokens value read
+    // above is preserved.
+    if (auto v = read_cache_hit_tokens(u, out.prompt_tokens))
+        out.cache_read_tokens = *v;
     return out;
 }
 

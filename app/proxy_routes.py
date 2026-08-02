@@ -253,11 +253,6 @@ def billing_summary():
     )
 
 
-@bp_proxy.route("/billing/by-account")
-def billing_by_account():
-    return jsonify(_proxy_db().get_billing_by_account())
-
-
 @bp_proxy.route("/billing/daily")
 def daily_billing():
     year = request.args.get("year", type=int)

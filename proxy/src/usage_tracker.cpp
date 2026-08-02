@@ -1,5 +1,6 @@
 #include "usage_tracker.h"
 #include "db.h"
+#include "format_common.h"
 
 #include "json.hpp"
 
@@ -31,15 +32,13 @@ UsageTracker::parse_usage(const std::string &body) {
             if (u.contains("total_tokens"))
                 info.total_tokens = u["total_tokens"].get<int>();
 
-            // Cached prompt tokens (OpenAI chat: usage.prompt_tokens_details).
-            // prompt_tokens already includes these, so the cache miss count is
-            // prompt_tokens - cache_read_tokens.
-            if (u.contains("prompt_tokens_details") &&
-                u["prompt_tokens_details"].is_object() &&
-                u["prompt_tokens_details"].contains("cached_tokens") &&
-                u["prompt_tokens_details"]["cached_tokens"].is_number_integer())
-                info.cache_read_tokens =
-                    u["prompt_tokens_details"]["cached_tokens"].get<int>();
+            // Cached prompt tokens.  Upstreams report them several ways:
+            // prompt_cache_hit_tokens (deepseek), prompt_tokens_details/
+            // input_tokens_details.cached_tokens (OpenAI chat / Responses),
+            // or not at all (minimax) → 0.  prompt_tokens already includes
+            // the hits, so cache miss = prompt_tokens - cache_read_tokens.
+            info.cache_read_tokens =
+                fmt::read_cache_hit_tokens(u, info.prompt_tokens).value_or(0);
 
             // If total_tokens is 0 but we have prompt + completion, sum them
             if (info.total_tokens == 0)
@@ -105,13 +104,11 @@ UsageTracker::parse_usage_from_sse(const std::string &sse_data) {
                 if (u.contains("total_tokens"))
                     info.total_tokens = u["total_tokens"].get<int>();
 
-                // Cached prompt tokens (OpenAI chat: prompt_tokens_details).
-                if (u.contains("prompt_tokens_details") &&
-                    u["prompt_tokens_details"].is_object() &&
-                    u["prompt_tokens_details"].contains("cached_tokens") &&
-                    u["prompt_tokens_details"]["cached_tokens"].is_number_integer())
-                    info.cache_read_tokens =
-                        u["prompt_tokens_details"]["cached_tokens"].get<int>();
+                // Cached prompt tokens — see parse_usage for the upstream
+                // variants.  The opencode.ai inference-cost frame below
+                // overrides this with its own cacheReadTokens when present.
+                info.cache_read_tokens =
+                    fmt::read_cache_hit_tokens(u, info.prompt_tokens).value_or(0);
 
                 found_usage = true;
             }
@@ -288,13 +285,11 @@ UsageTracker::parse_responses_usage(const std::string &body) {
                 info.total_tokens = u["total_tokens"].get<int>();
             else
                 info.total_tokens = info.prompt_tokens + info.completion_tokens;
-            // Cached prompt tokens (Responses: usage.input_tokens_details).
-            if (u.contains("input_tokens_details") &&
-                u["input_tokens_details"].is_object() &&
-                u["input_tokens_details"].contains("cached_tokens") &&
-                u["input_tokens_details"]["cached_tokens"].is_number_integer())
-                info.cache_read_tokens =
-                    u["input_tokens_details"]["cached_tokens"].get<int>();
+            // Cached prompt tokens — see parse_usage for the upstream
+            // variants (Responses format: input_tokens_details.cached_tokens
+            // or prompt_cache_hit_tokens / miss-derived).
+            info.cache_read_tokens =
+                fmt::read_cache_hit_tokens(u, info.prompt_tokens).value_or(0);
         }
         if (info.total_tokens == 0)
             info.total_tokens = info.prompt_tokens + info.completion_tokens;
@@ -340,13 +335,11 @@ UsageTracker::parse_responses_usage_from_sse(const std::string &sse_data) {
                     info.total_tokens = u["total_tokens"].get<int>();
                 else
                     info.total_tokens = info.prompt_tokens + info.completion_tokens;
-                // Cached prompt tokens (Responses: usage.input_tokens_details).
-                if (u.contains("input_tokens_details") &&
-                    u["input_tokens_details"].is_object() &&
-                    u["input_tokens_details"].contains("cached_tokens") &&
-                    u["input_tokens_details"]["cached_tokens"].is_number_integer())
-                    info.cache_read_tokens =
-                        u["input_tokens_details"]["cached_tokens"].get<int>();
+                // Cached prompt tokens — see parse_usage for the upstream
+                // variants (Responses format: input_tokens_details.cached_tokens
+                // or prompt_cache_hit_tokens / miss-derived).
+                info.cache_read_tokens =
+                    fmt::read_cache_hit_tokens(u, info.prompt_tokens).value_or(0);
                 found_usage = true;
             }
         } catch (const json::parse_error &) {
