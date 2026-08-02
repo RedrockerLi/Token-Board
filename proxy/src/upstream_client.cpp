@@ -47,7 +47,7 @@ UpstreamClient::forward(const std::string &method,
     // Create client
     httplib::Client cli(scheme_host);
     cli.set_connection_timeout(10, 0);   // 10 sec connect timeout
-    cli.set_read_timeout(300, 0);        // 5 min read timeout (for long generations)
+    cli.set_read_timeout(100, 0);        // 100s: no upstream data for 100s ⇒ timeout
     cli.set_write_timeout(30, 0);
     cli.enable_server_certificate_verification(true);
 

@@ -50,11 +50,51 @@ static std::string json_error(const std::string &msg, int code) {
     return j.dump();
 }
 
+/// Unified upstream-timeout error object returned to the client.
+/// type=timeout_error + code 504 — clients (opencode, Claude Code, SDK retry
+/// middlewares) recognize this as a retryable error instead of an opaque
+/// connection drop.
+static json timeout_error_body() {
+    return json{{"message",
+                 "Upstream timeout: no response within 100s. Please retry."},
+                {"type", "timeout_error"},
+                {"code", 504}};
+}
+
+/// SSE error frame for the passthrough streaming path (no codec available).
+/// Emits a terminal error event in the client's wire format instead of
+/// silently dropping the connection, so the client knows the upstream never
+/// replied and can prompt the user to retry.
+static std::string timeout_sse_frame(ir::ApiFormat fmt) {
+    json err = timeout_error_body();
+    switch (fmt) {
+        case ir::ApiFormat::Anthropic:
+            return "event: error\ndata: " +
+                   json{{"type", "error"},
+                        {"error", json{{"type", "timeout_error"},
+                                       {"message", err["message"]}}}}
+                       .dump() +
+                   "\n\n";
+        case ir::ApiFormat::OpenAIResponses:
+            return "data: " +
+                   json{{"type", "response.failed"},
+                        {"response", json{{"id", ""},
+                                          {"object", "response"},
+                                          {"status", "failed"},
+                                          {"error", err}}}}
+                       .dump() +
+                   "\n\n";
+        default:  // OpenAI chat completions
+            return "data: " + json{{"error", err}}.dump() + "\n\n"
+                   "data: [DONE]\n\n";
+    }
+}
+
 /// Shared state for client-disconnect monitoring: the upstream socket fd is
 /// captured by `UpstreamClient::forward` via `on_socket`; the monitor thread
 /// shutdown()s it to unblock an in-flight upstream read once the client
 /// disconnects, so the pool thread is freed promptly instead of waiting out
-/// the full 300s read timeout.
+/// the full 100s read timeout.
 struct AbortGuard {
     std::atomic<bool> running{false};
     std::atomic<int> upstream_fd{-1};
@@ -324,6 +364,20 @@ static bool client_disconnected(const httplib::Request &req, int inflight_id,
     return false;
 }
 
+/// True if the client socket is already closed.  Used in the streaming paths to
+/// distinguish a genuine upstream timeout from a client disconnect: the monitor
+/// thread shutdown()s the upstream socket when the client goes away, which the
+/// upstream client surfaces as a read error (is_timeout).
+static bool client_socket_gone(int sock) {
+    if (sock == INVALID_SOCKET) return false;
+    struct pollfd pfd;
+    pfd.fd = sock;
+    pfd.events = POLLIN | POLLRDHUP;
+    pfd.revents = 0;
+    return poll(&pfd, 1, 0) > 0 &&
+           (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP));
+}
+
 // ── handle_chat_request ──────────────────────────────────────────────────
 
 /// Entry point for /v1/chat/completions, /v1/messages and /v1/responses.
@@ -401,7 +455,7 @@ void ProxyServer::handle_passthrough(Router::RouteResult &route,
         // ── Streaming path ──────────────────────────────────────────
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, route, target, body, content_type, model_copy, t0,
+            [this, route, target, body, content_type, model_copy, upstream, t0,
              concurrent_count, inflight_id, think_filter, upstream_fmt,
              client_sock = req.client_socket](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
@@ -465,9 +519,20 @@ void ProxyServer::handle_passthrough(Router::RouteResult &route,
 
                 db_.request_end(inflight_id);
                 if (fwd.is_timeout) {
-                    fprintf(stderr, "[Proxy] Upstream timeout, disconnecting "
-                                    "client (inflight=%d)\n", inflight_id);
-                    return false;   // truncate SSE stream → connection drops
+                    // The monitor thread shutdown()s the upstream socket when
+                    // the client disconnects, which surfaces as a read error
+                    // (is_timeout) — the client is already gone, no error frame
+                    // needed.
+                    if (client_socket_gone(client_sock)) return false;
+                    // Don't drop the connection silently — emit a terminal
+                    // error event so the client sees "upstream timeout" and
+                    // can prompt the user to retry.
+                    fprintf(stderr, "[Proxy] Upstream timeout, sending error "
+                                    "event to client (inflight=%d)\n", inflight_id);
+                    std::string frame = timeout_sse_frame(upstream);
+                    write_to_sink(frame.data(), frame.size());
+                    sink.done();
+                    return true;
                 }
                 sink.done();
                 return true;
@@ -524,10 +589,16 @@ void ProxyServer::handle_passthrough(Router::RouteResult &route,
         res.status = fwd.status_code;
     } else {
         res.status = fwd.status_code;
-        if (fwd.is_timeout) res.set_header("Connection", "close");
-        res.set_content(json_error("Upstream error: " + fwd.error,
-                                   fwd.status_code),
-                        "application/json");
+        if (fwd.is_timeout) {
+            // Explicit, retryable timeout error instead of a generic error.
+            res.set_header("Connection", "close");
+            res.set_content(json{{"error", timeout_error_body()}}.dump(),
+                            "application/json");
+        } else {
+            res.set_content(json_error("Upstream error: " + fwd.error,
+                                       fwd.status_code),
+                            "application/json");
+        }
     }
 }
 
@@ -588,7 +659,7 @@ void ProxyServer::handle_converted(Router::RouteResult &route,
         // ── Streaming path ──────────────────────────────────────────
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, route, target, upstream_body, model_copy, upstream_fmt, upstream, t0,
+            [this, route, target, upstream_body, model_copy, upstream_fmt, harness, upstream, t0,
              concurrent_count, inflight_id, harness_codec_ptr, upstream_codec_ptr,
              client_sock = req.client_socket](
                 size_t /*offset*/, httplib::DataSink &sink) -> bool {
@@ -676,9 +747,25 @@ void ProxyServer::handle_converted(Router::RouteResult &route,
 
                 db_.request_end(inflight_id);
                 if (fwd.is_timeout) {
-                    fprintf(stderr, "[Proxy] Upstream timeout, disconnecting "
-                                    "client (inflight=%d)\n", inflight_id);
-                    return false;   // truncate SSE stream → connection drops
+                    // The monitor thread shutdown()s the upstream socket when
+                    // the client disconnects, which surfaces as a read error
+                    // (is_timeout) — the client is already gone, no error frame
+                    // needed.
+                    if (client_socket_gone(client_sock)) return false;
+                    // Don't drop the connection silently — emit a terminal
+                    // error event (in the harness wire format) so the client
+                    // sees "upstream timeout" and can prompt the user to retry.
+                    fprintf(stderr, "[Proxy] Upstream timeout, sending error "
+                                    "event to client (inflight=%d)\n", inflight_id);
+                    ir::StreamEvent err_ev;
+                    err_ev.type = ir::StreamEventType::ErrorEvent;
+                    err_ev.extra["error"] = timeout_error_body();
+                    emitter->emit(err_ev, sink_bridge);
+                    if (harness == ir::ApiFormat::OpenAI)
+                        sink_bridge("data: [DONE]\n\n");
+                    emitter->finish(sink_bridge);
+                    sink.done();
+                    return true;
                 }
                 sink.done();
                 return true;
@@ -735,10 +822,14 @@ void ProxyServer::handle_converted(Router::RouteResult &route,
         }
     } else {
         json normalized;
-        try {
-            normalized = upstream_codec.parse_error_body(json::parse(fwd.body));
-        } catch (...) {
-            normalized = json{{"message", fwd.error.empty() ? "upstream error" : fwd.error}};
+        if (fwd.is_timeout) {
+            normalized = timeout_error_body();
+        } else {
+            try {
+                normalized = upstream_codec.parse_error_body(json::parse(fwd.body));
+            } catch (...) {
+                normalized = json{{"message", fwd.error.empty() ? "upstream error" : fwd.error}};
+            }
         }
         res.status = (fwd.status_code >= 400) ? fwd.status_code : 502;
         if (fwd.is_timeout) res.set_header("Connection", "close");
@@ -835,10 +926,16 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         }
     } else {
         res.status = fwd.status_code;
-        if (fwd.is_timeout) res.set_header("Connection", "close");
-        res.set_content(json_error("Upstream error: " + fwd.error,
-                                   fwd.status_code),
-                        "application/json");
+        if (fwd.is_timeout) {
+            // Explicit, retryable timeout error instead of a generic error.
+            res.set_header("Connection", "close");
+            res.set_content(json{{"error", timeout_error_body()}}.dump(),
+                            "application/json");
+        } else {
+            res.set_content(json_error("Upstream error: " + fwd.error,
+                                       fwd.status_code),
+                            "application/json");
+        }
     }
 }
 
@@ -941,10 +1038,16 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         res.set_content(fwd.body, "application/json");
     } else {
         res.status = fwd.status_code;
-        if (fwd.is_timeout) res.set_header("Connection", "close");
-        res.set_content(
-            json_error("Upstream error: " + fwd.error, fwd.status_code),
-            "application/json");
+        if (fwd.is_timeout) {
+            // Explicit, retryable timeout error instead of a generic error.
+            res.set_header("Connection", "close");
+            res.set_content(json{{"error", timeout_error_body()}}.dump(),
+                            "application/json");
+        } else {
+            res.set_content(
+                json_error("Upstream error: " + fwd.error, fwd.status_code),
+                "application/json");
+        }
     }
 }
 

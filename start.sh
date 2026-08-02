@@ -37,15 +37,13 @@ echo ""
 
 if $START_ALL; then
 
-    # ── Build proxy if needed ──────────────────────────────────────────
-    if [ ! -f "$PROXY_BIN" ]; then
-        echo "[proxy] 编译 C++ 代理..."
-        cd "$SCRIPT_DIR/proxy"
-        cmake -B build -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-        cmake --build build -j$(nproc) > /dev/null 2>&1
-        cd "$SCRIPT_DIR"
-        echo -e "${GREEN}✓ 编译完成${NC}"
-    fi
+    # ── Build proxy  ──────────────────────────────────────────
+    echo "[proxy] 编译 C++ 代理..."
+    cd "$SCRIPT_DIR/proxy"
+    cmake -B build -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
+    cmake --build build -j$(nproc) > /dev/null 2>&1
+    cd "$SCRIPT_DIR"
+    echo -e "${GREEN}✓ 编译完成${NC}"
 
     # ── Install & start via systemd (or daemon fallback) ───────────────
     HAS_SYSTEMD=false
