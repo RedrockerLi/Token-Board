@@ -1,236 +1,202 @@
 # Token Board — AI API 代理 + 用量可视化
 
-一个集 **高性能 API 代理** 与 **用量数据可视化** 于一体的工具。代理负责将 AI 工具的请求按不同 API Key 路由到不同的上游账户，并自动记录每次请求的 Token 消耗与费用；仪表板提供直观的图表展示。
+一个集**高性能 API 代理**与**用量数据可视化**于一体的工具。代理把 AI 工具的请求按不同 API Key 路由到不同的上游账户,自动完成客户端与上游之间的格式转换,并记录每次请求的 Token 消耗与费用;仪表板把这些数据画成图表,还能把用量和配置同步到 WebDAV,多台电脑共用一套代理配置。
+
+核心特性:
+
+- 三种线格式互相转换:OpenAI 兼容(`/v1/chat/completions`)、OpenAI Responses(`/v1/responses`)、Anthropic 兼容(`/v1/messages`)。Claude Code、codex、OpenAI SDK 等工具可以同时接进来,客户端格式由请求 URL 自动识别
+- 多账户路由:一个本地密钥绑定一个上游账户;聚合账户把多个上游合并成一个模型列表,同一模型可配置多个账户自动回退
+- 峰谷定价:按时段给模型定价配倍率,成本在请求写入时按当时价格固化,改价不回溯
+- 用量看板:模型趋势、Token 类型分布、按用户分摊费用;支持 CSV 导入平台账单
+- 性能监控:成功率、延迟分布(P50/P95/P99)、吞吐、实时并发
+- WebDAV 同步:配置与聚合用量跨机器同步,明细数据不上传
+
+技术细节(架构、数据库、计费、格式转换、代理内部、同步协议、API 参考、开发)见 [doc/](doc/) 目录下的专题文档。
 
 ## 快速开始
 
 ```bash
-# 仅启动仪表板（默认）
+# 仅启动仪表板
 bash start.sh
 
-# 启动全部（代理 + 仪表板，代理设为开机自启）
+# 启动全部:编译并启动代理(开机自启)+ 仪表板
 bash start.sh --all
 
 # 不自动打开浏览器
 bash start.sh --no-browser
 ```
 
-浏览器访问仪表板，通过左侧导航栏切换功能页面。
+浏览器会打开仪表板,通过左侧导航栏切换功能页面。端口约定:代理监听 **8800**,仪表板在 **5000–5099** 区间自动找一个空闲端口(启动时会打印实际地址)。
 
-> 代理开机自启基于 systemd 用户服务。非 systemd 环境（macOS 等）请用 `bash scripts/start-proxy.sh --daemon` 后台启动。
+> 代理的开机自启基于 systemd 用户服务。非 systemd 环境(如 macOS)用 `bash scripts/start-proxy.sh --daemon` 后台启动。
 
----
+## 配置 AI 工具
 
-## 核心功能：API 代理
-
-### 工作原理
-
-```
-AI 工具                       代理                      上游 API
-(Claude Code 等)          localhost:8800              (OpenAI 兼容)
-     │                         │                           │
-     │  POST /v1/chat/         │                           │
-     │  completions            │                           │
-     │  Authorization:         │                           │
-     │  Bearer <本地密钥>       │                           │
-     ├────────────────────────▶│                           │
-     │                         │  查 SQLite 找到对         │
-     │                         │  应的上游账户              │
-     │                         │                           │
-     │                         │  POST /v1/chat/           │
-     │                         │  completions              │
-     │                         │  Authorization:           │
-     │                         │  Bearer <上游密钥>         │
-     │                         ├──────────────────────────▶│
-     │                         │                           │
-     │                         │      SSE / JSON 响应      │
-     │                         │◀──────────────────────────┤
-     │                         │                           │
-     │                         │  记录 usage → SQLite      │
-     │     响应（实时转发）      │                           │
-     │◀────────────────────────┤                           │
-```
-
-### 配置 AI 工具
-
-代理支持三种 API 格式：**OpenAI 兼容**（`/v1/chat/completions`）、**OpenAI Responses**（`/v1/responses`）和 **Anthropic 兼容**（`/v1/messages`）。上游账户与 AI 工具（harness）均可配置为任意格式，代理在中间自动完成请求/响应格式转换（含流式与用量解析）。
-
-### 格式配置
-
-- **上游账户**（上游服务端格式）：添加/编辑账户时选择 `API 格式`（OpenAI / OpenAI Responses / Anthropic），并可自定义 `上游路径`（默认按格式自动推导，如 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`）与 `认证方式`（Bearer 或 x-api-key + anthropic-version）。
-- **本地密钥**：一把密钥同时支持全部三种客户端格式。客户端格式由请求的 URL 路径自动识别：`/v1/chat/completions` → OpenAI，`/v1/responses` → OpenAI Responses，`/v1/messages` → Anthropic。代理自动将客户端请求转换为上游账户的格式；与上游格式一致时直接透传。
-
-同一把密钥绑定 openai 账户时，Claude Code 也能通过它（客户端访问 `/v1/messages`，代理自动转换为 OpenAI 请求再转发）。
-
-### OpenAI 兼容工具
-
-```
-OPENAI_BASE_URL = http://localhost:8800/v1
-OPENAI_API_KEY  = <在仪表板生成的本地密钥>
-```
-
-> **注意**：Base URL 的路径是 `/v1`，不是 `/v1/chat/completions`。OpenAI SDK 会自动拼接 `/chat/completions`。
-
-### Anthropic 兼容工具（Claude Code 等）
+先给工具配上代理的地址和本地密钥(密钥在仪表板生成,见下面的配置流程):
 
 ```bash
+# OpenAI 兼容工具(OpenAI SDK、各类兼容客户端)
+export OPENAI_BASE_URL=http://localhost:8800/v1
+export OPENAI_API_KEY=<本地密钥>
+
+# Anthropic 兼容工具(Claude Code 等)
 export ANTHROPIC_BASE_URL=http://localhost:8800/v1
-export ANTHROPIC_AUTH_TOKEN=<在仪表板生成的本地密钥>
+export ANTHROPIC_AUTH_TOKEN=<本地密钥>
+
+# OpenAI Responses(codex 等)
+export OPENAI_BASE_URL=http://localhost:8800/v1
+export OPENAI_API_KEY=<本地密钥>
 ```
 
-### 配置流程
+几点说明:
 
-1. 打开仪表板 → 侧边栏 **代理管理 → 上游账户** → 添加账户（填写上游 API 的 Base URL 和 Key）
-2. **代理管理 → 本地密钥** → 生成密钥（选择关联的账户）
-3. 将生成的密钥（格式 `tb-xxxxxxxx...`）填入 AI 工具的 `API_KEY`
-4. 发送请求后，用量自动记录到 **消费报告** 和 **请求日志**
+- Base URL 的路径是 `/v1`,不是 `/v1/chat/completions`。SDK 会自己拼端点。代理同时兼容 `/v1/v1/...` 这种重复前缀,已把 `/v1` 写进 base URL 的客户端也能直接用
+- 本地密钥对三种格式通用,一把密钥可以同时给 OpenAI 和 Anthropic 工具用
+- 工具请求的模型名要能被「模型定价」里的 pattern 匹配到,否则请求仍会转发,但计费会按 0 处理
 
-### 多账户路由
+## 配置流程
 
-不同本地密钥可以路由到不同上游账户，适合：
-- 团队多人共用一台代理服务器，各自使用独立的 API Key
-- 按项目/用途分配不同模型配额
-- 多平台统一接入（支持 OpenAI 兼容 + Anthropic 兼容 API）
+1. 打开仪表板 → **代理管理 → 上游账户** → 添加账户,填上游 API 的 Base URL、Key,选 API 格式(OpenAI / OpenAI Responses / Anthropic)
+2. **代理管理 → 本地密钥** → 生成密钥,选关联的账户(密钥只显示一次,注意保存)
+3. 把密钥填入 AI 工具的 `API_KEY`(或 `AUTH_TOKEN`),Base URL 指到代理
+4. 发一个请求验证:用量会出现在 **消费报告** 和 **请求日志**,实时并发与延迟看 **性能监控**
 
-### 账户类型与并发控制
+## 账户管理
 
-每个上游账户可配置：
+### 账户类型与并发
 
-- **账户类型**（`api` / `plan`）：
-  - `api`：按调用量正常计费
-  - `plan`：订阅套餐，调用本身不收费；可设置**每月价格**，当月只要使用过该 plan 账户，消费统计就计入一次月费。同时记录**虚拟消费**（按 api 计费口径计算的金额），用于衡量 plan 是否划算
-- **并发限额**：同一账户同时进行中的请求数上限，留空 = 无限制。超过限额的请求立即返回 HTTP 429（聚合链中则自动切换下一个账户）
-- **plan 冷却**：plan 账户收到上游 HTTP 429（限流）后自动冷却 **5 小时**，期间不再路由到该账户
+每个上游账户可配置:
+
+- **账户类型**:`api`(按量计费)或 `plan`(订阅套餐)。plan 账户调用不收费,真实消费记 0,同时按 api 口径记一笔**虚拟消费**,当月用过一次就计入一次月费,用来衡量套餐划不划算
+- **并发限额**:同一账户同时进行中的请求数上限,留空 = 不限。超限的请求立即返回 HTTP 429;在聚合链里则自动切到下一个账户
+- **plan 冷却**:plan 账户被上游限流(HTTP 429)后自动冷却 **5 小时**,期间不再路由到它
 
 ### 上游账户聚合
 
-聚合账户把多个上游账户合并为一个，对客户端暴露统一模型列表：
+把多个上游账户合并成一个,对客户端暴露统一的模型列表:
 
-1. 侧边栏 **代理管理 → 上游账户聚合** → 新建聚合账户
-2. 为每个模型添加一条映射（模型名 → 目标上游账户 → 上游模型名）
-3. **同一模型可配置多个上游账户**：请求从上到下依次尝试——当前账户达到并发限额或处于冷却期时自动使用下一个；若上游返回 429 / 5xx（尚未向客户端发送任何数据），本次请求立即回退到下一个账户；全部不可用时返回 HTTP 429
+1. **代理管理 → 上游账户聚合** → 新建聚合账户
+2. 为每个模型加一条映射:模型名 → 目标上游账户 → 上游模型名
+3. 同一模型可以配多个上游账户,请求从上到下依次尝试:当前账户达并发上限或处于冷却期时自动换下一个;上游返回 429 / 5xx 且尚未向客户端发任何数据时,本次请求立即回退;全部不可用时返回 429
 
----
+### 模型定价
 
-## 数据看板
+**代理管理 → 模型定价**:
 
-### 用量仪表板
+- 添加/编辑模型单价(元/百万 tokens):输入、输出、缓存命中(缺省按输入价)
+- 给每个定价配置**时段倍率**(峰谷定价):按「当日几点到几点」配一个倍率,比如夜间 1.2 倍。时段按北京时间(UTC+8)输入,跨午夜用起止倒置表示
+- 用上移/下移调整匹配优先级:同一请求命中多个 pattern 时,排在上面的生效
+- 改价、调档、换序都只影响新请求,已产生的费用不回溯重算
 
-展示从 CSV 文件导入的 API 用量数据，支持多平台、按月查看、按用户筛选。
+消费口径的说明见 [doc/billing-pricing.md](doc/billing-pricing.md)。
 
-数据来源：
-- **CSV 导入**：支持 DeepSeek、Mimo、BoardProxy 平台
-- **代理导出**：在消费报告页点击「导出数据」，未同步的用量自动聚合写入仪表板数据库，实时显示
+## 仪表板使用
 
-计费口径（两套价格互不重复）：
-- **CSV 导入的数据**：按 CSV 文件自带的金额计费，不受模型定价影响
-- **代理导出的数据**：按「模型定价」页配置的价格计算（缓存命中按 `cache_read_price`，plan 账户真实消费记为 0 并记录虚拟消费）
-- 同一笔数据不会同时按两种价格计算
+侧边栏共 8 个页面,时间显示统一为 UTC+8:
 
-消费口径：
-- **总消费** = api 按量消费 + plan 订阅价格（当月使用过的 plan 各计一次月费；按用户筛选时只统计该用户的 plan 订阅）
-- **理论消费** = api 按量消费 + plan 虚拟消费（即不买 plan、全按 api 计费应花的金额；按用户筛选时只统计该用户的 plan 虚拟消费，api / CSV 导入用户的理论消费等于其实际消费）
+| 页面 | 用途 |
+|------|------|
+| 用量仪表板 | 总 Token / 请求数 / 消费概览、模型占比饼图、Token 类型分布、每个模型的每日用量与月度趋势。支持按用户筛选(费用按 Token 占比分摊)与按月查看;全局占比 <1% 且当月未使用的模型自动隐藏 |
+| 消费报告 | 代理转发的请求统计:总 Token / 请求 / 消费概览、每日用量堆叠图、今日各上游明细、按月消费趋势、导出数据与 WebDAV 同步设置 |
+| 上游账户 | 账户增删改查、从上游拉取模型目录 |
+| 上游账户聚合 | 聚合账户的模型映射与回退顺序 |
+| 本地密钥 | 生成 / 复制 / 编辑 / 删除密钥,密钥列表打码显示 |
+| 模型定价 | 单价与峰谷时段编辑器 |
+| 请求日志 | 分页请求明细,按日期 / 模型 / 账户筛选 |
+| 性能监控 | 当前并发、RPM、成功率、平均延迟、P50/P95/P99、每分钟请求数、各上游成功率、各模型延迟,15 秒自动刷新 |
 
-### 消费报告
+### 数据看板与 CSV 导入
 
-显示代理转发的请求统计：
-- **总 Token / 总请求数 / 总消费** 概览卡片（总消费为真实口径：api 按量 + plan 月费；今日消费 = 今日 api 按量 + 今日 plan 虚拟）
-- **按月消费趋势** 柱状图
-- **账户消费明细** 表格
-- **导出数据**：将未同步的用量聚合写入仪表板数据库，并自动完成 WebDAV 云端同步（拉取 → 合并 → 上传）
-- **同步设置**：点击 **⚙** 配置 WebDAV 服务器，实现在多台电脑间同步配置与用量数据
+用量数据有两个来源,费用互不重复:
+
+- **代理导出**:消费报告页点「导出数据」,未同步的用量自动聚合写入仪表板数据库
+- **CSV 导入**:把平台导出的账单放进 `data/<平台>/` 目录,启动时自动导入。当前支持 **DeepSeek**(`amount-*.csv`、`cost-*.csv`)与 **Mimo**(`usage_data_*.csv`),导入成功后会删除原 CSV
 
 ### WebDAV 同步
 
-多台电脑共用代理时，可通过 WebDAV 同步配置与用量数据：
+多台电脑共用代理时,用 WebDAV 同步配置与聚合用量:
 
-1. 消费报告页 → 点击 **⚙** → 填写 WebDAV 服务器信息 → **测试连接** → **保存配置**
-2. 点击 **导出数据** 执行完整同步（拉取云端最新 → 合并到本地 → 导出本地新用量 → 上传云端）
+1. 消费报告页 → 点 **⚙** → 填服务器地址、账号、密码 → **测试连接** → **保存配置**
+2. 点 **导出数据** 执行一次完整同步:拉取云端最新 → 合并到本地 → 导出本地新用量 → 上传云端
 
-同步采用**追加模式**：每次上传生成带时间戳的文件（如 `dashboard_sync_20260731_143025.db`），云端旧文件保留不删除；拉取时自动选择时间戳最新的文件。配置修改后约 3 秒自动上传，仪表板启动时自动从云端拉取配置合并到本地（本地已有配置优先）。
+同步采用**追加模式**:每次上传生成带时间戳的文件,云端旧文件保留不删,拉取时自动取最新。配置修改后约 3 秒自动上传,仪表板启动时自动从云端拉取配置。
 
-同步内容：
-- **配置**：上游账户、本地密钥、模型映射模板、模型定价，跨机器自动同步
-- **用量数据**：按 日期 + 账户 + 模型 聚合后的 Token 用量与费用
+同步的是配置(账户、密钥、定价、聚合映射)与聚合后的用量;**绝不上传**请求明细、性能数据、在途请求和 WebDAV 账号密码。机制详见 [doc/sync.md](doc/sync.md)。
 
-同步规则：
-- `request_log` 明细**仅存本地**，不直接上传；通过三态标记（未导出 / 已导出待上传 / 已确认上传）只导出聚合后的用量，不重不漏，云端上传成功后才确认，失败自动重试
-- 本地 `request_log` 只清理**已确认上传**的旧记录（最多保留 1 万条），未导出 / 待上传的记录绝不删除
-- 云端保留全部历史文件，不做裁剪
-- **绝不上传**：`request_log` 明细、性能指标（perf_events）、在途请求、WebDAV 账号密码
+## 运维
 
----
+### 编译代理
 
-## API 端点
-
-### 仪表板 API（数据可视化）
-
-| 端点 | 说明 |
-|------|------|
-| `/api/summary` | 跨月份聚合统计 |
-| `/api/monthly` | 按月聚合统计 |
-| `/api/daily` | 指定月份的每日明细 |
-| `/api/models` | 模型列表及所属平台 |
-| `/api/token_types` | Token 类型分布 |
-| `/api/api_key_names` | 用户列表 |
-| `/api/refresh` | 重新扫描数据目录 |
-
-查询参数：`api_key_name`、`model`、`platform`、`year`、`month`。
-
-### 代理管理 API
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/api/proxy/stats` | GET | 代理统计概览 |
-| `/api/proxy/accounts` | GET/POST | 上游账户 CRUD |
-| `/api/proxy/accounts/<id>` | PUT/DELETE | 更新/停用账户 |
-| `/api/proxy/keys` | GET/POST | 本地密钥 CRUD |
-| `/api/proxy/keys/<id>` | PUT/DELETE | 更新/停用密钥 |
-| `/api/proxy/pricing` | GET/POST | 模型定价 CRUD |
-| `/api/proxy/pricing/<id>` | PUT/DELETE | 更新/删除定价 |
-| `/api/proxy/billing` | GET | 聚合费用数据 |
-| `/api/proxy/billing/monthly-trend` | GET | 按月费用趋势 |
-| `/api/proxy/billing/months` | GET | 可用月份列表 |
-| `/api/proxy/logs` | GET | 分页请求日志 |
-| `/api/proxy/export` | POST | 导出未同步用量到仪表板 + WebDAV 云端同步 |
-| `/api/proxy/sync/config` | GET/PUT | WebDAV 配置 |
-| `/api/proxy/sync/test` | POST | 测试 WebDAV 连接 |
-
-### 代理转发端点
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/v1/chat/completions` | POST | OpenAI 兼容代理转发 |
-| `/v1/responses` | POST | OpenAI Responses 代理转发 |
-| `/v1/messages` | POST | Anthropic 兼容代理转发 |
-| `/v1/embeddings` | POST | 嵌入向量代理转发 |
-| `/v1/models` | GET | 模型列表代理 |
-| `/health` | GET | 代理健康检查 |
-
-> 三个 chat 端点共享同一条管线：客户端格式由请求 URL 路径自动识别（`/v1/chat/completions` → OpenAI、`/v1/responses` → Responses、`/v1/messages` → Anthropic），与上游账户格式不同时由代理自动转换。
-
----
-
-## 编译代理
-
-代理使用 C++17 + CMake：
+代理是 C++17 + CMake,依赖已随仓库携带(`proxy/third_party/`),只需系统装了 OpenSSL 和 CMake:
 
 ```bash
 cd proxy
-bash setup_deps.sh          # 下载第三方依赖（首次）
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ./build/token_proxy --db ../data/proxy.db --schema-dir ../schema/proxy --port 8800
 ```
 
-命令行参数：
+命令行参数:
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--db` | `data/proxy.db` | SQLite 数据库路径 |
-| `--schema-dir` | 由 `--db` 推导（`<db目录>/../schema/proxy`） | 迁移文件目录（`schema/<库名>/NNNN_*.sql`） |
+| `--schema-dir` | 由 `--db` 推导 | 迁移文件目录(`schema/<库名>/NNNN_*.sql`) |
 | `--port` | `8800` | 监听端口 |
 | `--host` | `0.0.0.0` | 绑定地址 |
 | `--log-level` | `info` | 日志级别 |
 
-> 数据库 schema 由版本化迁移统一管理，升级流程见 [doc/database-migrations.md](doc/database-migrations.md)。
+### systemd 服务
+
+`start.sh --all` 会自动编译并安装 `token-proxy` 用户服务(开机自启)。单独管理:
+
+```bash
+bash scripts/start-proxy.sh --install      # 安装为 systemd 用户服务
+bash scripts/start-proxy.sh --uninstall    # 移除服务
+systemctl --user status token-proxy        # 查看状态
+systemctl --user restart token-proxy       # 重启
+journalctl --user -u token-proxy -f        # 查看日志
+```
+
+### 状态检查
+
+```bash
+bash scripts/status.sh
+```
+
+检查代理二进制、systemd 服务、8800 健康检查、仪表板进程与端口、数据库行数。
+
+### 数据目录
+
+运行时数据都在 `data/`(已 gitignore):`proxy.db`(代理运行库:账户、密钥、定价、请求日志)、`dashboard.db`(可视化聚合库)、`data/<平台>/`(CSV 导入目录)。两个库的 schema 由版本化迁移管理,升级规则见 [doc/database-migrations.md](doc/database-migrations.md)。
+
+## 常见问题
+
+**改了定价,之前的花费会变吗?**
+不会。成本在请求写入时按当时价格固化,改价、调整峰谷档位、换匹配顺序都不回溯历史。原因和公式见 [doc/billing-pricing.md](doc/billing-pricing.md)。
+
+**同一个模型为什么有时不走我想要的账户?**
+多账户聚合时,回退顺序是 冷却跳过 → 并发满跳过 → 429/5xx 回退。想固定走某个账户,就把它排在链最前,且只给这个模型配它。
+
+**agent 报 429 是什么意思?**
+所有候选账户都忙或都在冷却(聚合链),或单账户并发超限。可以调大 `max_concurrency`,或等 plan 账户的 5 小时冷却结束(重启代理可立即解除)。
+
+**上游 100 秒没回,连接被断开?**
+这是代理的上游读超时。代理会按客户端格式发一个明确的超时错误(504,`timeout_error`),而不是静默断连。SDK 通常会按这个错误重试。
+
+**想把账单明细带出去?**
+明细在本地 `data/proxy.db` 的 `request_log` 表,用 sqlite 工具直接查;云端同步的只是聚合结果。
+
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| [doc/architecture.md](doc/architecture.md) | 总体架构、目录结构、数据流、设计决策 |
+| [doc/database.md](doc/database.md) | 两个 SQLite 库的表结构、索引、触发器、计费公式 |
+| [doc/database-migrations.md](doc/database-migrations.md) | schema 迁移机制与升级步骤 |
+| [doc/billing-pricing.md](doc/billing-pricing.md) | 定价、峰谷档位、写时计价固化、plan 虚拟消费 |
+| [doc/format-conversion.md](doc/format-conversion.md) | 三格式转换、IR 与 codec、流式处理、think 抽取 |
+| [doc/proxy-internals.md](doc/proxy-internals.md) | 路由、并发闸门、超时、回退、性能监控 |
+| [doc/sync.md](doc/sync.md) | WebDAV 同步协议、三态导出、追加模式 |
+| [doc/api-reference.md](doc/api-reference.md) | 全部 API 端点与命令行参数 |
+| [doc/development.md](doc/development.md) | 构建、自测、模拟上游、前端开发 |

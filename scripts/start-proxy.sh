@@ -23,7 +23,6 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 # ── Build if needed ──
 if [ ! -f "$PROXY_BIN" ]; then
     echo "[INFO] 代理未编译，开始编译..."
-    [ -f "$SCRIPT_DIR/proxy/third_party/httplib.h" ] || bash "$SCRIPT_DIR/proxy/setup_deps.sh"
     cd "$SCRIPT_DIR/proxy"
     cmake -B build -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
     cmake --build build -j$(nproc) > /dev/null 2>&1
