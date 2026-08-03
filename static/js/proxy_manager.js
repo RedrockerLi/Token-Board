@@ -630,14 +630,81 @@ function initAggregatesPage() {
 
 // ── Pricing Page ─────────────────────────────────────────────────────────
 
+// Cached pricing rows (with slots) so the edit modal can look up by id.
+let _pricingCache = [];
+
+// ── Time-slot helpers (UTC+0 storage ↔ UTC+8 UI) ─────────────────────────
+// Slot boundaries are stored as minute-of-day in UTC+0; the UI enters and
+// shows them in UTC+8 (Beijing time).
+function minutesToHHMM(m) {
+    m = ((Math.round(m) % 1440) + 1440) % 1440;
+    return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+}
+function hhmmToMinutes(hhmm) {
+    var p = String(hhmm || '').split(':').map(Number);
+    if (p.length < 2 || isNaN(p[0]) || isNaN(p[1])) return NaN;
+    return p[0] * 60 + p[1];
+}
+function minutes8to0(min8) { return ((min8 - 480) % 1440 + 1440) % 1440; }  // UTC+8 → UTC+0
+function minutes0to8(min0) { return ((min0 + 480) % 1440 + 1440) % 1440; }  // UTC+0 → UTC+8
+
+function addSlotRow(slot) {
+    var rows = document.getElementById('slotRows');
+    if (!rows) return;
+    var div = document.createElement('div');
+    div.className = 'slot-row';
+    div.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:6px;';
+    var startVal = slot ? minutesToHHMM(minutes0to8(slot.start_minute)) : '08:00';
+    var endVal = slot ? minutesToHHMM(minutes0to8(slot.end_minute)) : '23:00';
+    var multVal = slot ? slot.multiplier : 1.0;
+    div.innerHTML =
+        '<input type="time" class="slot-start" step="60" value="' + startVal + '">' +
+        '<span style="color:var(--color-text-secondary);">至</span>' +
+        '<input type="time" class="slot-end" step="60" value="' + endVal + '">' +
+        '<input type="number" class="slot-multiplier" step="0.05" min="0" value="' + multVal + '" style="width:70px;" placeholder="倍率">' +
+        '<button type="button" class="btn btn--sm" onclick="removeSlotRow(this)">×</button>';
+    rows.appendChild(div);
+}
+
+function removeSlotRow(btn) {
+    var row = btn.parentElement;
+    if (row) row.remove();
+}
+
+function collectSlots() {
+    var rows = document.querySelectorAll('#slotRows .slot-row');
+    var slots = [];
+    rows.forEach(function (row) {
+        var start = hhmmToMinutes(row.querySelector('.slot-start').value);
+        var end = hhmmToMinutes(row.querySelector('.slot-end').value);
+        var mult = parseFloat(row.querySelector('.slot-multiplier').value);
+        if (isNaN(start) || isNaN(end) || isNaN(mult)) return;  // skip incomplete rows
+        if (start === end) return;  // zero-length window is meaningless
+        slots.push({
+            start_minute: minutes8to0(start),
+            end_minute: minutes8to0(end),
+            multiplier: mult,
+        });
+    });
+    return slots;
+}
+
+function slotsSummary(slots) {
+    if (!slots || !slots.length) return '<span style="color:var(--color-text-tertiary);">无</span>';
+    return slots.map(function (s) {
+        return minutesToHHMM(minutes0to8(s.start_minute)) + '-' + minutesToHHMM(minutes0to8(s.end_minute)) + ' ×' + s.multiplier;
+    }).join('、');
+}
+
 async function loadPricingTable() {
     const tbody = document.querySelector('#pricingTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="td-loading">加载中...</td></tr>';
     try {
         const pricing = await proxyFetch('/api/proxy/pricing');
+        _pricingCache = pricing;
         if (!pricing.length) {
-            tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无定价</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="7" class="td-empty">暂无定价</td></tr>';
             return;
         }
         tbody.innerHTML = pricing.map((p) => `
@@ -646,17 +713,18 @@ async function loadPricingTable() {
                 <td>¥${p.input_price.toFixed(4)} / 1M tokens</td>
                 <td>¥${p.output_price.toFixed(4)} / 1M tokens</td>
                 <td>${p.cache_read_price != null ? '¥' + p.cache_read_price.toFixed(4) + ' / 1M tokens' : '<span style="color:var(--color-text-tertiary);">同输入价</span>'}</td>
+                <td>${slotsSummary(p.slots)}</td>
                 <td>${esc(p.currency)}</td>
                 <td>
                     <button class="btn btn--sm" onclick="reorderPricing(${p.id},'up')">▲</button>
                     <button class="btn btn--sm" onclick="reorderPricing(${p.id},'down')">▼</button>
-                    <button class="btn btn--sm" onclick="editPricing(${p.id}, '${esc(p.model_pattern)}', ${p.input_price}, ${p.output_price}, ${p.cache_read_price == null ? 'null' : p.cache_read_price})">编辑</button>
+                    <button class="btn btn--sm" onclick="editPricing(${p.id})">编辑</button>
                     <button class="btn btn--sm" onclick="deletePricing(${p.id})">删除</button>
                 </td>
             </tr>
         `).join('');
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="6" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -666,7 +734,13 @@ async function savePricing(e) {
     const data = Object.fromEntries(new FormData(form));
     const id = form.dataset.editId;
     const cacheRead = data.cache_read_price !== '' ? parseFloat(data.cache_read_price) : null;
-    const payload = { model_pattern: data.model_pattern, input_price: parseFloat(data.input_price), output_price: parseFloat(data.output_price), cache_read_price: cacheRead };
+    const payload = {
+        model_pattern: data.model_pattern,
+        input_price: parseFloat(data.input_price),
+        output_price: parseFloat(data.output_price),
+        cache_read_price: cacheRead,
+        slots: collectSlots(),
+    };
     try {
         if (id) {
             await proxyFetch(`/api/proxy/pricing/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
@@ -678,6 +752,7 @@ async function savePricing(e) {
         form.reset();
         form.dataset.editId = '';
         form.querySelector('[type=submit]').textContent = '添加';
+        document.getElementById('slotRows').innerHTML = '';
         closeModal('pricingModal');
         loadPricingTable();
     } catch (err) {
@@ -685,12 +760,20 @@ async function savePricing(e) {
     }
 }
 
-function editPricing(id, pattern, inputPrice, outputPrice, cacheReadPrice) {
+function editPricing(id) {
+    const p = _pricingCache.find(x => x.id === id);
+    if (!p) return;
     const form = document.querySelector('#pricingForm');
-    form['model_pattern'].value = pattern;
-    form['input_price'].value = inputPrice;
-    form['output_price'].value = outputPrice;
-    form['cache_read_price'].value = cacheReadPrice == null ? '' : cacheReadPrice;
+    form['model_pattern'].value = p.model_pattern;
+    form['input_price'].value = p.input_price;
+    form['output_price'].value = p.output_price;
+    form['cache_read_price'].value = p.cache_read_price == null ? '' : p.cache_read_price;
+    // Populate time-slot editor (empty for new rows)
+    const slotRows = document.getElementById('slotRows');
+    if (slotRows) {
+        slotRows.innerHTML = '';
+        (p.slots || []).forEach(function (s) { addSlotRow(s); });
+    }
     form.dataset.editId = id;
     form.querySelector('[type=submit]').textContent = '更新';
     openModal('pricingModal');
@@ -721,11 +804,11 @@ function initPricingPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">模型定价管理</h1>
-            <p class="page-subtitle">配置模型价格（百万元 token 价格，人民币）</p>
+            <p class="page-subtitle">配置模型价格（百万元 token 价格，人民币）· 时段倍率按 UTC+8 时间设置</p>
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
         <table class="mgmt-table" id="pricingTable">
-            <thead><tr><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>货币</th><th>操作</th></tr></thead>
+            <thead><tr><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>时段倍率</th><th>货币</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
         <div class="modal-overlay" id="pricingModal" style="display:none">
@@ -739,10 +822,18 @@ function initPricingPage() {
                     <label>输入价格 (¥/1M tokens) <input name="input_price" type="number" step="0.0001" required></label>
                     <label>输出价格 (¥/1M tokens) <input name="output_price" type="number" step="0.0001" required></label>
                     <label>缓存命中价格 (¥/1M tokens，可选) <input name="cache_read_price" type="number" step="0.0001" placeholder="留空 = 与输入价格相同"></label>
+                    <div style="margin:10px 0;">
+                        <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:6px;">
+                            时段倍率（每日生效，按 UTC+8 时间；倍率作用于输入/输出/缓存三档价格）
+                        </div>
+                        <div id="slotRows"></div>
+                        <button type="button" class="btn btn--sm" onclick="addSlotRow(null)">+ 添加时段</button>
+                    </div>
                     <button type="submit" class="btn btn--primary">添加</button>
                 </form>
             </div>
         </div>
     `;
+    document.getElementById('slotRows').innerHTML = '';
     loadPricingTable();
 }

@@ -66,7 +66,7 @@ function updateSubtitle() {
     } else {
         parts.push('总览 (所有用户)');
     }
-    parts.push('所有日期均按 UTC+0 时间显示');
+    parts.push('所有时间均按 UTC+8 显示');
     el.textContent = parts.join(' · ');
 }
 
@@ -86,20 +86,72 @@ function populateMonthSelector(months) {
     return prevMonthVal;
 }
 
+// Full sorted user list (backend order: most-recent call month → month volume),
+// used by the "更多用户" picker. The dropdown itself shows the top 5.
+let allKeyNames = [];
+const KEY_SELECTOR_TOP = 5;
+
 function populateKeyNameSelector(keyNames) {
     var keySel = document.getElementById('keyNameSelector');
     if (!keySel) return '';
     var prevKeyVal = keySel.value;
     keySel.innerHTML = '<option value="">总览 (所有用户)</option>';
-    var hiddenUsers = displayConfig.hidden_users || [];
-    keyNames.forEach(function (name) {
-        if (matchesAny(name, hiddenUsers)) return;
+    allKeyNames = (keyNames || []).slice();
+    allKeyNames.slice(0, KEY_SELECTOR_TOP).forEach(function (name) {
         var opt = document.createElement('option');
         opt.value = name;
         opt.textContent = name;
         keySel.appendChild(opt);
     });
+    // Preserve a non-top selection across reloads so the filter isn't silently
+    // reset to "all users" (e.g. after picking a month/model).
+    if (prevKeyVal && allKeyNames.indexOf(prevKeyVal) >= 0 &&
+        allKeyNames.slice(0, KEY_SELECTOR_TOP).indexOf(prevKeyVal) < 0) {
+        var opt = document.createElement('option');
+        opt.value = prevKeyVal;
+        opt.textContent = prevKeyVal;
+        keySel.appendChild(opt);
+    }
     return prevKeyVal;
+}
+
+// ── "更多用户" picker ────────────────────────────────────────────────
+
+function openMoreUsersModal() {
+    var list = document.getElementById('moreUsersList');
+    if (!list) return;
+    if (!allKeyNames.length) {
+        list.innerHTML = '<div class="td-empty">暂无其他用户</div>';
+    } else {
+        list.innerHTML = allKeyNames.map(function (name) {
+            var active = (name === currentKeyName)
+                ? ' style="background:rgba(0,112,243,0.12);border-color:var(--color-accent, #0070F3);"'
+                : '';
+            return '<button type="button" class="btn btn--sm more-user-item" data-name="' +
+                esc(name) + '"' + active + ' style="display:block;width:100%;text-align:left;margin:2px 0;">' +
+                esc(name) + '</button>';
+        }).join('');
+    }
+    openModal('moreUsersModal');
+}
+
+function selectMoreUser(name) {
+    currentKeyName = name;
+    var keySel = document.getElementById('keyNameSelector');
+    if (keySel) {
+        var existing = Array.from(keySel.options).some(function (o) { return o.value === name; });
+        if (!existing) {
+            var opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            keySel.appendChild(opt);
+        }
+        keySel.value = name;
+    }
+    closeModal('moreUsersModal');
+    loadSummary();
+    loadModelPie();
+    loadTypePie();
 }
 
 // ── Dynamic chart container management ──
@@ -115,32 +167,124 @@ function clearDynamicCharts() {
     monthlyModelMap = {};
 }
 
-function buildDynamicCharts(models) {
-    clearDynamicCharts();
-    // Layer 1: Filter out hidden models and "unknown" model — never show in dashboard charts
-    var hiddenModels = (displayConfig.hidden_models || []).map(function (m) { return m.toLowerCase(); });
-    var filteredModels = models.filter(function (m) {
-        var lower = m.toLowerCase();
-        return lower !== 'unknown' && !matchesAny(lower, hiddenModels);
-    });
-    modelsList = filteredModels.slice();
+// Global deprecated model set — computed once from the ALL-USERS breakdown
+// (independent of the current user / month view).  A display unit (standalone
+// model or alias group) whose share of the total is <1% is deprecated and is
+// hidden from the model pie and the per-model cards.
+let globalDeprecated = null;  // null = not computed yet; object {displayName: true}
 
-    // Layer 2: Build alias maps and exclude individual models that belong to an alias group
+async function ensureGlobalDeprecated() {
+    if (globalDeprecated != null) return;
+    try {
+        // fetchJSON without buildParams → no api_key_name → all users.
+        var data = await fetchJSON('/api/summary');
+        var breakdown = data.model_breakdown || {};
+        var aliasMaps = buildAliasMaps(Object.keys(breakdown));
+        var modelToAlias = aliasMaps.modelToAlias;
+
+        // Merge individual models into display units (alias name or model name).
+        var units = {};
+        Object.keys(breakdown).forEach(function (m) {
+            var lower = m.toLowerCase();
+            var unit = (lower in modelToAlias) ? modelToAlias[lower] : m;
+            units[unit] = (units[unit] || 0) + (breakdown[m].total_tokens || 0);
+        });
+        var total = Object.keys(units).reduce(function (s, k) { return s + units[k]; }, 0);
+
+        globalDeprecated = {};
+        if (total > 0) {
+            Object.keys(units).forEach(function (k) {
+                if (units[k] / total < 0.01) globalDeprecated[k] = true;
+            });
+        }
+    } catch (e) {
+        globalDeprecated = {};  // fetch failed → nothing deprecated
+    }
+}
+
+// Models the CURRENT user actually used in the currently-selected month
+// (set of model names from that month's daily breakdown).  undefined = not yet
+// computed; null = no month / fetch failed.
+let currentMonthUsedModels = undefined;
+
+async function fetchCurrentMonthUsedModels() {
+    if (!currentMonth) return null;
+    try {
+        // buildParams applies the current user filter to fetchDaily.
+        var daily = await fetchDaily(currentMonth.year, currentMonth.month);
+        var set = {};
+        (daily.days || []).forEach(function (day) {
+            Object.keys(day.by_model || {}).forEach(function (m) { set[m] = true; });
+        });
+        return set;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Was the display unit (standalone model name or alias group name) used by the
+// current user in the current month?  aliasToModels maps alias → member models.
+function unitUsedThisMonth(unit, aliasToModels, usedModels) {
+    if (!usedModels) return false;
+    var members = aliasToModels[unit];
+    if (members) {
+        return members.some(function (m) {
+            var lower = String(m).toLowerCase();
+            return !!(lower in usedModels || m in usedModels);
+        });
+    }
+    var lower = String(unit).toLowerCase();
+    return !!(lower in usedModels || unit in usedModels);
+}
+
+// A unit is deprecated only when it is globally <1% AND the current user did
+// NOT use it this month — a model called this month is "in use", not deprecated.
+function isDeprecatedUnit(unit, aliasToModels, usedModels) {
+    if (!(globalDeprecated && globalDeprecated[unit])) return false;
+    return !unitUsedThisMonth(unit, aliasToModels, usedModels);
+}
+
+function buildDynamicCharts(models, usedModels) {
+    clearDynamicCharts();
+    // A display unit is deprecated only if globally <1% AND not used by the
+    // current user this month.  usedModels = set of model names the current
+    // user used this month; null = unknown (fall back to plain deprecation).
     var aliasMaps = buildAliasMaps(models);
     var modelToAlias = aliasMaps.modelToAlias;
     var aliasToModels = aliasMaps.aliasToModels;
+
+    var isDeprecatedModel = function (m) {
+        var lower = String(m).toLowerCase();
+        var unit = (lower in modelToAlias) ? modelToAlias[lower] : m;
+        return isDeprecatedUnit(unit, aliasToModels, usedModels);
+    };
+    var isUsed = function (m) {
+        if (usedModels == null) return true;
+        var lower = String(m).toLowerCase();
+        return !!(lower in usedModels || m in usedModels);
+    };
+
+    var filteredModels = models.filter(function (m) {
+        var lower = m.toLowerCase();
+        if (lower === 'unknown') return false;
+        return !isDeprecatedModel(m) && isUsed(m);
+    });
+    modelsList = filteredModels.slice();
 
     // Remove individual models that are covered by an alias group
     filteredModels = filteredModels.filter(function (m) {
         return !(m.toLowerCase() in modelToAlias);
     });
 
-    // Add alias group display names as chart entries (respect hidden_models)
+    // Add alias group display names as chart entries — only when at least one
+    // of the group's member models is used this month and the group isn't
+    // deprecated for this view.
     var chartEntries = filteredModels.slice();  // standalone models
     Object.keys(aliasToModels).forEach(function (aliasName) {
-        if (!matchesAny(aliasName.toLowerCase(), hiddenModels)) {
-            chartEntries.push(aliasName);
-        }
+        if (isDeprecatedUnit(aliasName, aliasToModels, usedModels)) return;
+        var members = aliasToModels[aliasName] || [];
+        var anyUsed = members.some(function (m) { return isUsed(m); });
+        if (anyUsed) chartEntries.push(aliasName);
     });
 
     modelsList = chartEntries.slice();
@@ -244,8 +388,6 @@ async function loadSummary() {
         }
     }
 
-    buildDynamicCharts(models);
-
     var sel = document.getElementById('monthSelector');
     if (months.length > 0) {
         var latest = months[months.length - 1];
@@ -262,6 +404,16 @@ async function loadSummary() {
             var labelEl = document.getElementById('currentMonthLabel');
             if (labelEl) labelEl.textContent = '当前显示: ' + label;
         }
+    }
+
+    // Models the current user actually used in the current month — used for
+    // the card filter and the "used this month → not deprecated" exemption.
+    currentMonthUsedModels = await fetchCurrentMonthUsedModels();
+    await ensureGlobalDeprecated();  // Global <1% baseline (all users, cached)
+
+    buildDynamicCharts(models, currentMonthUsedModels);
+
+    if (currentMonth) {
         loadDailyCharts();
     }
 
@@ -270,8 +422,9 @@ async function loadSummary() {
 
     var lastUpdatedEl = document.getElementById('lastUpdated');
     if (lastUpdatedEl) {
+        var nowUtc = new Date().toISOString().slice(0, 19).replace('T', ' ');
         lastUpdatedEl.textContent =
-            '数据更新时间: ' + new Date().toLocaleString('zh-CN') + ' · 共 ' + months.length + ' 个月数据';
+            '数据更新时间: ' + fmtUtc8(nowUtc) + ' · 共 ' + months.length + ' 个月数据';
     }
 }
 
@@ -381,12 +534,16 @@ async function loadDailyCharts() {
 
 async function loadModelPie() {
     await loadDisplayConfig();  // Ensure config is loaded (may race with loadSummary)
+    await ensureGlobalDeprecated();  // Global <1% baseline (all users, cached)
+    // "Used this month" set — lazily computed if loadSummary hasn't finished yet.
+    if (currentMonthUsedModels === undefined) {
+        currentMonthUsedModels = await fetchCurrentMonthUsedModels();
+    }
     var loader = document.getElementById('loadingModelPie');
     if (!loader) return;
     try {
         var data = await fetchSummary();
         var breakdown = data.model_breakdown || {};
-        var hiddenModels = (displayConfig.hidden_models || []).map(function (m) { return m.toLowerCase(); });
         var aliasMaps = buildAliasMaps(Object.keys(breakdown));
         var modelToAlias = aliasMaps.modelToAlias;
         var aliasToModels = aliasMaps.aliasToModels;
@@ -397,12 +554,9 @@ async function loadModelPie() {
             var modelName = entry[0];
             var tokens = entry[1].total_tokens || 0;
             var lower = modelName.toLowerCase();
-            if (matchesAny(lower, hiddenModels)) return;
             if (lower in modelToAlias) {
                 // This model belongs to an alias group → merge
                 var aliasName = modelToAlias[lower];
-                // Also skip if the alias name itself is hidden
-                if (matchesAny(aliasName.toLowerCase(), hiddenModels)) return;
                 merged[aliasName] = (merged[aliasName] || 0) + tokens;
             } else {
                 merged[modelName] = (merged[modelName] || 0) + tokens;
@@ -413,6 +567,12 @@ async function loadModelPie() {
             .map(function (entry) { return { name: entry[0], value: entry[1] }; })
             .filter(function (d) { return d.value > 0; })
             .sort(function (a, b) { return b.value - a.value; });
+
+        // A display unit is deprecated only if globally <1% AND not used by the
+        // current user this month — models called this month are "in use".
+        pieData = pieData.filter(function (d) {
+            return !isDeprecatedUnit(d.name, aliasToModels, currentMonthUsedModels);
+        });
 
         renderPieChart('chartModelPie', pieData, chartColors);
         loader.style.display = 'none';
@@ -530,6 +690,20 @@ function bindDashboardEvents() {
             await loadSummary();
             loadModelPie();
             loadTypePie();
+        });
+    }
+
+    var moreBtn = document.getElementById('moreUsersBtn');
+    if (moreBtn && !moreBtn._bound) {
+        moreBtn._bound = true;
+        moreBtn.addEventListener('click', openMoreUsersModal);
+    }
+    var moreList = document.getElementById('moreUsersList');
+    if (moreList && !moreList._bound) {
+        moreList._bound = true;
+        moreList.addEventListener('click', function (e) {
+            var btn = e.target.closest ? e.target.closest('.more-user-item') : null;
+            if (btn) selectMoreUser(btn.dataset.name);
         });
     }
 

@@ -102,8 +102,14 @@ class ProxyDatabase:
                 "SELECT COALESCE(SUM(total_tokens), 0) FROM request_log"
             ).fetchone()[0]
 
-            total_keys = conn.execute(
-                "SELECT COUNT(*) FROM local_keys"
+            # "Active upstreams" = real upstream accounts (non-aggregate) that
+            # handled at least one request today.
+            active_upstreams = conn.execute(
+                "SELECT COUNT(DISTINCT r.account_id) FROM request_log r "
+                "JOIN upstream_accounts ua ON r.account_id = ua.id "
+                "WHERE COALESCE(ua.is_aggregate, 0) = 0 "
+                "  AND date(r.requested_at) = ?",
+                (today,),
             ).fetchone()[0]
 
             total_accounts = conn.execute(
@@ -116,7 +122,7 @@ class ProxyDatabase:
                 "total_cost": round(total_cost, 4),
                 "today_cost": round(today_cost, 4),
                 "total_tokens": total_tokens,
-                "active_keys": total_keys,
+                "active_upstreams": active_upstreams,
                 "active_accounts": total_accounts,
             }
         finally:
@@ -418,9 +424,40 @@ class ProxyDatabase:
                 "cache_read_price, currency "
                 "FROM model_pricing ORDER BY id"
             ).fetchall()
-            return [dict(r) for r in rows]
+
+            # Attach time-slot multipliers (start/end in UTC+0 minutes).
+            slots_by_pricing: dict[int, list[dict]] = {}
+            for s in conn.execute(
+                "SELECT id, pricing_id, start_minute, end_minute, multiplier "
+                "FROM pricing_slots ORDER BY pricing_id, id"
+            ):
+                slots_by_pricing.setdefault(s["pricing_id"], []).append({
+                    "id": s["id"],
+                    "start_minute": s["start_minute"],
+                    "end_minute": s["end_minute"],
+                    "multiplier": s["multiplier"],
+                })
+            return [dict(r) | {"slots": slots_by_pricing.get(r["id"], [])} for r in rows]
         finally:
             conn.close()
+
+    @staticmethod
+    def _insert_pricing_slots(conn, pricing_id: int, slots) -> None:
+        """Insert time-slot multipliers for a pricing row.
+
+        slots: iterable of {start_minute, end_minute, multiplier} with
+        boundaries in UTC+0 minutes ([0,1439]; start>end means overnight).
+        """
+        if not slots:
+            return
+        for s in slots:
+            conn.execute(
+                "INSERT INTO pricing_slots "
+                "(pricing_id, start_minute, end_minute, multiplier) "
+                "VALUES (?,?,?,?)",
+                (pricing_id, int(s["start_minute"]), int(s["end_minute"]),
+                 float(s.get("multiplier", 1.0))),
+            )
 
     def create_pricing(self, data: dict) -> int:
         conn = self._connect()
@@ -431,10 +468,13 @@ class ProxyDatabase:
                 (data["model_pattern"], data["input_price"], data["output_price"],
                  data.get("cache_read_price")),
             )
+            pid = cursor.lastrowid
+            # Cost is frozen at write time (tr_request_log_insert); time-slot
+            # multipliers only affect future inserts.
+            self._insert_pricing_slots(conn, pid, data.get("slots"))
             conn.commit()
-            # tr_pricing_insert trigger auto-recalculates all costs
             self._schedule_config_sync()
-            return cursor.lastrowid
+            return pid
         finally:
             conn.close()
 
@@ -447,15 +487,20 @@ class ProxyDatabase:
                 if key in data:
                     fields.append(f"{key} = ?")
                     values.append(data[key])
-            if not fields:
+            if not fields and "slots" not in data:
                 return False
-            values.append(pricing_id)
-            conn.execute(
-                f"UPDATE model_pricing SET {', '.join(fields)} WHERE id = ?",
-                values,
-            )
+            if fields:
+                values.append(pricing_id)
+                conn.execute(
+                    f"UPDATE model_pricing SET {', '.join(fields)} WHERE id = ?",
+                    values,
+                )
+            if "slots" in data:
+                # Replace the full slot set for this pricing row.
+                conn.execute("DELETE FROM pricing_slots WHERE pricing_id = ?",
+                             (pricing_id,))
+                self._insert_pricing_slots(conn, pricing_id, data["slots"])
             conn.commit()
-            # tr_pricing_update trigger auto-recalculates all costs
             self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
@@ -466,7 +511,7 @@ class ProxyDatabase:
         try:
             conn.execute("DELETE FROM model_pricing WHERE id = ?", (pricing_id,))
             conn.commit()
-            # tr_pricing_delete trigger auto-recalculates all costs
+            # pricing_slots rows are removed by ON DELETE CASCADE.
             self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
@@ -490,7 +535,8 @@ class ProxyDatabase:
                 conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (a, b))
                 conn.execute("UPDATE model_pricing SET id=? WHERE id=?", (b, -1))
             conn.commit()
-            # tr_pricing_update triggers fire on the ID swap, auto-recalculating all costs
+            # Id swap changes match priority (ORDER BY id LIMIT 1) for new
+            # requests only; historical cost stays frozen at write time.
             self._schedule_config_sync()
             return True
         finally:
@@ -668,6 +714,32 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    def get_today_upstream_usage(self) -> list[dict]:
+        """Per real upstream account used today: real/theoretical cost, tokens, requests.
+
+        Active upstreams = non-aggregate upstream_accounts with at least one
+        request_log row today (UTC day, same boundary as get_stats).
+        """
+        conn = self._connect()
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            rows = conn.execute("""
+                SELECT a.name AS account_name,
+                       COALESCE(SUM(r.cost), 0) AS real_cost,
+                       COALESCE(SUM(r.cost + r.virtual_cost), 0) AS theoretical_cost,
+                       COALESCE(SUM(r.total_tokens), 0) AS tokens,
+                       COUNT(*) AS requests
+                FROM request_log r
+                JOIN upstream_accounts a ON r.account_id = a.id
+                WHERE COALESCE(a.is_aggregate, 0) = 0
+                  AND date(r.requested_at) = ?
+                GROUP BY r.account_id
+                ORDER BY theoretical_cost DESC
+            """, (today,)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     def export_to_dashboard(self, mark_exported: bool = True) -> dict:
         """Export request_log rows to dashboard.db.
 
@@ -694,6 +766,7 @@ class ProxyDatabase:
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
                     COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
+                    COALESCE(SUM(r.cost), 0) AS cost,
                     COUNT(*) AS request_count
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON r.account_id = a.id
@@ -705,7 +778,8 @@ class ProxyDatabase:
                 ORDER BY date(r.requested_at), a.name, r.model
             """).fetchall()
 
-            # Write to dashboard.db (only usage; cost_entry computed by triggers)
+            # Write to dashboard.db (usage + cost_entry aggregated from the
+            # frozen per-request cost recorded by the proxy).
             from app.dashboard_db import DashboardDatabase
             dash_db_path = os.path.join(
                 os.path.dirname(self.db_path), "dashboard.db"
@@ -727,12 +801,13 @@ class ProxyDatabase:
                     completion_tokens=r["completion_tokens"],
                     cache_read_tokens=r["cache_read_tokens"],
                     request_count=r["request_count"],
+                    cost=r["cost"],
                     account_type=r["account_type"],
                 )
 
-            # Always sync model_pricing — triggers recalculate all costs.
-            # Do this even when there are no new rows, so pricing changes
-            # take effect on the next export.
+            # Mirror pricing config to dashboard (cost is frozen at write time;
+            # this keeps the dashboard copy consistent for config sync).
+            # Do this even when there are no new rows.
             _sync_pricing_to_dashboard(conn, dash_db_path)
 
             # ── Plan economics: full rewrite of per-month plan summary ──
@@ -811,18 +886,23 @@ class ProxyDatabase:
     # ── Performance Metrics (local-only) ───────────────────────────────
 
     def get_perf_summary(self, window_minutes: int = 15) -> dict:
-        """Aggregated performance stats for the last N minutes."""
+        """Aggregated performance stats for the last N minutes.
+
+        Data source: request_log, which records every request outcome
+        (including aborted/timeout/error attempts). Errors = status_code >= 400.
+        """
         conn = self._connect()
         try:
             total = conn.execute(
-                "SELECT COUNT(*) FROM perf_events "
+                "SELECT COUNT(*) FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
 
             errors = conn.execute(
-                "SELECT COUNT(*) FROM perf_events "
-                "WHERE is_error = 1 AND requested_at >= datetime('now', '-' || ? || ' minutes')",
+                "SELECT COUNT(*) FROM request_log "
+                "WHERE status_code >= 400 "
+                "  AND requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
 
@@ -832,15 +912,10 @@ class ProxyDatabase:
                 (str(window_minutes),)
             ).fetchone()[0]
 
-            peak_concurrent = conn.execute(
-                "SELECT COALESCE(MAX(concurrent_count), 0) FROM perf_events "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
-                (str(window_minutes),)
-            ).fetchone()[0]
-
             avg_latency = conn.execute(
-                "SELECT COALESCE(AVG(total_latency_ms), 0) FROM perf_events "
-                "WHERE is_error = 0 AND requested_at >= datetime('now', '-' || ? || ' minutes')",
+                "SELECT COALESCE(AVG(duration_ms), 0) FROM request_log "
+                "WHERE status_code < 400 "
+                "  AND requested_at >= datetime('now', '-' || ? || ' minutes')",
                 (str(window_minutes),)
             ).fetchone()[0]
 
@@ -849,19 +924,21 @@ class ProxyDatabase:
                 "error_count": errors,
                 "success_rate": round((total - errors) / max(total, 1) * 100, 1),
                 "total_tokens": tokens,
-                "peak_concurrent": peak_concurrent,
                 "avg_latency_ms": round(avg_latency, 1),
             }
         finally:
             conn.close()
 
     def get_perf_latency(self, window_minutes: int = 60) -> list[dict]:
-        """Latency percentiles (P50/P95/P99) per 1-minute bucket."""
+        """Total-latency percentiles (P50/P95/P99 of duration_ms) per bucket.
+
+        request_log carries only the total duration (no upstream/proxy split).
+        """
         conn = self._connect()
         try:
             buckets = conn.execute(
                 "SELECT DISTINCT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket "
-                "FROM perf_events "
+                "FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "ORDER BY bucket",
                 (str(window_minutes),)
@@ -869,32 +946,25 @@ class ProxyDatabase:
 
             result = []
             for (bucket,) in buckets:
-                rows = conn.execute(
-                    "SELECT total_latency_ms, upstream_latency_ms FROM perf_events "
+                vals = [r[0] for r in conn.execute(
+                    "SELECT duration_ms FROM request_log "
                     "WHERE strftime('%Y-%m-%d %H:%M', requested_at) = ? "
-                    "ORDER BY total_latency_ms",
+                    "ORDER BY duration_ms",
                     (bucket,)
-                ).fetchall()
-
-                if not rows:
+                )]
+                if not vals:
                     continue
+                n = len(vals)
 
-                total_vals = [r[0] for r in rows]
-                upstream_vals = [r[1] for r in rows]
-                n = len(total_vals)
-
-                def percentile(sorted_vals, p):
+                def percentile(p):
                     k = max(0, min(n - 1, int(n * p / 100)))
-                    return sorted_vals[k]
+                    return vals[k]
 
                 result.append({
                     "bucket": bucket,
-                    "p50_total": percentile(total_vals, 50),
-                    "p95_total": percentile(total_vals, 95),
-                    "p99_total": percentile(total_vals, 99),
-                    "p50_upstream": percentile(upstream_vals, 50),
-                    "p95_upstream": percentile(upstream_vals, 95),
-                    "p99_upstream": percentile(upstream_vals, 99),
+                    "p50": percentile(50),
+                    "p95": percentile(95),
+                    "p99": percentile(99),
                     "count": n,
                 })
             return result
@@ -902,39 +972,34 @@ class ProxyDatabase:
             conn.close()
 
     def get_perf_throughput(self, window_minutes: int = 60) -> list[dict]:
-        """Request count and peak concurrency per 1-minute bucket."""
+        """Request count per 1-minute bucket (from request_log)."""
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
-                "COUNT(*) AS request_count, "
-                "MAX(concurrent_count) AS peak_concurrent "
-                "FROM perf_events "
+                "COUNT(*) AS request_count "
+                "FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "GROUP BY bucket "
                 "ORDER BY bucket",
                 (str(window_minutes),)
             ).fetchall()
 
-            return [{
-                "bucket": r[0],
-                "requests": r[1],
-                "peak_concurrent": r[2],
-            } for r in rows]
+            return [{"bucket": r[0], "requests": r[1]} for r in rows]
         finally:
             conn.close()
 
     def get_perf_models(self, window_minutes: int = 60) -> list[dict]:
-        """Per-model performance breakdown for the last N minutes."""
+        """Per-model performance breakdown for the last N minutes (from request_log)."""
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT model, COUNT(*) AS request_count, "
-                "AVG(CASE WHEN is_error = 0 THEN upstream_latency_ms END) AS avg_latency_ms, "
-                "MAX(CASE WHEN is_error = 0 THEN upstream_latency_ms END) AS max_latency_ms, "
-                "SUM(CASE WHEN is_error = 0 THEN 1 ELSE 0 END) AS success_count, "
-                "SUM(is_error) AS error_count "
-                "FROM perf_events "
+                "AVG(CASE WHEN status_code < 400 THEN duration_ms END) AS avg_latency_ms, "
+                "MAX(CASE WHEN status_code < 400 THEN duration_ms END) AS max_latency_ms, "
+                "SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) AS success_count, "
+                "SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count "
+                "FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "GROUP BY model "
                 "ORDER BY request_count DESC",
@@ -951,23 +1016,29 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    def get_perf_success_rate_history(self, window_minutes: int = 60) -> list[dict]:
-        """Per-minute success rate for the last N minutes (for line chart)."""
+    def get_perf_upstream_success_rate(self, window_minutes: int = 60) -> list[dict]:
+        """Per real-upstream success rate for the last N minutes.
+
+        'Real upstream' = non-aggregate upstream_accounts. Success = status < 400.
+        Sourced from request_log, which records every request outcome.
+        """
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
+                "SELECT a.name AS account_name, "
                 "COUNT(*) AS total, "
-                "SUM(is_error) AS errors "
-                "FROM perf_events "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
-                "GROUP BY bucket "
-                "ORDER BY bucket",
+                "SUM(CASE WHEN r.status_code >= 400 THEN 1 ELSE 0 END) AS errors "
+                "FROM request_log r "
+                "JOIN upstream_accounts a ON r.account_id = a.id "
+                "WHERE COALESCE(a.is_aggregate, 0) = 0 "
+                "  AND r.requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "GROUP BY r.account_id "
+                "ORDER BY total DESC",
                 (str(window_minutes),)
             ).fetchall()
 
             return [{
-                "bucket": r[0],
+                "account_name": r[0],
                 "total": r[1],
                 "errors": r[2],
                 "success_rate": round((r[1] - r[2]) / max(r[1], 1) * 100, 1),
@@ -978,13 +1049,13 @@ class ProxyDatabase:
     def get_perf_realtime(self, window_seconds: int = 60) -> dict:
         """Real-time metrics: current RPM estimate and live concurrency.
 
-        Concurrency is read directly from the in_flight_requests table,
-        which is maintained by the C++ proxy (INSERT on start, DELETE on end).
+        RPM is estimated from request_log; concurrency is read directly from
+        the in_flight_requests table maintained by the C++ proxy.
         """
         conn = self._connect()
         try:
             recent_count = conn.execute(
-                "SELECT COUNT(*) FROM perf_events "
+                "SELECT COUNT(*) FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' seconds')",
                 (str(window_seconds),)
             ).fetchone()[0]
@@ -1014,33 +1085,43 @@ class ProxyDatabase:
 
 
 def _sync_pricing_to_dashboard(proxy_conn, dash_db_path: str):
-    """Copy model_pricing from proxy.db to dashboard.db.
+    """Copy model_pricing (+ pricing_slots) from proxy.db to dashboard.db.
 
-    Replaces all pricing rows in dashboard. The model_pricing triggers
-    in dashboard.db automatically recalculate all cost_entry rows after
-    each pricing change.
+    Replaces all pricing rows in dashboard. Since cost is now frozen at
+    write time, this copy is for config mirroring / multi-machine sync only
+    (dashboard cost_entry is aggregated from request_log.cost on export).
     """
     import sqlite3
 
     dash_conn = sqlite3.connect(dash_db_path, timeout=5)
     dash_conn.execute("PRAGMA busy_timeout=5000")
     try:
-        # model_pricing (and its cost triggers) are guaranteed by the
-        # dashboard migration (schema/dashboard/0001_initial.sql), applied when
-        # DashboardDatabase is constructed in export_to_dashboard.
+        # model_pricing (and pricing_slots) are guaranteed by the dashboard
+        # migration (schema/dashboard/*.sql), applied when DashboardDatabase
+        # is constructed in export_to_dashboard.
         pricing_rows = proxy_conn.execute(
             "SELECT id, model_pattern, input_price, output_price, "
             "cache_read_price, currency "
             "FROM model_pricing ORDER BY id"
         ).fetchall()
+        slot_rows = proxy_conn.execute(
+            "SELECT id, pricing_id, start_minute, end_minute, multiplier "
+            "FROM pricing_slots ORDER BY pricing_id, id"
+        ).fetchall()
 
-        # Replace all pricing wrapped in a transaction for atomicity
+        # Replace all pricing wrapped in a transaction for atomicity.
         dash_conn.execute("BEGIN")
-        dash_conn.execute("DELETE FROM model_pricing")
+        dash_conn.execute("DELETE FROM model_pricing")  # cascade removes slots
         for row in pricing_rows:
             dash_conn.execute(
                 "INSERT INTO model_pricing (id, model_pattern, input_price, output_price, cache_read_price, currency) "
                 "VALUES (?,?,?,?,?,?)",
+                tuple(row),
+            )
+        for row in slot_rows:
+            dash_conn.execute(
+                "INSERT INTO pricing_slots (id, pricing_id, start_minute, end_minute, multiplier) "
+                "VALUES (?,?,?,?,?)",
                 tuple(row),
             )
         dash_conn.commit()

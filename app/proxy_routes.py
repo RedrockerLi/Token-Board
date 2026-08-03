@@ -276,6 +276,11 @@ def proxy_months():
     return jsonify(_proxy_db().get_available_proxy_months())
 
 
+@bp_proxy.route("/billing/today-upstreams")
+def billing_today_upstreams():
+    return jsonify(_proxy_db().get_today_upstream_usage())
+
+
 @bp_proxy.route("/export", methods=["POST"])
 def export_data():
     """Export unexported request_log → dashboard.db, then sync to cloud.
@@ -400,10 +405,10 @@ def perf_summary():
     return jsonify(_proxy_db().get_perf_summary(minutes))
 
 
-@bp_proxy.route("/perf/success-rate-history")
-def perf_success_rate_history():
+@bp_proxy.route("/perf/upstream-success-rate")
+def perf_upstream_success_rate():
     minutes = request.args.get("minutes", 60, type=int)
-    return jsonify(_proxy_db().get_perf_success_rate_history(minutes))
+    return jsonify(_proxy_db().get_perf_upstream_success_rate(minutes))
 
 
 @bp_proxy.route("/perf/latency")

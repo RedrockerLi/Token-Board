@@ -82,14 +82,21 @@ class DashboardDatabase:
                           account_name: str, prompt_tokens: int,
                           completion_tokens: int, cache_read_tokens: int,
                           request_count: int,
+                          cost: float = 0.0,
                           account_type: str = "api") -> int:
-        """Insert proxy usage data. cost_entry is maintained by model_pricing triggers.
+        """Insert proxy usage data, including a frozen cost_entry row.
+
+        cost is the per-request cost already computed by the proxy (frozen at
+        write time, peak/valley-aware) summed over the exported period — it is
+        written straight into cost_entry(source='proxy') and never recomputed
+        from model_pricing.
 
         prompt_tokens is the total input (including cache hits), so the miss
         bucket is prompt_tokens - cache_read_tokens and the hit bucket is
         cache_read_tokens — the sum stays equal to the upstream input count.
-        account_type ('api'|'plan') is mirrored into account_types so the
-        cost triggers can zero out real cost for plan accounts.
+        account_type ('api'|'plan') is mirrored into account_types (plan
+        accounts get cost 0 in cost_entry, subscription + virtual cost live in
+        proxy_plan_summary).
         """
         conn = self._connect()
         total = 0
@@ -134,6 +141,15 @@ class DashboardDatabase:
                     (date, model, account_name, request_count),
                 )
                 total += 1
+            # Frozen cost: write directly (plan accounts already carry cost 0
+            # from the proxy, so cost_entry stays 0 for them).
+            conn.execute(
+                """INSERT OR REPLACE INTO cost_entry
+                   (date, model, cost, cost_group_key, source)
+                   VALUES (?,?,?,?,'proxy')""",
+                (date, model, cost, account_name),
+            )
+            total += 1
             conn.commit()
         finally:
             conn.close()
@@ -180,6 +196,14 @@ class DashboardDatabase:
             months_set: set[tuple[int, int]] = set()
             api_key_names_set: set[str] = set()
             models_set: set[str] = set()
+            # User sort: most-recent call month desc → that month's call volume desc.
+            # ym = year*100+month (sortable). request counts are the primary
+            # volume signal; token amounts are a fallback for users without
+            # request_usage rows.
+            token_last_month: dict[str, int] = {}
+            token_month_vol: dict[str, int] = {}
+            request_last_month: dict[str, int] = {}
+            request_month_vol: dict[str, int] = {}
 
             for row in conn.execute("SELECT * FROM token_usage"):
                 date = row["date"]
@@ -201,6 +225,8 @@ class DashboardDatabase:
                 months_set.add((y, m))
                 api_key_names_set.add(row["api_key_name"])
                 models_set.add(row["model"])
+                _track_recency(token_last_month, token_month_vol,
+                               row["api_key_name"], y, m, row["amount"])
 
             for row in conn.execute("SELECT * FROM request_usage"):
                 date = row["date"]
@@ -220,6 +246,8 @@ class DashboardDatabase:
                 months_set.add((y, m))
                 api_key_names_set.add(row["api_key_name"])
                 models_set.add(row["model"])
+                _track_recency(request_last_month, request_month_vol,
+                               row["api_key_name"], y, m, row["count"])
 
             for row in conn.execute("SELECT * FROM cost_entry"):
                 date = row["date"]
@@ -256,12 +284,22 @@ class DashboardDatabase:
                 for y, m in sorted_months
             ]
 
+            def user_sort_key(name: str):
+                # Most-recent call month (desc); within the same month, that
+                # month's call volume (desc); then name as a stable tiebreak.
+                rym = request_last_month.get(name, -1)
+                tym = token_last_month.get(name, -1)
+                ym = rym if rym >= 0 else tym
+                vol = (request_month_vol.get(name, 0) if rym >= 0
+                       else token_month_vol.get(name, 0))
+                return (-ym, -vol, name.lower())
+
             return (
                 token_usages,
                 request_usages,
                 cost_entries,
                 available_months,
-                sorted(api_key_names_set),
+                sorted(api_key_names_set, key=user_sort_key),
                 [],  # platforms — no longer tracked
                 _sort_models(models_set),
                 plan_summary,
@@ -295,3 +333,19 @@ def _parse_date(date_str: str) -> tuple[int, int]:
     except (ValueError, IndexError):
         pass
     return 0, 0
+
+
+def _track_recency(last_month: dict, month_vol: dict,
+                   name: str, y: int, m: int, volume: int) -> None:
+    """Track a user's most-recent month and that month's accumulated volume.
+
+    ym = year*100+month (sortable).  When a later month is seen, the volume
+    restarts for that month; equal months accumulate.
+    """
+    ym = y * 100 + m
+    prev = last_month.get(name)
+    if prev is None or ym > prev:
+        last_month[name] = ym
+        month_vol[name] = volume
+    elif ym == prev:
+        month_vol[name] = month_vol.get(name, 0) + volume

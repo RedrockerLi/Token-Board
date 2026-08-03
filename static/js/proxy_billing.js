@@ -7,16 +7,13 @@
 
 /**
  * Format a UTC timestamp string from SQLite (YYYY-MM-DD HH:MM:SS)
- * into the browser's local timezone display.
+ * into UTC+8 display (all interfaces show UTC+8, independent of the
+ * browser's timezone).
  */
 function fmtTime(ts) {
     if (!ts) return '';
     // SQLite datetime('now') returns "YYYY-MM-DD HH:MM:SS" in UTC.
-    // Convert to ISO 8601 so JS Date parses it as UTC reliably.
-    const iso = ts.replace(' ', 'T') + 'Z';
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return ts; // fallback for malformed values
-    return d.toLocaleString();
+    return fmtUtc8(ts);
 }
 
 // ── Billing Page ─────────────────────────────────────────────────────────
@@ -29,9 +26,33 @@ async function loadBillingStats() {
         document.getElementById('billTotalCost').textContent = '¥' + (stats.total_cost || 0).toFixed(2);
         document.getElementById('billTodayCost').textContent = '¥' + (stats.today_cost || 0).toFixed(2);
         document.getElementById('billTotalTokens').textContent = fmtNum(stats.total_tokens);
-        document.getElementById('billActiveKeys').textContent = stats.active_keys;
+        document.getElementById('billActiveUpstreams').textContent = stats.active_upstreams;
     } catch (err) {
         console.error('Failed to load billing stats:', err);
+    }
+}
+
+async function loadTodayUpstreamTable() {
+    const tbody = document.querySelector('#todayUpstreamTable tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '<tr><td colspan="5" class="td-loading">加载中...</td></tr>';
+    try {
+        const rows = await proxyFetch('/api/proxy/billing/today-upstreams');
+        if (!rows.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="td-empty">今日暂无活跃上游</td></tr>';
+            return;
+        }
+        tbody.innerHTML = rows.map((r) => `
+            <tr>
+                <td><code>${esc(r.account_name)}</code></td>
+                <td>${fmtCost(r.real_cost)}</td>
+                <td>${fmtCost(r.theoretical_cost)}</td>
+                <td>${fmtNum(r.tokens)}</td>
+                <td>${fmtNum(r.requests)}</td>
+            </tr>
+        `).join('');
+    } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="5" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -86,8 +107,8 @@ async function loadDailyBillingChart(year, month) {
                 grid: { left: 70, right: 70, top: 20, bottom: 50 },
                 xAxis: { type: 'category', data: dates, axisLabel: { rotate: 30, fontSize: 10 } },
                 yAxis: [
-                    { type: 'value', name: 'Tokens', axisLabel: { formatter: v => fmtNum(v), fontSize: 10 } },
-                    { type: 'value', name: '消费 (¥)', axisLabel: { fontSize: 10 } },
+                    { type: 'value', axisLabel: { formatter: v => fmtNum(v), fontSize: 10 } },
+                    { type: 'value', axisLabel: { fontSize: 10 } },
                 ],
                 series: [
                     {
@@ -244,7 +265,7 @@ function initBillingPage() {
             <div class="stat-card stat-card--cyan">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 总消费（实际）</div>
                 <div class="stat-card__value number-lg" id="billTotalCost">--</div>
-                <div class="stat-card__sub">今日消费（含plan订阅）: <span id="billTodayCost">--</span> · <span id="billActiveKeys">0</span> 个活跃密钥</div>
+                <div class="stat-card__sub">今日消费（理论）: <span id="billTodayCost">--</span> · <span id="billActiveUpstreams">0</span> 个活跃上游</div>
             </div>
         </div>
 
@@ -263,9 +284,21 @@ function initBillingPage() {
                 <div class="chart-container chart-container--lg" id="chartBillingDaily"></div>
             </div>
         </div>
+
+        <!-- Today's active-upstream usage -->
+        <div class="section">
+            <div class="chart-card">
+                <div class="chart-card__title">今日活跃上游用量</div>
+                <table class="mgmt-table" id="todayUpstreamTable">
+                    <thead><tr><th>上游</th><th>实际消费</th><th>理论消费</th><th>Token 数</th><th>调用次数</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
     `;
 
     loadBillingStats();
+    loadTodayUpstreamTable();
     populateBillingMonthSelector();
 
     // Append sync modal to body (shared, outside page container)

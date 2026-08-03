@@ -1,12 +1,4 @@
 {
-    "hidden_users": [
-        "PC-AI-chat",
-        "PC-Draw.io"
-    ],
-    "hidden_models": [
-        "ds-v4-flash",
-        "Qwen3.5-397B-A17B"
-    ],
     "model_aliases": [
         {
             "name": "Minimax-M2.7",

@@ -268,6 +268,7 @@ CONFIG_TABLES = [
     "upstream_accounts",
     "local_keys",
     "model_pricing",
+    "pricing_slots",
     "account_models",
     "aggregate_entries",
 ]
@@ -374,6 +375,8 @@ def _merge_dashboard(remote_path: str, local_path: str):
         "cost_entry": ["date", "model", "cost", "cost_group_key", "source"],
         "model_pricing": ["id", "model_pattern", "input_price", "output_price",
                           "cache_read_price", "currency"],
+        "pricing_slots": ["id", "pricing_id", "start_minute", "end_minute",
+                          "multiplier"],
         "account_types": ["account_name", "account_type"],
         "proxy_plan_summary": ["month", "account_name", "subscription_cost", "virtual_cost"],
     }

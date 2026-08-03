@@ -6,7 +6,7 @@
  */
 
 // ── Display filter config (loaded from /static/display_config.json) ──
-var displayConfig = { hidden_users: [], hidden_models: [], model_aliases: [] };
+var displayConfig = { model_aliases: [] };
 var _displayConfigLoaded = false;
 
 async function loadDisplayConfig() {
@@ -16,7 +16,7 @@ async function loadDisplayConfig() {
         _displayConfigLoaded = true;
     } catch (e) {
         console.warn('Failed to load display config, using defaults:', e);
-        displayConfig = { hidden_users: [], hidden_models: [], model_aliases: [] };
+        displayConfig = { model_aliases: [] };
         _displayConfigLoaded = true;
     }
 }
@@ -106,8 +106,8 @@ async function fetchPerfModels(minutes) {
     return fetchJSON(buildParams('/api/proxy/perf/models', { minutes }));
 }
 
-async function fetchPerfSuccessRateHistory(minutes) {
-    return fetchJSON(buildParams('/api/proxy/perf/success-rate-history', { minutes }));
+async function fetchPerfUpstreamSuccessRate(minutes) {
+    return fetchJSON(buildParams('/api/proxy/perf/upstream-success-rate', { minutes }));
 }
 
 async function fetchPerfRealtime() {

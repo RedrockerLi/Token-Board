@@ -10,8 +10,7 @@ let perfRefreshTimer = null;
 // Chart instances for cleanup
 let chartLatency = null;
 let chartRPM = null;
-let chartUtilization = null;
-let chartSuccessRate = null;
+let chartUpstreamSuccess = null;
 let chartModelLatency = null;
 
 // ── Page HTML Builder ──────────────────────────────────────────────────
@@ -50,12 +49,12 @@ function buildPerfPageHTML() {
         <!-- Latency Distribution Chart -->
         <div class="section">
             <div class="chart-card">
-                <div class="chart-card__title">TTFT 首Token延迟分布</div>
+                <div class="chart-card__title">请求总延迟分布 (P50/P95/P99)</div>
                 <div class="chart-container chart-container--lg" id="chartLatency"></div>
             </div>
         </div>
 
-        <!-- Requests Per Minute + Proxy Utilization -->
+        <!-- Requests Per Minute -->
         <div class="section">
             <div class="charts-grid charts-grid--2col">
                 <div class="chart-card">
@@ -63,21 +62,17 @@ function buildPerfPageHTML() {
                     <div class="chart-container chart-container--lg" id="chartRPM"></div>
                 </div>
                 <div class="chart-card">
-                    <div class="chart-card__title">代理占用率</div>
-                    <div class="chart-container chart-container--lg" id="chartUtilization"></div>
+                    <div class="chart-card__title">各上游账户成功率 (最近 1h)</div>
+                    <div class="chart-container chart-container--sm" id="chartUpstreamSuccess"></div>
                 </div>
             </div>
         </div>
 
-        <!-- Success Rate + Per-Model -->
+        <!-- Per-Model -->
         <div class="section">
             <div class="charts-grid charts-grid--2col">
                 <div class="chart-card">
-                    <div class="chart-card__title">每分钟成功率</div>
-                    <div class="chart-container chart-container--sm" id="chartSuccessRate"></div>
-                </div>
-                <div class="chart-card">
-                    <div class="chart-card__title">各模型平均 TTFT</div>
+                    <div class="chart-card__title">各模型平均延迟</div>
                     <div class="chart-container chart-container--lg" id="chartModelLatency"></div>
                 </div>
             </div>
@@ -96,7 +91,7 @@ function renderLatencyChart(domId, data) {
         });
         return;
     }
-    var labels = data.map(function(d) { return d.bucket.substring(11); }); // HH:MM only
+    var labels = data.map(function(d) { return fmtUtc8HHMM(d.bucket); }); // HH:MM in UTC+8
 
     chartLatency.setOption({
         tooltip: {
@@ -110,47 +105,29 @@ function renderLatencyChart(domId, data) {
             }
         },
         legend: {
-            data: ['P50-上游', 'P50-代理', 'P95-上游', 'P95-代理', 'P99-上游', 'P99-代理'],
+            data: ['P50', 'P95', 'P99'],
             bottom: 0,
             textStyle: { fontSize: 10 }
         },
         grid: { left: 60, right: 20, top: 20, bottom: 50 },
         xAxis: { type: 'category', data: labels, axisLabel: { rotate: 45, fontSize: 10 } },
-        yAxis: { type: 'value', name: '延迟 (ms)', axisLabel: { fontSize: 10 } },
+        yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
         series: [
             {
-                name: 'P50-上游', type: 'line',
-                data: data.map(function(d) { return d.p50_upstream; }),
-                smooth: true, symbol: 'none',
-                lineStyle: { color: '#0070F3', width: 2, type: 'dashed' },
-            },
-            {
-                name: 'P50-代理', type: 'line',
-                data: data.map(function(d) { return d.p50_total; }),
+                name: 'P50', type: 'line',
+                data: data.map(function(d) { return d.p50; }),
                 smooth: true, symbol: 'none',
                 lineStyle: { color: '#0070F3', width: 2 },
             },
             {
-                name: 'P95-上游', type: 'line',
-                data: data.map(function(d) { return d.p95_upstream; }),
-                smooth: true, symbol: 'none',
-                lineStyle: { color: '#F59E0B', width: 2, type: 'dashed' },
-            },
-            {
-                name: 'P95-代理', type: 'line',
-                data: data.map(function(d) { return d.p95_total; }),
+                name: 'P95', type: 'line',
+                data: data.map(function(d) { return d.p95; }),
                 smooth: true, symbol: 'none',
                 lineStyle: { color: '#F59E0B', width: 2 },
             },
             {
-                name: 'P99-上游', type: 'line',
-                data: data.map(function(d) { return d.p99_upstream; }),
-                smooth: true, symbol: 'none',
-                lineStyle: { color: '#EF4444', width: 1.5, type: 'dashed' },
-            },
-            {
-                name: 'P99-代理', type: 'line',
-                data: data.map(function(d) { return d.p99_total; }),
+                name: 'P99', type: 'line',
+                data: data.map(function(d) { return d.p99; }),
                 smooth: true, symbol: 'none',
                 lineStyle: { color: '#EF4444', width: 1.5 },
             },
@@ -167,14 +144,14 @@ function renderRPMChart(domId, data) {
         });
         return;
     }
-    var labels = data.map(function(d) { return d.bucket.substring(11); });
+    var labels = data.map(function(d) { return fmtUtc8HHMM(d.bucket); });
     var vals = data.map(function(d) { return d.requests; });
 
     chartRPM.setOption({
         tooltip: { trigger: 'axis' },
         grid: { left: 50, right: 20, top: 20, bottom: 40 },
         xAxis: { type: 'category', data: labels, axisLabel: { rotate: 45, fontSize: 10 } },
-        yAxis: { type: 'value', name: '请求/分钟', axisLabel: { fontSize: 10 }, minInterval: 1 },
+        yAxis: { type: 'value', axisLabel: { fontSize: 10 }, minInterval: 1 },
         series: [{
             name: '请求数', type: 'line', data: vals,
             smooth: true, symbol: 'circle', symbolSize: 4,
@@ -185,72 +162,45 @@ function renderRPMChart(domId, data) {
     });
 }
 
-function renderUtilizationChart(domId, data) {
-    chartUtilization = initChart(domId);
-    if (!chartUtilization) return;
+function renderUpstreamSuccessRateChart(domId, data) {
+    chartUpstreamSuccess = initChart(domId);
+    if (!chartUpstreamSuccess) return;
     if (!data || !data.length) {
-        chartUtilization.setOption({
+        chartUpstreamSuccess.setOption({
             title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
         });
         return;
     }
-    var labels = data.map(function(d) { return d.bucket.substring(11); });
-    var concurrent = data.map(function(d) { return d.peak_concurrent; });
-
-    chartUtilization.setOption({
-        tooltip: {
-            trigger: 'axis',
-            formatter: function(params) {
-                var p = params[0];
-                return p.name + '<br/>峰值并发: ' + p.value + ' / 2048';
-            }
-        },
-        grid: { left: 50, right: 20, top: 20, bottom: 40 },
-        xAxis: { type: 'category', data: labels, axisLabel: { rotate: 45, fontSize: 10 } },
-        yAxis: { type: 'value', name: '并发数', axisLabel: { fontSize: 10 }, minInterval: 1 },
-        series: [{
-            name: '峰值并发', type: 'line', data: concurrent,
-            smooth: true, symbol: 'circle', symbolSize: 4,
-            lineStyle: { color: '#8B5CF6', width: 2 },
-            itemStyle: { color: '#8B5CF6' },
-            areaStyle: { color: 'rgba(139,92,246,0.1)' },
-        }],
-    });
-}
-function renderSuccessRateChart(domId, data) {
-    chartSuccessRate = initChart(domId);
-    if (!chartSuccessRate) return;
-    if (!data || !data.length) {
-        chartSuccessRate.setOption({
-            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
-        });
-        return;
-    }
-    var labels = data.map(function(d) { return d.bucket.substring(11); });
+    // Success rate per real upstream over the last hour — highest volume first.
+    var names = data.map(function(d) { return d.account_name; });
     var rates = data.map(function(d) { return d.success_rate; });
+    var colors = data.map(function(d) {
+        var r = d.success_rate;
+        if (r == null) return '#6B7280';
+        return r >= 95 ? '#22C55E' : (r >= 80 ? '#F59E0B' : '#EF4444');
+    });
 
-    chartSuccessRate.setOption({
+    chartUpstreamSuccess.setOption({
         tooltip: {
-            trigger: 'axis',
+            trigger: 'item',
             formatter: function(params) {
-                var p = params[0];
-                var d = data[p.dataIndex];
-                return p.name + '<br/>' + p.marker + ' 成功率: <b>' + p.value + '%</b><br/>'
+                var d = data[params.dataIndex];
+                return d.account_name + '<br/>成功率: <b>' + d.success_rate + '%</b><br/>'
                     + '总请求: ' + d.total + ' | 失败: ' + d.errors;
             }
         },
-        grid: { left: 55, right: 20, top: 20, bottom: 40 },
-        xAxis: { type: 'category', data: labels, axisLabel: { rotate: 45, fontSize: 10 } },
-        yAxis: { type: 'value', name: '成功率 (%)', axisLabel: { fontSize: 10 }, min: 0, max: 100 },
+        grid: { left: 50, right: 30, top: 30, bottom: 40 },
+        xAxis: { type: 'category', data: names, axisLabel: { rotate: 30, fontSize: 10 } },
+        yAxis: { type: 'value', axisLabel: { fontSize: 10 }, min: 0, max: 100 },
         series: [{
-            name: '成功率', type: 'line', data: rates,
-            smooth: true, symbol: 'circle', symbolSize: 4,
-            lineStyle: { color: '#22C55E', width: 2 },
-            itemStyle: { color: '#22C55E' },
-            areaStyle: { color: 'rgba(34,197,94,0.08)' },
-            markLine: {
-                silent: true,
-                data: [{ yAxis: 95, label: { formatter: '95%' }, lineStyle: { color: '#F59E0B', type: 'dashed' } }],
+            name: '成功率', type: 'bar',
+            data: rates.map(function(v, i) {
+                return { value: v, itemStyle: { color: colors[i] } };
+            }),
+            barMaxWidth: 28,
+            label: {
+                show: true, position: 'top', fontSize: 10,
+                formatter: function(p) { return p.value + '%'; },
             },
         }],
     });
@@ -275,7 +225,7 @@ function renderModelLatencyChart(domId, models) {
         tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
         grid: { left: 50, right: 20, top: 10, bottom: 60 },
         xAxis: { type: 'category', data: names, axisLabel: { rotate: 30, fontSize: 10 } },
-        yAxis: { type: 'value', name: 'TTFT (ms)', axisLabel: { fontSize: 10 } },
+        yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
         series: [{
             name: 'TTFT', type: 'bar',
             data: latencies.map(function(v, i) {
@@ -296,14 +246,14 @@ async function loadAllPerfData() {
             fetchPerfThroughput(60),
             fetchPerfModels(60),
             fetchPerfRealtime(),
-            fetchPerfSuccessRateHistory(60),
+            fetchPerfUpstreamSuccessRate(60),
         ]);
         var summary = results[0];
         var latency = results[1];
         var throughput = results[2];
         var models = results[3];
         var realtime = results[4];
-        var successRateHistory = results[5];
+        var upstreamSuccess = results[5];
 
         // Update stat cards
         var elConcurrent = document.getElementById('perfConcurrent');
@@ -319,8 +269,7 @@ async function loadAllPerfData() {
         // Render charts
         renderLatencyChart('chartLatency', latency);
         renderRPMChart('chartRPM', throughput);
-        renderUtilizationChart('chartUtilization', throughput);
-        renderSuccessRateChart('chartSuccessRate', successRateHistory);
+        renderUpstreamSuccessRateChart('chartUpstreamSuccess', upstreamSuccess);
         renderModelLatencyChart('chartModelLatency', models);
     } catch (err) {
         console.error('Failed to load perf data:', err);
@@ -349,10 +298,10 @@ function destroyPerfPage() {
         perfRefreshTimer = null;
     }
     // Dispose chart instances to avoid memory leaks
-    [chartLatency, chartRPM, chartUtilization, chartSuccessRate, chartModelLatency].forEach(function(c) {
+    [chartLatency, chartRPM, chartUpstreamSuccess, chartModelLatency].forEach(function(c) {
         if (c) { c.dispose(); }
     });
-    chartLatency = chartRPM = chartUtilization = chartSuccessRate = chartModelLatency = null;
+    chartLatency = chartRPM = chartUpstreamSuccess = chartModelLatency = null;
 
     // Clean up DOM
     var el = document.getElementById('page-proxy-perf');

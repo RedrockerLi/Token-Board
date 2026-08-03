@@ -1,23 +1,11 @@
 .vscode
 __pycache__
 
-# CSV data files — not tracked, imported into DB on startup
-data/*.csv
-data/**/*.csv
-
-# Runtime databases
-data/proxy.db
-data/proxy.db-wal
-data/proxy.db-shm
-data/dashboard.db
-data/dashboard.db-wal
-data/dashboard.db-shm
+# Runtime data — databases, imported CSVs, migration lock files, backups
+data/
 
 # C++ build artifacts
 proxy/build/
-
-# DB migration advisory locks
-*.migrate.lock
 
 # reference
 ref

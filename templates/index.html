@@ -87,12 +87,13 @@
             <!-- Page Title -->
             <div class="page-header">
                 <h1 class="page-title">AI API 用量可视化面板</h1>
-                <p class="page-subtitle" id="pageSubtitle">所有日期均按 UTC+0 时间显示 · Token 统计跨所有可用月份</p>
+                <p class="page-subtitle" id="pageSubtitle">所有时间均按 UTC+8 显示 · Token 统计跨所有可用月份</p>
                 <div class="controls-group" style="margin-top: 12px;">
                     <label style="font-size:13px;color:var(--color-text-secondary);white-space:nowrap;">用户选择</label>
                     <select class="select-styled" id="keyNameSelector">
                         <option value="">总览 (所有用户)</option>
                     </select>
+                    <button class="btn btn--sm" id="moreUsersBtn" type="button" style="margin-left:8px;white-space:nowrap;">更多用户</button>
                 </div>
             </div>
 
@@ -200,6 +201,17 @@
         <div class="page-container" id="page-proxy-perf" style="display:none;"></div>
 
     </main>
+</div>
+
+<!-- ═══ Modal: 更多用户 (dashboard) ═══ -->
+<div class="modal-overlay" id="moreUsersModal" style="display:none">
+    <div class="modal">
+        <div class="modal__header">
+            <h3>选择用户</h3>
+            <button class="modal__close" onclick="closeModal('moreUsersModal')">&times;</button>
+        </div>
+        <div id="moreUsersList" style="max-height:55vh;overflow-y:auto;padding:2px 0;"></div>
+    </div>
 </div>
 
 <!-- ═══ Scripts ═══ -->

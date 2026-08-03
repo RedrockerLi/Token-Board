@@ -1,28 +1,35 @@
 /**
  * utils.js — Shared utility functions.
  *
- * Loaded first (before all other app scripts) so helpers like fmtNum,
- * esc, and matchesAny are available everywhere.
+ * Loaded first (before all other app scripts) so helpers like fmtNum and esc
+ * are available everywhere.
  */
 
-// ── Glob / wildcard matching ────────────────────────────────────────────────
+// ── Time formatting (UTC → UTC+8) ─────────────────────────────────────────
 
-/** Convert a shell glob pattern to a RegExp.
- *  Supports * (any chars) and ? (single char), case-insensitive. */
-function globToRegex(pattern) {
-    var r = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-                   .replace(/\*/g, '.*')
-                   .replace(/\?/g, '.');
-    return new RegExp('^' + r + '$', 'i');
+/**
+ * Convert a UTC datetime string from the databases ("YYYY-MM-DD HH:MM:SS")
+ * into a UTC+8 (Asia/Shanghai) display string.  Falls back to the input on
+ * unparseable values.  All frontend time displays use this so every interface
+ * shows UTC+8 regardless of the browser's own timezone.
+ */
+function fmtUtc8(utcStr) {
+    if (utcStr == null || utcStr === '') return '';
+    var d = new Date(String(utcStr).replace(' ', 'T') + 'Z');
+    if (isNaN(d.getTime())) return String(utcStr);
+    return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 }
 
-/** Return true if `name` matches any glob pattern in `patterns`. */
-function matchesAny(name, patterns) {
-    var lower = name.toLowerCase();
-    for (var i = 0; i < patterns.length; i++) {
-        if (globToRegex(patterns[i]).test(lower)) return true;
-    }
-    return false;
+/** "YYYY-MM-DD HH:MM[:SS]" (UTC) → "HH:MM" in UTC+8 (for chart x-axis labels). */
+function fmtUtc8HHMM(utcStr) {
+    if (utcStr == null || utcStr === '') return '';
+    var s = String(utcStr);
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) s = s + ':00';
+    var out = fmtUtc8(s);
+    if (!out) return '';
+    // toLocaleString output ends with "YYYY/M/D HH:MM:SS" — take the time part.
+    var m = out.match(/(\d{1,2}:\d{2})/);
+    return m ? m[1] : out;
 }
 
 // ── Number formatting ───────────────────────────────────────────────────────

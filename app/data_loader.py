@@ -136,12 +136,32 @@ class DataStore:
             for y, m in sorted_months
         ]
 
+        # User sort: most-recent call month desc → that month's call volume desc.
+        token_last_month: dict[str, int] = {}
+        token_month_vol: dict[str, int] = {}
+        request_last_month: dict[str, int] = {}
+        request_month_vol: dict[str, int] = {}
+        for tu in token_usages:
+            _track_recency(token_last_month, token_month_vol,
+                           tu.api_key_name, tu._year, tu._month, tu.amount)
+        for ru in request_usages:
+            _track_recency(request_last_month, request_month_vol,
+                           ru.api_key_name, ru._year, ru._month, ru.count)
+
+        def user_sort_key(name: str):
+            rym = request_last_month.get(name, -1)
+            tym = token_last_month.get(name, -1)
+            ym = rym if rym >= 0 else tym
+            vol = (request_month_vol.get(name, 0) if rym >= 0
+                   else token_month_vol.get(name, 0))
+            return (-ym, -vol, name.lower())
+
         self._commit(
             token_usages,
             request_usages,
             cost_entries,
             available_months,
-            sorted(api_key_names_set),
+            sorted(api_key_names_set, key=user_sort_key),
             [],  # platforms no longer tracked
             _sort_models(models_set),
             [],  # plan_summary — CSV fallback has no proxy plan data
@@ -188,3 +208,19 @@ class DataStore:
         self.models = models
         if plan_summary is not None:
             self.plan_summary = plan_summary
+
+
+def _track_recency(last_month: dict, month_vol: dict,
+                   name: str, y: int, m: int, volume: int) -> None:
+    """Track a user's most-recent month and that month's accumulated volume.
+
+    ym = year*100+month (sortable).  A later month restarts the volume; equal
+    months accumulate.
+    """
+    ym = y * 100 + m
+    prev = last_month.get(name)
+    if prev is None or ym > prev:
+        last_month[name] = ym
+        month_vol[name] = volume
+    elif ym == prev:
+        month_vol[name] = month_vol.get(name, 0) + volume

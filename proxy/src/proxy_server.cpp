@@ -616,6 +616,15 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     }
 
     if (client_disconnected(req, inflight_id, model)) {
+        // Record the aborted request truthfully (client closed before we
+        // could send a response): status 499, zero tokens.
+        UsageTracker::UsageInfo zu;
+        zu.model = model;
+        int dur = static_cast<int>(std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+                .count());
+        tracker_.log_request(used->account.id, ar.route.local_key_id, zu,
+                             false, 499, dur);
         db_.request_end(inflight_id);
         gate_.release(used->account.id);
         return;
@@ -635,6 +644,12 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             fprintf(stderr, "[Proxy] Warning: could not parse usage "
                             "from non-streaming response, model=%s\n",
                     model.c_str());
+            // No usage to record — still log the attempt (zero tokens) so the
+            // request_log is a complete, truthful record.
+            UsageTracker::UsageInfo zu;
+            zu.model = model;
+            tracker_.log_request(used->account.id, ar.route.local_key_id, zu,
+                                 false, fwd.status_code, fwd.duration_ms);
         }
 
         if (fwd.success) {
@@ -645,6 +660,12 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 res.set_content(fwd.body, "application/json");
             res.status = fwd.status_code;
         } else {
+            // Upstream error / timeout: record the failed attempt (zero
+            // tokens, truthful status — 504 on timeout, else upstream code).
+            UsageTracker::UsageInfo zu;
+            zu.model = model;
+            tracker_.log_request(used->account.id, ar.route.local_key_id, zu,
+                                 false, fwd.status_code, fwd.duration_ms);
             res.status = fwd.status_code;
             if (fwd.is_timeout) {
                 res.set_header("Connection", "close");
@@ -683,11 +704,24 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                     tracker_.log_request(used->account.id, ar.route.local_key_id,
                                          *fb, false, fwd.status_code,
                                          fwd.duration_ms);
+                } else {
+                    // 2xx but no usable usage — log the attempt (zero tokens).
+                    UsageTracker::UsageInfo zu;
+                    zu.model = model;
+                    tracker_.log_request(used->account.id, ar.route.local_key_id,
+                                         zu, false, fwd.status_code,
+                                         fwd.duration_ms);
                 }
                 res.status = fwd.status_code;
                 res.set_content(fwd.body, "application/json");
             }
         } else {
+            // Non-2xx / upstream failure: record the failed attempt (zero
+            // tokens, truthful status — 504 on timeout, else 502/upstream).
+            UsageTracker::UsageInfo zu;
+            zu.model = model;
+            tracker_.log_request(used->account.id, ar.route.local_key_id,
+                                 zu, false, fwd.status_code, fwd.duration_ms);
             json normalized;
             if (fwd.is_timeout) {
                 normalized = timeout_error_body();
@@ -814,6 +848,13 @@ void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
             } else {
                 fprintf(stderr, "[Proxy] Warning: could not parse usage "
                                 "from streaming response\n");
+                // No usage — still log the attempt (zero tokens, truthful
+                // status: 504 on timeout, else the upstream status).
+                UsageTracker::UsageInfo zu;
+                zu.model = resolved_model;
+                tracker_.log_request(cand.account.id, local_key_id,
+                                     zu, true, fwd.status_code,
+                                     fwd.duration_ms);
             }
 
             tracker_.mark_key_used(local_key_id);
@@ -1050,15 +1091,16 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     // and refuses to start if it can't find it.  Like cc-switch, answer
     // Anthropic clients with an empty catalog so any model — including the
     // `[1m]`/`[1M]`-suffixed names the proxy strips before forwarding — is
-    // accepted by the client.
+    // accepted by the client.  (The `[1m]` marker is a cc-only local
+    // capability suffix; other clients must only ever see real model names.)
     if (req.has_header("anthropic-version")) {
         res.status = 200;
         res.set_content("{\"models\":[]}", "application/json");
         return;
     }
 
-    // Aggregate accounts expose their entry patterns as the model catalog
-    // (plus the [1m]/[1M] aliases the proxy strips before forwarding).
+    // Aggregate accounts expose their entry patterns as the model catalog —
+    // real names only, no `[1m]`/`[1M]` aliases (those are internal to cc).
     if (ar.route.is_aggregate) {
         auto patterns = db_.get_aggregate_model_patterns(ar.route.account_id);
         json out = json::array();
@@ -1066,8 +1108,6 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
             json m = {{"id", p}, {"object", "model"}, {"created", 1},
                       {"owned_by", "token-board"}};
             out.push_back(m);
-            json a1 = m; a1["id"] = p + "[1m]"; out.push_back(a1);
-            json a2 = m; a2["id"] = p + "[1M]"; out.push_back(a2);
         }
         res.status = 200;
         res.set_content(json{{"object", "list"}, {"data", std::move(out)}}.dump(),
@@ -1082,32 +1122,10 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
     if (fwd.success) {
-        // OpenAI-compatible clients still get the real upstream list, but
-        // augmented with `[1m]`/`[1M]` aliases of every model so the proxy's
-        // supported names (which it strips before forwarding) also pass
-        // client-side validation.
-        try {
-            json j = json::parse(fwd.body);
-            if (j.contains("data") && j["data"].is_array()) {
-                json out = json::array();
-                for (auto &m : j["data"]) {
-                    if (m.is_object() && m.contains("id") && m["id"].is_string()) {
-                        std::string id = m["id"].get<std::string>();
-                        out.push_back(m);
-                        json a1 = m; a1["id"] = id + "[1m]"; out.push_back(a1);
-                        json a2 = m; a2["id"] = id + "[1M]"; out.push_back(a2);
-                    } else {
-                        out.push_back(m);
-                    }
-                }
-                j["data"] = std::move(out);
-            }
-            res.status = fwd.status_code;
-            res.set_content(j.dump(), "application/json");
-        } catch (...) {
-            res.status = fwd.status_code;
-            res.set_content(fwd.body, "application/json");
-        }
+        // Real upstream model catalog, passed through unmodified — no
+        // `[1m]`/`[1M]` aliases (those are internal to cc's Anthropic flow).
+        res.status = fwd.status_code;
+        res.set_content(fwd.body, "application/json");
     } else {
         res.status = fwd.status_code;
         if (fwd.is_timeout) {

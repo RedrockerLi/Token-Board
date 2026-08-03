@@ -80,8 +80,6 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
         yAxis: [
             {
                 type: 'value',
-                name: 'Tokens',
-                nameTextStyle: { color: '#9094A2', fontSize: 11 },
                 axisLabel: {
                     color: '#9094A2',
                     fontSize: 11,
@@ -91,8 +89,6 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
             },
             {
                 type: 'value',
-                name: '消费 (CNY)',
-                nameTextStyle: { color: '#9094A2', fontSize: 11 },
                 axisLabel: { color: '#9094A2', fontSize: 11, formatter: function (v) { return fmtCost(v); } },
                 splitLine: { show: false }
             }
