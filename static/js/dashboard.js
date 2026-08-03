@@ -167,22 +167,30 @@ function clearDynamicCharts() {
     monthlyModelMap = {};
 }
 
-// Global deprecated model set — computed once from the ALL-USERS breakdown
-// (independent of the current user / month view).  A display unit (standalone
-// model or alias group) whose share of the total is <1% is deprecated and is
-// hidden from the model pie and the per-model cards.
-let globalDeprecated = null;  // null = not computed yet; object {displayName: true}
+// Deprecated model set — computed once per load/refresh as a fixed concept and
+// reused by the model pie and the per-model cards. A display unit (standalone
+// model or alias group) is deprecated only when BOTH hold:
+//   1. its global (all-history, all-users) token share is <1%, AND
+//   2. it has ZERO token usage in the base month (the latest available month,
+//      across all users) — a model whose calls all failed (0 tokens) counts
+//      as zero usage and is therefore deprecated.
+// The set is fixed once computed: changing the month/user selection does not
+// recompute it. "刷新数据" resets it so it recomputes from fresh data.
+let globalDeprecated = null;     // <1% baseline (all history, all users); null = not computed
+let deprecatedModels = null;     // final deprecated set {displayUnit: true}; null = not computed
+let deprecatedBaseMonth = null;  // {year, month} the set was computed from
 
-async function ensureGlobalDeprecated() {
-    if (globalDeprecated != null) return;
+async function computeDeprecatedModels() {
+    if (deprecatedModels != null) return;
     try {
         // fetchJSON without buildParams → no api_key_name → all users.
         var data = await fetchJSON('/api/summary');
         var breakdown = data.model_breakdown || {};
         var aliasMaps = buildAliasMaps(Object.keys(breakdown));
         var modelToAlias = aliasMaps.modelToAlias;
+        var aliasToModels = aliasMaps.aliasToModels;
 
-        // Merge individual models into display units (alias name or model name).
+        // 1) <1% global token-share baseline, merged into display units.
         var units = {};
         Object.keys(breakdown).forEach(function (m) {
             var lower = m.toLowerCase();
@@ -197,14 +205,43 @@ async function ensureGlobalDeprecated() {
                 if (units[k] / total < 0.01) globalDeprecated[k] = true;
             });
         }
+
+        // 2) Base month = the latest month that has data (available_months is
+        //    sorted ascending by the backend; when the current month has data
+        //    this equals the current calendar month).
+        var months = data.available_months || [];
+        if (!months.length) { deprecatedModels = {}; return; }
+        var base = months[months.length - 1];
+        deprecatedBaseMonth = { year: base.year, month: base.month };
+
+        // 3) Zero token usage in the base month, across all users.
+        //    /api/model_breakdown also lists models whose calls all failed
+        //    (0 tokens but requests > 0), so they are deprecated too.
+        var usage = await fetchModelBreakdownAllUsers(base.year, base.month);
+
+        deprecatedModels = {};
+        Object.keys(globalDeprecated).forEach(function (unit) {
+            if (!globalDeprecated[unit]) return;
+            var members = aliasToModels[unit];
+            var unitTokens = 0;
+            if (members && members.length) {
+                members.forEach(function (m) {
+                    unitTokens += (usage[m] || {}).total_tokens || 0;
+                });
+            } else {
+                unitTokens = (usage[unit] || {}).total_tokens || 0;
+            }
+            if (unitTokens === 0) deprecatedModels[unit] = true;
+        });
     } catch (e) {
-        globalDeprecated = {};  // fetch failed → nothing deprecated
+        deprecatedModels = {};  // fetch failed → nothing deprecated
     }
 }
 
 // Models the CURRENT user actually used in the currently-selected month
 // (set of model names from that month's daily breakdown).  undefined = not yet
-// computed; null = no month / fetch failed.
+// computed; null = no month / fetch failed. Used only to decide which per-model
+// cards to build (the deprecated set is computed separately, above).
 let currentMonthUsedModels = undefined;
 
 async function fetchCurrentMonthUsedModels() {
@@ -222,33 +259,17 @@ async function fetchCurrentMonthUsedModels() {
     }
 }
 
-// Was the display unit (standalone model name or alias group name) used by the
-// current user in the current month?  aliasToModels maps alias → member models.
-function unitUsedThisMonth(unit, aliasToModels, usedModels) {
-    if (!usedModels) return false;
-    var members = aliasToModels[unit];
-    if (members) {
-        return members.some(function (m) {
-            var lower = String(m).toLowerCase();
-            return !!(lower in usedModels || m in usedModels);
-        });
-    }
-    var lower = String(unit).toLowerCase();
-    return !!(lower in usedModels || unit in usedModels);
-}
-
-// A unit is deprecated only when it is globally <1% AND the current user did
-// NOT use it this month — a model called this month is "in use", not deprecated.
-function isDeprecatedUnit(unit, aliasToModels, usedModels) {
-    if (!(globalDeprecated && globalDeprecated[unit])) return false;
-    return !unitUsedThisMonth(unit, aliasToModels, usedModels);
+// Is the display unit (standalone model name or alias group name) deprecated?
+function isDeprecatedUnit(unit) {
+    return !!(deprecatedModels && deprecatedModels[unit]);
 }
 
 function buildDynamicCharts(models, usedModels) {
     clearDynamicCharts();
-    // A display unit is deprecated only if globally <1% AND not used by the
-    // current user this month.  usedModels = set of model names the current
-    // user used this month; null = unknown (fall back to plain deprecation).
+    // A display unit is deprecated if it is globally <1% AND has zero token
+    // usage in the base month (fixed set from computeDeprecatedModels).
+    // usedModels = set of model names the current user used this month;
+    // null = unknown (show everything that isn't deprecated).
     var aliasMaps = buildAliasMaps(models);
     var modelToAlias = aliasMaps.modelToAlias;
     var aliasToModels = aliasMaps.aliasToModels;
@@ -256,7 +277,7 @@ function buildDynamicCharts(models, usedModels) {
     var isDeprecatedModel = function (m) {
         var lower = String(m).toLowerCase();
         var unit = (lower in modelToAlias) ? modelToAlias[lower] : m;
-        return isDeprecatedUnit(unit, aliasToModels, usedModels);
+        return isDeprecatedUnit(unit);
     };
     var isUsed = function (m) {
         if (usedModels == null) return true;
@@ -281,7 +302,7 @@ function buildDynamicCharts(models, usedModels) {
     // deprecated for this view.
     var chartEntries = filteredModels.slice();  // standalone models
     Object.keys(aliasToModels).forEach(function (aliasName) {
-        if (isDeprecatedUnit(aliasName, aliasToModels, usedModels)) return;
+        if (isDeprecatedUnit(aliasName)) return;
         var members = aliasToModels[aliasName] || [];
         var anyUsed = members.some(function (m) { return isUsed(m); });
         if (anyUsed) chartEntries.push(aliasName);
@@ -407,9 +428,9 @@ async function loadSummary() {
     }
 
     // Models the current user actually used in the current month — used for
-    // the card filter and the "used this month → not deprecated" exemption.
+    // the card filter. The deprecated set is a separate, fixed concept.
     currentMonthUsedModels = await fetchCurrentMonthUsedModels();
-    await ensureGlobalDeprecated();  // Global <1% baseline (all users, cached)
+    await computeDeprecatedModels();  // Fixed deprecated set (all users, latest month)
 
     buildDynamicCharts(models, currentMonthUsedModels);
 
@@ -534,11 +555,7 @@ async function loadDailyCharts() {
 
 async function loadModelPie() {
     await loadDisplayConfig();  // Ensure config is loaded (may race with loadSummary)
-    await ensureGlobalDeprecated();  // Global <1% baseline (all users, cached)
-    // "Used this month" set — lazily computed if loadSummary hasn't finished yet.
-    if (currentMonthUsedModels === undefined) {
-        currentMonthUsedModels = await fetchCurrentMonthUsedModels();
-    }
+    await computeDeprecatedModels();  // Fixed deprecated set (all users, latest month)
     var loader = document.getElementById('loadingModelPie');
     if (!loader) return;
     try {
@@ -546,7 +563,6 @@ async function loadModelPie() {
         var breakdown = data.model_breakdown || {};
         var aliasMaps = buildAliasMaps(Object.keys(breakdown));
         var modelToAlias = aliasMaps.modelToAlias;
-        var aliasToModels = aliasMaps.aliasToModels;
 
         // Merge individual model entries into alias groups
         var merged = {};
@@ -568,10 +584,10 @@ async function loadModelPie() {
             .filter(function (d) { return d.value > 0; })
             .sort(function (a, b) { return b.value - a.value; });
 
-        // A display unit is deprecated only if globally <1% AND not used by the
-        // current user this month — models called this month are "in use".
+        // Hide deprecated display units (global <1% AND zero usage in the base
+        // month — a fixed set, independent of the selected month/user).
         pieData = pieData.filter(function (d) {
-            return !isDeprecatedUnit(d.name, aliasToModels, currentMonthUsedModels);
+            return !isDeprecatedUnit(d.name);
         });
 
         renderPieChart('chartModelPie', pieData, chartColors);
@@ -714,6 +730,11 @@ function bindDashboardEvents() {
 async function refreshData() {
     try {
         await fetchRefresh();
+        // Invalidate the fixed deprecated set so it recomputes from the fresh
+        // data (the base month may have moved on as well).
+        globalDeprecated = null;
+        deprecatedModels = null;
+        deprecatedBaseMonth = null;
         await loadSummary();
         await loadModelPie();
         await loadTypePie();

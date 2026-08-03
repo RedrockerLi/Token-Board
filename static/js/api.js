@@ -66,6 +66,12 @@ async function fetchTokenTypes() {
     return fetchJSON(buildParams('/api/token_types'));
 }
 
+// Per-model usage for a given month, across ALL users (no api_key_name) —
+// used to determine the deprecated-model set, which is a global concept.
+async function fetchModelBreakdownAllUsers(year, month) {
+    return fetchJSON('/api/model_breakdown?year=' + year + '&month=' + month);
+}
+
 async function fetchModels() {
     return fetchJSON('/api/models');
 }
