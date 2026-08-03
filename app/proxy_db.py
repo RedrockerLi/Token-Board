@@ -542,6 +542,71 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    # ── Timeout config (per client wire format) ────────────────────────
+
+    _TIMEOUT_GROUPS = ("anthropic", "openai_responses", "openai")
+    _TIMEOUT_FIELDS = ("streaming_first_byte_timeout",
+                       "streaming_idle_timeout",
+                       "non_streaming_timeout")
+
+    def get_timeout_config(self) -> list[dict]:
+        """All proxy_timeout_config rows (one per client wire format)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT app_type, streaming_first_byte_timeout, "
+                "streaming_idle_timeout, non_streaming_timeout "
+                "FROM proxy_timeout_config ORDER BY app_type"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def update_timeout_config(self, app_type: str, data: dict) -> bool:
+        """Validate and upsert one timeout group (all three fields required).
+
+        Ranges mirror cc-switch's UI: first-byte 1-120, idle 0-600 (0 = disabled),
+        non-streaming 60-1200.  Raises ValueError on invalid input.
+        """
+        if app_type not in self._TIMEOUT_GROUPS:
+            raise ValueError(f"未知的线格式分组: {app_type}")
+        values = {}
+        for key in self._TIMEOUT_FIELDS:
+            if key not in data:
+                raise ValueError(f"缺少字段: {key}")
+            try:
+                v = int(data[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} 必须是整数")
+            if key == "streaming_first_byte_timeout":
+                if not (1 <= v <= 120):
+                    raise ValueError("流式首字节超时范围 1-120 秒")
+            elif key == "streaming_idle_timeout":
+                if not (0 <= v <= 600):
+                    raise ValueError("流式静默超时范围 0-600 秒（0=禁用）")
+            else:
+                if not (60 <= v <= 1200):
+                    raise ValueError("非流式超时范围 60-1200 秒")
+            values[key] = v
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO proxy_timeout_config "
+                "(app_type, streaming_first_byte_timeout, streaming_idle_timeout, "
+                " non_streaming_timeout) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(app_type) DO UPDATE SET "
+                "  streaming_first_byte_timeout = excluded.streaming_first_byte_timeout, "
+                "  streaming_idle_timeout = excluded.streaming_idle_timeout, "
+                "  non_streaming_timeout = excluded.non_streaming_timeout",
+                (app_type, values["streaming_first_byte_timeout"],
+                 values["streaming_idle_timeout"], values["non_streaming_timeout"]),
+            )
+            conn.commit()
+            return conn.total_changes > 0
+        finally:
+            conn.close()
+
     # ── Billing / Usage ────────────────────────────────────────────────
 
     def get_billing_summary(

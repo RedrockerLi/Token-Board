@@ -192,6 +192,10 @@ void Database::prepare_statements() {
             "FROM model_pricing ORDER BY id",
             stmt_get_pricing_);
 
+    PREPARE("SELECT streaming_first_byte_timeout, streaming_idle_timeout, "
+            "non_streaming_timeout FROM proxy_timeout_config WHERE app_type = ?1",
+            stmt_get_timeout_config_);
+
     PREPARE("UPDATE local_keys SET last_used_at = datetime('now') "
             "WHERE id = ?1",
             stmt_update_last_used_);
@@ -230,6 +234,7 @@ void Database::finalize_statements() {
     FINALIZE(stmt_insert_log_);
     FINALIZE(stmt_get_aggregate_entries_);
     FINALIZE(stmt_get_pricing_);
+    FINALIZE(stmt_get_timeout_config_);
     FINALIZE(stmt_update_last_used_);
     FINALIZE(stmt_insert_perf_event_);
     FINALIZE(stmt_cleanup_perf_events_);
@@ -411,6 +416,27 @@ std::vector<Database::PricingEntry> Database::get_all_pricing() {
     }
     sqlite3_reset(stmt_get_pricing_);
     return result;
+}
+
+// ── get_timeout_config ──────────────────────────────────────────────────
+
+Database::TimeoutConfig Database::get_timeout_config(const std::string &app_type) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    TimeoutConfig tc;
+    sqlite3_reset(stmt_get_timeout_config_);
+    sqlite3_bind_text(stmt_get_timeout_config_, 1,
+                      app_type.c_str(), app_type.size(), SQLITE_STATIC);
+
+    if (sqlite3_step(stmt_get_timeout_config_) == SQLITE_ROW) {
+        tc.streaming_first_byte_timeout = sqlite3_column_int(stmt_get_timeout_config_, 0);
+        tc.streaming_idle_timeout = sqlite3_column_int(stmt_get_timeout_config_, 1);
+        tc.non_streaming_timeout = sqlite3_column_int(stmt_get_timeout_config_, 2);
+    }
+    // Missing row (or migration not applied on an ancient DB) → struct defaults.
+
+    sqlite3_reset(stmt_get_timeout_config_);
+    return tc;
 }
 
 // ── log_perf_event ───────────────────────────────────────────────────────

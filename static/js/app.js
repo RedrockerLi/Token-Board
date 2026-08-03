@@ -120,6 +120,14 @@ const PAGES = [
         initFn: 'initPerfPage',
         destroyFn: 'destroyPerfPage',
     },
+    {
+        hash: '#/proxy/settings',
+        container: 'page-proxy-settings',
+        title: '设置 · Token Board',
+        module: '/static/js/proxy_settings.js',
+        initFn: 'initSettingsPage',
+        destroyFn: null,
+    },
 ];
 
 const DEFAULT_HASH = '#/dashboard';

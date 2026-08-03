@@ -1,10 +1,68 @@
 #include "upstream_client.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
+
+namespace {
+
+/// A positive select() read-timeout value representing "no timeout".  httplib
+/// interprets a 0 read timeout as a non-blocking poll (select with {0,0}),
+/// which would fail every read immediately, so "disabled" uses a day.
+constexpr int NO_TIMEOUT_SECS = 24 * 3600;
+
+long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/// Deadline tracker for phase-aware streaming timeouts.  The httplib client's
+/// read timeout is select-based and fixed for the whole connection, so it
+/// cannot express "first-byte timeout, then idle timeout".  A watchdog thread
+/// shutdown()s the upstream socket at each deadline — the same trick the
+/// client-disconnect monitor uses — which unblocks the in-flight read and
+/// surfaces as a read error (is_timeout).
+struct StreamTimeoutWatch {
+    std::atomic<bool> running{true};
+    std::atomic<bool> got_first{false};
+    std::atomic<long long> first_byte_deadline_ms{0};  // 0 = disabled
+    std::atomic<long long> idle_deadline_ms{0};        // 0 = no idle deadline
+};
+
+std::thread spawn_timeout_watchdog(StreamTimeoutWatch &w,
+                                   const std::atomic<int> &fd) {
+    return std::thread([&w, &fd] {
+        while (w.running.load(std::memory_order_acquire)) {
+            long long now = now_ms();
+            bool expired = false;
+            if (!w.got_first.load(std::memory_order_acquire) &&
+                w.first_byte_deadline_ms.load(std::memory_order_relaxed) != 0 &&
+                now > w.first_byte_deadline_ms.load(std::memory_order_relaxed))
+                expired = true;
+            if (w.got_first.load(std::memory_order_acquire) &&
+                w.idle_deadline_ms.load(std::memory_order_relaxed) != 0 &&
+                now > w.idle_deadline_ms.load(std::memory_order_relaxed))
+                expired = true;
+            if (expired) {
+                int s = fd.load(std::memory_order_relaxed);
+                if (s >= 0) ::shutdown(s, SHUT_RDWR);  // unblock the read
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
+}
+
+}  // namespace
 
 UpstreamClient::ForwardResult
 UpstreamClient::forward(const std::string &method,
@@ -47,14 +105,16 @@ UpstreamClient::forward(const std::string &method,
     // Create client
     httplib::Client cli(scheme_host);
     cli.set_connection_timeout(10, 0);   // 10 sec connect timeout
-    cli.set_read_timeout(100, 0);        // 100s: no upstream data for 100s ⇒ timeout
     cli.set_write_timeout(30, 0);
     cli.enable_server_certificate_verification(true);
 
     // Expose the upstream socket fd so the caller can shutdown() it from a
-    // monitor thread to unblock an in-flight read (e.g. client disconnect).
+    // monitor thread to unblock an in-flight read (e.g. client disconnect),
+    // and so the streaming timeout watchdog can do the same at its deadlines.
+    std::atomic<int> upstream_sock{-1};
     if (on_socket) {
-        cli.set_socket_options([on_socket](int sock) {
+        cli.set_socket_options([on_socket, &upstream_sock](int sock) {
+            upstream_sock.store(sock, std::memory_order_relaxed);
             on_socket(sock);
         });
     }
@@ -82,13 +142,41 @@ UpstreamClient::forward(const std::string &method,
         bool first_chunk = true;
         std::chrono::steady_clock::time_point t_first;
 
+        // Phase-aware streaming timeouts (see StreamTimeoutWatch): httplib's
+        // read timeout is select-based and fixed for the connection, so it
+        // cannot express "first-byte timeout, then idle timeout".  A watchdog
+        // thread shutdown()s the upstream socket at each deadline; the socket's
+        // own select timeout is set to a large backstop so it never fires first.
+        StreamTimeoutWatch wd;
+        if (opts.streaming_first_byte_timeout > 0)
+            wd.first_byte_deadline_ms.store(
+                now_ms() +
+                    static_cast<long long>(opts.streaming_first_byte_timeout) * 1000,
+                std::memory_order_relaxed);
+        bool need_watchdog = opts.streaming_first_byte_timeout > 0 ||
+                             opts.streaming_idle_timeout > 0;
+        int backstop_sec = need_watchdog
+            ? std::max({3600, opts.streaming_first_byte_timeout,
+                        opts.streaming_idle_timeout})
+            : NO_TIMEOUT_SECS;
+        cli.set_read_timeout(backstop_sec, 0);
+        std::thread watchdog;
+        if (need_watchdog) watchdog = spawn_timeout_watchdog(wd, upstream_sock);
+
         // ContentReceiverWithProgress: (data, len, offset, total) -> bool
         auto receiver = [&](const char *data, size_t len,
                             uint64_t /*offset*/, uint64_t /*total*/) -> bool {
             if (first_chunk) {
                 t_first = std::chrono::steady_clock::now();
                 first_chunk = false;
+                wd.got_first.store(true, std::memory_order_release);
             }
+            // Reset the idle deadline on every chunk (first one included).
+            if (opts.streaming_idle_timeout > 0)
+                wd.idle_deadline_ms.store(
+                    now_ms() +
+                        static_cast<long long>(opts.streaming_idle_timeout) * 1000,
+                    std::memory_order_release);
             accumulated.append(data, len);
             if (client_connected) {
                 client_connected = on_chunk(data, len);
@@ -106,6 +194,9 @@ UpstreamClient::forward(const std::string &method,
         httplib::Response upstream_res;
         httplib::Error err;
         bool ok = cli.send(req, upstream_res, err);
+
+        wd.running.store(false, std::memory_order_release);
+        if (watchdog.joinable()) watchdog.join();
 
         auto t1 = std::chrono::steady_clock::now();
         result.duration_ms = static_cast<int>(
@@ -126,6 +217,10 @@ UpstreamClient::forward(const std::string &method,
         } else {
             result.is_timeout = (err == httplib::Error::ConnectionTimeout ||
                                  err == httplib::Error::Read);
+            result.timeout_secs = result.is_timeout
+                ? (first_chunk ? opts.streaming_first_byte_timeout
+                               : opts.streaming_idle_timeout)
+                : 0;
             result.status_code = result.is_timeout ? 504 : 502;
             result.success = false;
             result.error = "Upstream request failed: " +
@@ -133,6 +228,11 @@ UpstreamClient::forward(const std::string &method,
         }
     } else {
         // ── Non-streaming: use GET or POST based on method ─────
+        // Bounded by non_streaming_timeout (idle semantics: a read that gets no
+        // data for N seconds fails).  NO_TIMEOUT_SECS when disabled (a 0 read
+        // timeout would be a non-blocking poll, failing every read instantly).
+        cli.set_read_timeout(opts.non_streaming_timeout > 0
+                                 ? opts.non_streaming_timeout : NO_TIMEOUT_SECS, 0);
         httplib::Result upstream_res;
         if (method == "GET") {
             upstream_res = cli.Get(full_path, headers);
@@ -154,6 +254,7 @@ UpstreamClient::forward(const std::string &method,
         } else {
             result.is_timeout = (upstream_res.error() == httplib::Error::ConnectionTimeout ||
                                  upstream_res.error() == httplib::Error::Read);
+            result.timeout_secs = result.is_timeout ? opts.non_streaming_timeout : 0;
             result.status_code = result.is_timeout ? 504 : 502;
             result.success = false;
             result.error = "Upstream request failed: " +

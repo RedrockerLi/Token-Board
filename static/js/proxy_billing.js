@@ -183,55 +183,6 @@ async function exportData() {
     btn.textContent = '导出数据';
 }
 
-// ── Sync ─────────────────────────────────────────────────────────────
-
-async function openSyncConfig() {
-    try {
-        const cfg = await proxyFetch('/api/proxy/sync/config');
-        document.getElementById('syncBaseUrl').value = cfg.base_url || '';
-        document.getElementById('syncFolder').value = cfg.folder || 'token-board-sync';
-        document.getElementById('syncUsername').value = cfg.username || '';
-        document.getElementById('syncPassword').value = cfg.has_password ? '••••••' : '';
-    } catch (e) {
-        /* use empty form */
-    }
-    openModal('syncModal');
-}
-
-async function saveSyncConfig(e) {
-    e.preventDefault();
-    const form = e.target;
-    const data = Object.fromEntries(new FormData(form));
-    try {
-        await proxyFetch('/api/proxy/sync/config', {
-            method: 'PUT',
-            body: JSON.stringify(data),
-        });
-        showToast('同步配置已保存');
-        closeModal('syncModal');
-    } catch (err) {
-        showToast(err.message, 'error');
-    }
-}
-
-async function testSyncConnection() {
-    const btn = document.getElementById('btnTestSync');
-    btn.disabled = true;
-    btn.textContent = '测试中...';
-    try {
-        const data = Object.fromEntries(new FormData(document.getElementById('syncConfigForm')));
-        const result = await proxyFetch('/api/proxy/sync/test', {
-            method: 'POST',
-            body: JSON.stringify(data),
-        });
-        showToast(result.message, result.status === 'ok' ? 'success' : 'error');
-    } catch (err) {
-        showToast('测试失败: ' + err.message, 'error');
-    }
-    btn.disabled = false;
-    btn.textContent = '测试连接';
-}
-
 function initBillingPage() {
     const el = document.getElementById('page-billing');
     if (!el || el.dataset.initialized) return;
@@ -243,9 +194,6 @@ function initBillingPage() {
                 <div>
                     <h1 class="page-title">消费报告</h1>
                     <p class="page-subtitle">代理转发请求的消费概况</p>
-                </div>
-                <div class="controls-group">
-                    <button class="btn btn--sm" onclick="openSyncConfig()" title="同步设置">⚙</button>
                 </div>
             </div>
         </div>
@@ -300,33 +248,6 @@ function initBillingPage() {
     loadBillingStats();
     loadTodayUpstreamTable();
     populateBillingMonthSelector();
-
-    // Append sync modal to body (shared, outside page container)
-    if (!document.getElementById('syncModal')) {
-        const modal = document.createElement('div');
-        modal.id = 'syncModal';
-        modal.className = 'modal-overlay';
-        modal.style.display = 'none';
-        modal.innerHTML = `
-            <div class="modal">
-                <div class="modal__header">
-                    <h3>WebDAV 同步设置</h3>
-                    <button class="modal__close" onclick="closeModal('syncModal')">&times;</button>
-                </div>
-                <form id="syncConfigForm" onsubmit="saveSyncConfig(event)">
-                    <label>WebDAV 服务器地址 <input name="base_url" id="syncBaseUrl" required placeholder="https://dav.example.com/remote.php/dav/files/user"></label>
-                    <label>同步文件夹 <input name="folder" id="syncFolder" value="token-board-sync" placeholder="token-board-sync"></label>
-                    <label>用户名 <input name="username" id="syncUsername" required></label>
-                    <label>密码 <input name="password" id="syncPassword" type="password" placeholder="留空不变"></label>
-                    <div style="display:flex; gap:8px;">
-                        <button type="submit" class="btn btn--primary">保存配置</button>
-                        <button type="button" class="btn btn--sm" id="btnTestSync" onclick="testSyncConnection()">测试连接</button>
-                    </div>
-                </form>
-            </div>
-        `;
-        document.body.appendChild(modal);
-    }
 }
 
 // ── Logs Page ────────────────────────────────────────────────────────────

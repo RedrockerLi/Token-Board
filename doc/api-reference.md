@@ -72,6 +72,15 @@
 
 改价不影响已固化的历史成本,见 [billing-pricing.md](billing-pricing.md)。
 
+### 超时配置
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/proxy/timeout-config` | GET | 三组超时配置(anthropic / openai_responses / openai),每组含 `streaming_first_byte_timeout`、`streaming_idle_timeout`、`non_streaming_timeout`(秒) |
+| `/api/proxy/timeout-config` | PUT | 整体保存三组超时配置(body: `{<group>: {三个字段}, ...}`);范围校验:首字节 1-120、静默 0-600(0=禁用)、非流式 60-1200 |
+
+配置存 `proxy_timeout_config` 表,代理每次转发按客户端线格式读取,保存后即时生效、无需重启。超时机制见 [proxy-internals.md](proxy-internals.md)。
+
 ### 消费与日志
 
 | 端点 | 方法 | 说明 |

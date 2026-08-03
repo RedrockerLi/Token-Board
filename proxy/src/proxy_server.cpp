@@ -53,10 +53,14 @@ static std::string json_error(const std::string &msg, int code) {
 /// Unified upstream-timeout error object returned to the client.
 /// type=timeout_error + code 504 — clients (opencode, Claude Code, SDK retry
 /// middlewares) recognize this as a retryable error instead of an opaque
-/// connection drop.
-static json timeout_error_body() {
-    return json{{"message",
-                 "Upstream timeout: no response within 100s. Please retry."},
+/// connection drop.  `timeout_secs` is the configured value that fired.
+static json timeout_error_body(int timeout_secs = 0) {
+    std::string msg = timeout_secs > 0
+        ? "Upstream timeout: no response within " +
+              std::to_string(timeout_secs) + "s. Please retry."
+        : "Upstream timeout: no response within the configured "
+          "timeout. Please retry.";
+    return json{{"message", msg},
                 {"type", "timeout_error"},
                 {"code", 504}};
 }
@@ -65,8 +69,8 @@ static json timeout_error_body() {
 /// Emits a terminal error event in the client's wire format instead of
 /// silently dropping the connection, so the client knows the upstream never
 /// replied and can prompt the user to retry.
-static std::string timeout_sse_frame(ir::ApiFormat fmt) {
-    json err = timeout_error_body();
+static std::string timeout_sse_frame(ir::ApiFormat fmt, int timeout_secs = 0) {
+    json err = timeout_error_body(timeout_secs);
     switch (fmt) {
         case ir::ApiFormat::Anthropic:
             return "event: error\ndata: " +
@@ -332,7 +336,8 @@ struct UpstreamTarget {
 static UpstreamTarget resolve_upstream_target(const std::string &api_format,
                                               const std::string &base_url,
                                               const std::string &endpoint_path,
-                                              const std::string &auth_header) {
+                                              const std::string &auth_header,
+                                              const Database::TimeoutConfig &tc) {
     UpstreamTarget t;
     resolve_upstream_path(api_format, base_url, endpoint_path, t.path,
                           t.opts.path_is_full);
@@ -344,7 +349,24 @@ static UpstreamTarget resolve_upstream_target(const std::string &api_format,
         t.opts.auth_scheme = (api_format == "anthropic") ? "x-api-key" : "bearer";
     else
         t.opts.auth_scheme = auth_header;
+    t.opts.streaming_first_byte_timeout = tc.streaming_first_byte_timeout;
+    t.opts.streaming_idle_timeout = tc.streaming_idle_timeout;
+    t.opts.non_streaming_timeout = tc.non_streaming_timeout;
     return t;
+}
+
+/// Per-format timeout config for a client request, mirroring cc-switch's
+/// per-app-type timeouts keyed here by the client's wire format.
+static Database::TimeoutConfig timeout_config_for(Database &db,
+                                                  ir::ApiFormat harness) {
+    switch (harness) {
+        case ir::ApiFormat::Anthropic:
+            return db.get_timeout_config("anthropic");
+        case ir::ApiFormat::OpenAIResponses:
+            return db.get_timeout_config("openai_responses");
+        default:  // OpenAI chat
+            return db.get_timeout_config("openai");
+    }
 }
 
 /// Non-streaming usage parser dispatcher by upstream api_format.
@@ -558,7 +580,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         ir::ApiFormat upstream = ir::parse_api_format(c.account.api_format);
         auto target = resolve_upstream_target(
             c.account.api_format, c.account.base_url,
-            c.account.endpoint_path, c.account.auth_header);
+            c.account.endpoint_path, c.account.auth_header,
+            timeout_config_for(db_, harness));
 
         fprintf(stderr, "[Proxy] %s %s request from key_id=%d to account=%d "
                         "model=%s (concurrent=%d, inflight_id=%d)\n",
@@ -591,10 +614,12 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             gate_.mark_cooldown(c.account.id);
         }
 
-        // Fall back to the next candidate on 429/5xx, as long as nothing was
-        // sent to the client yet (non-streaming: nothing was).
+        // Fall back to the next candidate on 429/5xx (including upstream
+        // timeouts — a stuck upstream is a provider failure, so switch), as
+        // long as nothing was sent to the client yet (non-streaming: nothing
+        // was).  Mirrors cc-switch, which classifies timeouts as retryable.
         bool retryable = (fwd.status_code == 429 || fwd.status_code >= 500) &&
-                         !fwd.is_timeout && i + 1 < cands.size();
+                         i + 1 < cands.size();
         if (retryable) {
             fprintf(stderr, "[Proxy] upstream %d (%s) failed (%d), trying "
                             "next candidate\n",
@@ -608,10 +633,20 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
 
     if (!used) {
         if (inflight_id >= 0) db_.request_end(inflight_id);
-        res.status = 429;
-        res.set_content(json_error("All upstream accounts are busy, cooling "
-                                   "down, or failed", 429),
-                        "application/json");
+        if (fwd.is_timeout) {
+            // Every candidate timed out (the last forward was a timeout) — a
+            // timeout error, not a busy signal.
+            res.status = 504;
+            res.set_header("Connection", "close");
+            res.set_content(json{{"error",
+                                  timeout_error_body(fwd.timeout_secs)}}.dump(),
+                            "application/json");
+        } else {
+            res.status = 429;
+            res.set_content(json_error("All upstream accounts are busy, cooling "
+                                       "down, or failed", 429),
+                            "application/json");
+        }
         return;
     }
 
@@ -669,7 +704,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             res.status = fwd.status_code;
             if (fwd.is_timeout) {
                 res.set_header("Connection", "close");
-                res.set_content(json{{"error", timeout_error_body()}}.dump(),
+                res.set_content(json{{"error",
+                                      timeout_error_body(fwd.timeout_secs)}}.dump(),
                                 "application/json");
             } else {
                 res.set_content(json_error("Upstream error: " + fwd.error,
@@ -724,7 +760,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                                  zu, false, fwd.status_code, fwd.duration_ms);
             json normalized;
             if (fwd.is_timeout) {
-                normalized = timeout_error_body();
+                normalized = timeout_error_body(fwd.timeout_secs);
             } else {
                 try {
                     normalized = upstream_codec->parse_error_body(
@@ -784,7 +820,8 @@ void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
 
     auto target = resolve_upstream_target(
         cand.account.api_format, cand.account.base_url,
-        cand.account.endpoint_path, cand.account.auth_header);
+        cand.account.endpoint_path, cand.account.auth_header,
+        timeout_config_for(db_, upstream));
     bool think_filter = (upstream == ir::ApiFormat::OpenAI);
     std::string upstream_fmt = ir::to_string(upstream);
 
@@ -880,7 +917,7 @@ void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
                 // can prompt the user to retry.
                 fprintf(stderr, "[Proxy] Upstream timeout, sending error "
                                 "event to client (inflight=%d)\n", inflight_id);
-                std::string frame = timeout_sse_frame(upstream);
+                std::string frame = timeout_sse_frame(upstream, fwd.timeout_secs);
                 write_to_sink(frame.data(), frame.size());
                 sink.done();
                 return true;
@@ -934,7 +971,8 @@ void ProxyServer::handle_converted(const UpstreamCandidate &cand,
 
     auto target = resolve_upstream_target(
         cand.account.api_format, cand.account.base_url,
-        cand.account.endpoint_path, cand.account.auth_header);
+        cand.account.endpoint_path, cand.account.auth_header,
+        timeout_config_for(db_, harness));
 
     int inflight_id = db_.request_start(local_key_id, cand.account.id,
                                         cReq.model, true);
@@ -1060,7 +1098,7 @@ void ProxyServer::handle_converted(const UpstreamCandidate &cand,
                                 "event to client (inflight=%d)\n", inflight_id);
                 ir::StreamEvent err_ev;
                 err_ev.type = ir::StreamEventType::ErrorEvent;
-                err_ev.extra["error"] = timeout_error_body();
+                err_ev.extra["error"] = timeout_error_body(fwd.timeout_secs);
                 emitter->emit(err_ev, sink_bridge);
                 if (harness == ir::ApiFormat::OpenAI)
                     sink_bridge("data: [DONE]\n\n");
@@ -1115,9 +1153,13 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         return;
     }
 
+    ForwardOptions mopts;
+    mopts.non_streaming_timeout =
+        timeout_config_for(db_, ir::ApiFormat::OpenAI).non_streaming_timeout;
     auto fwd = upstream_.forward("GET", ar.route.base_url,
                                  ar.route.upstream_key,
-                                 "/models", "", "application/json", nullptr);
+                                 "/models", "", "application/json", nullptr,
+                                 mopts);
 
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
@@ -1131,7 +1173,8 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         if (fwd.is_timeout) {
             // Explicit, retryable timeout error instead of a generic error.
             res.set_header("Connection", "close");
-            res.set_content(json{{"error", timeout_error_body()}}.dump(),
+            res.set_content(json{{"error",
+                                  timeout_error_body(fwd.timeout_secs)}}.dump(),
                             "application/json");
         } else {
             res.set_content(json_error("Upstream error: " + fwd.error,
@@ -1201,9 +1244,12 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
 
         std::string eb = req.body;
         apply_body_model(eb, c.upstream_model);
+        ForwardOptions eopts;
+        eopts.non_streaming_timeout =
+            timeout_config_for(db_, ir::ApiFormat::OpenAI).non_streaming_timeout;
         fwd = upstream_.forward(
             "POST", c.account.base_url, c.account.upstream_key,
-            "/embeddings", eb, content_type, nullptr);
+            "/embeddings", eb, content_type, nullptr, eopts);
 
         if (fwd.status_code == 429 && c.account.account_type == "plan") {
             fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited (429), "
@@ -1213,7 +1259,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         }
 
         bool retryable = (fwd.status_code == 429 || fwd.status_code >= 500) &&
-                         !fwd.is_timeout && i + 1 < cands.size();
+                         i + 1 < cands.size();
         if (retryable) {
             fprintf(stderr, "[Proxy] upstream %d (%s) failed (%d), trying "
                             "next candidate\n",
@@ -1227,10 +1273,19 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
 
     if (!used) {
         if (inflight_id >= 0) db_.request_end(inflight_id);
-        res.status = 429;
-        res.set_content(json_error("All upstream accounts are busy, cooling "
-                                   "down, or failed", 429),
-                        "application/json");
+        if (fwd.is_timeout) {
+            // Every candidate timed out — a timeout error, not a busy signal.
+            res.status = 504;
+            res.set_header("Connection", "close");
+            res.set_content(json{{"error",
+                                  timeout_error_body(fwd.timeout_secs)}}.dump(),
+                            "application/json");
+        } else {
+            res.status = 429;
+            res.set_content(json_error("All upstream accounts are busy, cooling "
+                                       "down, or failed", 429),
+                            "application/json");
+        }
         return;
     }
 
@@ -1286,7 +1341,8 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         if (fwd.is_timeout) {
             // Explicit, retryable timeout error instead of a generic error.
             res.set_header("Connection", "close");
-            res.set_content(json{{"error", timeout_error_body()}}.dump(),
+            res.set_content(json{{"error",
+                                  timeout_error_body(fwd.timeout_secs)}}.dump(),
                             "application/json");
         } else {
             res.set_content(

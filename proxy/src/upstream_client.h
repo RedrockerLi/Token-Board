@@ -8,6 +8,14 @@ struct ForwardOptions {
     std::string auth_scheme = "bearer";  // "bearer" → Authorization: Bearer <key>
                                          // "x-api-key" → x-api-key: <key> + anthropic-version
     bool path_is_full = false;           // true → use `path` verbatim (skip base_url path prepend)
+
+    // Upstream timeouts, in seconds (0 = disabled).
+    // Streaming: first chunk is bounded by streaming_first_byte_timeout, then
+    // each subsequent read switches to streaming_idle_timeout (0 = no idle cap).
+    // Non-streaming: body reads bounded by non_streaming_timeout (idle semantics).
+    int streaming_first_byte_timeout = 60;
+    int streaming_idle_timeout = 120;
+    int non_streaming_timeout = 600;
 };
 
 /// Forwards requests to the upstream CSTCloud API.
@@ -21,6 +29,7 @@ public:
         std::string body;    // full response body (for non-streaming)
         bool success = false;
         bool is_timeout = false;  // true: upstream read timed out / stream interrupted
+        int timeout_secs = 0;     // the timeout value (s) that fired, when is_timeout
         std::string error;
         int duration_ms = 0;  // total upstream call time (streaming: until stream ends)
         int ttft_ms = 0;      // time-to-first-token (streaming: first chunk; non-streaming: =duration_ms)

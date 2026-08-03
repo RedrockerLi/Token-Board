@@ -58,6 +58,19 @@ public:
     };
     std::optional<AccountInfo> get_account(int account_id);
 
+    // ── Timeout config (per client wire format) ────────────────────────
+
+    /// Per-wire-format upstream timeouts (seconds; 0 = disabled).
+    struct TimeoutConfig {
+        int streaming_first_byte_timeout = 60;  // wait for first streaming chunk
+        int streaming_idle_timeout = 120;       // max gap between chunks; 0 = disabled
+        int non_streaming_timeout = 600;        // non-streaming body read timeout
+    };
+    /// Timeout config for a client wire format: "anthropic" | "openai_responses"
+    /// | "openai" (any other value → defaults).  Falls back to the struct
+    /// defaults when the row is missing.
+    TimeoutConfig get_timeout_config(const std::string &app_type);
+
     // ── Aggregate accounts ─────────────────────────────────────────────
 
     /// One model-mapping entry of an aggregate account.
@@ -138,6 +151,7 @@ private:
     sqlite3_stmt *stmt_insert_log_ = nullptr;
     sqlite3_stmt *stmt_get_aggregate_entries_ = nullptr;
     sqlite3_stmt *stmt_get_pricing_ = nullptr;
+    sqlite3_stmt *stmt_get_timeout_config_ = nullptr;
     sqlite3_stmt *stmt_update_last_used_ = nullptr;
     sqlite3_stmt *stmt_insert_perf_event_ = nullptr;
     sqlite3_stmt *stmt_cleanup_perf_events_ = nullptr;

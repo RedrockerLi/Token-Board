@@ -241,6 +241,34 @@ def reorder_pricing():
     return jsonify({"status": "ok"})
 
 
+# ── Timeout config (per client wire format) ───────────────────────────
+
+_TIMEOUT_GROUPS = ("anthropic", "openai_responses", "openai")
+
+
+@bp_proxy.route("/timeout-config", methods=["GET"])
+def get_timeout_config():
+    cfg = _proxy_db().get_timeout_config()
+    return jsonify({row["app_type"]: row for row in cfg})
+
+
+@bp_proxy.route("/timeout-config", methods=["PUT"])
+def save_timeout_config():
+    data = request.get_json(force=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求体必须包含各分组配置"}), 400
+    groups = {g: data[g] for g in _TIMEOUT_GROUPS
+              if isinstance(data.get(g), dict)}
+    if not groups:
+        return jsonify({"error": "缺少有效的分组配置"}), 400
+    try:
+        for app_type, group in groups.items():
+            _proxy_db().update_timeout_config(app_type, group)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"status": "ok"})
+
+
 # ── Billing / Usage ────────────────────────────────────────────────────
 
 @bp_proxy.route("/billing")

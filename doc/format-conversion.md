@@ -28,7 +28,7 @@ usage 的解析,非流式直接 parse 响应体;流式从累积的 SSE 中取最
 
 ## think 内容抽取
 
-DeepSeek 这类厂商会在 assistant 消息里输出 `<think>...</think>` 推理块。代理把它抽取到 `reasoning_content` 字段,而不是丢弃:
+部分厂商会在 assistant 消息里输出 `<think>...</think>` 推理块。代理把它抽取到 `reasoning_content` 字段,而不是丢弃:
 
 - 非流式:透传响应经过 `sanitize_response_body`,把 `<think>` 内容从 `content` 移到 `reasoning_content`。
 - 流式:`ThinkStreamFilter` 是个按行处理的状态机,区分 NORMAL / IN_THINK 两态,把 `<think>` 开合跨多个 chunk 的推理片段逐步累积到 `reasoning_content`,同时清掉 content 里残留的 think 标签。

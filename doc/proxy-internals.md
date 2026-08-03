@@ -35,7 +35,7 @@
 - 流式:校验 harness 请求(避免 400 提前返回漏掉并发槽)后,一次选定候选转发,不做回退——chunked 响应头发出后无法切换账户。
 - 非流式:循环候选。上游返回 429 或 5xx、且还没向客户端发任何数据时,释放当前账户的并发槽,试下一个。plan 账户收到 429 会触发 5 小时冷却。全部候选失败返回 429。
 
-超时错误(`is_timeout`)不参与回退,直接按 504 处理。嵌入端点 `/v1/embeddings` 也是非流式,走同样的候选循环,但没有格式转换。
+超时(`is_timeout`,504)与 429/5xx 一样参与回退——上游卡死不吐数据视为 provider 故障,换下一个账户(对齐 cc-switch 把超时归为 Retryable);全部候选失败时,若最后失败是超时则返回 504,否则 429。嵌入端点 `/v1/embeddings` 也是非流式,走同样的候选循环,但没有格式转换。
 
 ## 并发闸门:AccountGate
 
@@ -49,9 +49,17 @@
 
 ## 超时与客户端断连
 
-`upstream_client.cpp` 的 `forward` 建 httplib 客户端并设三档超时:连接 10s、读 100s、写 30s。读超时(100s 无数据)返回 `is_timeout=true`,对客户端统一给 `{"error":{"type":"timeout_error","code":504}}`。流式路径按客户端格式发终止错误帧:Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`,让客户端知道上游没回,而不是静默断连。
+上游超时按客户端线格式配置,存在 `proxy_timeout_config` 表(每行一组,默认值对齐 cc-switch:anthropic 90/180/600、openai_responses 与 openai 60/120/600),由仪表板「设置」页编辑、代理每次转发时按 harness 线格式读取,改动即时生效、无需重启:
 
-客户端断连的检测用 `spawn_client_monitor`:一个线程每 250ms poll 客户端 socket,发现 `POLLHUP / POLLERR / POLLRDHUP` 就 `shutdown()` 上游 socket,把阻塞中的上游读立刻打断,释放线程池线程,而不是干等满 100 秒。注意 TCP 对端 FIN 只表现为 `POLLIN + POLLRDHUP`,所以 poll 必须显式请求 `POLLRDHUP`。非流式路径也有等价的 `client_disconnected` 检查,确认客户端已走就把这次请求记为 499(零 token)结束。
+- `streaming_first_byte_timeout` — 流式等首个数据块的最大时间。
+- `streaming_idle_timeout` — 流式两个数据块之间的最大间隔,0=禁用。
+- `non_streaming_timeout` — 非流式 body 读取超时,作为整个 Get/Post 的读超时(每读无数据 N 秒即超时,等价于 cc-switch 的整包总超时;连接 10s、写 30s 保持固定)。
+
+流式的首字节/静默区分用 `upstream_client.cpp` 里的**超时看门狗线程**:httplib 客户端的读超时是 select-based、连接期固定,无法区分"等首块"和"块间间隔",所以看门狗在首字节截止点(请求发出后 `streaming_first_byte_timeout`)和每个块到达后重置的静默截止点(`now + streaming_idle_timeout`)检测超时,到点就 `shutdown()` 上游 socket 打断阻塞读(与客户端断连监视 `spawn_client_monitor` 同机制),阻塞读因此以读错误返回、记 `is_timeout`。httplib 自身读超时设成大的 backstop,只兜底。两个超时都配 0 时不开看门狗。
+
+超时(`is_timeout=true`)对客户端统一给 `{"error":{"type":"timeout_error","code":504}}`,错误消息带实际触发的秒数。流式路径按客户端格式发终止错误帧:Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`,让客户端知道上游没回,而不是静默断连。
+
+客户端断连的检测用 `spawn_client_monitor`:一个线程每 250ms poll 客户端 socket,发现 `POLLHUP / POLLERR / POLLRDHUP` 就 `shutdown()` 上游 socket,把阻塞中的上游读立刻打断,释放线程池线程,而不是干等满超时。注意 TCP 对端 FIN 只表现为 `POLLIN + POLLRDHUP`,所以 poll 必须显式请求 `POLLRDHUP`。非流式路径也有等价的 `client_disconnected` 检查,确认客户端已走就把这次请求记为 499(零 token)结束。
 
 ## 请求记账与性能事件
 
