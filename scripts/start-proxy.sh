@@ -47,7 +47,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PROXY_BIN --db $PROXY_DB --port $PROXY_PORT
+ExecStart=$PROXY_BIN --db $PROXY_DB --schema-dir $SCRIPT_DIR/schema/proxy --port $PROXY_PORT
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -88,7 +88,7 @@ do_start() {
     echo "  数据库: $PROXY_DB"
     echo "  按 Ctrl+C 停止"
     echo ""
-    exec "$PROXY_BIN" --db "$PROXY_DB" --port "$PROXY_PORT"
+    exec "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema/proxy" --port "$PROXY_PORT"
 }
 
 do_daemon() {
@@ -102,7 +102,7 @@ do_daemon() {
     fi
 
     echo -e "${CYAN}启动代理 (后台)...${NC}"
-    "$PROXY_BIN" --db "$PROXY_DB" --port "$PROXY_PORT" &
+    "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema/proxy" --port "$PROXY_PORT" &
     PROXY_PID=$!
     echo -e "${GREEN}✓ 代理已启动 (PID: $PROXY_PID)${NC}"
     echo "  代理地址: http://localhost:$PROXY_PORT/v1"

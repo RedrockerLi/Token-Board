@@ -25,9 +25,10 @@ public:
     Database(Database &&) = delete;
     Database &operator=(Database &&) = delete;
 
-    /// Open (or create) the database at `path`.  Creates all tables on first
-    /// open.  Returns true on success.
-    bool open(const std::string &path);
+    /// Open (or create) the database at `path`.  Applies pending schema
+    /// migrations from `schema_dir` (schema/<db>/NNNN_*.sql).  Returns true
+    /// on success.
+    bool open(const std::string &path, const std::string &schema_dir);
 
     /// Close the database and finalize all prepared statements.
     void close();
@@ -121,11 +122,14 @@ public:
     void cleanup_stale_in_flight(int max_age_minutes = 10);
 
 private:
-    void create_schema();
+    /// Apply pending versioned migrations (PRAGMA user_version-gated) from
+    /// `schema_dir`.  Returns false on failure (transaction rolled back).
+    bool run_migrations(const std::string &schema_dir);
     void prepare_statements();
     void finalize_statements();
 
     sqlite3 *db_ = nullptr;
+    std::string db_path_;  // used to derive the "<db>.migrate.lock" filename
     std::mutex mutex_;
 
     // Prepared statements (protected by mutex_)

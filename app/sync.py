@@ -36,20 +36,9 @@ class SyncConfig:
 
 # ── Config persistence ────────────────────────────────────────────────────
 
-def _ensure_sync_config_table(conn: sqlite3.Connection):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sync_config (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-
-
 def save_sync_config(db_path: str, config: SyncConfig):
     conn = sqlite3.connect(db_path)
     try:
-        _ensure_sync_config_table(conn)
         conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('url', ?)", (config.base_url,))
         conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('folder', ?)", (config.folder,))
         conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('username', ?)", (config.username,))
@@ -62,7 +51,6 @@ def save_sync_config(db_path: str, config: SyncConfig):
 def load_sync_config(db_path: str) -> SyncConfig | None:
     conn = sqlite3.connect(db_path)
     try:
-        _ensure_sync_config_table(conn)
         rows = dict(conn.execute("SELECT key, value FROM sync_config").fetchall())
         if rows.get("url") and rows.get("username"):
             old_url = rows["url"]

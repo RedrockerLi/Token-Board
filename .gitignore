@@ -16,5 +16,8 @@ data/dashboard.db-shm
 # C++ build artifacts
 proxy/build/
 
+# DB migration advisory locks
+*.migrate.lock
+
 # reference
 ref

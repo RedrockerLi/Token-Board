@@ -1,6 +1,15 @@
 #include "db.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <sys/file.h>
+#include <unistd.h>
+#include <utility>
+#include <vector>
 #include <sqlite3.h>
 
 // ── Internal helpers ────────────────────────────────────────────────────
@@ -25,7 +34,7 @@ Database::~Database() { close(); }
 
 // ── open ─────────────────────────────────────────────────────────────────
 
-bool Database::open(const std::string &path) {
+bool Database::open(const std::string &path, const std::string &schema_dir) {
     int rc = sqlite3_open_v2(
         path.c_str(), &db_,
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
@@ -35,13 +44,19 @@ bool Database::open(const std::string &path) {
                 sqlite3_errmsg(db_));
         return false;
     }
+    db_path_ = path;
 
     // Performance / safety pragmas
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA foreign_keys=ON", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000", nullptr, nullptr, nullptr);
 
-    create_schema();
+    if (!run_migrations(schema_dir)) {
+        fprintf(stderr, "[DB] Schema migration failed — see errors above\n");
+        sqlite3_close(db_);
+        db_ = nullptr;
+        return false;
+    }
 
     // Clear any stale in-flight records from a previous run (e.g. crash)
     sqlite3_exec(db_, "DELETE FROM in_flight_requests", nullptr, nullptr, nullptr);
@@ -59,249 +74,86 @@ void Database::close() {
     fprintf(stderr, "[DB] Closed\n");
 }
 
-// ── Schema creation ──────────────────────────────────────────────────────
+// ── Schema migrations ────────────────────────────────────────────────────
+//
+// Applies pending versioned migrations from `schema_dir` (schema/<db>/NNNN_*.sql),
+// the single source of truth for the database schema (shared with the Python
+// runner in app/migrations.py).  Each step runs inside
+// "BEGIN IMMEDIATE; <body>; PRAGMA user_version = N; COMMIT;" under an advisory
+// flock on <db>.migrate.lock, so concurrent runners (proxy + dashboard) and
+// concurrent processes are serialized and every step is all-or-nothing.
 
-void Database::create_schema() {
-    // CREATE TABLE IF NOT EXISTS defines the full current schema (including
-    // account_type / monthly_price / max_concurrency / virtual_cost).
-    const char *sql = R"SQL(
-        CREATE TABLE IF NOT EXISTS upstream_accounts (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL UNIQUE,
-            upstream_key TEXT NOT NULL,
-            base_url    TEXT NOT NULL DEFAULT '',
-            api_format  TEXT NOT NULL DEFAULT 'openai',
-            is_aggregate INTEGER NOT NULL DEFAULT 0,
-            endpoint_path TEXT NOT NULL DEFAULT '',
-            auth_header TEXT NOT NULL DEFAULT 'bearer',
-            account_type TEXT NOT NULL DEFAULT 'api',
-            monthly_price REAL NOT NULL DEFAULT 0,
-            max_concurrency INTEGER,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-        );
-
-        CREATE TABLE IF NOT EXISTS local_keys (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_value   TEXT NOT NULL UNIQUE,
-            label       TEXT,
-            account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id),
-            created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-            last_used_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS request_log (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id       INTEGER NOT NULL REFERENCES upstream_accounts(id),
-            local_key_id     INTEGER REFERENCES local_keys(id) ON DELETE SET NULL,
-            model            TEXT NOT NULL,
-            prompt_tokens    INTEGER NOT NULL DEFAULT 0,
-            completion_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            total_tokens     INTEGER NOT NULL DEFAULT 0,
-            cost             REAL NOT NULL DEFAULT 0.0,
-            virtual_cost     REAL NOT NULL DEFAULT 0.0,
-            exported         INTEGER NOT NULL DEFAULT 0,
-            is_streaming     INTEGER NOT NULL DEFAULT 0,
-            status_code      INTEGER NOT NULL,
-            duration_ms      INTEGER NOT NULL DEFAULT 0,
-            requested_at     TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_rl_account
-            ON request_log(account_id);
-        CREATE INDEX IF NOT EXISTS idx_rl_time
-            ON request_log(requested_at);
-        CREATE INDEX IF NOT EXISTS idx_rl_exported
-            ON request_log(exported);
-
-        CREATE TABLE IF NOT EXISTS model_pricing (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            model_pattern  TEXT NOT NULL UNIQUE,
-            input_price    REAL NOT NULL,
-            output_price   REAL NOT NULL,
-            cache_read_price REAL,
-            currency       TEXT NOT NULL DEFAULT 'CNY'
-        );
-
-        CREATE TABLE IF NOT EXISTS account_models (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id),
-            model_id    TEXT NOT NULL,
-            UNIQUE(account_id, model_id)
-        );
-
-        DROP TABLE IF EXISTS key_model_map;  -- legacy per-key model mapping (removed)
-
-        -- Aggregate account model routing: one entry per exposed model,
-        -- mapping to a real upstream account + upstream model name.
-        CREATE TABLE IF NOT EXISTS aggregate_entries (
-            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id           INTEGER NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
-            sort_order           INTEGER NOT NULL DEFAULT 0,
-            pattern              TEXT NOT NULL,
-            upstream_account_id  INTEGER NOT NULL REFERENCES upstream_accounts(id) ON DELETE CASCADE,
-            upstream_model       TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS perf_events (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            model               TEXT NOT NULL,
-            upstream_latency_ms INTEGER NOT NULL DEFAULT 0,
-            total_latency_ms    INTEGER NOT NULL DEFAULT 0,
-            status_code         INTEGER NOT NULL,
-            is_error            INTEGER NOT NULL DEFAULT 0,
-            concurrent_count    INTEGER NOT NULL DEFAULT 0,
-            requested_at        TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_perf_events_time
-            ON perf_events(requested_at);
-
-        CREATE TABLE IF NOT EXISTS in_flight_requests (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            local_key_id    INTEGER NOT NULL,
-            account_id      INTEGER NOT NULL,
-            model           TEXT NOT NULL,
-            is_streaming    INTEGER NOT NULL DEFAULT 0,
-            started_at      TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        -- Trigger: auto-compute cost from model_pricing when a request is logged.
-        -- Cost = cache-miss input at the input rate + cache-hit input at the
-        -- (optional, cheaper) cache_read rate + output at the output rate.
-        -- plan accounts: real cost = 0 (subscription covers usage), the
-        -- api-billed amount goes to virtual_cost (to gauge plan economics).
-        -- api accounts: real cost = api-billed amount, virtual_cost = 0.
-        DROP TRIGGER IF EXISTS tr_request_log_insert;
-        CREATE TRIGGER tr_request_log_insert
-        AFTER INSERT ON request_log
-        BEGIN
-            UPDATE request_log SET
-                cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE id = NEW.account_id) = 'plan'
-                    THEN 0.0
-                    ELSE COALESCE((
-                        SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                             + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                             + (NEW.completion_tokens / 1000000.0) * mp.output_price
-                        FROM model_pricing mp
-                        WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
-                        ORDER BY mp.id LIMIT 1
-                    ), 0.0)
-                END,
-                virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE id = NEW.account_id) = 'plan'
-                    THEN COALESCE((
-                        SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                             + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                             + (NEW.completion_tokens / 1000000.0) * mp.output_price
-                        FROM model_pricing mp
-                        WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
-                        ORDER BY mp.id LIMIT 1
-                    ), 0.0)
-                    ELSE 0.0
-                END
-            WHERE id = NEW.id AND NEW.prompt_tokens + NEW.completion_tokens > 0;
-        END;
-
-        -- Trigger: recalculate all costs when a pricing entry is inserted.
-        DROP TRIGGER IF EXISTS tr_pricing_insert;
-        CREATE TRIGGER tr_pricing_insert
-        AFTER INSERT ON model_pricing
-        BEGIN
-            UPDATE request_log SET
-                cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                    THEN 0.0
-                    ELSE COALESCE((
-                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                        FROM model_pricing mp
-                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                        ORDER BY mp.id LIMIT 1
-                    ), 0.0)
-                END,
-                virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                    THEN COALESCE((
-                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                        FROM model_pricing mp
-                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                        ORDER BY mp.id LIMIT 1
-                    ), 0.0)
-                    ELSE 0.0
-                END;
-        END;
-
-        -- Trigger: recalculate all costs when a pricing entry is updated.
-        DROP TRIGGER IF EXISTS tr_pricing_update;
-        CREATE TRIGGER tr_pricing_update
-        AFTER UPDATE ON model_pricing
-        BEGIN
-            UPDATE request_log SET
-                cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                    THEN 0.0
-                    ELSE COALESCE((
-                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                        FROM model_pricing mp
-                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                        ORDER BY mp.id LIMIT 1
-                    ), 0.0)
-                END,
-                virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                    THEN COALESCE((
-                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                        FROM model_pricing mp
-                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                        ORDER BY mp.id LIMIT 1
-                    ), 0.0)
-                    ELSE 0.0
-                END;
-        END;
-
-        -- Trigger: recalculate all costs when a pricing entry is deleted.
-        DROP TRIGGER IF EXISTS tr_pricing_delete;
-        CREATE TRIGGER tr_pricing_delete
-        AFTER DELETE ON model_pricing
-        BEGIN
-            UPDATE request_log SET
-                cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                    THEN 0.0
-                    ELSE COALESCE((
-                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                        FROM model_pricing mp
-                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                        ORDER BY mp.id LIMIT 1
-                    ), 0.0)
-                END,
-                virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                    THEN COALESCE((
-                        SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                             + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                             + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                        FROM model_pricing mp
-                        WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                        ORDER BY mp.id LIMIT 1
-                    ), 0.0)
-                    ELSE 0.0
-                END;
-        END;
-    )SQL";
-
-    char *err = nullptr;
-    int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &err);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "[DB] Schema creation error: %s\n", err);
-        sqlite3_free(err);
+bool Database::run_migrations(const std::string &schema_dir) {
+    namespace fs = std::filesystem;
+    if (!fs::is_directory(schema_dir)) {
+        fprintf(stderr, "[DB] schema dir not found: %s\n", schema_dir.c_str());
+        return false;
     }
 
-    // Pricing entries are managed by the web dashboard; no auto-seeding.
+    // Enumerate schema_dir/NNNN_*.sql and sort by the leading number.
+    std::vector<std::pair<int, fs::path>> steps;
+    for (const auto &e : fs::directory_iterator(schema_dir)) {
+        std::string fn = e.path().filename().string();
+        if (e.path().extension() != ".sql" || fn.size() < 5) continue;
+        if (!isdigit(static_cast<unsigned char>(fn[0]))) continue;
+        steps.emplace_back(std::stoi(fn.substr(0, 4)), e.path());
+    }
+    std::sort(steps.begin(), steps.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    if (steps.empty()) {
+        fprintf(stderr, "[DB] no migration files in %s\n", schema_dir.c_str());
+        return false;
+    }
+
+    // Advisory lock — pairs with the Python runner's fcntl.flock().
+    int lock_fd = ::open((db_path_ + ".migrate.lock").c_str(), O_CREAT | O_RDWR, 0644);
+    if (lock_fd < 0) {
+        fprintf(stderr, "[DB] cannot open migration lock\n");
+        return false;
+    }
+    flock(lock_fd, LOCK_EX);  // blocking
+
+    // Current schema version.
+    int version = 0;
+    {
+        sqlite3_stmt *s = nullptr;
+        if (sqlite3_prepare_v2(db_, "PRAGMA user_version", -1, &s, nullptr) == SQLITE_OK
+            && sqlite3_step(s) == SQLITE_ROW)
+            version = sqlite3_column_int(s, 0);
+        sqlite3_finalize(s);
+    }
+
+    bool ok = true;
+    for (const auto &[n, p] : steps) {
+        if (n <= version) continue;
+
+        std::ifstream f(p);
+        std::string body((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        if (body.empty()) {
+            fprintf(stderr, "[DB] Migration %s is empty/unreadable\n", p.c_str());
+            ok = false;
+            break;
+        }
+        std::string sql = "BEGIN IMMEDIATE;\n" + body +
+                          "\nPRAGMA user_version = " + std::to_string(n) + ";\nCOMMIT;";
+
+        char *err = nullptr;
+        if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+            fprintf(stderr, "[DB] Migration %s failed: %s\n",
+                    p.c_str(), err ? err : sqlite3_errmsg(db_));
+            if (err) sqlite3_free(err);
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);  // atomic step rollback
+            ok = false;
+            break;
+        }
+    }
+
+    flock(lock_fd, LOCK_UN);
+    ::close(lock_fd);
+    return ok;
 }
+
 
 // ── Prepared statements ──────────────────────────────────────────────────
 

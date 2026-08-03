@@ -10,6 +10,9 @@ static void print_help(const char *argv0) {
         "Usage: %s [OPTIONS]\n"
         "Options:\n"
         "  --db PATH       SQLite database path (default: data/proxy.db)\n"
+        "  --schema-dir PATH\n"
+        "                  Migration file directory (default: derived from --db\n"
+        "                  as <db_dir>/../schema/proxy)\n"
         "  --port PORT     Listen port (default: 8800)\n"
         "  --host HOST     Bind address (default: 0.0.0.0)\n"
         "  --log-level LVL Log level: debug|info|warn|error (default: info)\n"
@@ -26,6 +29,8 @@ Config parse_args(int argc, char *argv[]) {
             exit(0);
         } else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
             cfg.db_path = argv[++i];
+        } else if (strcmp(argv[i], "--schema-dir") == 0 && i + 1 < argc) {
+            cfg.schema_dir = argv[++i];
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             cfg.port = atoi(argv[++i]);
             if (cfg.port <= 0 || cfg.port > 65535) {

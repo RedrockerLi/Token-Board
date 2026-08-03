@@ -230,7 +230,7 @@ cd proxy
 bash setup_deps.sh          # 下载第三方依赖（首次）
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-./build/token_proxy --db ../data/proxy.db --port 8800
+./build/token_proxy --db ../data/proxy.db --schema-dir ../schema/proxy --port 8800
 ```
 
 命令行参数：
@@ -238,6 +238,9 @@ cmake --build build -j$(nproc)
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--db` | `data/proxy.db` | SQLite 数据库路径 |
+| `--schema-dir` | 由 `--db` 推导（`<db目录>/../schema/proxy`） | 迁移文件目录（`schema/<库名>/NNNN_*.sql`） |
 | `--port` | `8800` | 监听端口 |
 | `--host` | `0.0.0.0` | 绑定地址 |
 | `--log-level` | `info` | 日志级别 |
+
+> 数据库 schema 由版本化迁移统一管理，升级流程见 [doc/database-migrations.md](doc/database-migrations.md)。

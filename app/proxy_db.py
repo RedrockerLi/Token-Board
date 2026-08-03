@@ -24,6 +24,10 @@ class ProxyDatabase:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        # Schema is owned by versioned migrations (schema/proxy/*.sql); apply
+        # once at construction. Fails fast (create_app aborts) on error.
+        from app.migrations import migrate, schema_dir_for
+        migrate(self.db_path, schema_dir_for(self.db_path, "proxy"))
         self._sync_timer: threading.Timer | None = None
 
     def _schedule_config_sync(self):
@@ -48,161 +52,6 @@ class ProxyDatabase:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
-        # Ensure auxiliary tables exist (the C++ proxy creates the canonical
-        conn.execute("""CREATE TABLE IF NOT EXISTS account_models (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL, model_id TEXT NOT NULL,
-            UNIQUE(account_id, model_id))""")
-        conn.execute("DROP TABLE IF EXISTS key_model_map")  # legacy per-key mapping (removed)
-        conn.execute("""CREATE TABLE IF NOT EXISTS aggregate_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            pattern TEXT NOT NULL,
-            upstream_account_id INTEGER NOT NULL,
-            upstream_model TEXT NOT NULL)""")
-        # Performance metrics (local-only, not synced)
-        conn.execute("""CREATE TABLE IF NOT EXISTS perf_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            model TEXT NOT NULL,
-            upstream_latency_ms INTEGER NOT NULL DEFAULT 0,
-            total_latency_ms INTEGER NOT NULL DEFAULT 0,
-            status_code INTEGER NOT NULL,
-            is_error INTEGER NOT NULL DEFAULT 0,
-            concurrent_count INTEGER NOT NULL DEFAULT 0,
-            requested_at TEXT NOT NULL DEFAULT (datetime('now')))""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_perf_events_time ON perf_events(requested_at)")
-        conn.execute("""CREATE TABLE IF NOT EXISTS in_flight_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            local_key_id INTEGER NOT NULL,
-            account_id INTEGER NOT NULL,
-            model TEXT NOT NULL,
-            is_streaming INTEGER NOT NULL DEFAULT 0,
-            started_at TEXT NOT NULL DEFAULT (datetime('now')))""")
-        conn.commit()
-
-        # ── Triggers: automatic cost computation from model_pricing ──────
-        # Cost = cache-miss input at input_price + cache-hit input at
-        # COALESCE(cache_read_price, input_price) + output at output_price.
-        # plan accounts: real cost = 0 (subscription covers usage), the
-        # api-billed amount goes to virtual_cost (plan economics gauge).
-        # api accounts: real cost = api-billed amount, virtual_cost = 0.
-        # DROP + CREATE (not IF NOT EXISTS) so old databases pick up the
-        # new definitions on first connect.
-        conn.execute("DROP TRIGGER IF EXISTS tr_request_log_insert")
-        conn.execute("""CREATE TRIGGER tr_request_log_insert
-            AFTER INSERT ON request_log
-            BEGIN
-                UPDATE request_log SET
-                    cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE id = NEW.account_id) = 'plan'
-                        THEN 0.0
-                        ELSE COALESCE((
-                            SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                                 + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                                 + (NEW.completion_tokens / 1000000.0) * mp.output_price
-                            FROM model_pricing mp
-                            WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
-                            ORDER BY mp.id LIMIT 1
-                        ), 0.0)
-                    END,
-                    virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE id = NEW.account_id) = 'plan'
-                        THEN COALESCE((
-                            SELECT (MAX(NEW.prompt_tokens - NEW.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                                 + (NEW.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                                 + (NEW.completion_tokens / 1000000.0) * mp.output_price
-                            FROM model_pricing mp
-                            WHERE LOWER(NEW.model) GLOB LOWER(mp.model_pattern)
-                            ORDER BY mp.id LIMIT 1
-                        ), 0.0)
-                        ELSE 0.0
-                    END
-                WHERE id = NEW.id AND NEW.prompt_tokens + NEW.completion_tokens > 0;
-            END""")
-        conn.execute("DROP TRIGGER IF EXISTS tr_pricing_insert")
-        conn.execute("""CREATE TRIGGER tr_pricing_insert
-            AFTER INSERT ON model_pricing
-            BEGIN
-                UPDATE request_log SET
-                    cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                        THEN 0.0
-                        ELSE COALESCE((
-                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                            FROM model_pricing mp
-                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                            ORDER BY mp.id LIMIT 1
-                        ), 0.0)
-                    END,
-                    virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                        THEN COALESCE((
-                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                            FROM model_pricing mp
-                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                            ORDER BY mp.id LIMIT 1
-                        ), 0.0)
-                        ELSE 0.0
-                    END;
-            END""")
-        conn.execute("DROP TRIGGER IF EXISTS tr_pricing_update")
-        conn.execute("""CREATE TRIGGER tr_pricing_update
-            AFTER UPDATE ON model_pricing
-            BEGIN
-                UPDATE request_log SET
-                    cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                        THEN 0.0
-                        ELSE COALESCE((
-                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                            FROM model_pricing mp
-                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                            ORDER BY mp.id LIMIT 1
-                        ), 0.0)
-                    END,
-                    virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                        THEN COALESCE((
-                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                            FROM model_pricing mp
-                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                            ORDER BY mp.id LIMIT 1
-                        ), 0.0)
-                        ELSE 0.0
-                    END;
-            END""")
-        conn.execute("DROP TRIGGER IF EXISTS tr_pricing_delete")
-        conn.execute("""CREATE TRIGGER tr_pricing_delete
-            AFTER DELETE ON model_pricing
-            BEGIN
-                UPDATE request_log SET
-                    cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                        THEN 0.0
-                        ELSE COALESCE((
-                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                            FROM model_pricing mp
-                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                            ORDER BY mp.id LIMIT 1
-                        ), 0.0)
-                    END,
-                    virtual_cost = CASE WHEN (SELECT account_type FROM upstream_accounts WHERE upstream_accounts.id = request_log.account_id) = 'plan'
-                        THEN COALESCE((
-                            SELECT (MAX(request_log.prompt_tokens - request_log.cache_read_tokens, 0) / 1000000.0) * mp.input_price
-                                 + (request_log.cache_read_tokens / 1000000.0) * COALESCE(mp.cache_read_price, mp.input_price)
-                                 + (request_log.completion_tokens / 1000000.0) * mp.output_price
-                            FROM model_pricing mp
-                            WHERE LOWER(request_log.model) GLOB LOWER(mp.model_pattern)
-                            ORDER BY mp.id LIMIT 1
-                        ), 0.0)
-                        ELSE 0.0
-                    END;
-            END""")
-        conn.commit()
         return conn
 
     # ── Stats ──────────────────────────────────────────────────────────
@@ -1176,15 +1025,9 @@ def _sync_pricing_to_dashboard(proxy_conn, dash_db_path: str):
     dash_conn = sqlite3.connect(dash_db_path, timeout=5)
     dash_conn.execute("PRAGMA busy_timeout=5000")
     try:
-        # Ensure table and triggers exist (dashboard may be freshly downloaded)
-        dash_conn.execute("""CREATE TABLE IF NOT EXISTS model_pricing (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            model_pattern TEXT NOT NULL UNIQUE,
-            input_price REAL NOT NULL,
-            output_price REAL NOT NULL,
-            cache_read_price REAL,
-            currency TEXT NOT NULL DEFAULT 'CNY')""")
-
+        # model_pricing (and its cost triggers) are guaranteed by the
+        # dashboard migration (schema/dashboard/0001_initial.sql), applied when
+        # DashboardDatabase is constructed in export_to_dashboard.
         pricing_rows = proxy_conn.execute(
             "SELECT id, model_pattern, input_price, output_price, "
             "cache_read_price, currency "

@@ -19,96 +19,15 @@ MODEL_ORDER = {
 }
 
 
-# ── Cost recalculation SQL ──────────────────────────────────────────────────
-# Shared SELECT that recomputes proxy cost_entry from token_usage with
-# cache-aware pricing: output → output_price; input_cache_hit →
-# cache_read_price (falls back to input_price); the rest → input_price.
-# Used both inside the model_pricing triggers and for the one-off recompute
-# when upgrading legacy databases.  Accounts registered in account_types as
-# 'plan' get cost 0 (subscription covers usage — see proxy_plan_summary for
-# the real subscription cost and the api-billed virtual cost).
-#
-# CSV-imported groups are EXCLUDED: those rows already carry the price from
-# the CSV file (cost_entry.source='csv'), so recomputing them from
-# model_pricing would double-count (imported price + model price).
-_MP_COST_SELECT = """
-    SELECT
-        tu.date, tu.model,
-        SUM(
-            CASE WHEN COALESCE(
-                (SELECT at.account_type FROM account_types at
-                 WHERE at.account_name = tu.cost_group_key), 'api') = 'plan'
-            THEN 0
-            ELSE
-            CASE tu.token_type
-                WHEN 'output' THEN
-                    (tu.amount / 1000000.0) * COALESCE(
-                        (SELECT mp.output_price FROM model_pricing mp
-                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                         ORDER BY mp.id LIMIT 1), 0)
-                WHEN 'input_cache_hit' THEN
-                    (tu.amount / 1000000.0) * COALESCE(
-                        (SELECT COALESCE(mp.cache_read_price, mp.input_price) FROM model_pricing mp
-                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                         ORDER BY mp.id LIMIT 1), 0)
-                ELSE
-                    (tu.amount / 1000000.0) * COALESCE(
-                        (SELECT mp.input_price FROM model_pricing mp
-                         WHERE LOWER(tu.model) GLOB LOWER(mp.model_pattern)
-                         ORDER BY mp.id LIMIT 1), 0)
-            END
-            END
-        ),
-        tu.cost_group_key,
-        'proxy'
-    FROM token_usage tu
-    WHERE NOT EXISTS (
-        SELECT 1 FROM cost_entry ce
-        WHERE ce.source = 'csv'
-          AND ce.date = tu.date
-          AND ce.model = tu.model
-          AND ce.cost_group_key = tu.cost_group_key
-    )
-    GROUP BY tu.date, tu.model, tu.cost_group_key
-"""
-
-_TR_MP_INSERT = (
-    "CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_insert\n"
-    "AFTER INSERT ON model_pricing\n"
-    "BEGIN\n"
-    "    DELETE FROM cost_entry WHERE source = 'proxy';\n"
-    "    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)\n"
-    + _MP_COST_SELECT + ";\n"
-    "END;\n"
-)
-
-_TR_MP_UPDATE = (
-    "CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_update\n"
-    "AFTER UPDATE ON model_pricing\n"
-    "BEGIN\n"
-    "    DELETE FROM cost_entry WHERE source = 'proxy';\n"
-    "    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)\n"
-    + _MP_COST_SELECT + ";\n"
-    "END;\n"
-)
-
-_TR_MP_DELETE = (
-    "CREATE TRIGGER IF NOT EXISTS tr_mp_refresh_delete\n"
-    "AFTER DELETE ON model_pricing\n"
-    "BEGIN\n"
-    "    DELETE FROM cost_entry WHERE source = 'proxy';\n"
-    "    INSERT INTO cost_entry (date, model, cost, cost_group_key, source)\n"
-    + _MP_COST_SELECT + ";\n"
-    "END;\n"
-)
-
-
 class DashboardDatabase:
     """SQLite-backed storage for dashboard visualization data."""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._create_schema()
+        # Schema is owned by versioned migrations (schema/dashboard/*.sql);
+        # apply once at construction. Fails fast (caller aborts) on error.
+        from app.migrations import migrate, schema_dir_for
+        migrate(self.db_path, schema_dir_for(self.db_path, "dashboard"))
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=5)
@@ -117,86 +36,6 @@ class DashboardDatabase:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
-
-    def _create_schema(self):
-        conn = self._connect()
-        try:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS token_usage (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    api_key_name TEXT NOT NULL,
-                    token_type TEXT NOT NULL,
-                    amount INTEGER NOT NULL,
-                    cost_group_key TEXT DEFAULT ''
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_tu_unique
-                    ON token_usage(date, model, api_key_name, token_type, cost_group_key);
-                CREATE INDEX IF NOT EXISTS idx_tu_query
-                    ON token_usage(api_key_name, date, model);
-
-                CREATE TABLE IF NOT EXISTS request_usage (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    api_key_name TEXT NOT NULL,
-                    count INTEGER NOT NULL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_ru_unique
-                    ON request_usage(date, model, api_key_name);
-                CREATE INDEX IF NOT EXISTS idx_ru_query
-                    ON request_usage(api_key_name, date, model);
-
-                CREATE TABLE IF NOT EXISTS cost_entry (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    cost REAL NOT NULL,
-                    cost_group_key TEXT DEFAULT '',
-                    source TEXT NOT NULL DEFAULT 'proxy'
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_ce_unique
-                    ON cost_entry(date, model, cost_group_key, source);
-                CREATE INDEX IF NOT EXISTS idx_ce_query
-                    ON cost_entry(date, model, cost_group_key);
-
-                CREATE TABLE IF NOT EXISTS model_pricing (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    model_pattern TEXT NOT NULL UNIQUE,
-                    input_price REAL NOT NULL,
-                    output_price REAL NOT NULL,
-                    cache_read_price REAL,
-                    currency TEXT NOT NULL DEFAULT 'CNY'
-                );
-
-                -- Account type registry (mirrors upstream_accounts.account_type
-                -- for proxy-exported data; plan accounts get cost 0 in
-                -- cost_entry, their subscription + virtual costs live in
-                -- proxy_plan_summary).
-                CREATE TABLE IF NOT EXISTS account_types (
-                    account_name TEXT PRIMARY KEY,
-                    account_type TEXT NOT NULL DEFAULT 'api'
-                );
-
-                -- Per-month plan economics, written on export:
-                -- subscription_cost = monthly price (only for months with usage)
-                -- virtual_cost = api-billed amount of all plan usage that month
-                CREATE TABLE IF NOT EXISTS proxy_plan_summary (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    month TEXT NOT NULL,
-                    account_name TEXT NOT NULL,
-                    subscription_cost REAL NOT NULL DEFAULT 0,
-                    virtual_cost REAL NOT NULL DEFAULT 0,
-                    UNIQUE(month, account_name)
-                );
-
-                """
-                + _TR_MP_INSERT + _TR_MP_UPDATE + _TR_MP_DELETE
-            )
-            conn.commit()
-        finally:
-            conn.close()
 
     # ── Upsert from parsed IR records ───────────────────────────────────
 

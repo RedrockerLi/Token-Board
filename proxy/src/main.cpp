@@ -21,10 +21,11 @@
 #include "upstream_client.h"
 #include "usage_tracker.h"
 
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <chrono>
+#include <filesystem>
 
 // Signal-safe flag for graceful shutdown
 static volatile sig_atomic_t g_shutdown = 0;
@@ -46,8 +47,17 @@ int main(int argc, char *argv[]) {
     printf("  Log:  %s\n\n", cfg.log_level.c_str());
 
     // ── Open database ─────────────────────────────────────────────────
+    if (cfg.schema_dir.empty()) {
+        // Derive the default migration dir from the DB path:
+        // data/proxy.db → data/../schema/proxy → schema/proxy
+        auto dbp = std::filesystem::path(cfg.db_path);
+        cfg.schema_dir = (dbp.parent_path() / ".." / "schema" / "proxy")
+                             .lexically_normal()
+                             .string();
+    }
+
     Database db;
-    if (!db.open(cfg.db_path)) {
+    if (!db.open(cfg.db_path, cfg.schema_dir)) {
         fprintf(stderr, "FATAL: Cannot open database\n");
         return 1;
     }
