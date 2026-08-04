@@ -105,6 +105,7 @@ async function saveAccount(e) {
         if (id) {
             const payload = {
                 name: data.name,
+                upstream_key: data.upstream_key,
                 base_url: data.base_url,
                 api_format: data.api_format,
                 endpoint_path: data.endpoint_path || '',
@@ -113,9 +114,6 @@ async function saveAccount(e) {
                 monthly_price: data.monthly_price || 0,
                 max_concurrency: data.max_concurrency || null,
             };
-            // Only send the key when the user typed one — an empty field
-            // means "keep the existing local key" (never wipe it).
-            if (data.upstream_key) payload.upstream_key = data.upstream_key;
             await proxyFetch(`/api/proxy/accounts/${id}`, {
                 method: 'PUT',
                 body: JSON.stringify(payload),
@@ -153,7 +151,7 @@ function editAccount(id) {
         if (!acc) return;
         const form = document.querySelector('#accountForm');
         form['name'].value = acc.name;
-        form['upstream_key'].value = '';  // never pre-fill the secret; empty = keep existing
+        form['upstream_key'].value = acc.upstream_key || '';
         form['base_url'].value = acc.base_url;
         form['api_format'].value = acc.api_format || 'openai';
         form['endpoint_path'].value = acc.endpoint_path || '';
@@ -247,7 +245,7 @@ function initAccountsPage() {
                 </div>
                 <form id="accountForm" onsubmit="saveAccount(event)" data-edit-id="">
                     <label>名称 <input name="name" required></label>
-                    <label>上游 API Key <input name="upstream_key" type="password" placeholder="仅存本机，不上传云端；留空=保持不变"></label>
+                    <label>上游 API Key <input name="upstream_key" placeholder="仅存本机，不上传云端；留空=保持不变"></label>
                     <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1"></label>
                     <label>API 格式
                         <select name="api_format">
