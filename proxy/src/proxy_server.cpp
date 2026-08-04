@@ -271,6 +271,46 @@ static void apply_body_model(std::string &body, const std::string &model) {
 /// for aggregate accounts — collect every entry matching the model as a
 /// candidate (priority = sort_order, id).  Plain accounts yield one
 /// candidate.  Returns an empty list when an aggregate has no match.
+/// Expand one real account into candidates — one per configured key slot
+/// (ordered by position,id) or a single legacy candidate using the account's
+/// upstream_key when it has no upstream_keys rows.  `model` is the model name
+/// forwarded upstream.
+static void push_account_candidates(Database &db,
+                                    std::vector<UpstreamCandidate> &cands,
+                                    const Database::AccountInfo &acct,
+                                    const std::string &model) {
+    auto keys = db.get_upstream_keys(acct.id);
+    if (keys.empty()) {
+        // Legacy single-key fallback: use the account's upstream_key as a
+        // single candidate.  Concurrency slot = -account_id (negative, unique
+        // per account — never collides with real upstream_keys.id which is
+        // always positive), so legacy accounts keep independent budgets.
+        UpstreamCandidate c;
+        c.account = acct;
+        c.key = acct.upstream_key;
+        c.key_slot_id = -acct.id;
+        c.upstream_model = model;
+        cands.push_back(std::move(c));
+    } else {
+        // One candidate per key slot, same account config, ordered by
+        // (position, id) so overflow follows a fixed fill order.
+        for (auto &k : keys) {
+            UpstreamCandidate c;
+            c.account = acct;          // keys share the account config
+            c.key = std::move(k.key_value);
+            c.key_slot_id = k.id;
+            c.upstream_model = model;
+            cands.push_back(std::move(c));
+        }
+    }
+}
+
+/// Resolve the effective upstream targets for a request: strip the Claude
+/// Code `[1m]`/`[1M]` context-window marker (upstreams reject it), then —
+/// for aggregate accounts — collect every entry matching the model, each
+/// member account expanded into its key slots (priority = sort_order, id).
+/// Plain accounts yield one candidate per key slot.  Returns an empty list
+/// when an aggregate has no match.
 static std::vector<UpstreamCandidate>
 resolve_candidates(Database &db, const Router::RouteResult &route,
                    std::string &model) {
@@ -288,36 +328,12 @@ resolve_candidates(Database &db, const Router::RouteResult &route,
             fprintf(stderr, "[Proxy] aggregate %d: %s → account %d (%s) model %s\n",
                     route.account_id, model.c_str(), acct->id, acct->name.c_str(),
                     e.upstream_model.c_str());
-            UpstreamCandidate c;
-            c.account = std::move(*acct);
-            c.upstream_model = e.upstream_model;
-            cands.push_back(std::move(c));
+            push_account_candidates(db, cands, *acct, e.upstream_model);
         }
     } else {
         auto acct = db.get_account(route.account_id);
         if (!acct.has_value() || acct->deleted) return cands;
-        auto keys = db.get_upstream_keys(route.account_id);
-        if (keys.empty()) {
-            // Legacy single-key fallback: use the account's upstream_key as a
-            // single candidate (key_slot_id = -1).
-            UpstreamCandidate c;
-            c.account = *acct;
-            c.key = acct->upstream_key;
-            c.key_slot_id = -1;
-            c.upstream_model = model;
-            cands.push_back(std::move(c));
-        } else {
-            // One candidate per key slot, same account config, ordered by
-            // (position, id) so overflow follows a fixed fill order.
-            for (auto &k : keys) {
-                UpstreamCandidate c;
-                c.account = *acct;          // keys share the account config
-                c.key = std::move(k.key_value);
-                c.key_slot_id = k.id;
-                c.upstream_model = model;
-                cands.push_back(std::move(c));
-            }
-        }
+        push_account_candidates(db, cands, *acct, model);
     }
     return cands;
 }
