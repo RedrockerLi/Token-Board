@@ -22,12 +22,14 @@ MODEL_ORDER = {
 class DashboardDatabase:
     """SQLite-backed storage for dashboard visualization data."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, schema_dir: str | None = None):
         self.db_path = db_path
         # Schema is owned by versioned migrations (schema/dashboard/*.sql);
         # apply once at construction. Fails fast (caller aborts) on error.
+        # schema_dir may be passed explicitly when db_path is a shadow/temp
+        # copy outside the standard data/ layout (schema_dir_for would mis-derive).
         from app.migrations import migrate, schema_dir_for
-        migrate(self.db_path, schema_dir_for(self.db_path, "dashboard"))
+        migrate(self.db_path, schema_dir or schema_dir_for(self.db_path, "dashboard"))
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=5)
@@ -37,116 +39,76 @@ class DashboardDatabase:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
-    # ── Upsert from parsed IR records ───────────────────────────────────
-
-    def upsert_from_ir(self, token_usages: list[TokenUsage],
-                       request_usages: list[RequestUsage],
-                       cost_entries: list[CostEntry]) -> int:
-        conn = self._connect()
-        total = 0
-        try:
-            for tu in token_usages:
-                conn.execute(
-                    """INSERT OR REPLACE INTO token_usage
-                       (date, model, api_key_name, token_type, amount, cost_group_key)
-                       VALUES (?,?,?,?,?,?)""",
-                    (tu.date, tu.model, tu.api_key_name,
-                     tu.token_type, tu.amount, tu.cost_group_key),
-                )
-                total += 1
-
-            for ru in request_usages:
-                conn.execute(
-                    """INSERT OR REPLACE INTO request_usage
-                       (date, model, api_key_name, count)
-                       VALUES (?,?,?,?)""",
-                    (ru.date, ru.model, ru.api_key_name, ru.count),
-                )
-                total += 1
-
-            for ce in cost_entries:
-                conn.execute(
-                    """INSERT OR REPLACE INTO cost_entry
-                       (date, model, cost, cost_group_key, source)
-                       VALUES (?,?,?,?,'csv')""",
-                    (ce.date, ce.model, ce.cost, ce.cost_group_key),
-                )
-                total += 1
-
-            conn.commit()
-        finally:
-            conn.close()
-        return total
+    # ── Proxy export writes (additive, exactly-once) ────────────────────
 
     def upsert_proxy_data(self, date: str, model: str,
                           account_name: str, prompt_tokens: int,
                           completion_tokens: int, cache_read_tokens: int,
                           request_count: int,
-                          cost: float = 0.0,
-                          account_type: str = "api") -> int:
+                          cost: float = 0.0) -> int:
         """Insert proxy usage data, including a frozen cost_entry row.
 
         cost is the per-request cost already computed by the proxy (frozen at
         write time, peak/valley-aware) summed over the exported period — it is
-        written straight into cost_entry(source='proxy') and never recomputed
-        from model_pricing.
+        written straight into cost_entry and never recomputed.
 
-        prompt_tokens is the total input (including cache hits), so the miss
-        bucket is prompt_tokens - cache_read_tokens and the hit bucket is
-        cache_read_tokens — the sum stays equal to the upstream input count.
-        account_type ('api'|'plan') is mirrored into account_types (plan
-        accounts get cost 0 in cost_entry, subscription + virtual cost live in
-        proxy_plan_summary).
+        Writes are ADDITIVE (ON CONFLICT ... DO UPDATE ... +=): each export
+        batch contributes exactly once, so partial/re-export never double-counts
+        and an older merge never regresses a value. token_usage buckets: miss =
+        prompt - cache_read, hit = cache_read (sum = upstream input count).
         """
         conn = self._connect()
         total = 0
         try:
-            if account_type not in ("api", "plan"):
-                account_type = "api"
-            conn.execute(
-                "INSERT OR REPLACE INTO account_types (account_name, account_type) "
-                "VALUES (?,?)",
-                (account_name, account_type),
-            )
             if completion_tokens > 0:
                 conn.execute(
-                    """INSERT OR REPLACE INTO token_usage
+                    """INSERT INTO token_usage
                        (date, model, api_key_name, token_type, amount, cost_group_key)
-                       VALUES (?,?,?,'output',?,?)""",
+                       VALUES (?,?,?,'output',?,?)
+                       ON CONFLICT(date, model, api_key_name, token_type, cost_group_key)
+                       DO UPDATE SET amount = token_usage.amount + excluded.amount""",
                     (date, model, account_name, completion_tokens, account_name),
                 )
                 total += 1
             if cache_read_tokens > 0:
                 conn.execute(
-                    """INSERT OR REPLACE INTO token_usage
+                    """INSERT INTO token_usage
                        (date, model, api_key_name, token_type, amount, cost_group_key)
-                       VALUES (?,?,?,'input_cache_hit',?,?)""",
+                       VALUES (?,?,?,'input_cache_hit',?,?)
+                       ON CONFLICT(date, model, api_key_name, token_type, cost_group_key)
+                       DO UPDATE SET amount = token_usage.amount + excluded.amount""",
                     (date, model, account_name, cache_read_tokens, account_name),
                 )
                 total += 1
             miss = max(prompt_tokens - cache_read_tokens, 0)
             if miss > 0:
                 conn.execute(
-                    """INSERT OR REPLACE INTO token_usage
+                    """INSERT INTO token_usage
                        (date, model, api_key_name, token_type, amount, cost_group_key)
-                       VALUES (?,?,?,'input_cache_miss',?,?)""",
+                       VALUES (?,?,?,'input_cache_miss',?,?)
+                       ON CONFLICT(date, model, api_key_name, token_type, cost_group_key)
+                       DO UPDATE SET amount = token_usage.amount + excluded.amount""",
                     (date, model, account_name, miss, account_name),
                 )
                 total += 1
             if request_count > 0:
                 conn.execute(
-                    """INSERT OR REPLACE INTO request_usage
+                    """INSERT INTO request_usage
                        (date, model, api_key_name, count)
-                       VALUES (?,?,?,?)""",
+                       VALUES (?,?,?,?)
+                       ON CONFLICT(date, model, api_key_name)
+                       DO UPDATE SET count = request_usage.count + excluded.count""",
                     (date, model, account_name, request_count),
                 )
                 total += 1
-            # Frozen cost: write directly (plan accounts already carry cost 0
-            # from the proxy, so cost_entry stays 0 for them).
+            # Frozen cost: additive (plan accounts already carry cost 0 from
+            # the proxy, so cost_entry stays 0 for them).
             conn.execute(
-                """INSERT OR REPLACE INTO cost_entry
-                   (date, model, cost, cost_group_key, source)
-                   VALUES (?,?,?,?,'proxy')""",
+                """INSERT INTO cost_entry
+                   (date, model, cost, cost_group_key)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(date, model, cost_group_key)
+                   DO UPDATE SET cost = cost_entry.cost + excluded.cost""",
                 (date, model, cost, account_name),
             )
             total += 1
@@ -155,31 +117,31 @@ class DashboardDatabase:
             conn.close()
         return total
 
-    def upsert_plan_summary(self, month: str, account_name: str,
-                            subscription_cost: float, virtual_cost: float):
-        """Record one plan account's monthly economics (used on export).
+    def accumulate_plan_summary(self, month: str, account_name: str,
+                                subscription_cost: float, virtual_cost: float,
+                                refresh_subscription: bool = False):
+        """Accumulate one plan account's monthly economics into the archive.
 
-        month is 'YYYY-MM'. subscription_cost is the plan's monthly price
-        (present only for months that actually used the plan); virtual_cost
-        is the api-billed amount of that usage.
+        virtual_cost is ADDED to the bucket: request_log rows are cleaned 30d
+        after export, so the archive can never be recomputed from logs — it
+        accumulates (each export batch contributes once). subscription_cost is
+        set on first write and refreshed ONLY while the month is still current
+        (refresh_subscription=True), so past months are frozen forever — price
+        edits affect only the current month.
         """
         conn = self._connect()
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO proxy_plan_summary "
-                "(month, account_name, subscription_cost, virtual_cost) "
-                "VALUES (?,?,?,?)",
-                (month, account_name, subscription_cost, virtual_cost),
+                """INSERT INTO proxy_plan_summary
+                   (month, account_name, subscription_cost, virtual_cost)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(month, account_name) DO UPDATE SET
+                     virtual_cost = proxy_plan_summary.virtual_cost + excluded.virtual_cost,
+                     subscription_cost = CASE WHEN ? THEN excluded.subscription_cost
+                                              ELSE proxy_plan_summary.subscription_cost END""",
+                (month, account_name, subscription_cost, virtual_cost,
+                 bool(refresh_subscription)),
             )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def clear_plan_summary(self):
-        """Remove all plan summary rows (called before a full rewrite)."""
-        conn = self._connect()
-        try:
-            conn.execute("DELETE FROM proxy_plan_summary")
             conn.commit()
         finally:
             conn.close()

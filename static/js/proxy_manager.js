@@ -167,15 +167,43 @@ function editAccount(id) {
     });
 }
 
+let _deleteAccountPendingId = null;
+
 async function deleteAccount(id, name) {
-    if (!confirm(`确定删除账户 "${name}"？\n\n如果有本地密钥关联此账户，删除将被拒绝。`)) return;
+    // Count local keys bound to this account.
+    let keys = [];
+    try { keys = await proxyFetch('/api/proxy/keys'); } catch (_) {}
+    const bound = keys.filter((k) => k.account_id === id).length;
+
+    if (bound === 0) {
+        if (!confirm(`确定删除账户 "${name}"？\n\n请求日志将保留（按账户名快照存档）。`)) return;
+        await _doDeleteAccount(id, 'detach');
+        return;
+    }
+    // Has bound keys → let the user choose cascade vs detach.
+    _deleteAccountPendingId = id;
+    document.getElementById('deleteAccountMsg').textContent =
+        `账户 "${name}" 有 ${bound} 个关联本地密钥，选择删除方式：`;
+    openModal('deleteAccountModal');
+}
+
+async function _doDeleteAccount(id, mode) {
     try {
-        await proxyFetch(`/api/proxy/accounts/${id}`, { method: 'DELETE' });
+        await proxyFetch(`/api/proxy/accounts/${id}?mode=${mode}`, { method: 'DELETE' });
         showToast('账户已删除');
+        closeModal('deleteAccountModal');
         loadAccountsTable();
     } catch (err) {
         showToast(err.message, 'error');
     }
+}
+
+function deleteAccountCascade() {
+    if (_deleteAccountPendingId != null) _doDeleteAccount(_deleteAccountPendingId, 'cascade');
+}
+
+function deleteAccountDetach() {
+    if (_deleteAccountPendingId != null) _doDeleteAccount(_deleteAccountPendingId, 'detach');
 }
 
 async function updateAccountModels(id, name) {
@@ -251,6 +279,19 @@ function initAccountsPage() {
                 </form>
             </div>
         </div>
+        <div class="modal-overlay" id="deleteAccountModal" style="display:none">
+            <div class="modal">
+                <div class="modal__header">
+                    <h3>删除账户</h3>
+                    <button class="modal__close" onclick="closeModal('deleteAccountModal')">&times;</button>
+                </div>
+                <div id="deleteAccountMsg" style="padding:10px 0;"></div>
+                <div style="display:flex; flex-direction:column; gap:8px;">
+                    <button class="btn" onclick="deleteAccountCascade()">级联删除密钥并删除账户</button>
+                    <button class="btn" style="color:#EF4444;" onclick="deleteAccountDetach()">仅解绑密钥（密钥需重新分配）</button>
+                </div>
+            </div>
+        </div>
     `;
     loadAccountsTable();
 }
@@ -271,7 +312,7 @@ async function loadKeysTable() {
             <tr>
                 <td><code class="key-display" title="${esc(k.key_value)}">${esc(k.key_masked)}</code> <button class="btn btn--sm" onclick="copyKey('${esc(k.key_value)}')">复制</button></td>
                 <td>${esc(k.label || '-')}</td>
-                <td>${esc(k.account_name || `ID:${k.account_id}`)}</td>
+                <td>${k.account_id == null ? '<span style="color:#9CA3AF;">未分配</span>' : esc(k.account_name || `ID:${k.account_id}`)}</td>
                 <td>${esc(k.last_used_at || '从未使用')}</td>
                 <td>${esc(k.created_at || '')}</td>
                 <td>
@@ -330,9 +371,11 @@ async function openEditKeyModal(id) {
         // Populate form
         document.getElementById('editKeyLabel').value = key.label || '';
         const accountSel = document.getElementById('editKeyAccount');
-        accountSel.innerHTML = accounts.map((a) =>
-            `<option value="${a.id}" ${a.id === key.account_id ? 'selected' : ''}>${esc(a.name)}</option>`
-        ).join('');
+        accountSel.innerHTML =
+            `<option value="" ${key.account_id == null ? 'selected' : ''}>未分配</option>` +
+            accounts.map((a) =>
+                `<option value="${a.id}" ${a.id === key.account_id ? 'selected' : ''}>${esc(a.name)}</option>`
+            ).join('');
 
         document.getElementById('editKeyId').value = id;
         openModal('editKeyModal');
@@ -346,7 +389,8 @@ async function saveKeyEdit(e) {
     const form = e.target;
     const id = form['id'].value;
     const label = form['label'].value;
-    const accountId = parseInt(form['account_id'].value);
+    const accountIdVal = form['account_id'].value;
+    const accountId = accountIdVal === '' ? null : parseInt(accountIdVal);
 
     try {
         const data = {};

@@ -144,11 +144,6 @@ fi
 command -v python3 &>/dev/null || { echo "[ERROR] python3 not found"; exit 1; }
 python3 -c "import flask" 2>/dev/null || pip install -q --disable-pip-version-check flask > /dev/null 2>&1
 
-# Import CSV files
-echo "[dash] 导入 CSV 文件..."
-cd "$SCRIPT_DIR"
-python3 -m app.import_csv --data-dir data --db "$SCRIPT_DIR/data/dashboard.db" 2>&1 || true
-
 # Find free port
 PORT=$(python3 -c "
 import socket

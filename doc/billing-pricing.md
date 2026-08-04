@@ -38,17 +38,22 @@
 `account_type = 'plan'` 的账户代表订阅套餐,调用本身不按量收费。计费规则:
 
 - `cost = 0`(真实成本),`virtual_cost` 按 api 口径公式算出——即"这笔流量不买套餐的话要花多少钱"。
-- 当月只要用过该 plan 账户,看板消费统计就计入一次 `monthly_price` 月费。
+- 主看板存档按「有用量的月份」计入一次 `monthly_price` 月费(历史月冻结);代理账单页(近 30 天滚动)
+  计当月用过该 plan 账户的当月月费。
 - plan 账户收到上游 HTTP 429 限流时,代理给该账户做 5 小时冷却,期间不再路由到它(见 [proxy-internals.md](proxy-internals.md))。
 
 `virtual_cost` 的意义是衡量套餐划不划算:实际花的钱是月费,虚拟消费是省下来的按量金额。
 
-## 看板上的三种消费口径
+## 看板上的消费口径
 
-数据来源有两路,费用不重复计算:CSV 导入的数据按 CSV 自带金额(`cost_entry.source='csv'`),代理导出的数据按 `request_log.cost` 聚合(`source='proxy'`)。
+数据来源:代理导出的数据按 `request_log.cost`(写时固化)聚合写入 `cost_entry`。CSV 导入已弃用,
+存量 CSV 数据已并入 DeepSeek 账户,`cost_entry` 不再有 `source` 列。
 
-- **总消费(真实)**:api/CSV 按量费用 + plan 月费(当月用过的 plan 各计一次;按用户筛选时只统计该用户关联的 plan 账户)。
+- **总消费(真实)**:api 按量费用 + plan 月费。主看板为存档全量口径;代理账单页为**近 30 天滚动**口径
+  (近30天 `SUM(cost)` + 当月用过的 plan 各计一次当月月费)。
 - **今日消费**:今日 api 按量 + 今日 plan 虚拟消费(`get_stats` 中 `SUM(cost + virtual_cost)` 限今日)。
-- **理论消费**:api/CSV 按量 + plan 虚拟消费,即完全不买 plan 全按 api 计费应花的金额;按用户筛选时只统计该用户的 plan 虚拟消费。
+- **理论消费**:api 按量 + plan 虚拟消费,即完全不买 plan 全按 api 计费应花的金额。
 
-`proxy_plan_summary` 表在导出时全量重写,记录每个 月×plan账户 的 `subscription_cost` 与 `virtual_cost`,`/api/summary` 据此返回 `plan_subscription_cost` 与 `plan_virtual_cost`,前端把月费加进总消费、把虚拟消费显示为"理论消费"。
+`proxy_plan_summary` 表在导出时按 月×plan账户 **增量持久化**:历史月一旦写入即冻结(改价不回溯),
+当月按当前 `monthly_price` 刷新。`/api/summary` 据此返回 `plan_subscription_cost` 与 `plan_virtual_cost`,
+前端把月费加进总消费、把虚拟消费显示为"理论消费"。日志导出 30 天后清理,存档不再重算。

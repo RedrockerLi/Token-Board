@@ -58,20 +58,16 @@ async function loadTodayUpstreamTable() {
 
 let billingChart = null;
 
-async function loadDailyBillingChart(year, month) {
+async function loadDailyBillingChart() {
     const dom = document.getElementById('chartBillingDaily');
     if (!dom) return;
 
-    if (!year || !month) {
-        dom.innerHTML = '<div class="loading" style="display:flex">请选择月份</div>';
-        return;
-    }
-
     try {
-        const data = await proxyFetch(`/api/proxy/billing/daily-by-model?year=${year}&month=${month}`);
+        // Rolling 30-day window (no month selection).
+        const data = await proxyFetch('/api/proxy/billing/daily-by-model?days=30');
 
         if (!data.length) {
-            dom.innerHTML = '<div class="loading" style="display:flex">该月暂无数据</div>';
+            dom.innerHTML = '<div class="loading" style="display:flex">近30天暂无数据</div>';
             return;
         }
 
@@ -137,37 +133,6 @@ async function loadDailyBillingChart(year, month) {
     }
 }
 
-function onBillingMonthChange() {
-    const sel = document.getElementById('billingMonthSelector');
-    if (!sel || !sel.value) return;
-    const [year, month] = sel.value.split('-').map(Number);
-    loadDailyBillingChart(year, month);
-}
-
-async function populateBillingMonthSelector() {
-    const sel = document.getElementById('billingMonthSelector');
-    if (!sel) return;
-    try {
-        const months = await proxyFetch('/api/proxy/billing/months');
-        sel.innerHTML = '<option value="">-- 选择月份 --</option>';
-        months.forEach((m) => {
-            const opt = document.createElement('option');
-            opt.value = m.year + '-' + m.month;
-            opt.textContent = m.year + ' - ' + m.month + '月';
-            sel.appendChild(opt);
-        });
-        // Auto-select latest month
-        if (months.length > 0) {
-            const latest = months[months.length - 1];
-            sel.value = latest.year + '-' + latest.month;
-            const [y, m] = [latest.year, latest.month];
-            loadDailyBillingChart(y, m);
-        }
-    } catch (err) {
-        console.error('Failed to load billing months:', err);
-    }
-}
-
 async function exportData() {
     const btn = document.getElementById('btnExport');
     btn.disabled = true;
@@ -201,17 +166,17 @@ function initBillingPage() {
         <!-- Stats Cards -->
         <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr);">
             <div class="stat-card stat-card--highlight">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#0070F3;"></span> 总Token</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#0070F3;"></span> 近30天 Token</div>
                 <div class="stat-card__value number-lg" id="billTotalTokens">--</div>
-                <div class="stat-card__sub">跨所有账户</div>
+                <div class="stat-card__sub">滚动窗口，含当前计划</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#8B5CF6;"></span> 总请求数</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#8B5CF6;"></span> 近30天请求数</div>
                 <div class="stat-card__value number-lg" id="billTotalRequests">--</div>
                 <div class="stat-card__sub">今日: <span id="billTodayRequests">--</span></div>
             </div>
             <div class="stat-card stat-card--cyan">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 总消费（实际）</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 近30天消费（实际）</div>
                 <div class="stat-card__value number-lg" id="billTotalCost">--</div>
                 <div class="stat-card__sub">今日消费（理论）: <span id="billTodayCost">--</span> · <span id="billActiveUpstreams">0</span> 个活跃上游</div>
             </div>
@@ -221,11 +186,8 @@ function initBillingPage() {
         <div class="section">
             <div class="chart-card">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                    <div class="chart-card__title" style="margin-bottom:0;">每日用量</div>
+                    <div class="chart-card__title" style="margin-bottom:0;">每日用量（近30天滚动）</div>
                     <div class="controls-group">
-                        <select class="select-styled" id="billingMonthSelector" onchange="onBillingMonthChange()">
-                            <option value="">-- 选择月份 --</option>
-                        </select>
                         <button class="btn btn--sm" id="btnExport" onclick="exportData()">导出数据</button>
                     </div>
                 </div>
@@ -247,7 +209,7 @@ function initBillingPage() {
 
     loadBillingStats();
     loadTodayUpstreamTable();
-    populateBillingMonthSelector();
+    loadDailyBillingChart();
 }
 
 // ── Logs Page ────────────────────────────────────────────────────────────

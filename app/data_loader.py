@@ -1,13 +1,10 @@
 """Data loading and the DataStore singleton.
 
-Scans the data/ directory for platform subdirectories, dispatches CSV
-parsing to the appropriate adapter, and stores everything as IR records.
+Loads the dashboard archive (dashboard.db) and stores everything as IR records.
 """
 
-import os
 from collections import defaultdict
 
-from app.adapters import get_adapter, list_platforms
 from app.ir import CostEntry, RequestUsage, TokenUsage
 
 
@@ -60,112 +57,13 @@ class DataStore:
     # ── public API ──────────────────────────────────────────────────────
 
     def load(self):
-        """Rebuild state from dashboard.db (preferred) or CSV files (fallback)."""
-        data_dir = self.data_dir
-
-        # Try dashboard database first
-        db_path = data_dir / "dashboard.db"  # data/dashboard.db
-        if db_path.exists():
-            self._load_from_db(str(db_path))
-            return
-
-        # Fallback: scan CSV files (legacy path)
-        if not data_dir.exists():
-            print(f"[WARN] Data directory not found: {data_dir}")
+        """Rebuild state from the dashboard archive (dashboard.db)."""
+        db_path = self.data_dir / "dashboard.db"
+        if not db_path.exists():
+            print(f"[WARN] Dashboard archive not found: {db_path}")
             self._commit([], [], [], [], [], [], [], [])
             return
-
-        token_usages: list[TokenUsage] = []
-        request_usages: list[RequestUsage] = []
-        cost_entries: list[CostEntry] = []
-        months_set: set[tuple[int, int]] = set()
-        api_key_names_set: set[str] = set()
-        models_set: set[str] = set()
-
-        # Each immediate subdirectory of data_dir = one platform
-        try:
-            for entry in sorted(data_dir.iterdir()):
-                if not entry.is_dir():
-                    continue
-                platform_name = entry.name
-                adapter = get_adapter(platform_name)
-                if adapter is None:
-                    print(f"[WARN] No adapter for platform '{platform_name}', "
-                          f"skipping directory '{entry}'")
-                    continue
-
-                # Walk the platform directory tree for CSV files
-                for root, _dirs, files in os.walk(entry):
-                    for fname in sorted(files):
-                        if not fname.endswith(".csv"):
-                            continue
-                        filepath = os.path.join(root, fname)
-
-                        tus, rus, ces, year, month = adapter.parse(filepath)
-                        if year == 0 or month == 0:
-                            continue  # filename didn't match expected pattern
-
-                        months_set.add((year, month))
-
-                        # Stamp source metadata on every record
-                        for rec in tus:
-                            rec._year = year
-                            rec._month = month
-                            api_key_names_set.add(rec.api_key_name)
-                            models_set.add(rec.model)
-                        for rec in rus:
-                            rec._year = year
-                            rec._month = month
-                            api_key_names_set.add(rec.api_key_name)
-                            models_set.add(rec.model)
-                        for rec in ces:
-                            rec._year = year
-                            rec._month = month
-
-                        token_usages.extend(tus)
-                        request_usages.extend(rus)
-                        cost_entries.extend(ces)
-
-        except OSError as e:
-            print(f"[ERROR] Failed to scan data directory: {e}")
-
-        # Sort months
-        sorted_months = sorted(months_set, key=lambda x: (x[0], x[1]))
-        available_months = [
-            {"year": y, "month": m, "label": f"{y}-{m:02d}"}
-            for y, m in sorted_months
-        ]
-
-        # User sort: most-recent call month desc → that month's call volume desc.
-        token_last_month: dict[str, int] = {}
-        token_month_vol: dict[str, int] = {}
-        request_last_month: dict[str, int] = {}
-        request_month_vol: dict[str, int] = {}
-        for tu in token_usages:
-            _track_recency(token_last_month, token_month_vol,
-                           tu.api_key_name, tu._year, tu._month, tu.amount)
-        for ru in request_usages:
-            _track_recency(request_last_month, request_month_vol,
-                           ru.api_key_name, ru._year, ru._month, ru.count)
-
-        def user_sort_key(name: str):
-            rym = request_last_month.get(name, -1)
-            tym = token_last_month.get(name, -1)
-            ym = rym if rym >= 0 else tym
-            vol = (request_month_vol.get(name, 0) if rym >= 0
-                   else token_month_vol.get(name, 0))
-            return (-ym, -vol, name.lower())
-
-        self._commit(
-            token_usages,
-            request_usages,
-            cost_entries,
-            available_months,
-            sorted(api_key_names_set, key=user_sort_key),
-            [],  # platforms no longer tracked
-            _sort_models(models_set),
-            [],  # plan_summary — CSV fallback has no proxy plan data
-        )
+        self._load_from_db(str(db_path))
 
     # ── helpers ─────────────────────────────────────────────────────────
 

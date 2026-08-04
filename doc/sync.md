@@ -7,7 +7,7 @@
 上传的内容:
 
 - 配置表(`CONFIG_TABLES`):`upstream_accounts`、`local_keys`、`model_pricing`、`pricing_slots`、`account_models`、`aggregate_entries`。
-- dashboard 聚合数据:`token_usage`、`request_usage`、`cost_entry`、`model_pricing`、`pricing_slots`、`account_types`、`proxy_plan_summary`。
+- dashboard 存档(纯用量+总价,无价格表):`token_usage`、`request_usage`、`cost_entry`、`proxy_plan_summary`。
 
 绝不上传的内容:
 
@@ -22,30 +22,36 @@
 
 写入先经过 SQLite backup API 做一致性快照(`wal_checkpoint(TRUNCATE)` 后再 `backup`),保证 WAL 里的数据不丢。
 
-## 三态 exported 标记
+## 高水位提交检查点
 
-`request_log.exported` 是导出状态机,配合导出流水线保证"不重不漏":
+`request_log.exported` 三态标记已废弃。同步进度用一个**单值提交检查点**跟踪:`proxy.db` 的
+`sync_state.last_exported_log_id` —— 记录「最近一次**完整成功**的拉取-导出-上传事务把 request_log
+导出到了哪一行」。它只有两种语义:一行要么「已计入存档」(id ≤ 检查点),要么「未计入」(id > 检查点),
+**没有逐行标记、没有中间态**。
 
-- `0`:未导出。导出后置为 1。
-- `1`:已写入 dashboard 但云端上传未确认。上传失败时保持 1,下次同步重新导出(幂等,`INSERT OR REPLACE`)。
-- `2`:云端上传已确认。此后只参与清理,不再导出。
+- 检查点只在上传成功后推进(事务提交点);任一步失败 → 检查点保持原值 → 相当于回滚,下次重新导出这些行。
+- 清理规则:`cleanup_exported_logs` 只删 `id ≤ 检查点 且 请求时间超过 30 天` 的行;未计入存档的行永久保留。
 
-清理规则:`cleanup_exported_logs` 只删 `exported=2` 中最旧的记录,保留最新 1 万条;`exported` 为 0 或 1 的绝不删除。
+## 导出流水线(云端权威事务)
 
-## 导出流水线
+`POST /api/proxy/export` 触发 `sync_dashboard(proxy_db_path, dash_db_path)`,完整流程是一个事务:
 
-`POST /api/proxy/export` 触发 `sync_dashboard(proxy_db_path, dash_db_path)`,完整流程:
+1. **拉取**:下载云端最新的 `dashboard_sync_*.db` 到临时**影子库**;无云端文件(首次同步)→ 以当前本地
+   dashboard.db 为种子上传,保留历史基线。
+2. **对齐 schema**:对影子库应用 dashboard 迁移(云端可能是旧版本)。
+3. **导出**:`export_to_dashboard(shadow, mark, max_id)` 把 `request_log` 中 `id ∈ (mark, max_id]` 的行
+   按 日×账户名×模型 增量聚合写入影子库(`token_usage`/`request_usage`/`cost_entry`),并把 plan 订阅费
+   按月持久化到 `proxy_plan_summary`(历史月冻结、当月按当前月费刷新)。`max_id` 取导出开始时的最大值,
+   期间的并发新行留待下次。聚合时排除 model 为空或 `unknown` 的行。
+4. **上传**:把影子库上传云端(时间戳文件名)。
+5. **提交**(仅在上传成功后):推进 `last_exported_log_id = max_id`;用影子库替换本地 dashboard.db;
+   清理超 30 天的已导出日志行。
 
-1. 从云端下载最新的 `dashboard_sync_*.db` 到临时目录。
-2. 有远端文件就 `_merge_dashboard` 合并进本地 `dashboard.db`:按表 `INSERT OR REPLACE`,远端覆盖本地。合并用的列集合与 dashboard 各表的唯一键对齐。
-3. `export_to_dashboard(mark_exported=False)` 把 `request_log` 中 `exported IN (0,1)` 的行按 日×账户×模型 聚合,写入 `token_usage` / `request_usage` / `cost_entry(source='proxy')`,并镜像 `account_types`,全量重写 `proxy_plan_summary`。聚合时排除 model 为空或 `unknown` 的行。此步不推进 exported 标记,只做聚合。
-4. 清理旧日志(`cleanup_exported_logs`,保留最新 1 万条已确认上传的)。
-5. 把合并后的 `dashboard.db` 快照上传云端(时间戳文件名)。
-6. 上传成功后 `mark_uploaded()` 把 `exported` 从 1 推进到 2。
+任何一步失败 → 删除影子库,本地 dashboard.db / 检查点 / 云端**全部不变**。因此:
 
-这样一台机器的失败上传不会丢数据:它的行停在 1,下次同步从云端拉回其他机器已合并的数据后再补导出。`mark_exported=False` 的原因是云端确认必须发生在本地写入与云端上传都成功之后。
-
-`export_to_dashboard` 单独调用时(`app/proxy_db.py` 直接调用,`mark_exported=True`)会把 0 推进到 1,不碰云端。
+- **云端永远是最新版本**,每台机器的本地 dashboard.db 永远是云端的一个历史版本;
+- 上传失败不会丢数据(检查点不动,下次整库重传);不重算、不双计;
+- 多机同步要求非并发(两机同时 pull-push 时时间戳文件 last-wins,后上传者覆盖先上传者本批)。
 
 ## 配置同步
 

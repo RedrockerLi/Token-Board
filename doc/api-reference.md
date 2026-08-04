@@ -85,10 +85,10 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/proxy/billing` | GET | 按 账户×模型×日 聚合的账单(参数 `account_id`、`from`、`to`) |
-| `/api/proxy/billing/daily` | GET | 指定月每日账单(参数 `year`、`month`) |
-| `/api/proxy/billing/daily-by-model` | GET | 指定月每日 输入/输出/缓存命中 token 分解(堆叠柱状图用) |
-| `/api/proxy/billing/months` | GET | 有数据的月份列表 |
+| `/api/proxy/billing` | GET | 按 账户×模型×日 聚合的账单(默认近 30 天,参数 `account_id`、`from`、`to`、`days`) |
+| `/api/proxy/billing/daily` | GET | 近 `days` 天(默认 30)每日账单,滚动窗口 |
+| `/api/proxy/billing/daily-by-model` | GET | 近 `days` 天每日 输入/输出/缓存命中 token 分解(堆叠柱状图用) |
+| `/api/proxy/billing/recent-days` | GET | 近 `days` 天有数据的日期列表 |
 | `/api/proxy/billing/today-upstreams` | GET | 今日各真实上游的 真实/理论费用、token、请求数 |
 | `/api/proxy/logs` | GET | 分页请求日志(参数 `page`、`per_page`、`account_id`、`model`、`from`、`to`) |
 
@@ -96,7 +96,7 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/proxy/export` | POST | 导出流水线:拉取云端 → 合并 → 导出本地新用量 → 上传 → 确认(见 [sync.md](sync.md)) |
+| `/api/proxy/export` | POST | 导出事务:拉取云端 → 导出本地新用量 → 上传 → 成功后推进检查点并替换本地存档(见 [sync.md](sync.md)) |
 | `/api/proxy/sync/config` | GET | 读取 WebDAV 配置(密码脱敏) |
 | `/api/proxy/sync/config` | PUT | 保存 WebDAV 配置 |
 | `/api/proxy/sync/test` | POST | 测试 WebDAV 连接 |
@@ -133,5 +133,3 @@
 |------|------|------|
 | `--port` | 是 | 监听端口 |
 | `--proxy-db` | 否 | 传入 `data/proxy.db` 时启用代理管理功能与云端配置拉取 |
-
-CSV 导入: `python3 -m app.import_csv --data-dir data --db data/dashboard.db`。

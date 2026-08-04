@@ -39,14 +39,12 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 │   ├── routes.py           数据看板蓝图(/、/api/*)
 │   ├── proxy_routes.py     代理管理蓝图(/api/proxy/*)
 │   ├── proxy_db.py         proxy.db 的 Python 访问层(CRUD/计费/导出/性能)
-│   ├── dashboard_db.py     dashboard.db 访问层(upsert / 载入 IR)
-│   ├── data_loader.py      DataStore 单例:优先读 dashboard.db,回退扫 CSV
-│   ├── sync.py             WebDAV 同步(配置上传/下载、dashboard 全量同步)
+│   ├── dashboard_db.py     dashboard.db 访问层(增量 upsert / 载入 IR)
+│   ├── data_loader.py      DataStore 单例:读 dashboard.db 存档
+│   ├── sync.py             WebDAV 同步(配置上传/下载、dashboard 云端权威事务)
 │   ├── migrations.py       Python 侧迁移 runner
 │   ├── cost_allocator.py   按 Token 占比分摊成本
-│   ├── ir.py               平台无关 IR 数据类(TokenUsage/RequestUsage/CostEntry)
-│   ├── import_csv.py       CSV 导入 CLI(python3 -m app.import_csv)
-│   └── adapters/           CSV 平台适配器(deepseek / mimo,自注册)
+│   └── ir.py               平台无关 IR 数据类(TokenUsage/RequestUsage/CostEntry)
 ├── proxy/                  C++17 代理(CMake 工程)
 │   ├── CMakeLists.txt      构建(OpenSSL + Threads,vendored sqlite3/httplib/json)
 │   └── src/
@@ -79,9 +77,9 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 
 请求进来先走代理这一路。客户端密钥经 `Router::route` 找到上游账户,请求按客户端 URL 路径识别格式,与上游格式不同时经 IR 编解码转换(见 [format-conversion.md](format-conversion.md)),随后由 `UpstreamClient` 转发。每次请求的结果写进 `proxy.db` 的 `request_log`(计费)与 `perf_events`(性能),流式响应实时透传。
 
-看板这一路负责把 `proxy.db` 变成可读的图。配置(账户、密钥、定价)直接由看板写 `proxy.db`,代理下个请求自动读到新配置,路由缓存最长 60 秒。用量数据不走实时:看板导出流水线把 `request_log` 按 日×账户×模型 聚合写进 `dashboard.db`,再把 `dashboard.db` 全量同步到 WebDAV(见 [sync.md](sync.md))。`DataStore` 启动时读 `dashboard.db`,数据看板页面全部基于它渲染。
+看板这一路负责把 `proxy.db` 变成可读的图。配置(账户、密钥、定价)直接由看板写 `proxy.db`,代理下个请求自动读到新配置,路由缓存最长 60 秒。用量数据不走实时:看板导出事务把 `request_log` 按 日×账户名×模型 增量聚合写进 `dashboard.db` 存档,再以「云端权威」模型同步到 WebDAV(见 [sync.md](sync.md))。`DataStore` 启动时读 `dashboard.db`,数据看板页面全部基于它渲染。
 
-CSV 导入是另一条数据源:把平台导出的 CSV 放进 `data/<platform>/`,由 `import_csv` 解析成 IR 后 upsert 进 `dashboard.db`,与代理导出的数据并存。两路数据的费用在 `cost_entry` 里用 `source` 字段区分(proxy / csv),互不重复计费。
+dashboard.db 是**纯存档**:只存用量与总价,无价格表、无重算能力;`cost_entry` 一旦写入不再受改价影响。
 
 ## 关键设计决策
 
@@ -91,7 +89,7 @@ CSV 导入是另一条数据源:把平台导出的 CSV 放进 `data/<platform>/`
 
 **格式转换收敛到 IR。** 三种线格式的编解码统一到 `ir.h` 的中间表示:`parse(harness) → IR → serialize(upstream)`。同格式走透传快速路径,不经过 IR;客户端格式由请求 URL 路径识别,密钥不绑定格式(见 [format-conversion.md](format-conversion.md))。
 
-**request_log 明细绝不上传云端。** 多机同步只同步聚合后的 `dashboard.db` 和配置表,`request_log` 用三态 exported 标记保证导出不重不漏,云端上传成功后才确认(见 [sync.md](sync.md))。
+**request_log 明细绝不上传云端。** 多机同步只同步聚合后的 `dashboard.db` 和配置表;导出进度用一个单值检查点(`sync_state.last_exported_log_id`)跟踪,拉取-导出-上传是一个完整事务,失败即回滚(见 [sync.md](sync.md))。
 
 **schema 单一 DDL 来源。** 两库的全部 DDL 收敛到 `schema/<库>/NNNN_*.sql`,C++ 与 Python 共用同一份文件与同一套迁移协议,任何进程都能初始化或升级库(见 [database-migrations.md](database-migrations.md))。
 

@@ -52,7 +52,11 @@ def update_account(account_id):
 
 @bp_proxy.route("/accounts/<int:account_id>", methods=["DELETE"])
 def delete_account(account_id):
-    result = _proxy_db().delete_account(account_id)
+    # mode: "detach" (default) = unbind keys (account_id → NULL); "cascade" = delete keys too.
+    mode = request.args.get("mode", "detach")
+    if mode not in ("detach", "cascade"):
+        return jsonify({"error": "mode must be 'detach' or 'cascade'"}), 400
+    result = _proxy_db().delete_account(account_id, mode=mode)
     if not result["ok"]:
         return jsonify({"error": result["error"] or "Account not found"}), 400
     return jsonify({"status": "ok"})
@@ -276,32 +280,28 @@ def billing_summary():
     account_id = request.args.get("account_id", type=int)
     date_from = request.args.get("from")
     date_to = request.args.get("to")
+    days = request.args.get("days", type=int, default=30)
     return jsonify(
-        _proxy_db().get_billing_summary(account_id, date_from, date_to)
+        _proxy_db().get_billing_summary(account_id, date_from, date_to, days=days)
     )
 
 
 @bp_proxy.route("/billing/daily")
 def daily_billing():
-    year = request.args.get("year", type=int)
-    month = request.args.get("month", type=int)
-    if not year or not month:
-        return jsonify({"error": "year and month are required"}), 400
-    return jsonify(_proxy_db().get_daily_billing(year, month))
+    days = request.args.get("days", type=int, default=30)
+    return jsonify(_proxy_db().get_daily_billing(days))
 
 
 @bp_proxy.route("/billing/daily-by-model")
 def daily_billing_by_model():
-    year = request.args.get("year", type=int)
-    month = request.args.get("month", type=int)
-    if not year or not month:
-        return jsonify({"error": "year and month are required"}), 400
-    return jsonify(_proxy_db().get_daily_billing_by_model(year, month))
+    days = request.args.get("days", type=int, default=30)
+    return jsonify(_proxy_db().get_daily_billing_by_model(days))
 
 
-@bp_proxy.route("/billing/months")
-def proxy_months():
-    return jsonify(_proxy_db().get_available_proxy_months())
+@bp_proxy.route("/billing/recent-days")
+def recent_billing_days():
+    days = request.args.get("days", type=int, default=30)
+    return jsonify(_proxy_db().get_recent_billing_days(days))
 
 
 @bp_proxy.route("/billing/today-upstreams")

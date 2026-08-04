@@ -6,7 +6,7 @@
 
 ## proxy.db
 
-代理的运行库,表定义在 `schema/proxy/0001_initial.sql`,`user_version` 当前为 2。
+代理的运行库,表定义在 `schema/proxy/0001_*.sql`(0001–0004),`user_version` 当前为 4。
 
 ### upstream_accounts — 上游账户
 
@@ -27,7 +27,7 @@
 
 ### local_keys — 本地密钥
 
-客户端用 `tb-` + 32 位 hex 的密钥访问代理,一把密钥绑定一个上游账户。删除密钥时 `request_log.local_key_id` 经 `ON DELETE SET NULL` 保留,历史计费不丢。密钥只在此表存明文,看板 API 返回时打码(前 6 后 4)。
+客户端用 `tb-` + 32 位 hex 的密钥访问代理,一把密钥绑定一个上游账户。`account_id` 可空:删除账户时选「仅解绑」会让密钥的 `account_id` 置 NULL(前端显示"未分配",需重新选择);选「级联删除」则密钥随账户删除。删除密钥时 `request_log.local_key_id` 经 `ON DELETE SET NULL` 保留,历史计费不丢。密钥只在此表存明文,看板 API 返回时打码(前 6 后 4)。
 
 ### request_log — 请求日志与计费载体
 
@@ -35,7 +35,8 @@
 
 | 字段 | 说明 |
 |------|------|
-| `account_id` / `local_key_id` | 用了哪个账户、哪把密钥 |
+| `account_id` / `local_key_id` | 用了哪个账户、哪把密钥;账户删除后 `account_id` 经 `ON DELETE SET NULL` 置空,行保留 |
+| `account_name` / `account_type` / `is_aggregate` | 写入时的账户快照——账户删除后仍可按名字归档/展示/计费 |
 | `model` | 实际调用的模型名(聚合账户为上游模型名) |
 | `prompt_tokens` | 总输入,含缓存命中 |
 | `completion_tokens` | 输出 |
@@ -43,13 +44,12 @@
 | `total_tokens` | 输入 + 输出 |
 | `cost` | 真实成本,由触发器写时计价固化 |
 | `virtual_cost` | plan 账户的虚拟 api 口径金额;api 账户为 0 |
-| `exported` | 三态:0 未导出 / 1 已导出待上传 / 2 已确认上传 |
 | `is_streaming` / `status_code` / `duration_ms` | 流式与否、状态码、耗时 |
 | `requested_at` | UTC 时间 |
 
-索引:`idx_rl_account`、`idx_rl_time`、`idx_rl_exported`。
+索引:`idx_rl_account`、`idx_rl_time`。
 
-计费触发器 `tr_request_log_insert`(0002 版本)在插入时按"当前定价 × 命中时段倍率"计算 `cost` / `virtual_cost` 并固化,公式:
+计费触发器 `tr_request_log_insert`(0004 版本)在插入时先写账户快照(每行,含 0 token 行),再按"当前定价 × 命中时段倍率"计算 `cost` / `virtual_cost` 固化,公式:
 
 ```
 cost = (miss/1e6) × input_price
@@ -58,13 +58,19 @@ cost = (miss/1e6) × input_price
      ,再乘以 requested_at 命中 pricing_slots 档位的 multiplier(无命中=1.0)
 ```
 
-模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY mp.id LIMIT 1`,即第一条匹配生效,`reorder_pricing` 交换 `model_pricing.id` 来改变匹配优先级。plan 账户 `cost=0`,`virtual_cost` 按上面公式算出;api 账户反之。`prompt_tokens + completion_tokens = 0` 的行不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
+模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY mp.id LIMIT 1`,即第一条匹配生效,`reorder_pricing` 交换 `model_pricing.id` 来改变匹配优先级。plan 账户 `cost=0`,`virtual_cost` 按上面公式算出;api 账户反之。`prompt_tokens + completion_tokens = 0` 的行只写快照、不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
 
-清理规则:`cleanup_exported_logs` 只删 `exported=2` 中最旧的行,保留最新 1 万条;`exported` 为 0 或 1 的绝不删除(仍待导出或待确认)。
+清理规则:同步进度由 `sync_state.last_exported_log_id` 单值提交检查点记录(无逐行 exported 标记)。
+`cleanup_exported_logs` 只删 `id ≤ 检查点 且 请求时间超过 30 天` 的行;未计入存档的行永久保留。
+检查点只在上传成功后推进,失败即回滚——见 [sync.md](sync.md)。
+
+### sync_state — 同步检查点
+
+key/value 表,存 `last_exported_log_id`:最近一次**完整成功**的拉取-导出-上传事务导出的最大 `request_log.id`。
 
 ### model_pricing 与 pricing_slots — 定价
 
-`model_pricing` 每行一个 `model_pattern`(支持 `*` / `?` GLOB 通配),含 `input_price` / `output_price` / `cache_read_price`(缺省回落 input_price),单位元/百万 tokens。`pricing_slots` 给每个定价挂若干"当日时段×倍率"档位,`start_minute` / `end_minute` 是 UTC+0 当日分钟 `[0,1439]`,end 独占,`start > end` 表示跨午夜。档位删除随定价 `ON DELETE CASCADE`。
+`model_pricing` 每行一个 `model_pattern`(支持 `*` / `?` GLOB 通配),含 `input_price` / `output_price` / `cache_read_price`(缺省回落 input_price),单位元/百万 tokens。`pricing_slots` 给每个定价挂若干"当日时段×倍率"档位,`start_minute` / `end_minute` 是 UTC+0 当日分钟 `[0,1439]`,end 独占,`start > end` 表示跨午夜。档位删除随定价 `ON DELETE CASCADE`。价格表无状态——只存当前值,改价只影响之后写入的请求与当月 plan 订阅。
 
 ### account_models — 账户模型目录
 
@@ -84,7 +90,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。�
 
 ## dashboard.db
 
-可视化库,表定义在 `schema/dashboard/0001_initial.sql`。日粒度聚合,`(date, model, api_key_name, ...)` 上建唯一索引,`INSERT OR REPLACE` 保证重跑幂等。
+可视化**存档**库,表定义在 `schema/dashboard/0001_*.sql`(0001–0003),`user_version` 当前为 3。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
 ### token_usage / request_usage
 
@@ -92,15 +98,15 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。�
 
 ### cost_entry
 
-`(date, model, cost, cost_group_key)` + `source`(`proxy` / `csv`)。代理导出的费用在这里按 `request_log.cost` 聚合固化;CSV 导入的费用按 CSV 自带金额写入。同一 `(date, model, cost_group_key)` 上有 csv 行时,proxy 行不再计入,保证两套价格互不重复。
+`(date, model, cost, cost_group_key)`。代理导出的费用在这里按 `request_log.cost` 聚合固化,一旦写入不再重算。CSV 导入已弃用,存量 CSV 数据已并入 DeepSeek 账户。
 
-### account_types / proxy_plan_summary
+### proxy_plan_summary
 
-`account_types` 镜像 `upstream_accounts.account_type`,导出时写入,plan 账户在 `cost_entry` 里记 0。`proxy_plan_summary` 每月每 plan 账户一行:`subscription_cost`(当月有使用才计一次月费)、`virtual_cost`(当月该 plan 的 api 口径金额),导出时全量重写。
+每月每 plan 账户一行:`subscription_cost`(当月有使用才计一次月费)、`virtual_cost`(当月该 plan 的 api 口径金额)。导出时**增量持久化**:历史月一旦写入即冻结(改价不回溯),当月按当前 `monthly_price` 刷新;日志清理后存档不再重算。
 
-### model_pricing / pricing_slots
+### model_pricing / pricing_slots / account_types
 
-与 proxy.db 结构一致,导出时整表替换,用于多机配置镜像。`0002` 迁移删掉了 `tr_mp_refresh_*` 触发器——本库的 `cost_entry` 不再由触发器重算,历史行按迁移时的当前基础价回填一次,之后由导出链路给出精确成本。
+已删除(`0003` 迁移)。dashboard 不保留任何价格/账户类型镜像。
 
 ## 连接约定
 

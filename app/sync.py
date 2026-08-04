@@ -2,10 +2,14 @@
 
 Syncs:
   - Config tables (upstream_accounts, local_keys, model_pricing, etc.)
-  - Dashboard database (token_usage, request_usage, model_pricing, cost_entry)
+  - Dashboard archive (token_usage, request_usage, cost_entry, proxy_plan_summary)
 
-request_log is NOT synced — it is local-only, with an exported flag to track
-which rows have been exported to the dashboard database.
+request_log is NOT synced — it is local-only. Dashboard sync is a
+pull-export-upload transaction: **cloud is always the latest; every machine's
+local dashboard.db is always a historical version of the cloud**. Progress is
+tracked by a single high-water mark (sync_state.last_exported_log_id) that is
+advanced only AFTER a successful upload — any failed step rolls back by
+discarding the shadow db (no partial state, no per-row markers).
 """
 
 import os
@@ -358,61 +362,21 @@ def sync_config_download(db_path: str) -> bool:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-# ── Dashboard merge helper ──────────────────────────────────────────────
-
-def _merge_dashboard(remote_path: str, local_path: str):
-    """Copy remote dashboard rows into local via INSERT OR REPLACE.
-
-    Remote data overwrites local — the cloud copy is the authoritative
-    merged state from all machines. Any local data not yet in the remote
-    (because a previous upload failed) will be restored by the subsequent
-    export step, since those request_log rows still have exported=0.
-    """
-
-    TABLES = {
-        "token_usage": ["date", "model", "api_key_name", "token_type", "amount", "cost_group_key"],
-        "request_usage": ["date", "model", "api_key_name", "count"],
-        "cost_entry": ["date", "model", "cost", "cost_group_key", "source"],
-        "model_pricing": ["id", "model_pattern", "input_price", "output_price",
-                          "cache_read_price", "currency"],
-        "pricing_slots": ["id", "pricing_id", "start_minute", "end_minute",
-                          "multiplier"],
-        "account_types": ["account_name", "account_type"],
-        "proxy_plan_summary": ["month", "account_name", "subscription_cost", "virtual_cost"],
-    }
-
-    remote_conn = sqlite3.connect(remote_path)
-    local_conn = sqlite3.connect(local_path, timeout=10)
-    local_conn.execute("PRAGMA busy_timeout=5000")
-    try:
-        for table, cols in TABLES.items():
-            try:
-                cols_s = ", ".join(cols)
-                phs = ", ".join(["?"] * len(cols))
-                rows = remote_conn.execute(f"SELECT {cols_s} FROM {table}").fetchall()
-                for row in rows:
-                    local_conn.execute(
-                        f"INSERT OR REPLACE INTO {table} ({cols_s}) VALUES ({phs})", row
-                    )
-            except sqlite3.OperationalError:
-                pass
-        local_conn.commit()
-    finally:
-        local_conn.close()
-        remote_conn.close()
-
-
-# ── Dashboard DB sync ────────────────────────────────────────────────────
+# ── Dashboard archive sync (cloud-authoritative transaction) ──────────────
 
 def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
-    """Sync the dashboard database via WebDAV.
+    """Sync the dashboard archive via WebDAV — one atomic transaction.
 
-    Flow: download remote → export new local data → upload merged result.
-    Multi-machine safe when machines are not concurrent (pull-modify-push).
+    Flow: pull (cloud → shadow) → export (request_log → shadow) →
+    upload (shadow → cloud) → commit (advance mark, replace local, cleanup).
+
+    Cloud is always the latest; local is a historical version of the cloud.
+    If any step fails the shadow is discarded and nothing changes — a failed
+    upload never advances the high-water mark, so nothing is ever lost.
 
     Args:
-        proxy_db_path: Path to proxy.db (contains WebDAV config).
-        dash_db_path: Path to dashboard.db (the data to sync).
+        proxy_db_path: Path to proxy.db (WebDAV config + request_log).
+        dash_db_path: Path to dashboard.db (the local archive to replace).
     """
     project_root = Path(dash_db_path).resolve().parent
     tmp_dir = project_root / "tmp_dash"
@@ -423,33 +387,38 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
         return {"status": "error", "message": "未配置同步服务器"}
 
     try:
-        # 1. Download latest remote dashboard.db to temp (pick most recent by timestamp)
-        remote_path = str(tmp_dir / "dash_remote.db")
-        has_remote = _download_latest(config, remote_path, base="dashboard_sync")
+        # 1. Pull: download latest cloud archive into the shadow. No cloud file
+        #    yet (first sync) → seed the shadow from the current local archive
+        #    so the historical baseline is preserved.
+        shadow_path = str(tmp_dir / "dash_shadow.db")
+        has_remote = _download_latest(config, shadow_path, base="dashboard_sync")
+        if not has_remote and os.path.exists(dash_db_path):
+            _safe_copy_db(dash_db_path, shadow_path)
 
-        # 2. Merge remote → local
-        if has_remote:
-            _merge_dashboard(remote_path, dash_db_path)
-            print(f"[Sync] Dashboard: merged latest from cloud", flush=True)
+        # 2. Bring the shadow up to the current schema (cloud may be older).
+        from app.migrations import migrate, schema_dir_for
+        migrate(shadow_path, schema_dir_for(dash_db_path, "dashboard"))
 
-        # 3. Export unexported request_log → dashboard (syncs model_pricing too)
+        # 3. Export: request_log rows in (mark, max_id] → shadow, additively.
         from app.proxy_db import ProxyDatabase
         proxy_db = ProxyDatabase(proxy_db_path)
-        export_result = proxy_db.export_to_dashboard(mark_exported=False)
+        mark = proxy_db.get_export_mark()
+        max_id = proxy_db.get_max_log_id()
+        export_result = proxy_db.export_to_dashboard(shadow_path, mark, max_id)
 
-        # 4. Cleanup old exported request_log rows
-        cleaned = proxy_db.cleanup_exported_logs(max_exported=10000)
-        if cleaned > 0:
-            print(f"[Sync] Cleaned up {cleaned} old exported request_log rows", flush=True)
-
-        # 5. Upload merged dashboard.db to cloud with timestamp
-        upload_path = str(tmp_dir / "dash_upload.db")
-        _safe_copy_db(dash_db_path, upload_path)
-        _webdav_upload(config, upload_path,
+        # 4. Upload the shadow → cloud (cloud is always the latest).
+        _webdav_upload(config, shadow_path,
                        remote_filename=_make_timestamped_name("dashboard_sync.db"))
 
-        # 6. Upload succeeded — confirm: exported 1→2
-        proxy_db.mark_uploaded()
+        # 5. COMMIT — upload succeeded:
+        #    a. advance the high-water mark (these rows are confirmed on cloud);
+        #    b. replace the local archive with the shadow;
+        #    c. clean up archived rows older than 30 days.
+        proxy_db.set_export_mark(max_id)
+        _safe_copy_db(shadow_path, dash_db_path)
+        cleaned = proxy_db.cleanup_exported_logs(max_id)
+        if cleaned > 0:
+            print(f"[Sync] Cleaned up {cleaned} archived request_log rows", flush=True)
 
         upload_count = _count_dashboard_rows(dash_db_path)
         msg = (

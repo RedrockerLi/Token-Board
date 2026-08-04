@@ -29,11 +29,6 @@ if [ -n "$EXISTING_PID" ]; then
     kill -9 $EXISTING_PID 2>/dev/null || true
 fi
 
-# ── Import CSV files into dashboard DB ──
-cd "$SCRIPT_DIR"
-echo "[INFO] 导入 CSV 文件到仪表板数据库..."
-python3 -m app.import_csv --data-dir data --db "$SCRIPT_DIR/data/dashboard.db" 2>&1 || true
-
 # ── Find a free port ──
 PORT=$(python3 -c "
 import socket
