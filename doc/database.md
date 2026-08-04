@@ -6,16 +6,18 @@
 
 ## proxy.db
 
-代理的运行库,表定义在 `schema/proxy/0001_*.sql`(0001–0004),`user_version` 当前为 4。
+代理的运行库,表定义在 `schema/proxy/0001_*.sql`(0001–0006),`user_version` 当前为 6。
 
 ### upstream_accounts — 上游账户
 
-一个上游账户对应一个真实 API 服务端(或一个聚合账户)。
+一个上游账户对应一个真实 API 服务端(或一个聚合账户)。**`id` 是账户身份(自增主键、永不回收),`name` 只是可改属性**——改名不破坏任何引用,一切按 `id` 关联。
 
 | 字段 | 说明 |
 |------|------|
-| `name` | 账户名,唯一 |
+| `id` | 主键,递增身份,永不回收 |
+| `name` | 账户名,唯一,可随意改 |
 | `upstream_key` | 上游 API Key |
+| `deleted_at` | 软删除标记:非空 = 账户已停用(行保留、id 不回收,列表/路由过滤 `deleted_at IS NULL`) |
 | `base_url` | 上游 Base URL,如 `https://uni-api.cstcloud.cn/v1` |
 | `api_format` | `openai` / `openai_responses` / `anthropic`,上游线格式 |
 | `is_aggregate` | 是否聚合账户(聚合的模型映射在 `aggregate_entries`) |
@@ -35,8 +37,7 @@
 
 | 字段 | 说明 |
 |------|------|
-| `account_id` / `local_key_id` | 用了哪个账户、哪把密钥;账户删除后 `account_id` 经 `ON DELETE SET NULL` 置空,行保留 |
-| `account_name` / `account_type` / `is_aggregate` | 写入时的账户快照——账户删除后仍可按名字归档/展示/计费 |
+| `account_id` / `local_key_id` | 用了哪个账户、哪把密钥。账户软删除后行保留,`account_id` 仍指向该账户(id 永存),显示 JOIN `upstream_accounts` 取名字 |
 | `model` | 实际调用的模型名(聚合账户为上游模型名) |
 | `prompt_tokens` | 总输入,含缓存命中 |
 | `completion_tokens` | 输出 |
@@ -49,7 +50,7 @@
 
 索引:`idx_rl_account`、`idx_rl_time`。
 
-计费触发器 `tr_request_log_insert`(0004 版本)在插入时先写账户快照(每行,含 0 token 行),再按"当前定价 × 命中时段倍率"计算 `cost` / `virtual_cost` 固化,公式:
+计费触发器 `tr_request_log_insert`(0006 版本)在插入时按"当前定价 × 命中时段倍率"计算 `cost` / `virtual_cost` 固化(plan 判定 JOIN `upstream_accounts.account_type`),公式:
 
 ```
 cost = (miss/1e6) × input_price
@@ -58,7 +59,7 @@ cost = (miss/1e6) × input_price
      ,再乘以 requested_at 命中 pricing_slots 档位的 multiplier(无命中=1.0)
 ```
 
-模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY mp.id LIMIT 1`,即第一条匹配生效,`reorder_pricing` 交换 `model_pricing.id` 来改变匹配优先级。plan 账户 `cost=0`,`virtual_cost` 按上面公式算出;api 账户反之。`prompt_tokens + completion_tokens = 0` 的行只写快照、不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
+模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY mp.id LIMIT 1`,即第一条匹配生效,`reorder_pricing` 交换 `model_pricing.id` 来改变匹配优先级。plan 账户 `cost=0`,`virtual_cost` 按上面公式算出;api 账户反之。`prompt_tokens + completion_tokens = 0` 的行只记日志、不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
 
 清理规则:同步进度由 `sync_state.last_exported_log_id` 单值提交检查点记录(无逐行 exported 标记)。
 `cleanup_exported_logs` 只删 `id ≤ 检查点 且 请求时间超过 30 天` 的行;未计入存档的行永久保留。

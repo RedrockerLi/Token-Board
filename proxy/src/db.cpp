@@ -173,7 +173,7 @@ void Database::prepare_statements() {
     PREPARE("SELECT id, name, upstream_key, base_url, api_format, "
             "COALESCE(endpoint_path,''), COALESCE(auth_header,'bearer'), "
             "COALESCE(is_aggregate,0), COALESCE(account_type,'api'), "
-            "COALESCE(monthly_price,0), COALESCE(max_concurrency,0) "
+            "COALESCE(monthly_price,0), COALESCE(max_concurrency,0), deleted_at "
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
 
@@ -303,6 +303,7 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
         if (info.account_type.empty()) info.account_type = "api";
         info.monthly_price = sqlite3_column_double(stmt_get_account_, 9);
         info.max_concurrency = sqlite3_column_int(stmt_get_account_, 10);
+        info.deleted = sqlite3_column_text(stmt_get_account_, 11) != nullptr;
         result = std::move(info);
     }
     sqlite3_reset(stmt_get_account_);

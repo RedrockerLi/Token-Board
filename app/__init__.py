@@ -49,4 +49,15 @@ def create_app(proxy_db_path: str | None = None):
         except Exception:
             pass  # network / not configured — ignore
 
+        # Reconcile the local dashboard archive: mirror upstream_accounts
+        # (id → name) into dashboard.accounts and backfill any legacy
+        # name-keyed buckets to account_id. Runs before the DataStore loads
+        # (server.py calls .load() after create_app), so names display right.
+        try:
+            from app.dashboard_db import reconcile_accounts  # noqa: E402
+            dash_db_path = str(Path(proxy_db_path).parent / "dashboard.db")
+            reconcile_accounts(dash_db_path, proxy_db_path)
+        except Exception:
+            pass  # no dashboard archive yet / not migrated — ignore
+
     return flask_app

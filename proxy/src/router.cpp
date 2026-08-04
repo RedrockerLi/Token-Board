@@ -33,7 +33,7 @@ Router::RouteResult Router::route(const std::string &local_key) {
     }
 
     auto account = db_.get_account(key_info->account_id);
-    if (!account.has_value()) {
+    if (!account.has_value() || account->deleted) {
         result.success = false;
         result.error = "Account not found or inactive";
         std::lock_guard<std::mutex> lock(cache_mutex_);

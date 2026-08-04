@@ -46,7 +46,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PROXY_BIN --db $PROXY_DB --schema-dir $SCRIPT_DIR/schema/proxy --port $PROXY_PORT
+ExecStart=$PROXY_BIN --db $PROXY_DB --schema-dir $SCRIPT_DIR/schema/proxy --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -87,7 +87,7 @@ do_start() {
     echo "  数据库: $PROXY_DB"
     echo "  按 Ctrl+C 停止"
     echo ""
-    exec "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema/proxy" --port "$PROXY_PORT"
+    exec "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema/proxy" --host 127.0.0.1 --port "$PROXY_PORT"
 }
 
 do_daemon() {

@@ -11,7 +11,6 @@ import os
 import secrets
 import sqlite3
 import string
-import threading
 from datetime import datetime, timezone
 
 
@@ -29,23 +28,6 @@ class ProxyDatabase:
         # once at construction. Fails fast (create_app aborts) on error.
         from app.migrations import migrate, schema_dir_for
         migrate(self.db_path, schema_dir_for(self.db_path, "proxy"))
-        self._sync_timer: threading.Timer | None = None
-
-    def _schedule_config_sync(self):
-        """Debounced auto-sync: wait 3s after last config change, then upload."""
-        if self._sync_timer:
-            self._sync_timer.cancel()
-        self._sync_timer = threading.Timer(3.0, self._do_config_sync)
-        self._sync_timer.daemon = True
-        self._sync_timer.start()
-
-    def _do_config_sync(self):
-        """Upload config to cloud in a background thread."""
-        from app.sync import sync_config_upload
-        try:
-            sync_config_upload(self.db_path)
-        except Exception:
-            pass
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -90,14 +72,14 @@ class ProxyDatabase:
             plan_subscription = conn.execute("""
                 SELECT COALESCE(SUM(a.monthly_price), 0)
                 FROM (
-                    SELECT DISTINCT r.account_name
+                    SELECT DISTINCT r.account_id
                     FROM request_log r
-                    WHERE COALESCE(r.account_type, 'api') = 'plan'
-                      AND strftime('%Y-%m', r.requested_at) = strftime('%Y-%m', 'now')
-                      AND COALESCE(r.account_name, '') != ''
+                    WHERE strftime('%Y-%m', r.requested_at) = strftime('%Y-%m', 'now')
+                      AND r.account_id IS NOT NULL
                 ) t
-                JOIN upstream_accounts a ON a.name = t.account_name
+                JOIN upstream_accounts a ON a.id = t.account_id
                 WHERE COALESCE(a.account_type, 'api') = 'plan'
+                  AND a.deleted_at IS NULL
             """).fetchone()[0]
             total_cost += plan_subscription
 
@@ -115,16 +97,20 @@ class ProxyDatabase:
             ).fetchone()[0]
 
             # "Active upstreams" = real (non-aggregate) accounts with a request
-            # today, from the account_name snapshot (survives account deletion).
+            # today. account_id is the identity; is_aggregate comes from a JOIN
+            # (soft-deleted accounts are excluded — they are no longer routed).
             active_upstreams = conn.execute(
-                "SELECT COUNT(DISTINCT account_name) FROM request_log "
-                "WHERE COALESCE(is_aggregate, 0) = 0 AND date(requested_at) = ? "
-                "  AND COALESCE(account_name, '') != ''",
+                "SELECT COUNT(DISTINCT r.account_id) FROM request_log r "
+                "JOIN upstream_accounts a ON a.id = r.account_id "
+                "WHERE COALESCE(a.is_aggregate, 0) = 0 "
+                "  AND a.deleted_at IS NULL AND date(r.requested_at) = ? "
+                "  AND r.account_id IS NOT NULL",
                 (today,),
             ).fetchone()[0]
 
             total_accounts = conn.execute(
-                "SELECT COUNT(*) FROM upstream_accounts WHERE is_aggregate = 0"
+                "SELECT COUNT(*) FROM upstream_accounts "
+                "WHERE is_aggregate = 0 AND deleted_at IS NULL"
             ).fetchone()[0]
 
             return {
@@ -152,7 +138,7 @@ class ProxyDatabase:
                 "COALESCE(account_type,'api') AS account_type, "
                 "COALESCE(monthly_price,0) AS monthly_price, "
                 "max_concurrency, created_at "
-                "FROM upstream_accounts ORDER BY id"
+                "FROM upstream_accounts WHERE deleted_at IS NULL ORDER BY id"
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -179,7 +165,6 @@ class ProxyDatabase:
                 ),
             )
             conn.commit()
-            self._schedule_config_sync()
             return cursor.lastrowid
         finally:
             conn.close()
@@ -209,33 +194,47 @@ class ProxyDatabase:
                 values,
             )
             conn.commit()
-            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
 
     def delete_account(self, account_id: int, mode: str = "detach") -> dict:
-        """Delete an account. Returns {ok: bool, error: str}.
+        """Soft-delete an account. Returns {ok: bool, error: str}.
 
-        Logs are NEVER a blocker: request_log.account_id is detached via
-        ON DELETE SET NULL and the account_name/account_type snapshots keep the
-        rows usable for export/archive.
+        The row is kept (id is permanent, never recycled) and flagged with
+        deleted_at. The account stops being routed and disappears from lists
+        (all queries filter deleted_at IS NULL), but its historical
+        request_log rows keep their account_id and the dashboard archive keeps
+        showing the name (the accounts mirror preserves soft-deleted entries).
+        request_log rows are NOT touched; they are cleaned 30 days after
+        export by the normal high-water-mark cleanup.
 
         mode:
-          "cascade" — also delete this account's local keys.
-          "detach"  — keep the keys but unbind them (account_id → NULL; the
-                      keys become unassigned and need re-assignment).
-        account_models rows are deleted explicitly (no ON DELETE); aggregate_entries
-        already cascade.
+          "cascade" — also hard-delete this account's local keys.
+          "detach"  — unbind the keys (account_id → NULL, keys stay for reuse).
+        aggregate_entries referencing this account are deleted so an aggregate
+        chain never routes to a dead account.
         """
         conn = self._connect()
         try:
             if mode == "cascade":
                 conn.execute("DELETE FROM local_keys WHERE account_id = ?", (account_id,))
-            conn.execute("DELETE FROM account_models WHERE account_id = ?", (account_id,))
-            conn.execute("DELETE FROM upstream_accounts WHERE id = ?", (account_id,))
+            else:
+                conn.execute(
+                    "UPDATE local_keys SET account_id = NULL WHERE account_id = ?",
+                    (account_id,),
+                )
+            conn.execute("DELETE FROM aggregate_entries WHERE account_id = ?", (account_id,))
+            conn.execute(
+                "DELETE FROM aggregate_entries WHERE upstream_account_id = ?",
+                (account_id,),
+            )
+            conn.execute(
+                "UPDATE upstream_accounts SET deleted_at = datetime('now', 'localtime') "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (account_id,),
+            )
             conn.commit()
-            self._schedule_config_sync()
             return {"ok": conn.total_changes > 0, "error": ""}
         finally:
             conn.close()
@@ -253,7 +252,6 @@ class ProxyDatabase:
                     (account_id, m),
                 )
             conn.commit()
-            self._schedule_config_sync()
             return len(models)
         finally:
             conn.close()
@@ -277,7 +275,7 @@ class ProxyDatabase:
         try:
             rows = conn.execute(
                 "SELECT id, name, created_at FROM upstream_accounts "
-                "WHERE is_aggregate = 1 ORDER BY id"
+                "WHERE is_aggregate = 1 AND deleted_at IS NULL ORDER BY id"
             ).fetchall()
             result = []
             for r in rows:
@@ -313,7 +311,6 @@ class ProxyDatabase:
                     (agg_id, i, e["pattern"], e["account_id"], e["upstream_model"]),
                 )
             conn.commit()
-            self._schedule_config_sync()
             return agg_id
         finally:
             conn.close()
@@ -337,21 +334,21 @@ class ProxyDatabase:
                         (agg_id, i, e["pattern"], e["account_id"], e["upstream_model"]),
                     )
             conn.commit()
-            self._schedule_config_sync()
             return True
         finally:
             conn.close()
 
     def delete_aggregate(self, agg_id: int) -> bool:
-        """Delete an aggregate account. Entries cascade via FK."""
+        """Soft-delete an aggregate account (id stays, row flagged deleted_at)."""
         conn = self._connect()
         try:
             conn.execute(
-                "DELETE FROM upstream_accounts WHERE id=? AND is_aggregate=1",
+                "UPDATE upstream_accounts SET deleted_at = datetime('now', 'localtime') "
+                "WHERE id=? AND is_aggregate=1 AND deleted_at IS NULL",
                 (agg_id,),
             )
+            conn.execute("DELETE FROM aggregate_entries WHERE account_id=?", (agg_id,))
             conn.commit()
-            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -384,7 +381,6 @@ class ProxyDatabase:
                 (key_value, data.get("label", ""), data["account_id"]),
             )
             conn.commit()
-            self._schedule_config_sync()
             return key_value
         finally:
             conn.close()
@@ -406,7 +402,6 @@ class ProxyDatabase:
                 values,
             )
             conn.commit()
-            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -419,7 +414,6 @@ class ProxyDatabase:
         try:
             conn.execute("DELETE FROM local_keys WHERE id = ?", (key_id,))
             conn.commit()
-            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -483,7 +477,6 @@ class ProxyDatabase:
             # multipliers only affect future inserts.
             self._insert_pricing_slots(conn, pid, data.get("slots"))
             conn.commit()
-            self._schedule_config_sync()
             return pid
         finally:
             conn.close()
@@ -511,7 +504,6 @@ class ProxyDatabase:
                              (pricing_id,))
                 self._insert_pricing_slots(conn, pricing_id, data["slots"])
             conn.commit()
-            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -522,7 +514,6 @@ class ProxyDatabase:
             conn.execute("DELETE FROM model_pricing WHERE id = ?", (pricing_id,))
             conn.commit()
             # pricing_slots rows are removed by ON DELETE CASCADE.
-            self._schedule_config_sync()
             return conn.total_changes > 0
         finally:
             conn.close()
@@ -547,7 +538,6 @@ class ProxyDatabase:
             conn.commit()
             # Id swap changes match priority (ORDER BY id LIMIT 1) for new
             # requests only; historical cost stays frozen at write time.
-            self._schedule_config_sync()
             return True
         finally:
             conn.close()
@@ -635,7 +625,7 @@ class ProxyDatabase:
         try:
             sql = """
                 SELECT
-                    COALESCE(r.account_name, 'unknown') AS account_name,
+                    COALESCE(a.name, 'unknown') AS account_name,
                     r.account_id,
                     r.model,
                     date(r.requested_at) AS date,
@@ -645,7 +635,8 @@ class ProxyDatabase:
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens,
                     COALESCE(SUM(r.cost), 0) AS cost
                 FROM request_log r
-                WHERE COALESCE(r.is_aggregate, 0) = 0
+                LEFT JOIN upstream_accounts a ON a.id = r.account_id
+                WHERE COALESCE(a.is_aggregate, 0) = 0
             """
             params = []
             if account_id:
@@ -662,8 +653,8 @@ class ProxyDatabase:
                 params.append(date_to)
 
             sql += """
-                GROUP BY r.account_name, r.model, date(r.requested_at)
-                ORDER BY date(r.requested_at) DESC, r.account_name, r.model
+                GROUP BY r.account_id, r.model, date(r.requested_at)
+                ORDER BY date(r.requested_at) DESC, r.account_id, r.model
             """
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
@@ -710,12 +701,13 @@ class ProxyDatabase:
             offset = (page - 1) * per_page
             rows = conn.execute(
                 f"""SELECT
-                    r.id, r.account_id, COALESCE(r.account_name, 'unknown') AS account_name,
+                    r.id, r.account_id, COALESCE(a.name, 'unknown') AS account_name,
                     r.model, r.prompt_tokens, r.cache_read_tokens,
                     r.completion_tokens,
                     r.total_tokens, r.cost, r.is_streaming,
                     r.status_code, r.duration_ms, r.requested_at
                 FROM request_log r
+                LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE {where_clause}
                 ORDER BY r.requested_at DESC
                 LIMIT ? OFFSET ?""",
@@ -739,15 +731,16 @@ class ProxyDatabase:
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
-                    COALESCE(r.account_name, 'unknown') AS account_name,
+                    COALESCE(a.name, 'unknown') AS account_name,
                     COALESCE(SUM(r.cost), 0) AS cost,
                     COUNT(*) AS requests,
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
-                WHERE COALESCE(r.is_aggregate, 0) = 0
+                LEFT JOIN upstream_accounts a ON a.id = r.account_id
+                WHERE COALESCE(a.is_aggregate, 0) = 0
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
-                GROUP BY date(r.requested_at), r.account_name
-                ORDER BY date, r.account_name
+                GROUP BY date(r.requested_at), r.account_id
+                ORDER BY date, r.account_id
             """, (str(days),)).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -767,7 +760,8 @@ class ProxyDatabase:
                     COUNT(*) AS requests,
                     COALESCE(SUM(r.cost), 0) AS cost
                 FROM request_log r
-                WHERE COALESCE(r.is_aggregate, 0) = 0
+                LEFT JOIN upstream_accounts a ON a.id = r.account_id
+                WHERE COALESCE(a.is_aggregate, 0) = 0
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at)
                 ORDER BY date
@@ -794,22 +788,23 @@ class ProxyDatabase:
         """Per real upstream account used today: real/theoretical cost, tokens, requests.
 
         Active upstreams = non-aggregate accounts with at least one request
-        today (UTC day, same boundary as get_stats); identified by the
-        account_name snapshot so rows survive account deletion.
+        today (UTC day, same boundary as get_stats); grouped by account_id (the
+        identity), display name JOINed from upstream_accounts.
         """
         conn = self._connect()
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             rows = conn.execute("""
-                SELECT COALESCE(r.account_name, 'unknown') AS account_name,
+                SELECT COALESCE(a.name, 'unknown') AS account_name,
                        COALESCE(SUM(r.cost), 0) AS real_cost,
                        COALESCE(SUM(r.cost + r.virtual_cost), 0) AS theoretical_cost,
                        COALESCE(SUM(r.total_tokens), 0) AS tokens,
                        COUNT(*) AS requests
                 FROM request_log r
-                WHERE COALESCE(r.is_aggregate, 0) = 0
+                LEFT JOIN upstream_accounts a ON a.id = r.account_id
+                WHERE COALESCE(a.is_aggregate, 0) = 0
                   AND date(r.requested_at) = ?
-                GROUP BY r.account_name
+                GROUP BY r.account_id
                 ORDER BY theoretical_cost DESC
             """, (today,)).fetchall()
             return [dict(r) for r in rows]
@@ -841,12 +836,12 @@ class ProxyDatabase:
             )
             dash_db = DashboardDatabase(target_path, schema_dir=dash_schema_dir)
 
-            # A) usage + frozen cost: snapshot columns, no JOIN to
-            #    upstream_accounts (survives account deletion).
+            # A) usage + frozen cost: keyed by account_id (the identity). The
+            #    display name comes from the dashboard `accounts` mirror.
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
-                    COALESCE(r.account_name, 'unknown') AS account_name,
+                    r.account_id,
                     r.model,
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
@@ -856,9 +851,9 @@ class ProxyDatabase:
                 FROM request_log r
                 WHERE r.id > ? AND r.id <= ?
                   AND LOWER(r.model) != 'unknown' AND r.model != ''
-                  AND COALESCE(r.account_name, '') != ''
-                GROUP BY date(r.requested_at), r.account_name, r.model
-                ORDER BY date(r.requested_at), r.account_name, r.model
+                  AND r.account_id IS NOT NULL
+                GROUP BY date(r.requested_at), r.account_id, r.model
+                ORDER BY date(r.requested_at), r.account_id, r.model
             """, (mark, max_id)).fetchall()
 
             dash_count = 0
@@ -866,7 +861,7 @@ class ProxyDatabase:
                 dash_count += dash_db.upsert_proxy_data(
                     date=r["date"],
                     model=r["model"],
-                    account_name=r["account_name"],
+                    account_id=r["account_id"],
                     prompt_tokens=r["prompt_tokens"],
                     completion_tokens=r["completion_tokens"],
                     cache_read_tokens=r["cache_read_tokens"],
@@ -876,37 +871,41 @@ class ProxyDatabase:
 
             # B) plan economics: persist per (account, month) — logs are cleaned
             #    30d after export, so the archive must never be recomputed.
+            #    account_id is the identity; account_type JOINed (soft-deleted
+            #    accounts still archive their usage — the accounts mirror keeps
+            #    their name for display).
             current_month = datetime.now(timezone.utc).strftime("%Y-%m")
             plan_rows = conn.execute("""
                 SELECT
-                    COALESCE(r.account_name, 'unknown') AS account_name,
+                    r.account_id,
                     strftime('%Y-%m', r.requested_at) AS month,
                     COALESCE(SUM(r.virtual_cost), 0) AS virtual_cost
                 FROM request_log r
+                JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE r.id > ? AND r.id <= ?
-                  AND COALESCE(r.account_type, 'api') = 'plan'
-                  AND COALESCE(r.account_name, '') != ''
-                GROUP BY r.account_name, month
+                  AND COALESCE(a.account_type, 'api') = 'plan'
+                GROUP BY r.account_id, month
             """, (mark, max_id)).fetchall()
             for pr in plan_rows:
                 price = conn.execute(
-                    "SELECT monthly_price FROM upstream_accounts WHERE name = ?",
-                    (pr["account_name"],),
+                    "SELECT monthly_price, deleted_at FROM upstream_accounts WHERE id = ?",
+                    (pr["account_id"],),
                 ).fetchone()
                 if price is not None:
                     dash_db.accumulate_plan_summary(
                         month=pr["month"],
-                        account_name=pr["account_name"],
+                        account_id=pr["account_id"],
                         subscription_cost=float(price["monthly_price"] or 0),
                         virtual_cost=float(pr["virtual_cost"] or 0),
-                        refresh_subscription=(pr["month"] == current_month),
+                        refresh_subscription=(pr["month"] == current_month
+                                              and price["deleted_at"] is None),
                     )
                 else:
-                    # account deleted/renamed: keep existing subscription_cost,
-                    # just accumulate the virtual (api-billed) amount.
+                    # account gone: keep existing subscription_cost, just
+                    # accumulate the virtual (api-billed) amount.
                     dash_db.accumulate_plan_summary(
                         month=pr["month"],
-                        account_name=pr["account_name"],
+                        account_id=pr["account_id"],
                         subscription_cost=0.0,
                         virtual_cost=float(pr["virtual_cost"] or 0),
                         refresh_subscription=False,
@@ -915,28 +914,25 @@ class ProxyDatabase:
             # Current-month refresh is NOT tied to the export batch: a price
             # edit mid-month must reach the archive even when this batch has no
             # new plan rows (all of the month's rows were already exported and
-            # mark has passed them). Every plan account used this month — any
-            # request_log row, exported or not; current-month rows are younger
-            # than the 30-day cleanup horizon so they always survive — gets its
-            # subscription set to the current monthly_price. Past months are
-            # never touched here (frozen in the batch loop above); deleted or
-            # renamed accounts drop out of the JOIN and keep their value.
+            # mark has passed them). Every ACTIVE plan account used this month
+            # gets its subscription set to the current monthly_price. Past
+            # months are never touched here (frozen in the batch loop above).
             cur_plans = conn.execute("""
-                SELECT a.name, a.monthly_price
+                SELECT a.id, a.monthly_price
                 FROM (
-                    SELECT DISTINCT r.account_name AS name
+                    SELECT DISTINCT r.account_id AS id
                     FROM request_log r
                     WHERE strftime('%Y-%m', r.requested_at) = ?
-                      AND COALESCE(r.account_type, 'api') = 'plan'
-                      AND COALESCE(r.account_name, '') != ''
+                      AND r.account_id IS NOT NULL
                 ) t
-                JOIN upstream_accounts a ON a.name = t.name
+                JOIN upstream_accounts a ON a.id = t.id
                 WHERE COALESCE(a.account_type, 'api') = 'plan'
+                  AND a.deleted_at IS NULL
             """, (current_month,)).fetchall()
             for cp in cur_plans:
                 dash_db.accumulate_plan_summary(
                     month=current_month,
-                    account_name=cp["name"],
+                    account_id=cp["id"],
                     subscription_cost=float(cp["monthly_price"] or 0),
                     virtual_cost=0.0,
                     refresh_subscription=True,
@@ -1140,19 +1136,20 @@ class ProxyDatabase:
     def get_perf_upstream_success_rate(self, window_minutes: int = 60) -> list[dict]:
         """Per real-upstream success rate for the last N minutes.
 
-        'Real upstream' = non-aggregate accounts (is_aggregate snapshot).
+        'Real upstream' = non-aggregate accounts (is_aggregate via JOIN).
         Success = status < 400. Sourced from request_log.
         """
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT COALESCE(r.account_name, 'unknown') AS account_name, "
+                "SELECT COALESCE(a.name, 'unknown') AS account_name, "
                 "COUNT(*) AS total, "
                 "SUM(CASE WHEN r.status_code >= 400 THEN 1 ELSE 0 END) AS errors "
                 "FROM request_log r "
-                "WHERE COALESCE(r.is_aggregate, 0) = 0 "
+                "LEFT JOIN upstream_accounts a ON a.id = r.account_id "
+                "WHERE COALESCE(a.is_aggregate, 0) = 0 "
                 "  AND r.requested_at >= datetime('now', '-' || ? || ' minutes') "
-                "GROUP BY r.account_name "
+                "GROUP BY r.account_id "
                 "ORDER BY total DESC",
                 (str(window_minutes),)
             ).fetchall()

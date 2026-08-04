@@ -81,7 +81,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PROXY_BIN --db $PROXY_DB --schema-dir $SCRIPT_DIR/schema/proxy --port $PROXY_PORT
+ExecStart=$PROXY_BIN --db $PROXY_DB --schema-dir $SCRIPT_DIR/schema/proxy --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -98,7 +98,7 @@ EOF
         systemctl --user restart "$SERVICE_NAME"
         echo -e "${GREEN}✓ 代理已重启 (systemd)${NC}"
     else
-        "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema/proxy" --port "$PROXY_PORT" &
+        "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema/proxy" --host 127.0.0.1 --port "$PROXY_PORT" &
         PROXY_PID=$!
         echo -e "${GREEN}✓ 代理已启动 (PID: $PROXY_PID)${NC}"
     fi
@@ -150,7 +150,7 @@ import socket
 for port in range(5000, 5100):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('0.0.0.0', port))
+            s.bind(('127.0.0.1', port))
             print(port)
             break
     except OSError:
@@ -159,7 +159,7 @@ for port in range(5000, 5100):
 [ -d "$SCRIPT_DIR/data" ] || mkdir -p "$SCRIPT_DIR/data"
 
 cd "$SCRIPT_DIR"
-python3 server.py --port "$PORT" --proxy-db "$PROXY_DB" &
+python3 server.py --port "$PORT" --proxy-db "$PROXY_DB" --host 127.0.0.1 &
 DASHBOARD_PID=$!
 
 for i in $(seq 1 10); do

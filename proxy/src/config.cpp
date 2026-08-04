@@ -14,7 +14,7 @@ static void print_help(const char *argv0) {
         "                  Migration file directory (default: derived from --db\n"
         "                  as <db_dir>/../schema/proxy)\n"
         "  --port PORT     Listen port (default: 8800)\n"
-        "  --host HOST     Bind address (default: 0.0.0.0)\n"
+        "  --host HOST     Bind address (default: 127.0.0.1 — loopback only)\n"
         "  --log-level LVL Log level: debug|info|warn|error (default: info)\n"
         "  --help          Show this message\n",
         argv0);

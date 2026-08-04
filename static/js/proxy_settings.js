@@ -70,6 +70,7 @@ async function saveTimeoutConfig() {
             body: JSON.stringify(collectTimeoutConfig()),
         });
         showToast('超时配置已保存（即时生效）');
+        ConfigSync.markDirty();
     } catch (err) {
         showToast(err.message, 'error');
     }

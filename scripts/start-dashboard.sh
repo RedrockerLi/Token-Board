@@ -35,7 +35,7 @@ import socket
 for port in range(5000, 5100):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('0.0.0.0', port))
+            s.bind(('127.0.0.1', port))
             print(port)
             break
     except OSError:
@@ -45,7 +45,7 @@ for port in range(5000, 5100):
 # ── Start dashboard ──
 echo "[INFO] 启动仪表板..."
 cd "$SCRIPT_DIR"
-python3 server.py --port "$PORT" --proxy-db "$PROXY_DB" > /dev/null 2>&1 &
+python3 server.py --port "$PORT" --proxy-db "$PROXY_DB" --host 127.0.0.1 > /dev/null 2>&1 &
 SERVER_PID=$!
 
 # ── Wait for ready ──

@@ -7,7 +7,7 @@ struct Config {
     std::string db_path = "data/proxy.db";
     std::string schema_dir;      // directory of NNNN_*.sql migration files
     int port = 8800;
-    std::string host = "0.0.0.0";
+    std::string host = "127.0.0.1";  // loopback only — the proxy is a local endpoint
     std::string log_level = "info";
 };
 

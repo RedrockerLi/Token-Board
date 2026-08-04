@@ -253,8 +253,8 @@ resolve_candidates(Database &db, const Router::RouteResult &route,
         auto entries = db.resolve_aggregate(route.account_id, model);
         for (const auto &e : entries) {
             auto acct = db.get_account(e.upstream_account_id);
-            if (!acct.has_value()) {
-                fprintf(stderr, "[Proxy] aggregate account %d: upstream account %d missing\n",
+            if (!acct.has_value() || acct->deleted) {
+                fprintf(stderr, "[Proxy] aggregate account %d: upstream account %d missing/deleted\n",
                         route.account_id, e.upstream_account_id);
                 continue;
             }
@@ -268,7 +268,7 @@ resolve_candidates(Database &db, const Router::RouteResult &route,
         }
     } else {
         auto acct = db.get_account(route.account_id);
-        if (!acct.has_value()) return cands;
+        if (!acct.has_value() || acct->deleted) return cands;
         UpstreamCandidate c;
         c.account = std::move(*acct);
         c.upstream_model = model;

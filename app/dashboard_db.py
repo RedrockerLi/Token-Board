@@ -42,7 +42,7 @@ class DashboardDatabase:
     # ── Proxy export writes (additive, exactly-once) ────────────────────
 
     def upsert_proxy_data(self, date: str, model: str,
-                          account_name: str, prompt_tokens: int,
+                          account_id: int, prompt_tokens: int,
                           completion_tokens: int, cache_read_tokens: int,
                           request_count: int,
                           cost: float = 0.0) -> int:
@@ -52,10 +52,12 @@ class DashboardDatabase:
         write time, peak/valley-aware) summed over the exported period — it is
         written straight into cost_entry and never recomputed.
 
-        Writes are ADDITIVE (ON CONFLICT ... DO UPDATE ... +=): each export
-        batch contributes exactly once, so partial/re-export never double-counts
-        and an older merge never regresses a value. token_usage buckets: miss =
-        prompt - cache_read, hit = cache_read (sum = upstream input count).
+        Buckets are keyed by account_id (the stable identity; the display name
+        lives in the `accounts` mirror). Writes are ADDITIVE (ON CONFLICT ...
+        DO UPDATE ... +=): each export batch contributes exactly once, so
+        partial/re-export never double-counts and an older merge never regresses
+        a value. token_usage buckets: miss = prompt - cache_read, hit =
+        cache_read (sum = upstream input count).
         """
         conn = self._connect()
         total = 0
@@ -63,53 +65,53 @@ class DashboardDatabase:
             if completion_tokens > 0:
                 conn.execute(
                     """INSERT INTO token_usage
-                       (date, model, api_key_name, token_type, amount, cost_group_key)
-                       VALUES (?,?,?,'output',?,?)
-                       ON CONFLICT(date, model, api_key_name, token_type, cost_group_key)
+                       (date, model, account_id, token_type, amount)
+                       VALUES (?,?,?,'output',?)
+                       ON CONFLICT(date, model, account_id, token_type)
                        DO UPDATE SET amount = token_usage.amount + excluded.amount""",
-                    (date, model, account_name, completion_tokens, account_name),
+                    (date, model, account_id, completion_tokens),
                 )
                 total += 1
             if cache_read_tokens > 0:
                 conn.execute(
                     """INSERT INTO token_usage
-                       (date, model, api_key_name, token_type, amount, cost_group_key)
-                       VALUES (?,?,?,'input_cache_hit',?,?)
-                       ON CONFLICT(date, model, api_key_name, token_type, cost_group_key)
+                       (date, model, account_id, token_type, amount)
+                       VALUES (?,?,?,'input_cache_hit',?)
+                       ON CONFLICT(date, model, account_id, token_type)
                        DO UPDATE SET amount = token_usage.amount + excluded.amount""",
-                    (date, model, account_name, cache_read_tokens, account_name),
+                    (date, model, account_id, cache_read_tokens),
                 )
                 total += 1
             miss = max(prompt_tokens - cache_read_tokens, 0)
             if miss > 0:
                 conn.execute(
                     """INSERT INTO token_usage
-                       (date, model, api_key_name, token_type, amount, cost_group_key)
-                       VALUES (?,?,?,'input_cache_miss',?,?)
-                       ON CONFLICT(date, model, api_key_name, token_type, cost_group_key)
+                       (date, model, account_id, token_type, amount)
+                       VALUES (?,?,?,'input_cache_miss',?)
+                       ON CONFLICT(date, model, account_id, token_type)
                        DO UPDATE SET amount = token_usage.amount + excluded.amount""",
-                    (date, model, account_name, miss, account_name),
+                    (date, model, account_id, miss),
                 )
                 total += 1
             if request_count > 0:
                 conn.execute(
                     """INSERT INTO request_usage
-                       (date, model, api_key_name, count)
+                       (date, model, account_id, count)
                        VALUES (?,?,?,?)
-                       ON CONFLICT(date, model, api_key_name)
+                       ON CONFLICT(date, model, account_id)
                        DO UPDATE SET count = request_usage.count + excluded.count""",
-                    (date, model, account_name, request_count),
+                    (date, model, account_id, request_count),
                 )
                 total += 1
             # Frozen cost: additive (plan accounts already carry cost 0 from
             # the proxy, so cost_entry stays 0 for them).
             conn.execute(
                 """INSERT INTO cost_entry
-                   (date, model, cost, cost_group_key)
+                   (date, model, cost, account_id)
                    VALUES (?,?,?,?)
-                   ON CONFLICT(date, model, cost_group_key)
+                   ON CONFLICT(date, model, account_id)
                    DO UPDATE SET cost = cost_entry.cost + excluded.cost""",
-                (date, model, cost, account_name),
+                (date, model, cost, account_id),
             )
             total += 1
             conn.commit()
@@ -117,7 +119,7 @@ class DashboardDatabase:
             conn.close()
         return total
 
-    def accumulate_plan_summary(self, month: str, account_name: str,
+    def accumulate_plan_summary(self, month: str, account_id: int,
                                 subscription_cost: float, virtual_cost: float,
                                 refresh_subscription: bool = False):
         """Accumulate one plan account's monthly economics into the archive.
@@ -133,13 +135,13 @@ class DashboardDatabase:
         try:
             conn.execute(
                 """INSERT INTO proxy_plan_summary
-                   (month, account_name, subscription_cost, virtual_cost)
+                   (month, account_id, subscription_cost, virtual_cost)
                    VALUES (?,?,?,?)
-                   ON CONFLICT(month, account_name) DO UPDATE SET
+                   ON CONFLICT(month, account_id) DO UPDATE SET
                      virtual_cost = proxy_plan_summary.virtual_cost + excluded.virtual_cost,
                      subscription_cost = CASE WHEN ? THEN excluded.subscription_cost
                                               ELSE proxy_plan_summary.subscription_cost END""",
-                (month, account_name, subscription_cost, virtual_cost,
+                (month, account_id, subscription_cost, virtual_cost,
                  bool(refresh_subscription)),
             )
             conn.commit()
@@ -167,61 +169,73 @@ class DashboardDatabase:
             request_last_month: dict[str, int] = {}
             request_month_vol: dict[str, int] = {}
 
-            for row in conn.execute("SELECT * FROM token_usage"):
+            for row in conn.execute(
+                "SELECT t.*, COALESCE(a.name, 'unknown') AS _display_name "
+                "FROM token_usage t LEFT JOIN accounts a ON a.account_id = t.account_id"
+            ):
                 date = row["date"]
                 y, m = _parse_date(date)
                 if y == 0:
                     continue
+                name = row["_display_name"]
                 tu = TokenUsage(
                     platform="",
                     date=date,
                     model=row["model"],
-                    api_key_name=row["api_key_name"],
+                    api_key_name=name,
                     token_type=row["token_type"],
                     amount=row["amount"],
-                    cost_group_key=row["cost_group_key"],
+                    cost_group_key=name,
                 )
                 tu._year = y
                 tu._month = m
                 token_usages.append(tu)
                 months_set.add((y, m))
-                api_key_names_set.add(row["api_key_name"])
+                api_key_names_set.add(name)
                 models_set.add(row["model"])
                 _track_recency(token_last_month, token_month_vol,
-                               row["api_key_name"], y, m, row["amount"])
+                               name, y, m, row["amount"])
 
-            for row in conn.execute("SELECT * FROM request_usage"):
+            for row in conn.execute(
+                "SELECT r.*, COALESCE(a.name, 'unknown') AS _display_name "
+                "FROM request_usage r LEFT JOIN accounts a ON a.account_id = r.account_id"
+            ):
                 date = row["date"]
                 y, m = _parse_date(date)
                 if y == 0:
                     continue
+                name = row["_display_name"]
                 ru = RequestUsage(
                     platform="",
                     date=date,
                     model=row["model"],
-                    api_key_name=row["api_key_name"],
+                    api_key_name=name,
                     count=row["count"],
                 )
                 ru._year = y
                 ru._month = m
                 request_usages.append(ru)
                 months_set.add((y, m))
-                api_key_names_set.add(row["api_key_name"])
+                api_key_names_set.add(name)
                 models_set.add(row["model"])
                 _track_recency(request_last_month, request_month_vol,
-                               row["api_key_name"], y, m, row["count"])
+                               name, y, m, row["count"])
 
-            for row in conn.execute("SELECT * FROM cost_entry"):
+            for row in conn.execute(
+                "SELECT c.*, COALESCE(a.name, 'unknown') AS _display_name "
+                "FROM cost_entry c LEFT JOIN accounts a ON a.account_id = c.account_id"
+            ):
                 date = row["date"]
                 y, m = _parse_date(date)
                 if y == 0:
                     continue
+                name = row["_display_name"]
                 ce = CostEntry(
                     platform="",
                     date=date,
                     model=row["model"],
                     cost=row["cost"],
-                    cost_group_key=row["cost_group_key"],
+                    cost_group_key=name,
                 )
                 ce._year = y
                 ce._month = m
@@ -230,8 +244,12 @@ class DashboardDatabase:
                 models_set.add(row["model"])
 
             for row in conn.execute(
-                "SELECT month, account_name, subscription_cost, virtual_cost "
-                "FROM proxy_plan_summary ORDER BY month, account_name"
+                "SELECT p.month, p.account_id, "
+                "COALESCE(a.name, 'unknown') AS account_name, "
+                "p.subscription_cost, p.virtual_cost "
+                "FROM proxy_plan_summary p "
+                "LEFT JOIN accounts a ON a.account_id = p.account_id "
+                "ORDER BY p.month, p.account_id"
             ):
                 plan_summary.append({
                     "month": row["month"],
@@ -311,3 +329,133 @@ def _track_recency(last_month: dict, month_vol: dict,
         month_vol[name] = volume
     elif ym == prev:
         month_vol[name] = month_vol.get(name, 0) + volume
+
+
+# ── Account mirror reconciliation ─────────────────────────────────────────
+
+def _column_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    return any(r[1] == col for r in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def _rebuild_tables_by_id(dash: sqlite3.Connection) -> None:
+    """Rebuild the four archive tables keyed by account_id (drop the legacy
+    name columns, add account_id unique indexes). Called once by
+    reconcile_accounts when legacy name columns are still present."""
+    # token_usage
+    dash.execute("DROP INDEX IF EXISTS idx_tu_unique")
+    dash.execute("DROP INDEX IF EXISTS idx_tu_query")
+    dash.execute("DROP TABLE IF EXISTS token_usage_new")
+    dash.execute(
+        "CREATE TABLE token_usage_new ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, model TEXT NOT NULL,"
+        " account_id INTEGER NOT NULL DEFAULT 0, token_type TEXT NOT NULL, amount INTEGER NOT NULL)")
+    dash.execute(
+        "INSERT INTO token_usage_new (id, date, model, account_id, token_type, amount) "
+        "SELECT id, date, model, account_id, token_type, amount FROM token_usage")
+    dash.execute("DROP TABLE token_usage")
+    dash.execute("ALTER TABLE token_usage_new RENAME TO token_usage")
+    dash.execute(
+        "CREATE UNIQUE INDEX idx_tu_unique ON token_usage(date, model, account_id, token_type)")
+    dash.execute("CREATE INDEX idx_tu_query ON token_usage(account_id, date, model)")
+
+    # request_usage
+    dash.execute("DROP INDEX IF EXISTS idx_ru_unique")
+    dash.execute("DROP INDEX IF EXISTS idx_ru_query")
+    dash.execute("DROP TABLE IF EXISTS request_usage_new")
+    dash.execute(
+        "CREATE TABLE request_usage_new ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, model TEXT NOT NULL,"
+        " account_id INTEGER NOT NULL DEFAULT 0, count INTEGER NOT NULL)")
+    dash.execute(
+        "INSERT INTO request_usage_new (id, date, model, account_id, count) "
+        "SELECT id, date, model, account_id, count FROM request_usage")
+    dash.execute("DROP TABLE request_usage")
+    dash.execute("ALTER TABLE request_usage_new RENAME TO request_usage")
+    dash.execute(
+        "CREATE UNIQUE INDEX idx_ru_unique ON request_usage(date, model, account_id)")
+    dash.execute("CREATE INDEX idx_ru_query ON request_usage(account_id, date, model)")
+
+    # cost_entry
+    dash.execute("DROP INDEX IF EXISTS idx_ce_unique")
+    dash.execute("DROP INDEX IF EXISTS idx_ce_query")
+    dash.execute("DROP TABLE IF EXISTS cost_entry_new")
+    dash.execute(
+        "CREATE TABLE cost_entry_new ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, model TEXT NOT NULL,"
+        " cost REAL NOT NULL, account_id INTEGER NOT NULL DEFAULT 0)")
+    dash.execute(
+        "INSERT INTO cost_entry_new (id, date, model, cost, account_id) "
+        "SELECT id, date, model, cost, account_id FROM cost_entry")
+    dash.execute("DROP TABLE cost_entry")
+    dash.execute("ALTER TABLE cost_entry_new RENAME TO cost_entry")
+    dash.execute(
+        "CREATE UNIQUE INDEX idx_ce_unique ON cost_entry(date, model, account_id)")
+    dash.execute("CREATE INDEX idx_ce_query ON cost_entry(account_id, date, model)")
+
+    # proxy_plan_summary (was UNIQUE(month, account_name) inline — rebuilt)
+    dash.execute("DROP INDEX IF EXISTS idx_pps_unique")
+    dash.execute("DROP TABLE IF EXISTS proxy_plan_summary_new")
+    dash.execute(
+        "CREATE TABLE proxy_plan_summary_new ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT, month TEXT NOT NULL,"
+        " account_id INTEGER NOT NULL DEFAULT 0,"
+        " subscription_cost REAL NOT NULL DEFAULT 0, virtual_cost REAL NOT NULL DEFAULT 0)")
+    dash.execute(
+        "INSERT INTO proxy_plan_summary_new (id, month, account_id, subscription_cost, virtual_cost) "
+        "SELECT id, month, account_id, subscription_cost, virtual_cost FROM proxy_plan_summary")
+    dash.execute("DROP TABLE proxy_plan_summary")
+    dash.execute("ALTER TABLE proxy_plan_summary_new RENAME TO proxy_plan_summary")
+    dash.execute(
+        "CREATE UNIQUE INDEX idx_pps_unique ON proxy_plan_summary(month, account_id)")
+
+
+def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
+    """Mirror upstream_accounts (id → name / account_type / deleted_at) into the
+    dashboard `accounts` table and migrate any legacy name-keyed archive rows to
+    account_id keys. Idempotent.
+
+    Runs on the local dashboard at startup and on the sync shadow right after
+    the schema migrate (before export), so the local archive and the cloud copy
+    both converge on account_id bucketing with a consistent name mirror. Once
+    the legacy name columns are dropped the rebuild step is skipped.
+    """
+    proxy = sqlite3.connect(proxy_path)
+    proxy.row_factory = sqlite3.Row
+    dash = sqlite3.connect(dash_path, timeout=10)
+    try:
+        accts = proxy.execute(
+            "SELECT id, name, COALESCE(account_type, 'api') AS account_type, deleted_at "
+            "FROM upstream_accounts"
+        ).fetchall()
+        for a in accts:
+            dash.execute(
+                "INSERT OR REPLACE INTO accounts (account_id, name, account_type, deleted_at) "
+                "VALUES (?,?,?,?)",
+                (a["id"], a["name"], a["account_type"], a["deleted_at"]),
+            )
+
+        # Legacy name-keyed rows: backfill account_id from the name→id map,
+        # then rebuild the tables without the name columns.
+        name_cols = {
+            "token_usage": "api_key_name",
+            "request_usage": "api_key_name",
+            "cost_entry": "cost_group_key",
+            "proxy_plan_summary": "account_name",
+        }
+        legacy = any(_column_exists(dash, t, c) for t, c in name_cols.items())
+        if legacy:
+            name2id = {a["name"]: a["id"] for a in accts}
+            for table, col in name_cols.items():
+                if not _column_exists(dash, table, col):
+                    continue
+                for name, aid in name2id.items():
+                    dash.execute(
+                        f"UPDATE {table} SET account_id = ? "
+                        f"WHERE account_id = 0 AND {col} = ?",
+                        (aid, name),
+                    )
+            _rebuild_tables_by_id(dash)
+        dash.commit()
+    finally:
+        proxy.close()
+        dash.close()

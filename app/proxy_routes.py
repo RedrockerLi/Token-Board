@@ -32,8 +32,8 @@ def list_accounts():
 @bp_proxy.route("/accounts", methods=["POST"])
 def create_account():
     data = request.get_json(force=True)
-    if not data.get("name") or not data.get("upstream_key"):
-        return jsonify({"error": "name and upstream_key are required"}), 400
+    if not data.get("name"):
+        return jsonify({"error": "name is required"}), 400
     try:
         account_id = _proxy_db().create_account(data)
         return jsonify({"id": account_id}), 201
@@ -409,6 +409,36 @@ def test_sync_connection():
     if err:
         return jsonify({"status": "error", "message": f"连接失败: {err}"}), 400
     return jsonify({"status": "ok", "message": "连接成功"})
+
+
+@bp_proxy.route("/sync/config/upload", methods=["POST"])
+def upload_config():
+    """Upload local config to cloud as one transaction (exit settings page).
+
+    Never uploads upstream API keys or the WebDAV credentials. Refuses
+    (conflict) if the cloud moved past this machine's last sync.
+    """
+    from app.sync import sync_config_upload
+
+    db_path = current_app.config["PROXY_DB"].db_path
+    result = sync_config_upload(db_path)
+    return jsonify(result)
+
+
+@bp_proxy.route("/sync/config/discard", methods=["POST"])
+def discard_config():
+    """Roll local config tables back to the last-committed snapshot.
+
+    Called when the user chooses "丢弃设置" after a failed upload — local
+    edits are reverted (including per-machine upstream keys) without network.
+    """
+    from app.sync import restore_config_snapshot
+
+    db_path = current_app.config["PROXY_DB"].db_path
+    if not restore_config_snapshot(db_path):
+        return jsonify({"status": "error",
+                        "message": "没有可回滚的快照(本机尚未成功同步过)"}), 400
+    return jsonify({"status": "ok", "message": "已回滚到上次同步状态"})
 
 
 @bp_proxy.route("/logs")

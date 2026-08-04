@@ -221,6 +221,21 @@
     </div>
 </div>
 
+<!-- ═══ Modal: 配置上传失败 (retry / discard) ═══ -->
+<div class="modal-overlay" id="configSyncModal" style="display:none">
+    <div class="modal" style="max-width:440px;">
+        <div class="modal__header">
+            <h3>设置保存失败</h3>
+            <button class="modal__close" onclick="closeModal('configSyncModal')">&times;</button>
+        </div>
+        <div id="configSyncMsg" style="padding:10px 0; font-size:14px; line-height:1.7; color:var(--color-text-secondary);"></div>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:10px;">
+            <button class="btn btn--sm" onclick="configSyncRetry()">重试上传</button>
+            <button class="btn btn--sm" style="color:#EF4444;" onclick="configSyncDiscard()">丢弃设置</button>
+        </div>
+    </div>
+</div>
+
 <!-- ═══ Scripts ═══ -->
 <!-- Load order: utils → primitives → router → page modules → chart rendering -->
 <script src="/static/js/utils.js"></script>
