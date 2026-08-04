@@ -122,7 +122,7 @@ class DashboardDatabase:
             conn.close()
         return total
 
-    def accumulate_plan_summary(self, month: str, account_id: int,
+    def accumulate_plan_summary(self, month: str, account_id: int, key_masked: str,
                                 subscription_cost: float, virtual_cost: float,
                                 refresh_subscription: bool = False):
         """Accumulate one plan account's monthly economics into the archive.
@@ -138,15 +138,50 @@ class DashboardDatabase:
         try:
             conn.execute(
                 """INSERT INTO proxy_plan_summary
-                   (month, account_id, subscription_cost, virtual_cost)
-                   VALUES (?,?,?,?)
-                   ON CONFLICT(month, account_id) DO UPDATE SET
+                   (month, account_id, key_masked, subscription_cost, virtual_cost)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(month, account_id, key_masked) DO UPDATE SET
                      virtual_cost = proxy_plan_summary.virtual_cost + excluded.virtual_cost,
                      subscription_cost = CASE WHEN ? THEN excluded.subscription_cost
                                               ELSE proxy_plan_summary.subscription_cost END""",
-                (month, account_id, subscription_cost, virtual_cost,
+                (month, account_id, key_masked, subscription_cost, virtual_cost,
                  bool(refresh_subscription)),
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def reconcile_plan_subscription(self, account_id: int, key_masked: str,
+                                    subscriptions: dict[str, float]) -> None:
+        """Set one key lifecycle's subscription rows without touching virtual cost.
+
+        Unlike request usage, subscriptions are derived state.  Reconciliation
+        lets an edited valid_from, cancellation, or scheduled price remove a
+        previously generated period while preserving the additive virtual-cost
+        archive in the same row.
+        """
+        conn = self._connect()
+        try:
+            existing = conn.execute(
+                "SELECT month FROM proxy_plan_summary WHERE account_id=? AND key_masked=?",
+                (account_id, key_masked),
+            ).fetchall()
+            for row in existing:
+                if row["month"] not in subscriptions:
+                    conn.execute(
+                        "UPDATE proxy_plan_summary SET subscription_cost=0 "
+                        "WHERE account_id=? AND key_masked=? AND month=?",
+                        (account_id, key_masked, row["month"]),
+                    )
+            for month, cost in subscriptions.items():
+                conn.execute(
+                    "INSERT INTO proxy_plan_summary "
+                    "(month,account_id,key_masked,subscription_cost,virtual_cost) "
+                    "VALUES (?,?,?,?,0) "
+                    "ON CONFLICT(month,account_id,key_masked) DO UPDATE SET "
+                    "subscription_cost=excluded.subscription_cost",
+                    (month, account_id, key_masked, cost),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -402,14 +437,15 @@ def _rebuild_tables_by_id(dash: sqlite3.Connection) -> None:
         "CREATE TABLE proxy_plan_summary_new ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT, month TEXT NOT NULL,"
         " account_id INTEGER NOT NULL DEFAULT 0,"
+        " key_masked TEXT NOT NULL DEFAULT '',"
         " subscription_cost REAL NOT NULL DEFAULT 0, virtual_cost REAL NOT NULL DEFAULT 0)")
     dash.execute(
-        "INSERT INTO proxy_plan_summary_new (id, month, account_id, subscription_cost, virtual_cost) "
-        "SELECT id, month, account_id, subscription_cost, virtual_cost FROM proxy_plan_summary")
+        "INSERT INTO proxy_plan_summary_new (id, month, account_id, key_masked, subscription_cost, virtual_cost) "
+        "SELECT id, month, account_id, '', subscription_cost, virtual_cost FROM proxy_plan_summary")
     dash.execute("DROP TABLE proxy_plan_summary")
     dash.execute("ALTER TABLE proxy_plan_summary_new RENAME TO proxy_plan_summary")
     dash.execute(
-        "CREATE UNIQUE INDEX idx_pps_unique ON proxy_plan_summary(month, account_id)")
+        "CREATE UNIQUE INDEX idx_pps_unique ON proxy_plan_summary(month, account_id, key_masked)")
 
 
 def reconcile_accounts(dash_path: str, proxy_path: str) -> None:

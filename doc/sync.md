@@ -6,12 +6,14 @@
 
 上传的内容:
 
-- 配置表(`CONFIG_TABLES`):`upstream_accounts`、`local_keys`、`model_pricing`、`pricing_slots`、`account_models`、`aggregate_entries`。
+- 配置表(`CONFIG_TABLES`):`upstream_accounts`、`local_keys`、`model_pricing`、`pricing_slots`、`account_models`、`aggregate_entries`、超时配置、Plan 计费设置和价格历史。
 - dashboard 存档(纯用量+总价,无价格表):`token_usage`、`request_usage`、`cost_entry`、`proxy_plan_summary`。
+- Plan 计费配置和价格历史；以及仅含 `mask_key()` 结果、订阅起始日、取消标记的 `upstream_keys_cloud` 元数据。
 
 绝不上传的内容:
 
 - `request_log` 明细(只同步聚合结果,明细仅存本地)
+- `upstream_keys.key_value` 与 `upstream_accounts.upstream_key` 的完整明文
 - `perf_events` 性能事件
 - `in_flight_requests` 在途请求
 - `sync_config`(WebDAV 账号密码)

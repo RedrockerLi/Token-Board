@@ -178,7 +178,8 @@ void Database::prepare_statements() {
             stmt_get_account_);
 
     PREPARE("SELECT id, key_value, position "
-            "FROM upstream_keys WHERE account_id = ?1 ORDER BY position, id",
+            "FROM upstream_keys WHERE account_id = ?1 AND deleted_at IS NULL "
+            "ORDER BY position, id",
             stmt_get_upstream_keys_);
 
     PREPARE("INSERT INTO request_log "

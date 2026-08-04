@@ -277,6 +277,8 @@ CONFIG_TABLES = [
     "account_models",
     "aggregate_entries",
     "proxy_timeout_config",
+    "plan_billing_config",
+    "plan_price_history",
 ]
 
 # Runtime/secret tables stripped from the upload copy before it ever reaches
@@ -298,6 +300,59 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
+
+
+def _merge_upstream_keys_cloud(remote_path: str, local_path: str) -> None:
+    """Merge masked key metadata as an additive, idempotent union.
+
+    The table deliberately stays outside the normal config hash: two machines
+    can have different local secrets.  Therefore every upload and download
+    explicitly unions it instead of allowing a stale upload to erase rows.
+    A deletion is a tombstone: once observed it wins over an active copy.
+    """
+    remote = sqlite3.connect(remote_path)
+    remote.row_factory = sqlite3.Row
+    local = sqlite3.connect(local_path)
+    local.row_factory = sqlite3.Row
+    try:
+        if not _table_exists(remote, "upstream_keys_cloud") or not _table_exists(local, "upstream_keys_cloud"):
+            return
+        local.execute("BEGIN IMMEDIATE")
+        for incoming in remote.execute("SELECT * FROM upstream_keys_cloud"):
+            current = local.execute(
+                "SELECT * FROM upstream_keys_cloud WHERE account_id=? AND key_masked=?",
+                (incoming["account_id"], incoming["key_masked"]),
+            ).fetchone()
+            if current is None:
+                cols = [d[0] for d in remote.execute("SELECT * FROM upstream_keys_cloud LIMIT 0").description]
+                local.execute(
+                    f"INSERT INTO upstream_keys_cloud ({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})",
+                    [incoming[c] for c in cols],
+                )
+                continue
+            valid_values = [v for v in (current["valid_from"], incoming["valid_from"]) if v]
+            deleted_values = [v for v in (current["deleted_at"], incoming["deleted_at"]) if v]
+            # Keep the grace value attached to the earliest cancellation.
+            deleted_at = min(deleted_values) if deleted_values else None
+            grace = current["cancellation_grace_hours"]
+            if incoming["deleted_at"] and (
+                not current["deleted_at"] or incoming["deleted_at"] <= current["deleted_at"]
+            ):
+                grace = incoming["cancellation_grace_hours"]
+            local.execute(
+                "UPDATE upstream_keys_cloud SET position=?, valid_from=?, deleted_at=?, "
+                "cancellation_grace_hours=? WHERE account_id=? AND key_masked=?",
+                (min(current["position"], incoming["position"]),
+                 min(valid_values) if valid_values else None, deleted_at, grace,
+                 incoming["account_id"], incoming["key_masked"]),
+            )
+        local.commit()
+    except Exception:
+        local.rollback()
+        raise
+    finally:
+        remote.close()
+        local.close()
 
 
 def _config_hash_of_db(db_path: str) -> str:
@@ -358,7 +413,7 @@ def snapshot_config(db_path: str) -> None:
     dst = sqlite3.connect(snap)
     try:
         dst.execute("PRAGMA foreign_keys=OFF")
-        for table in CONFIG_TABLES + ["upstream_keys"]:
+        for table in CONFIG_TABLES + ["upstream_keys", "upstream_keys_cloud"]:
             if not _table_exists(src, table):
                 continue
             cols = [d[0] for d in src.execute(f"SELECT * FROM {table} LIMIT 0").description]
@@ -400,11 +455,12 @@ def restore_config_snapshot(db_path: str) -> bool:
         local.execute("PRAGMA foreign_keys=OFF")
         local.execute("BEGIN IMMEDIATE")
         children = ["aggregate_entries", "account_models", "local_keys",
-                    "pricing_slots", "proxy_timeout_config", "upstream_keys"]
+                    "pricing_slots", "proxy_timeout_config", "plan_price_history",
+                    "upstream_keys", "upstream_keys_cloud"]
         parents = ["upstream_accounts", "model_pricing"]
         # Delete child-first, then parents.
         for table in children + parents:
-            if _table_exists(local, table):
+            if _table_exists(local, table) and _table_exists(snap, table):
                 local.execute(f"DELETE FROM {table}")
         # Insert parents first, then children.
         for table in parents + children:
@@ -446,6 +502,7 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
     - account_models / aggregate_entries / pricing_slots /
       proxy_timeout_config: replaced wholesale from the cloud.
     """
+    _merge_upstream_keys_cloud(remote_path, local_path)
     remote = sqlite3.connect(remote_path)
     remote.row_factory = sqlite3.Row
     local = sqlite3.connect(local_path, timeout=10)
@@ -469,8 +526,13 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
         # ── Phase A: clear replace-wholesale child tables first, so parent
         #    delete-stale never trips a FOREIGN KEY (account_models has no
         #    ON DELETE clause). ──
-        for table in ("account_models", "aggregate_entries", "pricing_slots", "proxy_timeout_config"):
-            if _table_exists(local, table):
+        for table in ("account_models", "aggregate_entries", "pricing_slots",
+                      "proxy_timeout_config", "plan_billing_config", "plan_price_history"):
+            # A cloud config created by an older release does not have newly
+            # introduced tables.  Preserve local defaults/history in that
+            # case instead of clearing them before there is remote data to
+            # restore.
+            if _table_exists(local, table) and _table_exists(remote, table):
                 local.execute(f"DELETE FROM {table}")
 
         # ── upstream_accounts: upsert by id, preserve local key, delete-stale ──
@@ -528,7 +590,8 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
 
         # ── Phase B: rebuild the replace-wholesale tables from the cloud
         #    (ids preserved, so no remapping is needed). ──
-        for table in ("account_models", "aggregate_entries", "pricing_slots", "proxy_timeout_config"):
+        for table in ("account_models", "aggregate_entries", "pricing_slots",
+                      "proxy_timeout_config", "plan_billing_config", "plan_price_history"):
             if _table_exists(remote, table):
                 c = cols(remote, table)
                 for r in remote.execute(f"SELECT * FROM {table}"):
@@ -574,6 +637,10 @@ def sync_config_upload(db_path: str) -> dict:
 
         # ── 2. Build upload copy: strip secrets, drop runtime tables. ──
         _safe_copy_db(db_path, config_path)
+        if has_remote:
+            # config_hash intentionally excludes per-machine masked metadata;
+            # merge it explicitly before this upload copy becomes authoritative.
+            _merge_upstream_keys_cloud(remote_path, config_path)
         dst = sqlite3.connect(config_path)
         try:
             for table in _RUNTIME_TABLES:

@@ -90,6 +90,37 @@ function resetTimeoutConfig() {
     showToast('已填入默认值，点击「保存超时配置」生效');
 }
 
+// ── Plan billing config ─────────────────────────────────────────────────
+
+async function loadBillingConfig() {
+    try {
+        const cfg = await proxyFetch('/api/proxy/billing-config');
+        document.getElementById('billingPriceEffective').value = cfg.price_change_effective || 'current_period';
+        document.getElementById('billingGraceHours').value = cfg.cancellation_grace_hours ?? 24;
+    } catch (err) {
+        showToast('加载 Plan 计费设置失败: ' + err.message, 'error');
+    }
+}
+
+async function saveBillingConfig() {
+    const btn = document.getElementById('btnBillingConfigSave');
+    btn.disabled = true;
+    try {
+        await proxyFetch('/api/proxy/billing-config', {
+            method: 'PUT',
+            body: JSON.stringify({
+                price_change_effective: document.getElementById('billingPriceEffective').value,
+                cancellation_grace_hours: document.getElementById('billingGraceHours').value,
+            }),
+        });
+        showToast('Plan 计费设置已保存');
+        ConfigSync.markDirty();
+    } catch (err) {
+        showToast(err.message, 'error');
+    }
+    btn.disabled = false;
+}
+
 // ── WebDAV sync ───────────────────────────────────────────────────────────
 
 async function loadSyncConfig() {
@@ -166,7 +197,7 @@ function initSettingsPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">设置</h1>
-            <p class="page-subtitle">代理超时配置（按客户端线格式分组，保存后即时生效）与 WebDAV 同步</p>
+            <p class="page-subtitle">代理超时、Plan 计费与 WebDAV 同步设置</p>
         </div>
 
         <!-- ═══ Timeout config ═══ -->
@@ -191,6 +222,33 @@ function initSettingsPage() {
                 <div style="display:flex; gap:8px; margin-top:12px; justify-content:flex-end;">
                     <button class="btn btn--sm" onclick="resetTimeoutConfig()">恢复默认</button>
                     <button class="btn btn--primary" id="btnTimeoutSave" onclick="saveTimeoutConfig()">保存超时配置</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══ Plan billing config ═══ -->
+        <div class="section">
+            <div class="chart-card">
+                <div class="chart-card__title" style="margin-bottom:12px;">Plan 订阅计费</div>
+                <p style="margin:0 0 12px; font-size:13px; color:var(--color-text-secondary);">
+                    所有订阅起止、价格变更与宽限判断均使用 UTC+0。密钥有各自的订阅周期，因此“本月/下月”分别表示该密钥的本期/下期。
+                </p>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                    <label>修改月费的默认生效时间
+                        <select id="billingPriceEffective">
+                            <option value="current_period">本计费周期生效</option>
+                            <option value="next_period">下一计费周期生效</option>
+                        </select>
+                    </label>
+                    <label>取消订阅免收当期费用的宽限（小时）
+                        <input id="billingGraceHours" type="number" min="0" max="744" step="1">
+                    </label>
+                </div>
+                <div style="margin-top:10px; font-size:13px; color:var(--color-text-secondary);">
+                    填 0 关闭宽限。删除密钥或账户时会记录当时的宽限值，之后修改设置不会改写历史账单。
+                </div>
+                <div style="display:flex; justify-content:flex-end; margin-top:12px;">
+                    <button class="btn btn--primary" id="btnBillingConfigSave" onclick="saveBillingConfig()">保存 Plan 计费设置</button>
                 </div>
             </div>
         </div>
@@ -228,5 +286,6 @@ function initSettingsPage() {
     `;
 
     loadTimeoutConfig();
+    loadBillingConfig();
     loadSyncConfig();
 }

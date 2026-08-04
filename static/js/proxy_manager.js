@@ -71,7 +71,7 @@ function togglePlanFields(sel) {
 // the user touched the key section so a rename-only save never wipes keys.
 let _keyRowsEdited = false;
 
-function addKeyRow(value) {
+function addKeyRow(value, validFrom) {
     const list = document.getElementById('keyList');
     if (!list) return;
     const div = document.createElement('div');
@@ -82,17 +82,24 @@ function addKeyRow(value) {
     input.placeholder = 'sk-...（新密钥）';
     input.value = value || '';
     input.addEventListener('input', () => { _keyRowsEdited = true; });
+    const date = document.createElement('input');
+    date.type = 'date';
+    date.name = 'upstream_valid_froms[]';
+    date.title = '订阅起始日（UTC，留空=创建日期）';
+    date.value = validFrom || '';
+    date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'btn btn--sm';
     del.textContent = '删除';
     del.onclick = () => { _keyRowsEdited = true; div.remove(); };
     div.appendChild(input);
+    div.appendChild(date);
     div.appendChild(del);
     list.appendChild(div);
 }
 
-function addExistingKeyRow(keepId, masked) {
+function addExistingKeyRow(keepId, masked, validFrom) {
     const list = document.getElementById('keyList');
     if (!list) return;
     const div = document.createElement('div');
@@ -102,12 +109,19 @@ function addExistingKeyRow(keepId, masked) {
     const span = document.createElement('span');
     span.style.cssText = 'flex:1; font-family:monospace; background:#f3f4f6; padding:4px 8px; border-radius:4px; color:var(--color-text-secondary, #6b7280);';
     span.textContent = masked + '（已配置，如需删除点“移除”）';
+    const date = document.createElement('input');
+    date.type = 'date';
+    date.className = 'existing-key-valid-from';
+    date.title = '订阅起始日（UTC，留空=创建日期）';
+    date.value = validFrom || '';
+    date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'btn btn--sm';
     del.textContent = '移除';
     del.onclick = () => { _keyRowsEdited = true; div.remove(); };
     div.appendChild(span);
+    div.appendChild(date);
     div.appendChild(del);
     list.appendChild(div);
 }
@@ -120,10 +134,20 @@ function resetKeyList() {
 
 function collectKeyRows(form) {
     const keyInputs = [...form.querySelectorAll('#keyList input[name="upstream_keys[]"]')];
-    const upstream_keys = keyInputs.map(i => i.value.trim()).filter(v => v);
+    const upstream_keys = [];
+    const new_valid_froms = [];
+    keyInputs.forEach((input) => {
+        if (!input.value.trim()) return;
+        upstream_keys.push(input.value.trim());
+        new_valid_froms.push(input.parentElement.querySelector('[name="upstream_valid_froms[]"]').value || null);
+    });
     const keepRows = [...form.querySelectorAll('#keyList .existing-key')];
     const keep_key_ids = keepRows.map(r => r.dataset.keepId);
-    return { upstream_keys, keep_key_ids };
+    const keep_valid_froms = Object.fromEntries(keepRows.map(r => [
+        r.dataset.keepId,
+        r.querySelector('.existing-key-valid-from').value || null,
+    ]));
+    return { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms };
 }
 
 async function loadAccountsTable() {
@@ -144,7 +168,7 @@ async function loadAccountsTable() {
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
                 <td>${a.account_type === 'plan' ? '<span class="badge badge--active">plan</span>' : '<span class="badge">api</span>'}</td>
-                <td>${a.account_type === 'plan' ? '¥' + (+(a.monthly_price || 0)).toFixed(2) + (a.key_count > 1 ? '×' + a.key_count : '') + '/月' : '-'}</td>
+                <td>${a.account_type === 'plan' ? '¥' + (+(a.monthly_price || 0)).toFixed(2) + '/密钥·周期' : '-'}</td>
                 <td>${a.max_concurrency ? a.max_concurrency + ' 并发' : '无限制'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
@@ -161,7 +185,7 @@ async function saveAccount(e) {
     e.preventDefault();
     const form = e.target;
     const id = form.dataset.editId;
-    const { upstream_keys, keep_key_ids } = collectKeyRows(form);
+    const { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms } = collectKeyRows(form);
     try {
         if (id) {
             const payload = {
@@ -178,7 +202,9 @@ async function saveAccount(e) {
             // rename-only save must never wipe the existing keys.
             if (_keyRowsEdited) {
                 payload.upstream_keys = upstream_keys;
+                payload.new_valid_froms = new_valid_froms;
                 payload.keep_key_ids = keep_key_ids;
+                payload.keep_valid_froms = keep_valid_froms;
                 payload.keys_edited = true;
             }
             await proxyFetch(`/api/proxy/accounts/${id}`, {
@@ -193,6 +219,7 @@ async function saveAccount(e) {
                 body: JSON.stringify({
                     name: form['name'].value,
                     upstream_keys,
+                    new_valid_froms,
                     base_url: form['base_url'].value,
                     api_format: form['api_format'].value,
                     endpoint_path: form['endpoint_path'].value || '',
@@ -234,7 +261,7 @@ function editAccount(id) {
         togglePlanFields(form['account_type']);
         // Existing keys → masked keep-rows; user adds new rows as needed.
         resetKeyList();
-        (acc.keys || []).forEach((k) => addExistingKeyRow(k.id, k.masked));
+        (acc.keys || []).forEach((k) => addExistingKeyRow(k.id, k.masked, k.valid_from));
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';

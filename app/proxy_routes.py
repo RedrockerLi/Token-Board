@@ -59,7 +59,9 @@ def delete_account(account_id):
     result = _proxy_db().delete_account(account_id, mode=mode)
     if not result["ok"]:
         return jsonify({"error": result["error"] or "Account not found"}), 400
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "cancelled_at": result.get("cancelled_at"),
+                    "cancellation_grace_hours": result.get("cancellation_grace_hours"),
+                    "cancellation_effects": result.get("cancellation_effects", [])})
 
 
 # ── Account Models ───────────────────────────────────────────────────
@@ -271,6 +273,22 @@ def save_timeout_config():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"status": "ok"})
+
+
+# ── Plan billing settings ──────────────────────────────────────────────
+
+@bp_proxy.route("/billing-config", methods=["GET"])
+def get_billing_config():
+    return jsonify(_proxy_db().get_plan_billing_config())
+
+
+@bp_proxy.route("/billing-config", methods=["PUT"])
+def save_billing_config():
+    try:
+        _proxy_db().update_plan_billing_config(request.get_json(force=True))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(_proxy_db().get_plan_billing_config())
 
 
 # ── Billing / Usage ────────────────────────────────────────────────────

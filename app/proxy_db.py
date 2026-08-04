@@ -11,7 +11,8 @@ import os
 import secrets
 import sqlite3
 import string
-from datetime import datetime, timezone
+from calendar import monthrange
+from datetime import date, datetime, timedelta, timezone
 
 
 def _generate_key() -> str:
@@ -26,6 +27,70 @@ def mask_key(key: str) -> str:
     if len(key) <= 10:
         return key[:3] + "…"
     return f"{key[:6]}…{key[-4:]}"
+
+
+UTC = timezone.utc
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC).replace(microsecond=0)
+
+
+def _parse_iso_date(value: object) -> date | None:
+    """Parse a user-facing UTC calendar date, rejecting ambiguous values."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise ValueError("订阅起始日必须是 YYYY-MM-DD")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("订阅起始日必须是 YYYY-MM-DD") from exc
+
+
+def _parse_utc_timestamp(value: object) -> datetime | None:
+    if value in (None, ""):
+        return None
+    text = str(value).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        # SQLite's datetime('now') has a space separator and no offset.
+        parsed = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _period_start(month: str, anchor_day: int) -> datetime:
+    year, month_number = (int(part) for part in month.split("-", 1))
+    return datetime(year, month_number, min(anchor_day, monthrange(year, month_number)[1]), tzinfo=UTC)
+
+
+def _previous_month(month: str) -> str:
+    year, number = (int(part) for part in month.split("-", 1))
+    return f"{year - 1:04d}-12" if number == 1 else f"{year:04d}-{number - 1:02d}"
+
+
+def _next_month(month: str) -> str:
+    year, number = (int(part) for part in month.split("-", 1))
+    return f"{year + 1:04d}-01" if number == 12 else f"{year:04d}-{number + 1:02d}"
+
+
+def _billing_period_month(when: datetime | date, anchor_day: int) -> str:
+    """Return the administrative billing month containing *when* (UTC)."""
+    if isinstance(when, datetime):
+        moment = when.astimezone(UTC)
+        day = moment.date()
+    else:
+        day = when
+    month = f"{day.year:04d}-{day.month:02d}"
+    return month if day >= _period_start(month, anchor_day).date() else _previous_month(month)
+
+
+def _iter_months(first: str, last: str):
+    month = first
+    while month <= last:
+        yield month
+        month = _next_month(month)
 
 
 class ProxyDatabase:
@@ -83,25 +148,14 @@ class ProxyDatabase:
                 "  AND r.requested_at >= datetime('now', '-30 days')"
             ).fetchone()[0]
 
-            # Current-month plan subscription: current monthly_price × key count
-            # for plan accounts used this month (price edits affect only the
-            # current month; past months are frozen in the archive). Key count
-            # falls back to 1 (the account's legacy single upstream_key) when
-            # the account has no upstream_keys rows.
-            plan_subscription = conn.execute("""
-                SELECT COALESCE(SUM(a.monthly_price * (
-                    SELECT MAX(1, COUNT(*)) FROM upstream_keys k
-                    WHERE k.account_id = a.id)), 0)
-                FROM (
-                    SELECT DISTINCT r.account_id
-                    FROM request_log r
-                    WHERE strftime('%Y-%m', r.requested_at) = strftime('%Y-%m', 'now')
-                      AND r.account_id IS NOT NULL
-                ) t
-                JOIN upstream_accounts a ON a.id = t.account_id
-                WHERE COALESCE(a.account_type, 'api') = 'plan'
-                  AND a.deleted_at IS NULL
-            """).fetchone()[0]
+            # Current plan subscriptions are independent of usage.  Use the
+            # same lifecycle/price-history resolver as dashboard export so a
+            # key deleted after its grace window remains billed this period.
+            plan_subscription = 0.0
+            now = _utc_now()
+            for meta in self._plan_key_billing_meta(conn):
+                current_period = _billing_period_month(now, meta["anchor"].day)
+                plan_subscription += self._subscription_periods(conn, meta).get(current_period, 0.0)
             total_cost += plan_subscription
 
             # Today's consumption = api billed today + plan virtual cost today
@@ -159,7 +213,8 @@ class ProxyDatabase:
                 "COALESCE(account_type,'api') AS account_type, "
                 "COALESCE(monthly_price,0) AS monthly_price, "
                 "max_concurrency, created_at, "
-                "(SELECT COUNT(*) FROM upstream_keys k WHERE k.account_id = upstream_accounts.id) AS key_count "
+                "(SELECT COUNT(*) FROM upstream_keys k WHERE k.account_id = upstream_accounts.id "
+                " AND k.deleted_at IS NULL) AS key_count "
                 "FROM upstream_accounts WHERE deleted_at IS NULL ORDER BY id"
             ).fetchall()
             accounts = []
@@ -169,11 +224,12 @@ class ProxyDatabase:
                 # never leave the server in plaintext).  ids let the frontend
                 # reference kept keys without ever sending the real values.
                 key_rows = conn.execute(
-                    "SELECT id, key_value FROM upstream_keys "
-                    "WHERE account_id = ? ORDER BY position, id",
+                    "SELECT id, key_value, COALESCE(valid_from, date(created_at)) AS valid_from "
+                    "FROM upstream_keys WHERE account_id = ? AND deleted_at IS NULL ORDER BY position, id",
                     (acc["id"],),
                 ).fetchall()
-                acc["keys"] = [{"id": k[0], "masked": mask_key(k[1])}
+                acc["keys"] = [{"id": k[0], "masked": mask_key(k[1]),
+                                "valid_from": k[2]}
                                for k in key_rows] if key_rows else []
                 accounts.append(acc)
             return accounts
@@ -197,27 +253,86 @@ class ProxyDatabase:
         return []
 
     @staticmethod
-    def _set_upstream_keys(conn: sqlite3.Connection, account_id: int,
-                           keys: list[str]) -> None:
-        """Replace an account's key set (position = list index)."""
-        conn.execute("DELETE FROM upstream_keys WHERE account_id = ?", (account_id,))
-        for i, k in enumerate(keys):
+    def _billing_config_conn(conn: sqlite3.Connection) -> sqlite3.Row:
+        return conn.execute(
+            "SELECT price_change_effective, cancellation_grace_hours "
+            "FROM plan_billing_config WHERE id=1"
+        ).fetchone()
+
+    @staticmethod
+    def _refresh_upstream_keys_cloud(conn: sqlite3.Connection, account_id: int) -> None:
+        """Mirror local key lifecycle metadata without ever copying a secret."""
+        conn.execute("DELETE FROM upstream_keys_cloud WHERE account_id=?", (account_id,))
+        for row in conn.execute(
+            "SELECT key_value, position, valid_from, deleted_at, cancellation_grace_hours "
+            "FROM upstream_keys WHERE account_id=?", (account_id,)
+        ):
             conn.execute(
-                "INSERT OR IGNORE INTO upstream_keys "
-                "(account_id, key_value, position) VALUES (?,?,?)",
-                (account_id, k, i),
+                "INSERT INTO upstream_keys_cloud "
+                "(account_id,key_masked,position,valid_from,deleted_at,cancellation_grace_hours) "
+                "VALUES (?,?,?,?,?,?)",
+                (account_id, mask_key(row["key_value"]), row["position"],
+                 row["valid_from"], row["deleted_at"], row["cancellation_grace_hours"]),
             )
 
     @staticmethod
-    def _plan_key_count(conn: sqlite3.Connection, account_id: int) -> int:
-        """Number of keys configured for an account — at least 1 (an account
-        with no upstream_keys rows falls back to its legacy single
-        upstream_key slot, so its plan subscription still counts as 1)."""
-        n = conn.execute(
-            "SELECT COUNT(*) FROM upstream_keys WHERE account_id = ?",
-            (account_id,),
-        ).fetchone()[0]
-        return max(1, n)
+    def _set_upstream_keys(conn: sqlite3.Connection, account_id: int,
+                           keep_ids: list[int], new_keys: list[str],
+                           keep_valid_froms: dict[str, object] | None = None,
+                           new_valid_froms: list[object] | None = None) -> list[str]:
+        """Diff an account's local keys, preserving soft-deleted lifecycles.
+
+        Returns active plaintext values only so the legacy account column can
+        retain its first active fallback key.  This function is called inside
+        the same transaction that updates the cloud-safe metadata mirror.
+        """
+        keep_valid_froms = keep_valid_froms or {}
+        new_valid_froms = new_valid_froms or []
+        active = {
+            row["id"]: row for row in conn.execute(
+                "SELECT id,key_value,valid_from FROM upstream_keys "
+                "WHERE account_id=? AND deleted_at IS NULL", (account_id,)
+            )
+        }
+        retained = [key_id for key_id in keep_ids if key_id in active]
+        config = ProxyDatabase._billing_config_conn(conn)
+        now = _utc_now().strftime("%Y-%m-%d %H:%M:%S")
+        for key_id in active:
+            if key_id not in retained:
+                conn.execute(
+                    "UPDATE upstream_keys SET deleted_at=?, cancellation_grace_hours=? "
+                    "WHERE id=?",
+                    (now, config["cancellation_grace_hours"], key_id),
+                )
+
+        active_values: list[str] = []
+        position = 0
+        for key_id in retained:
+            valid = _parse_iso_date(keep_valid_froms.get(str(key_id)))
+            conn.execute(
+                "UPDATE upstream_keys SET position=?, valid_from=? WHERE id=?",
+                (position, valid.isoformat() if valid else None, key_id),
+            )
+            active_values.append(active[key_id]["key_value"])
+            position += 1
+
+        seen = set(active_values)
+        for index, raw_key in enumerate(new_keys):
+            key = raw_key.strip()
+            if not key or key in seen:
+                continue
+            valid = _parse_iso_date(new_valid_froms[index] if index < len(new_valid_froms) else None)
+            conn.execute(
+                "INSERT INTO upstream_keys (account_id,key_value,position,valid_from) "
+                "VALUES (?,?,?,?)",
+                (account_id, key, position, valid.isoformat() if valid else None),
+            )
+            active_values.append(key)
+            seen.add(key)
+            position += 1
+
+        ProxyDatabase._refresh_upstream_keys_cloud(conn, account_id)
+        return active_values
 
     def create_account(self, data: dict) -> int:
         keys = self._normalize_keys(data)
@@ -243,7 +358,16 @@ class ProxyDatabase:
             )
             account_id = cursor.lastrowid
             if keys:
-                self._set_upstream_keys(conn, account_id, keys)
+                self._set_upstream_keys(
+                    conn, account_id, [], keys, new_valid_froms=data.get("new_valid_froms")
+                )
+            if data.get("account_type", "api") == "plan":
+                conn.execute(
+                    "INSERT INTO plan_price_history "
+                    "(account_id,monthly_price,changed_at,effective_mode) VALUES (?,?,?,?)",
+                    (account_id, float(data.get("monthly_price", 0) or 0),
+                     _utc_now().strftime("%Y-%m-%d %H:%M:%S"), "current_period"),
+                )
             conn.commit()
             return account_id
         finally:
@@ -252,6 +376,12 @@ class ProxyDatabase:
     def update_account(self, account_id: int, data: dict) -> bool:
         conn = self._connect()
         try:
+            original = conn.execute(
+                "SELECT account_type, monthly_price FROM upstream_accounts "
+                "WHERE id=? AND deleted_at IS NULL", (account_id,)
+            ).fetchone()
+            if original is None:
+                return False
             fields = []
             values = []
             for key in ("name", "base_url", "api_format",
@@ -278,18 +408,11 @@ class ProxyDatabase:
                 # id — the UI only ever sees masked values, never the real
                 # secrets) + newly-typed keys, in that order.
                 keep_ids = [int(i) for i in (data.get("keep_key_ids") or []) if str(i).lstrip('-').isdigit()]
-                keep_vals = []
-                if keep_ids:
-                    ph = ",".join("?" for _ in keep_ids)
-                    rows = conn.execute(
-                        f"SELECT key_value FROM upstream_keys "
-                        f"WHERE account_id = ? AND id IN ({ph}) "
-                        f"ORDER BY position, id",
-                        [account_id] + keep_ids,
-                    ).fetchall()
-                    keep_vals = [r[0] for r in rows]
-                final_keys = keep_vals + self._normalize_keys(data)
-                self._set_upstream_keys(conn, account_id, final_keys)
+                final_keys = self._set_upstream_keys(
+                    conn, account_id, keep_ids, self._normalize_keys(data),
+                    keep_valid_froms=data.get("keep_valid_froms"),
+                    new_valid_froms=data.get("new_valid_froms"),
+                )
                 first = final_keys[0] if final_keys else ""
                 fields.append("upstream_key = ?")
                 values.append(first)
@@ -302,6 +425,23 @@ class ProxyDatabase:
                 f"UPDATE upstream_accounts SET {', '.join(fields)} WHERE id = ?",
                 values,
             )
+            final_type = data.get("account_type", original["account_type"])
+            final_price = float(data.get("monthly_price", original["monthly_price"]) or 0)
+            if final_type == "plan" and (
+                original["account_type"] != "plan" or
+                final_price != float(original["monthly_price"] or 0)
+            ):
+                mode = data.get("price_effective")
+                if mode is not None and mode not in ("current_period", "next_period"):
+                    raise ValueError("价格生效方式必须是 current_period 或 next_period")
+                if mode is None:
+                    mode = self._billing_config_conn(conn)["price_change_effective"]
+                conn.execute(
+                    "INSERT INTO plan_price_history "
+                    "(account_id,monthly_price,changed_at,effective_mode) VALUES (?,?,?,?)",
+                    (account_id, final_price, _utc_now().strftime("%Y-%m-%d %H:%M:%S"), mode),
+                )
+            self._refresh_upstream_keys_cloud(conn, account_id)
             conn.commit()
             return conn.total_changes > 0
         finally:
@@ -326,6 +466,21 @@ class ProxyDatabase:
         """
         conn = self._connect()
         try:
+            config = self._billing_config_conn(conn)
+            cancelled_at = _utc_now()
+            active_keys = conn.execute(
+                "SELECT id, valid_from, created_at FROM upstream_keys "
+                "WHERE account_id=? AND deleted_at IS NULL", (account_id,)
+            ).fetchall()
+            cancellation_effects = []
+            for key in active_keys:
+                anchor = _parse_iso_date(key["valid_from"]) or _parse_utc_timestamp(key["created_at"]).date()
+                current = _billing_period_month(cancelled_at, anchor.day)
+                waived = cancelled_at < _period_start(current, anchor.day) + timedelta(
+                    hours=config["cancellation_grace_hours"]
+                )
+                cancellation_effects.append({"upstream_key_id": key["id"],
+                                             "current_period_waived": waived})
             if mode == "cascade":
                 conn.execute("DELETE FROM local_keys WHERE account_id = ?", (account_id,))
             else:
@@ -339,12 +494,23 @@ class ProxyDatabase:
                 (account_id,),
             )
             conn.execute(
-                "UPDATE upstream_accounts SET deleted_at = datetime('now', 'localtime') "
+                "UPDATE upstream_accounts SET deleted_at = ? "
                 "WHERE id = ? AND deleted_at IS NULL",
-                (account_id,),
+                (cancelled_at.strftime("%Y-%m-%d %H:%M:%S"), account_id),
             )
+            conn.execute(
+                "UPDATE upstream_keys SET deleted_at=?, "
+                "cancellation_grace_hours=? "
+                "WHERE account_id=? AND deleted_at IS NULL",
+                (cancelled_at.strftime("%Y-%m-%d %H:%M:%S"),
+                 config["cancellation_grace_hours"], account_id),
+            )
+            self._refresh_upstream_keys_cloud(conn, account_id)
             conn.commit()
-            return {"ok": conn.total_changes > 0, "error": ""}
+            return {"ok": conn.total_changes > 0, "error": "",
+                    "cancelled_at": cancelled_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "cancellation_grace_hours": config["cancellation_grace_hours"],
+                    "cancellation_effects": cancellation_effects}
         finally:
             conn.close()
 
@@ -716,6 +882,42 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    # ── Plan billing settings (all timestamps are UTC+0) ───────────────
+
+    def get_plan_billing_config(self) -> dict:
+        conn = self._connect()
+        try:
+            row = self._billing_config_conn(conn)
+            return {
+                "price_change_effective": row["price_change_effective"],
+                "cancellation_grace_hours": row["cancellation_grace_hours"],
+                "timezone": "UTC",
+            }
+        finally:
+            conn.close()
+
+    def update_plan_billing_config(self, data: dict) -> bool:
+        mode = data.get("price_change_effective")
+        if mode not in ("current_period", "next_period"):
+            raise ValueError("价格生效方式必须是 current_period 或 next_period")
+        try:
+            grace = int(data.get("cancellation_grace_hours"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("取消宽限必须是整数小时") from exc
+        if not 0 <= grace <= 744:
+            raise ValueError("取消宽限范围为 0-744 小时")
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE plan_billing_config SET price_change_effective=?, "
+                "cancellation_grace_hours=? WHERE id=1",
+                (mode, grace),
+            )
+            conn.commit()
+            return conn.total_changes > 0
+        finally:
+            conn.close()
+
     # ── Billing / Usage ────────────────────────────────────────────────
 
     def get_billing_summary(
@@ -924,6 +1126,108 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    # ── Per-key plan billing helpers ───────────────────────────────────
+
+    @staticmethod
+    def _plan_key_billing_meta(conn: sqlite3.Connection) -> list[dict]:
+        """Build billable key lifecycles, including cloud-only masked keys."""
+        now = _utc_now()
+        config = ProxyDatabase._billing_config_conn(conn)
+        by_identity: dict[tuple[int, str], dict] = {}
+        accounts = conn.execute(
+            "SELECT id, upstream_key, created_at, deleted_at FROM upstream_accounts "
+            "WHERE COALESCE(account_type,'api')='plan' AND COALESCE(is_aggregate,0)=0"
+        ).fetchall()
+        account_rows = {row["id"]: row for row in accounts}
+        for row in conn.execute(
+            "SELECT k.id,k.account_id,k.key_value,k.created_at,k.valid_from,k.deleted_at,"
+            "k.cancellation_grace_hours,a.deleted_at AS account_deleted_at "
+            "FROM upstream_keys k JOIN upstream_accounts a ON a.id=k.account_id "
+            "WHERE COALESCE(a.account_type,'api')='plan' AND COALESCE(a.is_aggregate,0)=0"
+        ):
+            anchor = _parse_iso_date(row["valid_from"]) or _parse_utc_timestamp(row["created_at"]).date()
+            key_end = _parse_utc_timestamp(row["deleted_at"])
+            account_end = _parse_utc_timestamp(row["account_deleted_at"])
+            end = min((v for v in (key_end, account_end) if v is not None), default=None)
+            identity = (row["account_id"], mask_key(row["key_value"]))
+            by_identity[identity] = {
+                "account_id": row["account_id"], "key_id": row["id"],
+                "key_masked": identity[1], "anchor": anchor,
+                "end": end, "grace": row["cancellation_grace_hours"],
+            }
+        for row in conn.execute("SELECT * FROM upstream_keys_cloud"):
+            if row["account_id"] not in account_rows:
+                continue
+            identity = (row["account_id"], row["key_masked"])
+            anchor = _parse_iso_date(row["valid_from"]) or _parse_utc_timestamp(
+                account_rows[row["account_id"]]["created_at"]
+            ).date()
+            cloud_end = _parse_utc_timestamp(row["deleted_at"])
+            account_end = _parse_utc_timestamp(account_rows[row["account_id"]]["deleted_at"])
+            end = min((v for v in (cloud_end, account_end) if v is not None), default=None)
+            if identity in by_identity:
+                meta = by_identity[identity]
+                meta["anchor"] = min(meta["anchor"], anchor)
+                if end is not None:
+                    meta["end"] = min((v for v in (meta["end"], end) if v is not None), default=end)
+                if row["cancellation_grace_hours"] is not None:
+                    meta["grace"] = row["cancellation_grace_hours"]
+            else:
+                by_identity[identity] = {
+                    "account_id": row["account_id"], "key_id": None,
+                    "key_masked": row["key_masked"], "anchor": anchor, "end": end,
+                    "grace": row["cancellation_grace_hours"],
+                }
+        # Old databases may contain a plan account with a legacy key but no
+        # key row.  An empty cloud-synced account is not a billable key.
+        for account in accounts:
+            if account["upstream_key"] and not any(
+                meta["account_id"] == account["id"] for meta in by_identity.values()
+            ):
+                anchor = _parse_utc_timestamp(account["created_at"]).date()
+                by_identity[(account["id"], mask_key(account["upstream_key"]))] = {
+                    "account_id": account["id"], "key_id": None,
+                    "key_masked": mask_key(account["upstream_key"]), "anchor": anchor,
+                    "end": _parse_utc_timestamp(account["deleted_at"]), "grace": None,
+                }
+        for meta in by_identity.values():
+            if meta["grace"] is None:
+                meta["grace"] = config["cancellation_grace_hours"]
+            meta["now"] = now
+        return list(by_identity.values())
+
+    @staticmethod
+    def _price_for_period(conn: sqlite3.Connection, account_id: int,
+                          period: str, anchor_day: int) -> float:
+        price = 0.0
+        for row in conn.execute(
+            "SELECT monthly_price,changed_at,effective_mode FROM plan_price_history "
+            "WHERE account_id=? ORDER BY changed_at,id", (account_id,)
+        ):
+            changed = _parse_utc_timestamp(row["changed_at"])
+            effective = _billing_period_month(changed, anchor_day)
+            if row["effective_mode"] == "next_period":
+                effective = _next_month(effective)
+            if effective <= period:
+                price = float(row["monthly_price"] or 0)
+        return price
+
+    @classmethod
+    def _subscription_periods(cls, conn: sqlite3.Connection, meta: dict) -> dict[str, float]:
+        now = meta["now"]
+        first = _billing_period_month(meta["anchor"], meta["anchor"].day)
+        last = _billing_period_month(meta["end"] or now, meta["anchor"].day)
+        if first > last:
+            return {}
+        periods = {month: cls._price_for_period(conn, meta["account_id"], month,
+                                                 meta["anchor"].day)
+                   for month in _iter_months(first, last)}
+        if meta["end"] is not None:
+            start = _period_start(last, meta["anchor"].day)
+            if meta["end"] < start + timedelta(hours=int(meta["grace"])):
+                periods.pop(last, None)
+        return periods
+
     def export_to_dashboard(self, target_path: str, mark: int, max_id: int) -> dict:
         """Export request_log rows (id in (mark, max_id]) into a dashboard archive.
 
@@ -982,75 +1286,40 @@ class ProxyDatabase:
                     cost=r["cost"],
                 )
 
-            # B) plan economics: persist per (account, month) — logs are cleaned
-            #    30d after export, so the archive must never be recomputed.
-            #    account_id is the identity; account_type JOINed (soft-deleted
-            #    accounts still archive their usage — the accounts mirror keeps
-            #    their name for display).
-            current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-            plan_rows = conn.execute("""
-                SELECT
-                    r.account_id,
-                    strftime('%Y-%m', r.requested_at) AS month,
-                    COALESCE(SUM(r.api_cost), 0) AS virtual_cost
-                FROM request_log r
-                JOIN upstream_accounts a ON a.id = r.account_id
-                WHERE r.id > ? AND r.id <= ?
-                  AND COALESCE(a.account_type, 'api') = 'plan'
-                GROUP BY r.account_id, month
-            """, (mark, max_id)).fetchall()
-            for pr in plan_rows:
-                price = conn.execute(
-                    "SELECT monthly_price, deleted_at FROM upstream_accounts WHERE id = ?",
-                    (pr["account_id"],),
-                ).fetchone()
-                if price is not None:
-                    dash_db.accumulate_plan_summary(
-                        month=pr["month"],
-                        account_id=pr["account_id"],
-                        subscription_cost=float(price["monthly_price"] or 0)
-                                        * self._plan_key_count(conn, pr["account_id"]),
-                        virtual_cost=float(pr["virtual_cost"] or 0),
-                        refresh_subscription=(pr["month"] == current_month
-                                              and price["deleted_at"] is None),
-                    )
-                else:
-                    # account gone: keep existing subscription_cost, just
-                    # accumulate the virtual (api-billed) amount.
-                    dash_db.accumulate_plan_summary(
-                        month=pr["month"],
-                        account_id=pr["account_id"],
-                        subscription_cost=0.0,
-                        virtual_cost=float(pr["virtual_cost"] or 0),
-                        refresh_subscription=False,
-                    )
+            # B) Plan subscriptions are derived from key lifecycles, not from
+            # usage.  Reconcile every known lifecycle on every export so an
+            # edited start date, cancellation, or scheduled price cannot leave
+            # stale subscription rows behind.
+            metas = self._plan_key_billing_meta(conn)
+            by_key_id = {meta["key_id"]: meta for meta in metas if meta["key_id"] is not None}
+            by_account = {}
+            for meta in metas:
+                by_account.setdefault(meta["account_id"], meta)
+                dash_db.reconcile_plan_subscription(
+                    meta["account_id"], meta["key_masked"],
+                    self._subscription_periods(conn, meta),
+                )
 
-            # Current-month refresh is NOT tied to the export batch: a price
-            # edit mid-month must reach the archive even when this batch has no
-            # new plan rows (all of the month's rows were already exported and
-            # mark has passed them). Every ACTIVE plan account used this month
-            # gets its subscription set to the current monthly_price. Past
-            # months are never touched here (frozen in the batch loop above).
-            cur_plans = conn.execute("""
-                SELECT a.id, a.monthly_price
-                FROM (
-                    SELECT DISTINCT r.account_id AS id
-                    FROM request_log r
-                    WHERE strftime('%Y-%m', r.requested_at) = ?
-                      AND r.account_id IS NOT NULL
-                ) t
-                JOIN upstream_accounts a ON a.id = t.id
-                WHERE COALESCE(a.account_type, 'api') = 'plan'
-                  AND a.deleted_at IS NULL
-            """, (current_month,)).fetchall()
-            for cp in cur_plans:
+            virtual_buckets: dict[tuple[str, int, str], float] = {}
+            plan_logs = conn.execute(
+                "SELECT r.account_id,r.upstream_key_id,r.requested_at,r.api_cost "
+                "FROM request_log r JOIN upstream_accounts a ON a.id=r.account_id "
+                "WHERE r.id>? AND r.id<=? AND COALESCE(a.account_type,'api')='plan'",
+                (mark, max_id),
+            ).fetchall()
+            for log in plan_logs:
+                meta = by_key_id.get(log["upstream_key_id"]) or by_account.get(log["account_id"])
+                if meta is None:
+                    continue
+                requested = _parse_utc_timestamp(log["requested_at"])
+                month = _billing_period_month(requested, meta["anchor"].day)
+                bucket = (month, meta["account_id"], meta["key_masked"])
+                virtual_buckets[bucket] = virtual_buckets.get(bucket, 0.0) + float(log["api_cost"] or 0)
+            for (month, account_id, key_masked), virtual_cost in virtual_buckets.items():
                 dash_db.accumulate_plan_summary(
-                    month=current_month,
-                    account_id=cp["id"],
-                    subscription_cost=float(cp["monthly_price"] or 0)
-                                    * self._plan_key_count(conn, cp["id"]),
-                    virtual_cost=0.0,
-                    refresh_subscription=True,
+                    month=month, account_id=account_id, key_masked=key_masked,
+                    subscription_cost=0.0, virtual_cost=virtual_cost,
+                    refresh_subscription=False,
                 )
 
             return {
@@ -1314,4 +1583,3 @@ class ProxyDatabase:
             }
         finally:
             conn.close()
-

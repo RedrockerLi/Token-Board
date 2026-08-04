@@ -142,6 +142,14 @@ UpstreamClient::forward(const std::string &method,
         bool first_chunk = true;
         std::chrono::steady_clock::time_point t_first;
 
+        // Status captured by response_handler BEFORE the body is read.  The
+        // receiver only relays the body to on_chunk for 2xx responses; a
+        // non-2xx response (429/5xx — always a complete small error body, the
+        // upstream never returns one mid-stream) is buffered into
+        // `accumulated` instead, so the caller can fall back to the next
+        // candidate without anything having reached the client.
+        int upstream_status = 0;
+
         // Phase-aware streaming timeouts (see StreamTimeoutWatch): httplib's
         // read timeout is select-based and fixed for the connection, so it
         // cannot express "first-byte timeout, then idle timeout".  A watchdog
@@ -178,7 +186,8 @@ UpstreamClient::forward(const std::string &method,
                         static_cast<long long>(opts.streaming_idle_timeout) * 1000,
                     std::memory_order_release);
             accumulated.append(data, len);
-            if (client_connected) {
+            if (client_connected &&
+                upstream_status >= 200 && upstream_status < 300) {
                 client_connected = on_chunk(data, len);
             }
             return client_connected;
@@ -189,6 +198,10 @@ UpstreamClient::forward(const std::string &method,
         req.path = full_path;
         req.headers = headers;
         req.body = body;
+        req.response_handler = [&](const httplib::Response &r) -> bool {
+            upstream_status = r.status;
+            return true;  // always read the body; the receiver decides
+        };
         req.content_receiver = receiver;
 
         httplib::Response upstream_res;

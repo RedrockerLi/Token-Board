@@ -339,8 +339,8 @@ resolve_candidates(Database &db, const Router::RouteResult &route,
 }
 
 /// Pick a candidate starting at `start` and advancing in cyclic order
-/// (start, start+1, …, n-1, 0, …, start-1).  Concurrency is tracked per key
-/// slot; plan cooldown is per account.  Returns the picked index via `picked`.
+/// (start, start+1, …, n-1, 0, …, start-1).  Concurrency and plan cooldown
+/// are both tracked per key slot.  Returns the picked index via `picked`.
 static bool pick_candidate(AccountGate &gate,
                            const std::vector<UpstreamCandidate> &cands,
                            size_t start, size_t &picked) {
@@ -348,9 +348,10 @@ static bool pick_candidate(AccountGate &gate,
     for (size_t i = 0; i < n; ++i) {
         size_t idx = (start + i) % n;
         const auto &c = cands[idx];
-        if (gate.in_cooldown(c.account.id)) {
-            fprintf(stderr, "[Proxy] account %d (%s) cooling down, skip\n",
-                    c.account.id, c.account.name.c_str());
+        if (gate.in_cooldown(c.key_slot_id)) {
+            fprintf(stderr, "[Proxy] key slot %d (account %d %s) cooling "
+                            "down, skip\n",
+                    c.key_slot_id, c.account.id, c.account.name.c_str());
             continue;
         }
         if (!gate.acquire(c.key_slot_id, c.account.max_concurrency)) {
@@ -554,7 +555,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     ir::ApiFormat harness = harness_format_from_path(req.path);
     bool is_stream = is_streaming_request(req.body);
 
-    // ── Streaming: pick one candidate, forward, done ──────────────────
+    // ── Streaming: defer candidate selection into the provider ─────────
+    // The chunked response headers are intentionally not committed until the
+    // provider writes its first event.  This lets handle_streaming try the
+    // next key when an upstream returns 429/5xx before emitting any bytes.
     if (is_stream) {
         // Validate the harness request BEFORE acquiring a gate slot: a
         // 400 early-return must not leak the concurrency slot.
@@ -582,24 +586,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         std::string session_id = extract_session_id(req, req_json);
         size_t start = static_cast<size_t>(
             affinity_.preferred_index(session_id, cands.size()));
-        size_t picked = 0;
-        if (!pick_candidate(gate_, cands, start, picked)) {
-            res.status = 429;
-            res.set_content(json_error("All upstream accounts are busy or cooling down", 429),
-                            "application/json");
-            return;
-        }
-        const UpstreamCandidate &cand = cands[picked];
-        if (affinity_.binding_changed(session_id, cand.key_slot_id))
-            db_.log_session_key(session_id, cand.account.id, cand.key_slot_id);
-        ir::ApiFormat upstream =
-            ir::parse_api_format(cand.account.api_format);
-        if (harness == upstream)
-            handle_passthrough(cand, ar.route.local_key_id, upstream,
-                               model, req, res, t0);
-        else
-            handle_converted(cand, ar.route.local_key_id, harness,
-                             upstream, model, req, res, t0);
+        handle_streaming(cands, start, session_id, ar.route.local_key_id,
+                         harness, model, req, res, t0);
         return;
     }
 
@@ -647,7 +635,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     for (size_t i = 0; i < cands.size(); ++i) {
         size_t ci = (start + i) % cands.size();
         const UpstreamCandidate &c = cands[ci];
-        if (gate_.in_cooldown(c.account.id)) continue;
+        if (gate_.in_cooldown(c.key_slot_id)) continue;
         if (!gate_.acquire(c.key_slot_id, c.account.max_concurrency)) continue;
 
         if (inflight_id < 0) {
@@ -685,12 +673,12 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         }
         used_upstream_fmt = upstream;
 
-        // plan accounts cool down for 5h when the upstream rate-limits them.
+        // plan keys cool down for 5h when the upstream rate-limits them.
         if (fwd.status_code == 429 && c.account.account_type == "plan") {
-            fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited (429), "
-                            "cooling down 5h\n",
-                    c.account.id, c.account.name.c_str());
-            gate_.mark_cooldown(c.account.id);
+            fprintf(stderr, "[Proxy] key slot %d (account %d %s) plan "
+                            "rate-limited (429), cooling down 5h\n",
+                    c.key_slot_id, c.account.id, c.account.name.c_str());
+            gate_.mark_cooldown(c.key_slot_id);
         }
 
         // Fall back to the next candidate on 429/5xx (including upstream
@@ -877,6 +865,207 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     gate_.release(used->key_slot_id);
 }
 
+// ── handle_streaming ──────────────────────────────────────────────────
+
+void ProxyServer::handle_streaming(
+    const std::vector<UpstreamCandidate> &cands, size_t start,
+    const std::string &session_id, int local_key_id, ir::ApiFormat harness,
+    const std::string &resolved_model, const httplib::Request &req,
+    httplib::Response &res, std::chrono::steady_clock::time_point t0) {
+    const FormatCodec &harness_codec = codecs_.get(harness);
+    ir::ChatRequest parsed_request;
+    std::string parse_error;
+    json request_json;
+    try {
+        request_json = json::parse(req.body);
+    } catch (...) {
+        res.status = 400;
+        res.set_content(harness_codec.serialize_error_body(
+                            json{{"message", "invalid JSON body"}, {"type", "parse_error"}}).dump(),
+                        "application/json");
+        return;
+    }
+    if (!harness_codec.parse_request(request_json, parsed_request, parse_error)) {
+        res.status = 400;
+        res.set_content(harness_codec.serialize_error_body(
+                            json{{"message", parse_error}, {"type", "parse_error"}}).dump(),
+                        "application/json");
+        return;
+    }
+
+    const std::string content_type = req.has_header("Content-Type")
+        ? req.get_header_value("Content-Type") : "application/json";
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [this, cands, start, session_id, local_key_id, harness, resolved_model,
+         request_body = req.body, content_type, parsed_request, t0, &res,
+         client_sock = req.client_socket](size_t, httplib::DataSink &sink) -> bool {
+            const FormatCodec &out_codec = codecs_.get(harness);
+            int inflight_id = -1;
+            int concurrent_count = 0;
+            const UpstreamCandidate *used = nullptr;
+            UpstreamClient::ForwardResult final_result;
+            bool committed = false;
+            bool last_timeout = false;
+            int last_status = 429;
+            int last_account_id = 0;
+            int last_slot_id = 0;
+            int last_duration_ms = 0;
+            std::string last_body;
+            bool first_response = true;
+            std::chrono::steady_clock::time_point first_response_at;
+
+            auto write_to_sink = [&](const std::string &data) -> bool {
+                if (data.empty()) return true;
+                bool ok = sink.write(data.data(), data.size());
+                if (ok) committed = true;
+                return ok;
+            };
+            auto emit_error = [&](const json &normalized) {
+                auto emitter = out_codec.make_stream_emitter();
+                ir::StreamEvent event;
+                event.type = ir::StreamEventType::ErrorEvent;
+                event.extra["error"] = normalized;
+                emitter->emit(event, write_to_sink);
+                emitter->finish(write_to_sink);
+            };
+
+            for (size_t attempt = 0; attempt < cands.size(); ++attempt) {
+                const auto &candidate = cands[(start + attempt) % cands.size()];
+                if (gate_.in_cooldown(candidate.key_slot_id)) continue;
+                if (!gate_.acquire(candidate.key_slot_id, candidate.account.max_concurrency)) continue;
+
+                if (inflight_id < 0) {
+                    inflight_id = db_.request_start(local_key_id, candidate.account.id,
+                                                    candidate.upstream_model, true);
+                    concurrent_count = db_.get_in_flight_count();
+                }
+
+                const auto upstream = ir::parse_api_format(candidate.account.api_format);
+                const bool passthrough = harness == upstream;
+                const bool filter_thinking = passthrough && upstream == ir::ApiFormat::OpenAI;
+                auto target = resolve_upstream_target(
+                    candidate.account.api_format, candidate.account.base_url,
+                    candidate.account.endpoint_path, candidate.account.auth_header,
+                    timeout_config_for(db_, harness));
+                std::string body;
+                if (passthrough) {
+                    body = request_body;
+                    apply_body_model(body, candidate.upstream_model);
+                } else {
+                    auto converted = parsed_request;
+                    converted.model = candidate.upstream_model;
+                    body = codecs_.get(upstream).serialize_request(converted).dump();
+                }
+
+                std::unique_ptr<ir::StreamParser> parser;
+                std::unique_ptr<ir::StreamEmitter> emitter;
+                ThinkStreamFilter think_filter;
+                bool has_reasoning = false;
+                if (!passthrough) {
+                    parser = codecs_.get(upstream).make_stream_parser();
+                    emitter = out_codec.make_stream_emitter();
+                }
+                auto on_event = [&](const ir::StreamEvent &event) -> bool {
+                    return emitter->emit(event, write_to_sink);
+                };
+                auto on_chunk = [&](const char *data, size_t len) -> bool {
+                    if (first_response) {
+                        first_response = false;
+                        first_response_at = std::chrono::steady_clock::now();
+                    }
+                    if (!passthrough) return parser->feed(data, len, on_event);
+                    if (!filter_thinking) return write_to_sink(std::string(data, len));
+                    if (!has_reasoning && sse_chunk_has_reasoning(data, len)) has_reasoning = true;
+                    if (has_reasoning) return write_to_sink(std::string(data, len));
+                    std::string filtered = think_filter.feed(data, len);
+                    return filtered.empty() || write_to_sink(filtered);
+                };
+
+                AbortGuard abort;
+                auto monitor = spawn_client_monitor(client_sock, abort);
+                auto result = upstream_.forward(
+                    "POST", candidate.account.base_url, candidate.key, target.path, body,
+                    passthrough ? content_type : "application/json", on_chunk, target.opts,
+                    [&](int fd) { abort.upstream_fd.store(fd, std::memory_order_relaxed); });
+                abort.running.store(false, std::memory_order_release);
+                if (monitor.joinable()) monitor.join();
+
+                if (result.success && result.status_code >= 200 && result.status_code < 300) {
+                    if (!passthrough) {
+                        parser->finish(on_event);
+                        emitter->finish(write_to_sink);
+                    }
+                    final_result = std::move(result);
+                    used = &candidate;
+                    break;
+                }
+
+                if (result.status_code == 429 && candidate.account.account_type == "plan")
+                    gate_.mark_cooldown(candidate.key_slot_id);
+                last_timeout = result.is_timeout;
+                last_status = result.status_code;
+                last_account_id = candidate.account.id;
+                last_slot_id = candidate.key_slot_id;
+                last_duration_ms = result.duration_ms;
+                last_body = result.body;
+                final_result = std::move(result);
+                gate_.release(candidate.key_slot_id);
+
+                // A parser can receive bytes without emitting a harness event;
+                // only a successful sink.write commits this client response.
+                if (committed || !(last_status == 429 || last_status >= 500)) break;
+            }
+
+            if (inflight_id >= 0) db_.request_end(inflight_id);
+            if (used) {
+                auto usage = UsageTracker::parse_stream_usage(
+                    ir::to_string(ir::parse_api_format(used->account.api_format)), final_result.body);
+                if (!usage) {
+                    UsageTracker::UsageInfo zero;
+                    zero.model = resolved_model;
+                    usage = zero;
+                }
+                usage->model = resolved_model;
+                tracker_.log_request(used->account.id, local_key_id, *usage, true,
+                                     final_result.status_code, final_result.duration_ms, used->key_slot_id);
+                tracker_.mark_key_used(local_key_id);
+                const int proxy_ttft = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        (first_response ? std::chrono::steady_clock::now() : first_response_at) - t0).count());
+                tracker_.log_perf_event(resolved_model, final_result.ttft_ms, proxy_ttft,
+                                        final_result.status_code, false, concurrent_count);
+                if (affinity_.binding_changed(session_id, used->key_slot_id))
+                    db_.log_session_key(session_id, used->account.id, used->key_slot_id);
+                gate_.release(used->key_slot_id);
+                sink.done();
+                return true;
+            }
+
+            if (client_socket_gone(client_sock)) return false;
+            const int final_status = last_timeout ? 504 : last_status;
+            res.status = final_status;
+            json normalized = last_timeout
+                ? timeout_error_body(final_result.timeout_secs)
+                : json{{"message", last_body.empty()
+                    ? "All upstream accounts are busy, cooling down, or failed" : last_body},
+                       {"type", final_status == 429 ? "rate_limit_error" : "upstream_error"},
+                       {"code", final_status}};
+            if (last_account_id) {
+                UsageTracker::UsageInfo zero;
+                zero.model = resolved_model;
+                tracker_.log_request(last_account_id, local_key_id, zero, true,
+                                     final_status, last_duration_ms, last_slot_id);
+            }
+            emit_error(normalized);
+            sink.done();
+            return true;
+        },
+        nullptr);
+    res.set_deferred_chunked_headers();
+}
+
+#if 0  // Replaced by handle_streaming; retained temporarily for reference.
 // ── handle_passthrough (streaming only) ─────────────────────────────────
 
 /// Streaming passthrough for one already-picked candidate.  Non-streaming
@@ -955,12 +1144,12 @@ void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
             abort.running.store(false, std::memory_order_release);
             if (monitor.joinable()) monitor.join();
 
-            // plan accounts cool down for 5h when the upstream rate-limits them.
+            // plan keys cool down for 5h when the upstream rate-limits them.
             if (fwd.status_code == 429 && cand.account.account_type == "plan") {
-                fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited "
-                                "(429), cooling down 5h\n",
-                        cand.account.id, cand.account.name.c_str());
-                gate_.mark_cooldown(cand.account.id);
+                fprintf(stderr, "[Proxy] key slot %d (account %d %s) plan "
+                                "rate-limited (429), cooling down 5h\n",
+                        cand.key_slot_id, cand.account.id, cand.account.name.c_str());
+                gate_.mark_cooldown(cand.key_slot_id);
             }
 
             auto usage = UsageTracker::parse_stream_usage(upstream_fmt, fwd.body);
@@ -1116,12 +1305,12 @@ void ProxyServer::handle_converted(const UpstreamCandidate &cand,
             abort.running.store(false, std::memory_order_release);
             if (monitor.joinable()) monitor.join();
 
-            // plan accounts cool down for 5h when the upstream rate-limits them.
+            // plan keys cool down for 5h when the upstream rate-limits them.
             if (fwd.status_code == 429 && cand.account.account_type == "plan") {
-                fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited "
-                                "(429), cooling down 5h\n",
-                        cand.account.id, cand.account.name.c_str());
-                gate_.mark_cooldown(cand.account.id);
+                fprintf(stderr, "[Proxy] key slot %d (account %d %s) plan "
+                                "rate-limited (429), cooling down 5h\n",
+                        cand.key_slot_id, cand.account.id, cand.account.name.c_str());
+                gate_.mark_cooldown(cand.key_slot_id);
             }
 
             if ((fwd.status_code >= 400 || !fwd.success) && !fwd.is_timeout) {
@@ -1197,6 +1386,8 @@ void ProxyServer::handle_converted(const UpstreamCandidate &cand,
         },
         /* user_data */ nullptr);
 }
+
+#endif
 
 // ── handle_list_models ─────────────────────────────────────────────────
 
@@ -1313,7 +1504,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
 
     for (size_t i = 0; i < cands.size(); ++i) {
         const UpstreamCandidate &c = cands[i];
-        if (gate_.in_cooldown(c.account.id)) continue;
+        if (gate_.in_cooldown(c.key_slot_id)) continue;
         if (!gate_.acquire(c.key_slot_id, c.account.max_concurrency)) continue;
 
         if (inflight_id < 0) {
@@ -1338,10 +1529,10 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
             "/embeddings", eb, content_type, nullptr, eopts);
 
         if (fwd.status_code == 429 && c.account.account_type == "plan") {
-            fprintf(stderr, "[Proxy] account %d (%s) plan rate-limited (429), "
-                            "cooling down 5h\n",
-                    c.account.id, c.account.name.c_str());
-            gate_.mark_cooldown(c.account.id);
+            fprintf(stderr, "[Proxy] key slot %d (account %d %s) plan "
+                            "rate-limited (429), cooling down 5h\n",
+                    c.key_slot_id, c.account.id, c.account.name.c_str());
+            gate_.mark_cooldown(c.key_slot_id);
         }
 
         bool retryable = (fwd.status_code == 429 || fwd.status_code >= 500) &&

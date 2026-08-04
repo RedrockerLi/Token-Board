@@ -31,6 +31,12 @@
 
 客户端用 `tb-` + 32 位 hex 的密钥访问代理,一把密钥绑定一个上游账户。`account_id` 可空:删除账户时选「仅解绑」会让密钥的 `account_id` 置 NULL(前端显示"未分配",需重新选择);选「级联删除」则密钥随账户删除。删除密钥时 `request_log.local_key_id` 经 `ON DELETE SET NULL` 保留,历史计费不丢。密钥只在此表存明文,看板 API 返回时打码(前 6 后 4)。
 
+### upstream_keys — 本地上游密钥生命周期
+
+一行代表一把本机上游密钥。`valid_from` 是 UTC 日期（NULL 回落 `created_at` 的日期）；`deleted_at` 是 UTC 时间。移除密钥不会物理删除该行，而是写入删除时间和当时的 `cancellation_grace_hours`，因此已归档账单能够稳定重算。明文 `key_value` 永远不上传。
+
+`upstream_keys_cloud` 只保存 `key_masked`、起始日、位置、删除标记和宽限快照，供多机把同一物理密钥的账单归并；不含可用密钥材料。
+
 ### request_log — 请求日志与计费载体
 
 每次请求写一行,是计费、消费报告、性能监控的共同数据源。
@@ -103,7 +109,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。�
 
 ### proxy_plan_summary
 
-每月每 plan 账户一行:`subscription_cost`(当月有使用才计一次月费)、`virtual_cost`(当月该 plan 的 api 口径金额)。导出时**增量持久化**:历史月一旦写入即冻结(改价不回溯),当月按当前 `monthly_price` 刷新;日志清理后存档不再重算。
+每个“行政月 × plan 账户 × masked 上游密钥”一行：`subscription_cost` 是该密钥无论使用与否都产生的周期月费，`virtual_cost` 是该密钥所承载请求的 api 口径金额。订阅费由 `valid_from`、删除宽限和 `plan_price_history` 重建；虚拟消费仍按导出批次增量持久化。
 
 ### model_pricing / pricing_slots / account_types
 

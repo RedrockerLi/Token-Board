@@ -5,17 +5,20 @@
 #include <mutex>
 #include <unordered_map>
 
-/// Per-key-slot concurrency gate + per-account plan cooldown tracking.
+/// Per-key-slot concurrency gate + per-key-slot plan cooldown tracking.
 ///
 /// Thread-safe, all state in memory (a plan's 5h cooldown is intentionally
 /// not persisted — a proxy restart simply retries the upstream once).
 ///
 /// Concurrency is tracked PER KEY SLOT (one `upstream_keys` row per slot, or
-/// -1 for an account's legacy single key): each key of an account gets its
-/// own `max_concurrency` budget, so one saturated key overflows to the next.
-/// Plan cooldown stays PER ACCOUNT — a 429 on one key of a plan account
-/// usually means the whole account is rate-limited, so they cool down
-/// together.
+/// -account_id for an account's legacy single key): each key of an account
+/// gets its own `max_concurrency` budget, so one saturated key overflows to
+/// the next.
+///
+/// Plan cooldown is ALSO PER KEY SLOT: a 429 on one key of a plan account
+/// cools down only that key, so the fallback loop can immediately move to the
+/// next key of the same account (each key is a separate upstream
+/// subscription — a rate limit on one does not rate-limit its siblings).
 ///
 /// Concurrency slots are reclaimed lazily after SLOT_TTL: normally every
 /// acquire() is paired with release() when the request finishes, but a
@@ -62,17 +65,19 @@ public:
         }
     }
 
-    /// Mark a plan account as rate-limited: it cools down for 5 hours.
-    void mark_cooldown(int account_id) {
+    /// Mark a plan key slot as rate-limited: it cools down for 5 hours.
+    /// Per-key: only this `key_slot_id` is affected — sibling keys of the
+    /// same account stay usable so the fallback loop can switch to them.
+    void mark_cooldown(int key_slot_id) {
         std::lock_guard<std::mutex> lock(mutex_);
-        cooldown_until_[account_id] =
+        cooldown_until_[key_slot_id] =
             std::chrono::steady_clock::now() + PLAN_COOLDOWN;
     }
 
-    /// True while the account is inside its 5h cooldown window.
-    bool in_cooldown(int account_id) {
+    /// True while the key slot is inside its 5h cooldown window.
+    bool in_cooldown(int key_slot_id) {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = cooldown_until_.find(account_id);
+        auto it = cooldown_until_.find(key_slot_id);
         if (it == cooldown_until_.end()) return false;
         if (std::chrono::steady_clock::now() < it->second) return true;
         cooldown_until_.erase(it);  // expired — lazily cleaned up

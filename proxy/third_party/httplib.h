@@ -699,6 +699,13 @@ struct Response {
       const std::string &content_type, ContentProviderWithoutLength provider,
       ContentProviderResourceReleaser resource_releaser = nullptr);
 
+  // Server-only opt-in: delay a chunked response's status line and headers
+  // until its provider writes.  The default preserves upstream httplib's
+  // eager-header behavior for every other chunked endpoint.
+  void set_deferred_chunked_headers(bool enabled = true) {
+    defer_chunked_headers_ = enabled;
+  }
+
   void set_file_content(const std::string &path,
                         const std::string &content_type);
   void set_file_content(const std::string &path);
@@ -719,6 +726,7 @@ struct Response {
   ContentProvider content_provider_;
   ContentProviderResourceReleaser content_provider_resource_releaser_;
   bool is_chunked_content_provider_ = false;
+  bool defer_chunked_headers_ = false;
   bool content_provider_success_ = false;
   std::string file_content_path_;
   std::string file_content_content_type_;
@@ -4514,14 +4522,29 @@ write_content_without_length(Stream &strm,
 template <typename T, typename U>
 inline bool
 write_content_chunked(Stream &strm, const ContentProvider &content_provider,
-                      const T &is_shutting_down, U &compressor, Error &error) {
+                      const T &is_shutting_down, U &compressor, Error &error,
+                      const std::function<bool()> &write_deferred_headers = {}) {
   size_t offset = 0;
   auto data_available = true;
   auto ok = true;
   DataSink data_sink;
 
+  // For the server's chunked providers, the status line + headers are written
+  // lazily on the FIRST sink.write (or on sink.done) — the provider may still
+  // change res.status (e.g. to 429/504) before anything reaches the client,
+  // which is what lets a streaming request fall back to another candidate
+  // before committing.  Empty callback = headers already written up front.
+  bool deferred_headers_written = false;
+  auto flush_deferred_headers = [&]() -> bool {
+    if (!write_deferred_headers || deferred_headers_written) return true;
+    if (!write_deferred_headers()) return false;
+    deferred_headers_written = true;
+    return true;
+  };
+
   data_sink.write = [&](const char *d, size_t l) -> bool {
     if (ok) {
+      if (!flush_deferred_headers()) { ok = false; return false; }
       data_available = l > 0;
       offset += l;
 
@@ -4551,6 +4574,10 @@ write_content_chunked(Stream &strm, const ContentProvider &content_provider,
 
   auto done_with_trailer = [&](const Headers *trailer) {
     if (!ok) { return; }
+
+    // A provider that finishes without ever writing a chunk still needs the
+    // (deferred) status line + headers emitted before the 0-chunk terminator.
+    if (!flush_deferred_headers()) { ok = false; return; }
 
     data_available = false;
 
@@ -4619,10 +4646,11 @@ write_content_chunked(Stream &strm, const ContentProvider &content_provider,
 template <typename T, typename U>
 inline bool write_content_chunked(Stream &strm,
                                   const ContentProvider &content_provider,
-                                  const T &is_shutting_down, U &compressor) {
+                                  const T &is_shutting_down, U &compressor,
+                                  const std::function<bool()> &write_deferred_headers = {}) {
   auto error = Error::Success;
   return write_content_chunked(strm, content_provider, is_shutting_down,
-                               compressor, error);
+                               compressor, error, write_deferred_headers);
 }
 
 template <typename T>
@@ -5780,6 +5808,7 @@ inline void Response::set_content_provider(
   if (in_length > 0) { content_provider_ = std::move(provider); }
   content_provider_resource_releaser_ = std::move(resource_releaser);
   is_chunked_content_provider_ = false;
+  defer_chunked_headers_ = false;
 }
 
 inline void Response::set_content_provider(
@@ -5790,6 +5819,7 @@ inline void Response::set_content_provider(
   content_provider_ = detail::ContentProviderAdapter(std::move(provider));
   content_provider_resource_releaser_ = std::move(resource_releaser);
   is_chunked_content_provider_ = false;
+  defer_chunked_headers_ = false;
 }
 
 inline void Response::set_chunked_content_provider(
@@ -5800,6 +5830,7 @@ inline void Response::set_chunked_content_provider(
   content_provider_ = detail::ContentProviderAdapter(std::move(provider));
   content_provider_resource_releaser_ = std::move(resource_releaser);
   is_chunked_content_provider_ = true;
+  defer_chunked_headers_ = false;
 }
 
 inline void Response::set_file_content(const std::string &path,
@@ -6431,8 +6462,13 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
 
   if (post_routing_handler_) { post_routing_handler_(req, res); }
 
-  // Response line and headers
-  {
+  // Response line and headers.  For chunked-content providers these are
+  // DEFERRED until the provider's first sink.write (or sink.done): the
+  // provider may still change res.status — e.g. a streaming proxy that fell
+  // back through every upstream candidate sets 429/504 — before anything is
+  // committed to the client.  Non-chunked responses keep the eager write.
+  if (!res.is_chunked_content_provider_ || !res.defer_chunked_headers_ ||
+      req.method == "HEAD") {
     detail::BufferStream bstrm;
     if (!detail::write_response_line(bstrm, res.status)) { return false; }
     if (!header_writer_(bstrm, res.headers)) { return false; }
@@ -6506,8 +6542,17 @@ Server::write_content_with_provider(Stream &strm, const Request &req,
       }
       assert(compressor != nullptr);
 
+      std::function<bool()> write_deferred_headers;
+      if (res.defer_chunked_headers_) write_deferred_headers = [&]() -> bool {
+        detail::BufferStream bstrm;
+        if (!detail::write_response_line(bstrm, res.status)) { return false; }
+        if (!header_writer_(bstrm, res.headers)) { return false; }
+        auto &data = bstrm.get_buffer();
+        return detail::write_data(strm, data.data(), data.size());
+      };
       return detail::write_content_chunked(strm, res.content_provider_,
-                                           is_shutting_down, *compressor);
+                                           is_shutting_down, *compressor,
+                                           write_deferred_headers);
     } else {
       return detail::write_content_without_length(strm, res.content_provider_,
                                                   is_shutting_down);

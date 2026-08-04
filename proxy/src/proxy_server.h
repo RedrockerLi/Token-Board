@@ -109,16 +109,17 @@ public:
 private:
     void handle_chat_request(const httplib::Request &req,
                              httplib::Response &res);
-    /// Streaming-only passthrough for one already-picked candidate.
-    void handle_passthrough(const UpstreamCandidate &cand, int local_key_id,
-                            ir::ApiFormat upstream,
-                            const std::string &resolved_model,
-                            const httplib::Request &req,
-                            httplib::Response &res,
-                            std::chrono::steady_clock::time_point t0);
-    /// Streaming-only converted path for one already-picked candidate.
-    void handle_converted(const UpstreamCandidate &cand, int local_key_id,
-                          ir::ApiFormat harness, ir::ApiFormat upstream,
+    /// Streaming chat path with in-request fallback.  Tries candidates from
+    /// `start` cyclically; each candidate is forwarded as passthrough (when its
+    /// format matches the harness) or converted, decided per candidate.  The
+    /// upstream status is read (via response_handler) before the first
+    /// sink.write, and the server's chunked response headers are DEFERRED until
+    /// that write — so a 429/5xx from one key falls through to the next
+    /// key/upstream within the same request, and only after every candidate
+    /// fails is an error status (429/504) committed to the client.
+    void handle_streaming(const std::vector<UpstreamCandidate> &cands,
+                          size_t start, const std::string &session_id,
+                          int local_key_id, ir::ApiFormat harness,
                           const std::string &resolved_model,
                           const httplib::Request &req,
                           httplib::Response &res,

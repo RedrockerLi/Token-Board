@@ -33,6 +33,8 @@ Response selection:
   - If the request body contains "mock_format": "<fmt>", that wins.
   - If the request body contains "mock_status": <code>, that HTTP status is
     returned instead (error-path testing; bypasses strict validation).
+  - "mock_status_by_key": {"sk-key1": 429, "sk-key2": 200} selects a
+    status from the incoming Authorization key, for fallback tests.
   - "mock_simple_stream": true returns the plain content-only stream (no
     reasoning_content / cost frames).
   - Streaming: request body "stream": true returns an SSE stream.
@@ -118,6 +120,11 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 fmt = "openai"
         status = req.get("mock_status", 200)
+        status_by_key = req.get("mock_status_by_key")
+        authorization = self.headers.get("Authorization") or ""
+        auth_key = authorization.removeprefix("Bearer ")
+        if isinstance(status_by_key, dict) and auth_key in status_by_key:
+            status = status_by_key[auth_key]
         if req.get("model") == "trigger-error":
             status = 400  # model-based trigger survives format conversion
         if req.get("model") == "trigger-429":
