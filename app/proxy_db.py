@@ -826,7 +826,8 @@ class ProxyDatabase:
 
         plan subscription fees are persisted per (account, month): past months
         frozen forever, current month refreshed from the current monthly_price
-        (Requirement 4: price edits affect only the current month).
+        on every export regardless of the batch window (Requirement 4: price
+        edits affect only the current month).
         """
         from app.dashboard_db import DashboardDatabase
         from app.migrations import schema_dir_for
@@ -910,6 +911,36 @@ class ProxyDatabase:
                         virtual_cost=float(pr["virtual_cost"] or 0),
                         refresh_subscription=False,
                     )
+
+            # Current-month refresh is NOT tied to the export batch: a price
+            # edit mid-month must reach the archive even when this batch has no
+            # new plan rows (all of the month's rows were already exported and
+            # mark has passed them). Every plan account used this month — any
+            # request_log row, exported or not; current-month rows are younger
+            # than the 30-day cleanup horizon so they always survive — gets its
+            # subscription set to the current monthly_price. Past months are
+            # never touched here (frozen in the batch loop above); deleted or
+            # renamed accounts drop out of the JOIN and keep their value.
+            cur_plans = conn.execute("""
+                SELECT a.name, a.monthly_price
+                FROM (
+                    SELECT DISTINCT r.account_name AS name
+                    FROM request_log r
+                    WHERE strftime('%Y-%m', r.requested_at) = ?
+                      AND COALESCE(r.account_type, 'api') = 'plan'
+                      AND COALESCE(r.account_name, '') != ''
+                ) t
+                JOIN upstream_accounts a ON a.name = t.name
+                WHERE COALESCE(a.account_type, 'api') = 'plan'
+            """, (current_month,)).fetchall()
+            for cp in cur_plans:
+                dash_db.accumulate_plan_summary(
+                    month=current_month,
+                    account_name=cp["name"],
+                    subscription_cost=float(cp["monthly_price"] or 0),
+                    virtual_cost=0.0,
+                    refresh_subscription=True,
+                )
 
             return {
                 "record_count": len(rows),
