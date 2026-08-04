@@ -222,7 +222,14 @@ function renderModelLatencyChart(domId, models) {
     var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#0070F3','#00CEF3','#22C55E','#F59E0B','#8B5CF6','#EF4444','#EC4899','#6366F1'])[i % 8]; });
 
     chartModelLatency.setOption({
-        tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+        tooltip: {
+            trigger: 'axis',
+            axisPointer: { type: 'shadow' },
+            formatter: function(params) {
+                var p = params[0];
+                return p.name + '<br/>' + p.marker + ' ' + p.seriesName + ': <b>' + p.value + ' ms</b>';
+            }
+        },
         grid: { left: 50, right: 20, top: 10, bottom: 60 },
         xAxis: { type: 'category', data: names, axisLabel: { rotate: 30, fontSize: 10 } },
         yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
