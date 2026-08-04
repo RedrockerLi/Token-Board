@@ -281,12 +281,16 @@ CONFIG_TABLES = [
 
 # Runtime/secret tables stripped from the upload copy before it ever reaches
 # the cloud. sync_state holds the machine-local sync watermark + config hash.
+# upstream_keys (the per-account multi-key set) and session_key_log (session→
+# key observability) are local secrets — never uploaded.
 _RUNTIME_TABLES = [
     "request_log",
     "perf_events",
     "sync_config",
     "in_flight_requests",
     "sync_state",
+    "upstream_keys",
+    "session_key_log",
 ]
 
 
@@ -346,14 +350,15 @@ def _snapshot_path(db_path: str) -> str:
 
 
 def snapshot_config(db_path: str) -> None:
-    """Copy CONFIG_TABLES (WITH local upstream keys) into the snapshot DB."""
+    """Copy CONFIG_TABLES (+ the local-only upstream_keys, WITH their values —
+    keys are secrets that must survive a "discard" rollback) into the snapshot."""
     snap = _snapshot_path(db_path)
     src = sqlite3.connect(db_path)
     src.row_factory = sqlite3.Row
     dst = sqlite3.connect(snap)
     try:
         dst.execute("PRAGMA foreign_keys=OFF")
-        for table in CONFIG_TABLES:
+        for table in CONFIG_TABLES + ["upstream_keys"]:
             if not _table_exists(src, table):
                 continue
             cols = [d[0] for d in src.execute(f"SELECT * FROM {table} LIMIT 0").description]
@@ -395,7 +400,7 @@ def restore_config_snapshot(db_path: str) -> bool:
         local.execute("PRAGMA foreign_keys=OFF")
         local.execute("BEGIN IMMEDIATE")
         children = ["aggregate_entries", "account_models", "local_keys",
-                    "pricing_slots", "proxy_timeout_config"]
+                    "pricing_slots", "proxy_timeout_config", "upstream_keys"]
         parents = ["upstream_accounts", "model_pricing"]
         # Delete child-first, then parents.
         for table in children + parents:

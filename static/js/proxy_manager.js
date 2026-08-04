@@ -65,6 +65,67 @@ function togglePlanFields(sel) {
     field.style.display = (sel && sel.value === 'plan') ? '' : 'none';
 }
 
+// ── Multi-key form helpers ─────────────────────────────────────────────
+// Editing shows existing keys as masked keep-rows (id + masked value, never
+// the secret) plus editable rows for NEW keys. `_keyRowsEdited` tracks whether
+// the user touched the key section so a rename-only save never wipes keys.
+let _keyRowsEdited = false;
+
+function addKeyRow(value) {
+    const list = document.getElementById('keyList');
+    if (!list) return;
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex; gap:6px; margin:6px 0; align-items:center;';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.name = 'upstream_keys[]';
+    input.placeholder = 'sk-...（新密钥）';
+    input.value = value || '';
+    input.addEventListener('input', () => { _keyRowsEdited = true; });
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn btn--sm';
+    del.textContent = '删除';
+    del.onclick = () => { _keyRowsEdited = true; div.remove(); };
+    div.appendChild(input);
+    div.appendChild(del);
+    list.appendChild(div);
+}
+
+function addExistingKeyRow(keepId, masked) {
+    const list = document.getElementById('keyList');
+    if (!list) return;
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex; gap:6px; margin:6px 0; align-items:center;';
+    div.className = 'existing-key';
+    div.dataset.keepId = keepId;
+    const span = document.createElement('span');
+    span.style.cssText = 'flex:1; font-family:monospace; background:#f3f4f6; padding:4px 8px; border-radius:4px; color:var(--color-text-secondary, #6b7280);';
+    span.textContent = masked + '（已配置，如需删除点“移除”）';
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn btn--sm';
+    del.textContent = '移除';
+    del.onclick = () => { _keyRowsEdited = true; div.remove(); };
+    div.appendChild(span);
+    div.appendChild(del);
+    list.appendChild(div);
+}
+
+function resetKeyList() {
+    const list = document.getElementById('keyList');
+    if (list) list.innerHTML = '';
+    _keyRowsEdited = false;
+}
+
+function collectKeyRows(form) {
+    const keyInputs = [...form.querySelectorAll('#keyList input[name="upstream_keys[]"]')];
+    const upstream_keys = keyInputs.map(i => i.value.trim()).filter(v => v);
+    const keepRows = [...form.querySelectorAll('#keyList .existing-key')];
+    const keep_key_ids = keepRows.map(r => r.dataset.keepId);
+    return { upstream_keys, keep_key_ids };
+}
+
 async function loadAccountsTable() {
     const tbody = document.querySelector('#accountsTable tbody');
     if (!tbody) return;
@@ -79,11 +140,11 @@ async function loadAccountsTable() {
         tbody.innerHTML = real.map((a) => `
             <tr>
                 <td>${esc(a.name)}</td>
-                <td><code>${esc(maskKey(a.upstream_key))}</code>${!a.upstream_key ? ' <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
+                <td><code>${esc(maskKey(a.upstream_key))}</code>${a.key_count > 1 ? ` <span class="badge" title="${a.key_count} 把密钥（同一配置的多个并发槽位）">×${a.key_count}</span>` : ''}${!a.upstream_key && !a.key_count ? ' <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
                 <td>${a.account_type === 'plan' ? '<span class="badge badge--active">plan</span>' : '<span class="badge">api</span>'}</td>
-                <td>${a.account_type === 'plan' ? '¥' + (+(a.monthly_price || 0)).toFixed(2) + '/月' : '-'}</td>
+                <td>${a.account_type === 'plan' ? '¥' + (+(a.monthly_price || 0)).toFixed(2) + (a.key_count > 1 ? '×' + a.key_count : '') + '/月' : '-'}</td>
                 <td>${a.max_concurrency ? a.max_concurrency + ' 并发' : '无限制'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
@@ -99,21 +160,27 @@ async function loadAccountsTable() {
 async function saveAccount(e) {
     e.preventDefault();
     const form = e.target;
-    const data = Object.fromEntries(new FormData(form));
     const id = form.dataset.editId;
+    const { upstream_keys, keep_key_ids } = collectKeyRows(form);
     try {
         if (id) {
             const payload = {
-                name: data.name,
-                upstream_key: data.upstream_key,
-                base_url: data.base_url,
-                api_format: data.api_format,
-                endpoint_path: data.endpoint_path || '',
-                auth_header: data.auth_header || 'auto',
-                account_type: data.account_type || 'api',
-                monthly_price: data.monthly_price || 0,
-                max_concurrency: data.max_concurrency || null,
+                name: form['name'].value,
+                base_url: form['base_url'].value,
+                api_format: form['api_format'].value,
+                endpoint_path: form['endpoint_path'].value || '',
+                auth_header: form['auth_header'].value || 'auto',
+                account_type: form['account_type'].value || 'api',
+                monthly_price: form['monthly_price'].value || 0,
+                max_concurrency: form['max_concurrency'].value || null,
             };
+            // Only send the key set when the user actually edited it — a
+            // rename-only save must never wipe the existing keys.
+            if (_keyRowsEdited) {
+                payload.upstream_keys = upstream_keys;
+                payload.keep_key_ids = keep_key_ids;
+                payload.keys_edited = true;
+            }
             await proxyFetch(`/api/proxy/accounts/${id}`, {
                 method: 'PUT',
                 body: JSON.stringify(payload),
@@ -124,16 +191,22 @@ async function saveAccount(e) {
             await proxyFetch('/api/proxy/accounts', {
                 method: 'POST',
                 body: JSON.stringify({
-                    ...data,
-                    account_type: data.account_type || 'api',
-                    monthly_price: data.monthly_price || 0,
-                    max_concurrency: data.max_concurrency || null,
+                    name: form['name'].value,
+                    upstream_keys,
+                    base_url: form['base_url'].value,
+                    api_format: form['api_format'].value,
+                    endpoint_path: form['endpoint_path'].value || '',
+                    auth_header: form['auth_header'].value || 'auto',
+                    account_type: form['account_type'].value || 'api',
+                    monthly_price: form['monthly_price'].value || 0,
+                    max_concurrency: form['max_concurrency'].value || null,
                 }),
             });
             showToast('账户已创建');
             ConfigSync.markDirty();
         }
         form.reset();
+        resetKeyList();
         form.dataset.editId = '';
         document.getElementById('accountDeleteBtn').style.display = 'none';
         document.getElementById('accountModelBtn').style.display = 'none';
@@ -151,7 +224,6 @@ function editAccount(id) {
         if (!acc) return;
         const form = document.querySelector('#accountForm');
         form['name'].value = acc.name;
-        form['upstream_key'].value = acc.upstream_key || '';
         form['base_url'].value = acc.base_url;
         form['api_format'].value = acc.api_format || 'openai';
         form['endpoint_path'].value = acc.endpoint_path || '';
@@ -160,6 +232,9 @@ function editAccount(id) {
         form['monthly_price'].value = acc.account_type === 'plan' ? (acc.monthly_price || 0) : '';
         form['max_concurrency'].value = acc.max_concurrency || '';
         togglePlanFields(form['account_type']);
+        // Existing keys → masked keep-rows; user adds new rows as needed.
+        resetKeyList();
+        (acc.keys || []).forEach((k) => addExistingKeyRow(k.id, k.masked));
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
@@ -223,6 +298,23 @@ async function updateAccountModels(id, name) {
     btns.forEach(b => { b.disabled = false; b.textContent = '更新模型'; });
 }
 
+function openAddAccountModal() {
+    const form = document.querySelector('#accountForm');
+    if (form) {
+        form.reset();
+        form.dataset.editId = '';
+        togglePlanFields(form['account_type']);
+    }
+    resetKeyList();
+    const delBtn = document.getElementById('accountDeleteBtn');
+    const modelBtn = document.getElementById('accountModelBtn');
+    if (delBtn) delBtn.style.display = 'none';
+    if (modelBtn) modelBtn.style.display = 'none';
+    const submit = form && form.querySelector('[type=submit]');
+    if (submit) submit.textContent = '添加账户';
+    openModal('accountModal');
+}
+
 function initAccountsPage() {
     const el = document.getElementById('page-proxy-accounts');
     if (!el || el.dataset.initialized) return;
@@ -231,7 +323,7 @@ function initAccountsPage() {
         <div class="page-header">
             <h1 class="page-title">上游账户管理</h1>
             <p class="page-subtitle">支持 OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 的上游服务</p>
-            <button class="btn btn--primary" onclick="openModal('accountModal')">+ 添加账户</button>
+            <button class="btn btn--primary" onclick="openAddAccountModal()">+ 添加账户</button>
         </div>
         <table class="mgmt-table" id="accountsTable">
             <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>类型</th><th>plan 月费</th><th>并发限额</th><th>操作</th></tr></thead>
@@ -245,7 +337,11 @@ function initAccountsPage() {
                 </div>
                 <form id="accountForm" onsubmit="saveAccount(event)" data-edit-id="">
                     <label>名称 <input name="name" required></label>
-                    <label>上游 API Key <input name="upstream_key" placeholder="仅存本机，不上传云端；留空=保持不变"></label>
+                    <div style="margin-bottom:10px;">
+                        <label>上游 API Key（多把密钥 = 同一配置的多个槽位；仅存本机，不上传云端）</label>
+                        <div id="keyList" style="margin:4px 0;"></div>
+                        <button type="button" class="btn btn--sm" onclick="addKeyRow()">+ 添加密钥</button>
+                    </div>
                     <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1"></label>
                     <label>API 格式
                         <select name="api_format">

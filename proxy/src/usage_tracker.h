@@ -57,7 +57,8 @@ public:
 
     /// Compute cost and write a request-log entry.
     void log_request(int account_id, int local_key_id, const UsageInfo &usage,
-                     bool is_streaming, int status_code, int duration_ms);
+                     bool is_streaming, int status_code, int duration_ms,
+                     int upstream_key_id = 0);
 
     /// Write a performance-metrics event (local-only, not synced).
     void log_perf_event(const std::string &model, int upstream_latency_ms,

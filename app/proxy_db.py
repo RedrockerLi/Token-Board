@@ -19,6 +19,15 @@ def _generate_key() -> str:
     return "tb-" + secrets.token_hex(16)
 
 
+def mask_key(key: str) -> str:
+    """Mask an upstream key for display: 'sk-abc…' (first 6 + '…' + last 4)."""
+    if not key:
+        return ""
+    if len(key) <= 10:
+        return key[:3] + "…"
+    return f"{key[:6]}…{key[-4:]}"
+
+
 class ProxyDatabase:
     """Manages the proxy SQLite database from the Flask side."""
 
@@ -42,10 +51,13 @@ class ProxyDatabase:
     def get_stats(self) -> dict:
         """Proxy billing overview — 30-day rolling window.
 
-        total_cost = api usage billed in the last 30 days (SUM(cost), plan
-        accounts carry 0) + current month's plan subscription fees (current
-        monthly_price of plan accounts actually used this month). Past months'
-        fees live frozen in the archive and are NOT recomputed here.
+        total_cost (real) = api accounts' billed usage in the last 30 days
+        (SUM(api_cost) where account_type='api'; plan carries virtual only in
+        api_cost) + current month's plan subscription fees. Plan subscription
+        = monthly_price × key count per plan account used this month. Past
+        months' fees live frozen in the archive and are NOT recomputed here.
+        today_cost (theoretical) = SUM(api_cost) today (api bill + plan's
+        api-equivalent amount the plan covered).
         """
         conn = self._connect()
         try:
@@ -61,16 +73,25 @@ class ProxyDatabase:
                 (today,),
             ).fetchone()[0]
 
+            # Real billed usage: api accounts only (plan accounts' api_cost is
+            # their virtual/theoretical bill — never counted as real, which
+            # would double-count their subscription).
             total_cost = conn.execute(
-                "SELECT COALESCE(SUM(cost), 0) FROM request_log "
-                "WHERE requested_at >= datetime('now', '-30 days')"
+                "SELECT COALESCE(SUM(r.api_cost), 0) FROM request_log r "
+                "JOIN upstream_accounts a ON a.id = r.account_id "
+                "WHERE COALESCE(a.account_type, 'api') = 'api' "
+                "  AND r.requested_at >= datetime('now', '-30 days')"
             ).fetchone()[0]
 
-            # Current-month plan subscription: current monthly_price for plan
-            # accounts used this month (price edits affect only the current
-            # month; past months are frozen in the archive).
+            # Current-month plan subscription: current monthly_price × key count
+            # for plan accounts used this month (price edits affect only the
+            # current month; past months are frozen in the archive). Key count
+            # falls back to 1 (the account's legacy single upstream_key) when
+            # the account has no upstream_keys rows.
             plan_subscription = conn.execute("""
-                SELECT COALESCE(SUM(a.monthly_price), 0)
+                SELECT COALESCE(SUM(a.monthly_price * (
+                    SELECT MAX(1, COUNT(*)) FROM upstream_keys k
+                    WHERE k.account_id = a.id)), 0)
                 FROM (
                     SELECT DISTINCT r.account_id
                     FROM request_log r
@@ -86,7 +107,7 @@ class ProxyDatabase:
             # Today's consumption = api billed today + plan virtual cost today
             # (the api-billed amount the plan covered).
             today_cost = conn.execute(
-                "SELECT COALESCE(SUM(cost + virtual_cost), 0) FROM request_log "
+                "SELECT COALESCE(SUM(api_cost), 0) FROM request_log "
                 "WHERE date(requested_at) = ?",
                 (today,),
             ).fetchone()[0]
@@ -137,14 +158,70 @@ class ProxyDatabase:
                 "COALESCE(is_aggregate,0) AS is_aggregate, "
                 "COALESCE(account_type,'api') AS account_type, "
                 "COALESCE(monthly_price,0) AS monthly_price, "
-                "max_concurrency, created_at "
+                "max_concurrency, created_at, "
+                "(SELECT COUNT(*) FROM upstream_keys k WHERE k.account_id = upstream_accounts.id) AS key_count "
                 "FROM upstream_accounts WHERE deleted_at IS NULL ORDER BY id"
             ).fetchall()
-            return [dict(r) for r in rows]
+            accounts = []
+            for r in rows:
+                acc = dict(r)
+                # Masked key list for display / edit-form placeholders (secrets
+                # never leave the server in plaintext).  ids let the frontend
+                # reference kept keys without ever sending the real values.
+                key_rows = conn.execute(
+                    "SELECT id, key_value FROM upstream_keys "
+                    "WHERE account_id = ? ORDER BY position, id",
+                    (acc["id"],),
+                ).fetchall()
+                acc["keys"] = [{"id": k[0], "masked": mask_key(k[1])}
+                               for k in key_rows] if key_rows else []
+                accounts.append(acc)
+            return accounts
         finally:
             conn.close()
 
+    @staticmethod
+    def _normalize_keys(data: dict) -> list[str]:
+        """Collect the intended upstream key list, dropping empty entries.
+
+        Precedence: explicit `upstream_keys` list (new UI) → legacy single
+        `upstream_key` scalar.  Empty strings are dropped (留空=保持 convention).
+        """
+        if data.get("upstream_keys") is not None:
+            raw = data["upstream_keys"]
+            if isinstance(raw, str):
+                raw = [raw]
+            return [k for k in raw if isinstance(k, str) and k.strip()]
+        if data.get("upstream_key"):
+            return [data["upstream_key"]]
+        return []
+
+    @staticmethod
+    def _set_upstream_keys(conn: sqlite3.Connection, account_id: int,
+                           keys: list[str]) -> None:
+        """Replace an account's key set (position = list index)."""
+        conn.execute("DELETE FROM upstream_keys WHERE account_id = ?", (account_id,))
+        for i, k in enumerate(keys):
+            conn.execute(
+                "INSERT OR IGNORE INTO upstream_keys "
+                "(account_id, key_value, position) VALUES (?,?,?)",
+                (account_id, k, i),
+            )
+
+    @staticmethod
+    def _plan_key_count(conn: sqlite3.Connection, account_id: int) -> int:
+        """Number of keys configured for an account — at least 1 (an account
+        with no upstream_keys rows falls back to its legacy single
+        upstream_key slot, so its plan subscription still counts as 1)."""
+        n = conn.execute(
+            "SELECT COUNT(*) FROM upstream_keys WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()[0]
+        return max(1, n)
+
     def create_account(self, data: dict) -> int:
+        keys = self._normalize_keys(data)
+        first = keys[0] if keys else ""
         conn = self._connect()
         try:
             cursor = conn.execute(
@@ -154,7 +231,7 @@ class ProxyDatabase:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     data["name"],
-                    data["upstream_key"],
+                    first,
                     data.get("base_url", ""),
                     data.get("api_format", "openai"),
                     data.get("endpoint_path", ""),
@@ -164,8 +241,11 @@ class ProxyDatabase:
                     data.get("max_concurrency"),
                 ),
             )
+            account_id = cursor.lastrowid
+            if keys:
+                self._set_upstream_keys(conn, account_id, keys)
             conn.commit()
-            return cursor.lastrowid
+            return account_id
         finally:
             conn.close()
 
@@ -174,19 +254,48 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("name", "upstream_key", "base_url", "api_format",
+            for key in ("name", "base_url", "api_format",
                         "endpoint_path", "auth_header", "account_type",
                         "monthly_price", "max_concurrency"):
-                if key in data:
-                    if key == "monthly_price":
-                        val = float(data[key] or 0)
-                    elif key == "max_concurrency":
-                        val = data[key] if data[key] not in (None, "") else None
-                    else:
-                        val = data[key]
-                    fields.append(f"{key} = ?")
-                    values.append(val)
+                if key not in data:
+                    continue
+                if key == "monthly_price":
+                    val = float(data[key] or 0)
+                elif key == "max_concurrency":
+                    val = data[key] if data[key] not in (None, "") else None
+                else:
+                    val = data[key]
+                fields.append(f"{key} = ?")
+                values.append(val)
+
+            # Keys are only touched when the client explicitly edited them
+            # (keys_edited=true) or sent a legacy non-empty `upstream_key`;
+            # otherwise the existing key set is preserved (e.g. a rename-only
+            # edit must never wipe the keys).
+            replace_keys = bool(data.get("keys_edited")) or bool(data.get("upstream_key"))
+            if replace_keys:
+                # Replace semantics: the final key set = kept existing keys (by
+                # id — the UI only ever sees masked values, never the real
+                # secrets) + newly-typed keys, in that order.
+                keep_ids = [int(i) for i in (data.get("keep_key_ids") or []) if str(i).lstrip('-').isdigit()]
+                keep_vals = []
+                if keep_ids:
+                    ph = ",".join("?" for _ in keep_ids)
+                    rows = conn.execute(
+                        f"SELECT key_value FROM upstream_keys "
+                        f"WHERE account_id = ? AND id IN ({ph}) "
+                        f"ORDER BY position, id",
+                        [account_id] + keep_ids,
+                    ).fetchall()
+                    keep_vals = [r[0] for r in rows]
+                final_keys = keep_vals + self._normalize_keys(data)
+                self._set_upstream_keys(conn, account_id, final_keys)
+                first = final_keys[0] if final_keys else ""
+                fields.append("upstream_key = ?")
+                values.append(first)
+
             if not fields:
+                conn.commit()
                 return False
             values.append(account_id)
             conn.execute(
@@ -633,10 +742,11 @@ class ProxyDatabase:
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens,
-                    COALESCE(SUM(r.cost), 0) AS cost
+                    COALESCE(SUM(r.api_cost), 0) AS cost
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE COALESCE(a.is_aggregate, 0) = 0
+                  AND COALESCE(a.account_type, 'api') = 'api'
             """
             params = []
             if account_id:
@@ -704,7 +814,7 @@ class ProxyDatabase:
                     r.id, r.account_id, COALESCE(a.name, 'unknown') AS account_name,
                     r.model, r.prompt_tokens, r.cache_read_tokens,
                     r.completion_tokens,
-                    r.total_tokens, r.cost, r.is_streaming,
+                    r.total_tokens, r.api_cost AS cost, r.is_streaming,
                     r.status_code, r.duration_ms, r.requested_at
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
@@ -732,12 +842,13 @@ class ProxyDatabase:
                 SELECT
                     date(r.requested_at) AS date,
                     COALESCE(a.name, 'unknown') AS account_name,
-                    COALESCE(SUM(r.cost), 0) AS cost,
+                    COALESCE(SUM(r.api_cost), 0) AS cost,
                     COUNT(*) AS requests,
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE COALESCE(a.is_aggregate, 0) = 0
+                  AND COALESCE(a.account_type, 'api') = 'api'
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at), r.account_id
                 ORDER BY date, r.account_id
@@ -758,10 +869,11 @@ class ProxyDatabase:
                     COALESCE(SUM(r.cache_read_tokens), 0) AS cache_hit_tokens,
                     MAX(COALESCE(SUM(r.prompt_tokens), 0) - COALESCE(SUM(r.cache_read_tokens), 0), 0) AS cache_miss_tokens,
                     COUNT(*) AS requests,
-                    COALESCE(SUM(r.cost), 0) AS cost
+                    COALESCE(SUM(r.api_cost), 0) AS cost
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE COALESCE(a.is_aggregate, 0) = 0
+                  AND COALESCE(a.account_type, 'api') = 'api'
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at)
                 ORDER BY date
@@ -796,8 +908,9 @@ class ProxyDatabase:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             rows = conn.execute("""
                 SELECT COALESCE(a.name, 'unknown') AS account_name,
-                       COALESCE(SUM(r.cost), 0) AS real_cost,
-                       COALESCE(SUM(r.cost + r.virtual_cost), 0) AS theoretical_cost,
+                       COALESCE(SUM(CASE WHEN COALESCE(a.account_type, 'api') = 'api'
+                                         THEN r.api_cost ELSE 0 END), 0) AS real_cost,
+                       COALESCE(SUM(r.api_cost), 0) AS theoretical_cost,
                        COALESCE(SUM(r.total_tokens), 0) AS tokens,
                        COUNT(*) AS requests
                 FROM request_log r
@@ -846,7 +959,7 @@ class ProxyDatabase:
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
                     COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
-                    COALESCE(SUM(r.cost), 0) AS cost,
+                    COALESCE(SUM(r.api_cost), 0) AS cost,
                     COUNT(*) AS request_count
                 FROM request_log r
                 WHERE r.id > ? AND r.id <= ?
@@ -879,7 +992,7 @@ class ProxyDatabase:
                 SELECT
                     r.account_id,
                     strftime('%Y-%m', r.requested_at) AS month,
-                    COALESCE(SUM(r.virtual_cost), 0) AS virtual_cost
+                    COALESCE(SUM(r.api_cost), 0) AS virtual_cost
                 FROM request_log r
                 JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE r.id > ? AND r.id <= ?
@@ -895,7 +1008,8 @@ class ProxyDatabase:
                     dash_db.accumulate_plan_summary(
                         month=pr["month"],
                         account_id=pr["account_id"],
-                        subscription_cost=float(price["monthly_price"] or 0),
+                        subscription_cost=float(price["monthly_price"] or 0)
+                                        * self._plan_key_count(conn, pr["account_id"]),
                         virtual_cost=float(pr["virtual_cost"] or 0),
                         refresh_subscription=(pr["month"] == current_month
                                               and price["deleted_at"] is None),
@@ -933,7 +1047,8 @@ class ProxyDatabase:
                 dash_db.accumulate_plan_summary(
                     month=current_month,
                     account_id=cp["id"],
-                    subscription_cost=float(cp["monthly_price"] or 0),
+                    subscription_cost=float(cp["monthly_price"] or 0)
+                                    * self._plan_key_count(conn, cp["id"]),
                     virtual_cost=0.0,
                     refresh_subscription=True,
                 )

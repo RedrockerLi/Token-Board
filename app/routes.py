@@ -109,18 +109,31 @@ def api_summary():
 
     total_tokens = total_output + total_input_hit + total_input_miss
 
-    # Cost stats
+    # Cost stats.
+    # A plan account's cost_entry now carries its API-equivalent (theoretical)
+    # bill, so it must be EXCLUDED from the *real* total_cost (which is
+    # api-account usage + plan subscriptions, added below) — otherwise the plan
+    # virtual bill would be double-counted with its subscription. The
+    # plan accounts' api-equivalent shows up only in the per-model usage cards
+    # (api_daily / api_monthly sum ALL cost_entry rows).
+    plan_account_names = {
+        ps.get("account_name") for ps in _store().plan_summary if ps.get("account_name")
+    }
+
+    def _non_plan(ces):
+        return [ce for ce in ces if ce.cost_group_key not in plan_account_names]
+
     if api_key_name:
         total_cost = compute_proportional_cost(
-            _store().token_usages, _store().cost_entries, api_key_name
+            _store().token_usages, _non_plan(_store().cost_entries), api_key_name
         )
         model_cost = compute_proportional_cost_by_model(
-            _store().token_usages, _store().cost_entries, api_key_name
+            _store().token_usages, _non_plan(_store().cost_entries), api_key_name
         )
     else:
         total_cost = 0.0
         model_cost: dict[str, float] = defaultdict(float)
-        for ce in _store().cost_entries:
+        for ce in _non_plan(_store().cost_entries):
             if platform_filter and ce.platform != platform_filter:
                 continue
             total_cost += ce.cost

@@ -370,16 +370,16 @@ UsageTracker::parse_stream_usage(const std::string &api_format,
 void UsageTracker::log_request(int account_id, int local_key_id,
                                const UsageInfo &usage,
                                bool is_streaming, int status_code,
-                               int duration_ms) {
+                               int duration_ms, int upstream_key_id) {
     // Cost is computed automatically by the tr_request_log_insert SQLite
     // trigger, so we pass 0.0 here. The trigger reads model_pricing and
-    // sets the correct cost immediately after insert.
+    // sets the correct api_cost immediately after insert.
     double cost = 0.0;
 
     db_.log_request(account_id, local_key_id, usage.model,
                     usage.prompt_tokens, usage.completion_tokens,
                     usage.cache_read_tokens, usage.total_tokens, cost,
-                    is_streaming, status_code, duration_ms);
+                    is_streaming, status_code, duration_ms, upstream_key_id);
 
     fprintf(stderr,
             "[Tracker] account=%d model=%s prompt=%d comp=%d cache_read=%d "

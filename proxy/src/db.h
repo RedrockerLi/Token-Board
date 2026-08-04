@@ -59,6 +59,20 @@ public:
     };
     std::optional<AccountInfo> get_account(int account_id);
 
+    // ── Upstream keys (multi-key per account, local-only) ───────────────
+
+    /// One API key slot of an account (child of upstream_accounts).  The key
+    /// itself is a local secret — never synced to the cloud.
+    struct KeySlot {
+        int id;
+        std::string key_value;
+        int position = 0;   // fill / session-affinity preference order
+    };
+    /// All keys of an account, ordered by (position, id).  Empty when the
+    /// account has no keys configured (caller falls back to the account's
+    /// legacy single upstream_key).
+    std::vector<KeySlot> get_upstream_keys(int account_id);
+
     // ── Timeout config (per client wire format) ────────────────────────
 
     /// Per-wire-format upstream timeouts (seconds; 0 = disabled).
@@ -95,9 +109,17 @@ public:
                      int prompt_tokens, int completion_tokens,
                      int cache_read_tokens, int total_tokens,
                      double cost, bool is_streaming, int status_code,
-                     int duration_ms);
+                     int duration_ms, int upstream_key_id = 0);
 
     void update_key_last_used(int local_key_id);
+
+    // ── Session-affinity log (local, 7-day rolling, never synced) ───────
+
+    /// Record a (session → key) binding when it is established or changed.
+    void log_session_key(const std::string &session_id, int account_id,
+                         int key_id);
+    /// Delete session→key bindings older than 7 days.
+    void prune_session_key_log();
 
     // ── Pricing ─────────────────────────────────────────────────────────
 
@@ -149,7 +171,10 @@ private:
     // Prepared statements (protected by mutex_)
     sqlite3_stmt *stmt_lookup_key_ = nullptr;
     sqlite3_stmt *stmt_get_account_ = nullptr;
+    sqlite3_stmt *stmt_get_upstream_keys_ = nullptr;
     sqlite3_stmt *stmt_insert_log_ = nullptr;
+    sqlite3_stmt *stmt_insert_session_key_ = nullptr;
+    sqlite3_stmt *stmt_prune_session_key_ = nullptr;
     sqlite3_stmt *stmt_get_aggregate_entries_ = nullptr;
     sqlite3_stmt *stmt_get_pricing_ = nullptr;
     sqlite3_stmt *stmt_get_timeout_config_ = nullptr;

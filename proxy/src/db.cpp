@@ -177,12 +177,24 @@ void Database::prepare_statements() {
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
 
+    PREPARE("SELECT id, key_value, position "
+            "FROM upstream_keys WHERE account_id = ?1 ORDER BY position, id",
+            stmt_get_upstream_keys_);
+
     PREPARE("INSERT INTO request_log "
             "(account_id, local_key_id, model, prompt_tokens, "
-            " completion_tokens, cache_read_tokens, total_tokens, cost, "
-            " is_streaming, status_code, duration_ms) "
-            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            " completion_tokens, cache_read_tokens, total_tokens, api_cost, "
+            " is_streaming, status_code, duration_ms, upstream_key_id) "
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             stmt_insert_log_);
+
+    PREPARE("INSERT INTO session_key_log (session_id, account_id, key_id) "
+            "VALUES (?1,?2,?3)",
+            stmt_insert_session_key_);
+
+    PREPARE("DELETE FROM session_key_log "
+            "WHERE requested_at < datetime('now', '-7 days')",
+            stmt_prune_session_key_);
 
     PREPARE("SELECT pattern, upstream_account_id, upstream_model "
             "FROM aggregate_entries WHERE account_id = ?1 ORDER BY sort_order, id",
@@ -231,7 +243,10 @@ void Database::finalize_statements() {
     #define FINALIZE(s) do { if (s) { sqlite3_finalize(s); s = nullptr; } } while (0)
     FINALIZE(stmt_lookup_key_);
     FINALIZE(stmt_get_account_);
+    FINALIZE(stmt_get_upstream_keys_);
     FINALIZE(stmt_insert_log_);
+    FINALIZE(stmt_insert_session_key_);
+    FINALIZE(stmt_prune_session_key_);
     FINALIZE(stmt_get_aggregate_entries_);
     FINALIZE(stmt_get_pricing_);
     FINALIZE(stmt_get_timeout_config_);
@@ -310,6 +325,27 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
     return result;
 }
 
+// ── get_upstream_keys ────────────────────────────────────────────────────
+
+std::vector<Database::KeySlot> Database::get_upstream_keys(int account_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_get_upstream_keys_);
+    sqlite3_bind_int(stmt_get_upstream_keys_, 1, account_id);
+
+    std::vector<KeySlot> result;
+    while (sqlite3_step(stmt_get_upstream_keys_) == SQLITE_ROW) {
+        KeySlot k;
+        k.id = sqlite3_column_int(stmt_get_upstream_keys_, 0);
+        k.key_value = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_get_upstream_keys_, 1));
+        k.position = sqlite3_column_int(stmt_get_upstream_keys_, 2);
+        result.push_back(std::move(k));
+    }
+    sqlite3_reset(stmt_get_upstream_keys_);
+    return result;
+}
+
 // ── log_request ──────────────────────────────────────────────────────────
 
 void Database::log_request(int account_id, int local_key_id,
@@ -318,7 +354,7 @@ void Database::log_request(int account_id, int local_key_id,
                            int cache_read_tokens, int total_tokens,
                            double cost,
                            bool is_streaming, int status_code,
-                           int duration_ms) {
+                           int duration_ms, int upstream_key_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     sqlite3_reset(stmt_insert_log_);
@@ -334,12 +370,40 @@ void Database::log_request(int account_id, int local_key_id,
     sqlite3_bind_int(stmt_insert_log_, 9, is_streaming ? 1 : 0);
     sqlite3_bind_int(stmt_insert_log_, 10, status_code);
     sqlite3_bind_int(stmt_insert_log_, 11, duration_ms);
+    sqlite3_bind_int(stmt_insert_log_, 12, upstream_key_id);
 
     int rc = sqlite3_step(stmt_insert_log_);
     if (rc != SQLITE_DONE)
         fprintf(stderr, "[DB] log_request insert error: %s\n",
                 sqlite3_errmsg(db_));
     sqlite3_reset(stmt_insert_log_);
+}
+
+// ── log_session_key / prune_session_key_log ──────────────────────────────
+
+void Database::log_session_key(const std::string &session_id, int account_id,
+                               int key_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_insert_session_key_);
+    sqlite3_bind_text(stmt_insert_session_key_, 1,
+                      session_id.c_str(), session_id.size(), SQLITE_STATIC);
+    sqlite3_bind_int(stmt_insert_session_key_, 2, account_id);
+    sqlite3_bind_int(stmt_insert_session_key_, 3, key_id);
+
+    int rc = sqlite3_step(stmt_insert_session_key_);
+    if (rc != SQLITE_DONE)
+        fprintf(stderr, "[DB] log_session_key insert error: %s\n",
+                sqlite3_errmsg(db_));
+    sqlite3_reset(stmt_insert_session_key_);
+}
+
+void Database::prune_session_key_log() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_reset(stmt_prune_session_key_);
+    sqlite3_step(stmt_prune_session_key_);
+    sqlite3_reset(stmt_prune_session_key_);
 }
 
 // ── update_key_last_used ─────────────────────────────────────────────────

@@ -103,8 +103,11 @@ class DashboardDatabase:
                     (date, model, account_id, request_count),
                 )
                 total += 1
-            # Frozen cost: additive (plan accounts already carry cost 0 from
-            # the proxy, so cost_entry stays 0 for them).
+            # Frozen cost: additive. `cost` here is the api-equivalent price for
+            # EVERY account (api real bill and plan's theoretical bill alike —
+            # the proxy writes one unified api_cost column). Plan accounts'
+            # real cost lives in proxy_plan_summary.subscription_cost; their
+            # api-equivalent in cost_entry is used by the usage cards.
             conn.execute(
                 """INSERT INTO cost_entry
                    (date, model, cost, account_id)

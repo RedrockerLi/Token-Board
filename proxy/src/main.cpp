@@ -115,6 +115,7 @@ int main(int argc, char *argv[]) {
         if (now >= cleanup_deadline) {
             db.cleanup_old_perf_events(1440);  // keep last 24 hours
             db.cleanup_stale_in_flight(10);     // remove stuck records older than 10 min
+            db.prune_session_key_log();         // session→key bindings: keep 7 days
             cleanup_deadline = now + std::chrono::minutes(5);
         }
     }

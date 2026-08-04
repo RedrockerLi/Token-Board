@@ -43,6 +43,33 @@ static std::string extract_model(const std::string &body) {
     return body.substr(q1 + 1, q2 - q1 - 1);
 }
 
+/// Best-effort session identifier for session-affinity routing.
+///
+/// Precedence: an explicit `x-session-id` / `x-conversation-id` header, then a
+/// stable body field the client actually sends (OpenAI `user`, Anthropic
+/// `metadata.user_id`, Responses `previous_response_id`).  Empty result →
+/// plain fill-first (no affinity).  A stable value keeps the same session on
+/// the same upstream key for cache affinity.
+static std::string extract_session_id(const httplib::Request &req,
+                                      const json &req_json) {
+    std::string hdr = req.get_header_value("x-session-id");
+    if (hdr.empty()) hdr = req.get_header_value("x-conversation-id");
+    if (!hdr.empty()) return hdr;
+    if (req_json.is_object()) {
+        if (req_json.contains("user") && req_json["user"].is_string())
+            return req_json["user"].get<std::string>();
+        if (req_json.contains("metadata") && req_json["metadata"].is_object()) {
+            const auto &md = req_json["metadata"];
+            if (md.contains("user_id") && md["user_id"].is_string())
+                return md["user_id"].get<std::string>();
+        }
+        if (req_json.contains("previous_response_id") &&
+            req_json["previous_response_id"].is_string())
+            return req_json["previous_response_id"].get<std::string>();
+    }
+    return "";
+}
+
 /// Build a JSON error response.
 static std::string json_error(const std::string &msg, int code) {
     json j;
@@ -269,32 +296,55 @@ resolve_candidates(Database &db, const Router::RouteResult &route,
     } else {
         auto acct = db.get_account(route.account_id);
         if (!acct.has_value() || acct->deleted) return cands;
-        UpstreamCandidate c;
-        c.account = std::move(*acct);
-        c.upstream_model = model;
-        cands.push_back(std::move(c));
+        auto keys = db.get_upstream_keys(route.account_id);
+        if (keys.empty()) {
+            // Legacy single-key fallback: use the account's upstream_key as a
+            // single candidate (key_slot_id = -1).
+            UpstreamCandidate c;
+            c.account = *acct;
+            c.key = acct->upstream_key;
+            c.key_slot_id = -1;
+            c.upstream_model = model;
+            cands.push_back(std::move(c));
+        } else {
+            // One candidate per key slot, same account config, ordered by
+            // (position, id) so overflow follows a fixed fill order.
+            for (auto &k : keys) {
+                UpstreamCandidate c;
+                c.account = *acct;          // keys share the account config
+                c.key = std::move(k.key_value);
+                c.key_slot_id = k.id;
+                c.upstream_model = model;
+                cands.push_back(std::move(c));
+            }
+        }
     }
     return cands;
 }
 
-/// Pick the first candidate from `idx` onward whose account is not cooling
-/// down and has a free concurrency slot (occupying it).  `idx` is advanced
-/// past rejected candidates.  Returns true when a candidate was picked.
+/// Pick a candidate starting at `start` and advancing in cyclic order
+/// (start, start+1, …, n-1, 0, …, start-1).  Concurrency is tracked per key
+/// slot; plan cooldown is per account.  Returns the picked index via `picked`.
 static bool pick_candidate(AccountGate &gate,
                            const std::vector<UpstreamCandidate> &cands,
-                           size_t &idx) {
-    for (; idx < cands.size(); ++idx) {
-        const auto &acct = cands[idx].account;
-        if (gate.in_cooldown(acct.id)) {
+                           size_t start, size_t &picked) {
+    size_t n = cands.size();
+    for (size_t i = 0; i < n; ++i) {
+        size_t idx = (start + i) % n;
+        const auto &c = cands[idx];
+        if (gate.in_cooldown(c.account.id)) {
             fprintf(stderr, "[Proxy] account %d (%s) cooling down, skip\n",
-                    acct.id, acct.name.c_str());
+                    c.account.id, c.account.name.c_str());
             continue;
         }
-        if (!gate.acquire(acct.id, acct.max_concurrency)) {
-            fprintf(stderr, "[Proxy] account %d (%s) at concurrency limit (%d), try next\n",
-                    acct.id, acct.name.c_str(), acct.max_concurrency);
+        if (!gate.acquire(c.key_slot_id, c.account.max_concurrency)) {
+            fprintf(stderr, "[Proxy] key slot %d (account %d %s) at "
+                            "concurrency limit (%d), try next\n",
+                    c.key_slot_id, c.account.id, c.account.name.c_str(),
+                    c.account.max_concurrency);
             continue;
         }
+        picked = idx;
         return true;
     }
     return false;
@@ -436,7 +486,7 @@ forward_once(UpstreamClient &upstream, const std::string &body,
     AbortGuard abort;
     auto monitor = spawn_client_monitor(client_sock, abort);
     auto fwd = upstream.forward(
-        "POST", c.account.base_url, c.account.upstream_key,
+        "POST", c.account.base_url, c.key,
         target.path, body, content_type, nullptr, target.opts,
         [&](int fd) {
             abort.upstream_fd.store(fd, std::memory_order_relaxed);
@@ -513,20 +563,26 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             return;
         }
 
-        size_t idx = 0;
-        if (!pick_candidate(gate_, cands, idx)) {
+        std::string session_id = extract_session_id(req, req_json);
+        size_t start = static_cast<size_t>(
+            affinity_.preferred_index(session_id, cands.size()));
+        size_t picked = 0;
+        if (!pick_candidate(gate_, cands, start, picked)) {
             res.status = 429;
             res.set_content(json_error("All upstream accounts are busy or cooling down", 429),
                             "application/json");
             return;
         }
+        const UpstreamCandidate &cand = cands[picked];
+        if (affinity_.binding_changed(session_id, cand.key_slot_id))
+            db_.log_session_key(session_id, cand.account.id, cand.key_slot_id);
         ir::ApiFormat upstream =
-            ir::parse_api_format(cands[idx].account.api_format);
+            ir::parse_api_format(cand.account.api_format);
         if (harness == upstream)
-            handle_passthrough(cands[idx], ar.route.local_key_id, upstream,
+            handle_passthrough(cand, ar.route.local_key_id, upstream,
                                model, req, res, t0);
         else
-            handle_converted(cands[idx], ar.route.local_key_id, harness,
+            handle_converted(cand, ar.route.local_key_id, harness,
                              upstream, model, req, res, t0);
         return;
     }
@@ -566,10 +622,17 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     ir::ApiFormat used_upstream_fmt = harness;
     const FormatCodec *upstream_codec = nullptr;
 
+    // Session-affinity spillover: start at the session's preferred candidate
+    // and wrap around in fixed order (P, P+1, …, n-1, 0, …, P-1).
+    std::string session_id = extract_session_id(req, req_json);
+    size_t start = static_cast<size_t>(
+        affinity_.preferred_index(session_id, cands.size()));
+
     for (size_t i = 0; i < cands.size(); ++i) {
-        const UpstreamCandidate &c = cands[i];
+        size_t ci = (start + i) % cands.size();
+        const UpstreamCandidate &c = cands[ci];
         if (gate_.in_cooldown(c.account.id)) continue;
-        if (!gate_.acquire(c.account.id, c.account.max_concurrency)) continue;
+        if (!gate_.acquire(c.key_slot_id, c.account.max_concurrency)) continue;
 
         if (inflight_id < 0) {
             inflight_id = db_.request_start(ar.route.local_key_id, c.account.id,
@@ -624,11 +687,18 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             fprintf(stderr, "[Proxy] upstream %d (%s) failed (%d), trying "
                             "next candidate\n",
                     c.account.id, c.account.name.c_str(), fwd.status_code);
-            gate_.release(c.account.id);
+            gate_.release(c.key_slot_id);
             continue;
         }
         used = &c;
         break;
+    }
+
+    if (used) {
+        // Log the (session → key) binding once when established/changed.
+        if (affinity_.binding_changed(session_id, used->key_slot_id))
+            db_.log_session_key(session_id, used->account.id,
+                                used->key_slot_id);
     }
 
     if (!used) {
@@ -659,9 +729,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
                 .count());
         tracker_.log_request(used->account.id, ar.route.local_key_id, zu,
-                             false, 499, dur);
+                             false, 499, dur, used->key_slot_id);
         db_.request_end(inflight_id);
-        gate_.release(used->account.id);
+        gate_.release(used->key_slot_id);
         return;
     }
 
@@ -674,7 +744,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         if (usage.has_value()) {
             tracker_.log_request(used->account.id, ar.route.local_key_id,
                                  *usage, false, fwd.status_code,
-                                 fwd.duration_ms);
+                                 fwd.duration_ms, used->key_slot_id);
         } else {
             fprintf(stderr, "[Proxy] Warning: could not parse usage "
                             "from non-streaming response, model=%s\n",
@@ -684,7 +754,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             UsageTracker::UsageInfo zu;
             zu.model = model;
             tracker_.log_request(used->account.id, ar.route.local_key_id, zu,
-                                 false, fwd.status_code, fwd.duration_ms);
+                                 false, fwd.status_code, fwd.duration_ms, used->key_slot_id);
         }
 
         if (fwd.success) {
@@ -700,7 +770,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             UsageTracker::UsageInfo zu;
             zu.model = model;
             tracker_.log_request(used->account.id, ar.route.local_key_id, zu,
-                                 false, fwd.status_code, fwd.duration_ms);
+                                 false, fwd.status_code, fwd.duration_ms, used->key_slot_id);
             res.status = fwd.status_code;
             if (fwd.is_timeout) {
                 res.set_header("Connection", "close");
@@ -728,7 +798,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 usage_info.model = model;
                 tracker_.log_request(used->account.id, ar.route.local_key_id,
                                      usage_info, false,
-                                     fwd.status_code, fwd.duration_ms);
+                                     fwd.status_code, fwd.duration_ms, used->key_slot_id);
                 res.status = fwd.status_code;
                 res.set_content(harness_codec.serialize_response(cResp).dump(),
                                 "application/json");
@@ -739,14 +809,14 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                     if (fb->model.empty()) fb->model = model;
                     tracker_.log_request(used->account.id, ar.route.local_key_id,
                                          *fb, false, fwd.status_code,
-                                         fwd.duration_ms);
+                                         fwd.duration_ms, used->key_slot_id);
                 } else {
                     // 2xx but no usable usage — log the attempt (zero tokens).
                     UsageTracker::UsageInfo zu;
                     zu.model = model;
                     tracker_.log_request(used->account.id, ar.route.local_key_id,
                                          zu, false, fwd.status_code,
-                                         fwd.duration_ms);
+                                         fwd.duration_ms, used->key_slot_id);
                 }
                 res.status = fwd.status_code;
                 res.set_content(fwd.body, "application/json");
@@ -757,7 +827,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             UsageTracker::UsageInfo zu;
             zu.model = model;
             tracker_.log_request(used->account.id, ar.route.local_key_id,
-                                 zu, false, fwd.status_code, fwd.duration_ms);
+                                 zu, false, fwd.status_code, fwd.duration_ms, used->key_slot_id);
             json normalized;
             if (fwd.is_timeout) {
                 normalized = timeout_error_body(fwd.timeout_secs);
@@ -788,7 +858,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                             concurrent_count);
 
     db_.request_end(inflight_id);
-    gate_.release(used->account.id);
+    gate_.release(used->key_slot_id);
 }
 
 // ── handle_passthrough (streaming only) ─────────────────────────────────
@@ -861,7 +931,7 @@ void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
             AbortGuard abort;
             auto monitor = spawn_client_monitor(client_sock, abort);
             auto fwd = upstream_.forward(
-                "POST", cand.account.base_url, cand.account.upstream_key,
+                "POST", cand.account.base_url, cand.key,
                 target.path, body, content_type, on_chunk, target.opts,
                 [&](int fd) {
                     abort.upstream_fd.store(fd, std::memory_order_relaxed);
@@ -881,7 +951,7 @@ void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
             if (usage.has_value()) {
                 tracker_.log_request(cand.account.id, local_key_id,
                                      *usage, true, fwd.status_code,
-                                     fwd.duration_ms);
+                                     fwd.duration_ms, cand.key_slot_id);
             } else {
                 fprintf(stderr, "[Proxy] Warning: could not parse usage "
                                 "from streaming response\n");
@@ -891,7 +961,7 @@ void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
                 zu.model = resolved_model;
                 tracker_.log_request(cand.account.id, local_key_id,
                                      zu, true, fwd.status_code,
-                                     fwd.duration_ms);
+                                     fwd.duration_ms, cand.key_slot_id);
             }
 
             tracker_.mark_key_used(local_key_id);
@@ -905,7 +975,7 @@ void ProxyServer::handle_passthrough(const UpstreamCandidate &cand,
                                     concurrent_count);
 
             db_.request_end(inflight_id);
-            gate_.release(cand.account.id);
+            gate_.release(cand.key_slot_id);
             if (fwd.is_timeout) {
                 // The monitor thread shutdown()s the upstream socket when
                 // the client disconnects, which surfaces as a read error
@@ -1021,7 +1091,7 @@ void ProxyServer::handle_converted(const UpstreamCandidate &cand,
             AbortGuard abort;
             auto monitor = spawn_client_monitor(client_sock, abort);
             auto fwd = upstream_.forward(
-                "POST", cand.account.base_url, cand.account.upstream_key,
+                "POST", cand.account.base_url, cand.key,
                 target.path, upstream_body, "application/json",
                 on_chunk, target.opts,
                 [&](int fd) {
@@ -1071,7 +1141,7 @@ void ProxyServer::handle_converted(const UpstreamCandidate &cand,
             usage_info.model = model_copy;
             tracker_.log_request(cand.account.id, local_key_id,
                                  usage_info, true, fwd.status_code,
-                                 fwd.duration_ms);
+                                 fwd.duration_ms, cand.key_slot_id);
 
             tracker_.mark_key_used(local_key_id);
 
@@ -1084,7 +1154,7 @@ void ProxyServer::handle_converted(const UpstreamCandidate &cand,
                                     concurrent_count);
 
             db_.request_end(inflight_id);
-            gate_.release(cand.account.id);
+            gate_.release(cand.key_slot_id);
             if (fwd.is_timeout) {
                 // The monitor thread shutdown()s the upstream socket when
                 // the client disconnects, which surfaces as a read error
@@ -1228,7 +1298,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     for (size_t i = 0; i < cands.size(); ++i) {
         const UpstreamCandidate &c = cands[i];
         if (gate_.in_cooldown(c.account.id)) continue;
-        if (!gate_.acquire(c.account.id, c.account.max_concurrency)) continue;
+        if (!gate_.acquire(c.key_slot_id, c.account.max_concurrency)) continue;
 
         if (inflight_id < 0) {
             inflight_id = db_.request_start(ar.route.local_key_id,
@@ -1248,7 +1318,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         eopts.non_streaming_timeout =
             timeout_config_for(db_, ir::ApiFormat::OpenAI).non_streaming_timeout;
         fwd = upstream_.forward(
-            "POST", c.account.base_url, c.account.upstream_key,
+            "POST", c.account.base_url, c.key,
             "/embeddings", eb, content_type, nullptr, eopts);
 
         if (fwd.status_code == 429 && c.account.account_type == "plan") {
@@ -1264,7 +1334,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
             fprintf(stderr, "[Proxy] upstream %d (%s) failed (%d), trying "
                             "next candidate\n",
                     c.account.id, c.account.name.c_str(), fwd.status_code);
-            gate_.release(c.account.id);
+            gate_.release(c.key_slot_id);
             continue;
         }
         used = &c;
@@ -1300,7 +1370,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
             fprintf(stderr, "[Proxy] Client gone (embeddings), drop response "
                     "(inflight=%d, model=%s)\n", inflight_id, req_model.c_str());
             db_.request_end(inflight_id);
-            gate_.release(used->account.id);
+            gate_.release(used->key_slot_id);
             return;
         }
     }
@@ -1313,7 +1383,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         tracker_.log_request(used->account.id,
                              ar.route.local_key_id,
                              *usage, false, fwd.status_code,
-                             fwd.duration_ms);
+                             fwd.duration_ms, used->key_slot_id);
     } else {
         fprintf(stderr, "[Proxy] Warning: could not parse usage "
                         "from embedding response, model=%s\n",
@@ -1331,7 +1401,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                             concurrent_count);
 
     db_.request_end(inflight_id);
-    gate_.release(used->account.id);
+    gate_.release(used->key_slot_id);
 
     if (fwd.success) {
         res.status = fwd.status_code;
