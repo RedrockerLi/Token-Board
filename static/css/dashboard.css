@@ -625,6 +625,22 @@ body {
     color: #991B1B;
 }
 
+/* Account-type badges: soft pastel pills (API blue / Plan green / Agent violet) */
+.badge--type-api {
+    background: #DBEAFE;
+    color: #1E40AF;
+}
+
+.badge--type-plan {
+    background: #DCFCE7;
+    color: #166534;
+}
+
+.badge--type-agent {
+    background: #EDE9FE;
+    color: #5B21B6;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
    Modals
    ═══════════════════════════════════════════════════════════════════════ */

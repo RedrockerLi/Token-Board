@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <fcntl.h>
 #include <filesystem>
@@ -357,7 +358,7 @@ bool Database::prepare_statements() {
             "COALESCE(a.is_aggregate,0), COALESCE(a.account_type,'api'), "
             "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), a.deleted_at "
             "FROM local_keys k JOIN upstream_accounts a ON a.id=k.account_id "
-            "WHERE k.key_value=?1",
+            "WHERE k.key_value=?1 AND COALESCE(a.account_type,'api') <> 'agent'",
             stmt_lookup_route_);
 
     PREPARE_ON(read_db_, "SELECT id, key_value, position "
@@ -371,7 +372,8 @@ bool Database::prepare_statements() {
     PREPARE_ON(read_db_,
             "WITH root AS ("
             "  SELECT id, COALESCE(is_aggregate,0) AS is_aggregate "
-            "  FROM upstream_accounts WHERE id=?1 AND deleted_at IS NULL"
+            "  FROM upstream_accounts WHERE id=?1 AND deleted_at IS NULL "
+            "    AND COALESCE(account_type,'api') <> 'agent'"
             "), targets(target_id, upstream_model, priority_group, "
             "          priority_sort, priority_id) AS ("
             "  SELECT r.id, ?2, 0, 0, 0 FROM root r WHERE r.is_aggregate=0 "
@@ -389,6 +391,7 @@ bool Database::prepare_statements() {
             "k.id, k.key_value, k.position "
             "FROM targets JOIN upstream_accounts a "
             "  ON a.id=targets.target_id AND a.deleted_at IS NULL "
+            " AND COALESCE(a.account_type,'api') <> 'agent' "
             "LEFT JOIN upstream_keys k "
             "  ON k.account_id=a.id AND k.deleted_at IS NULL "
             "ORDER BY targets.priority_sort, targets.priority_id, "
@@ -436,7 +439,12 @@ bool Database::prepare_statements() {
             "                     ?2>=ps.start_minute AND ?2<ps.end_minute) OR "
             "                    (ps.start_minute>ps.end_minute AND "
             "                     (?2>=ps.start_minute OR ?2<ps.end_minute))) "
-            "                 ORDER BY ps.id LIMIT 1), 1.0) "
+            "                 ORDER BY ps.id LIMIT 1), 1.0), "
+            "       COALESCE(mp.currency,'CNY'), "
+            "       COALESCE((SELECT fr.rate FROM fx_rate fr "
+            "                 WHERE fr.base='USD' AND fr.quote='CNY' "
+            "                   AND fr.date <= date(?3,'unixepoch') "
+            "                 ORDER BY fr.date DESC LIMIT 1), 1.0) "
             "FROM model_pricing mp "
             "WHERE LOWER(?1) GLOB LOWER(mp.model_pattern) "
             "ORDER BY mp.id LIMIT 1",
@@ -798,7 +806,15 @@ bool Database::snapshot_request_cost(const std::string &model,
                                      std::int64_t requested_at_unix,
                                      double &cost) {
     int minute = static_cast<int>((requested_at_unix % 86400 + 86400) % 86400) / 60;
-    const std::string cache_key = model + '\x1f' + std::to_string(minute);
+    // Include the UTC date in the cache key: the FX rate is per-day, so a
+    // snapshot fetched yesterday must never be reused for today's requests.
+    std::tm tm{};
+    const std::time_t ts = static_cast<std::time_t>(requested_at_unix);
+    gmtime_r(&ts, &tm);
+    char date_buf[16] = {0};
+    std::strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &tm);
+    const std::string cache_key = model + '\x1f' + std::string(date_buf) + '\x1f'
+                                + std::to_string(minute);
     std::lock_guard<std::mutex> lock(pricing_mutex_);
     if (!pricing_db_ || !stmt_snapshot_price_) return false;
 
@@ -814,6 +830,9 @@ bool Database::snapshot_request_cost(const std::string &model,
         cost = ((uncached / 1000000.0) * rate.input_price +
                 (cache / 1000000.0) * rate.cache_read_price +
                 (completion / 1000000.0) * rate.output_price) * rate.multiplier;
+        // USD-priced models are normalized to CNY using the rate in effect on
+        // the request's UTC day (nearest-latest; 1.0 when none is stored).
+        if (rate.currency == "USD") cost *= rate.fx_rate;
         return std::isfinite(cost);
     };
 
@@ -828,6 +847,7 @@ bool Database::snapshot_request_cost(const std::string &model,
     sqlite3_bind_text(stmt_snapshot_price_, 1, model.c_str(),
                       static_cast<int>(model.size()), SQLITE_STATIC);
     sqlite3_bind_int(stmt_snapshot_price_, 2, minute);
+    sqlite3_bind_int64(stmt_snapshot_price_, 3, requested_at_unix);
 
     FrozenRate rate;
     const int rc = sqlite3_step(stmt_snapshot_price_);
@@ -837,6 +857,10 @@ bool Database::snapshot_request_cost(const std::string &model,
         rate.output_price = sqlite3_column_double(stmt_snapshot_price_, 1);
         rate.cache_read_price = sqlite3_column_double(stmt_snapshot_price_, 2);
         rate.multiplier = sqlite3_column_double(stmt_snapshot_price_, 3);
+        const unsigned char *cur = sqlite3_column_text(stmt_snapshot_price_, 4);
+        if (cur) rate.currency.assign(reinterpret_cast<const char *>(cur),
+                                      static_cast<size_t>(sqlite3_column_bytes(stmt_snapshot_price_, 4)));
+        rate.fx_rate = sqlite3_column_double(stmt_snapshot_price_, 5);
         sqlite3_reset(stmt_snapshot_price_);
         if (frozen_rate_cache_.size() >= 1024 &&
             frozen_rate_cache_.find(cache_key) == frozen_rate_cache_.end())

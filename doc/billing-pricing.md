@@ -58,3 +58,20 @@
 `proxy_plan_summary` 表按“行政月 × 账户 × masked 密钥”保存。订阅费由生命周期和价格历史校准，
 虚拟消费仍是追加式归档。`/api/summary` 据此返回 `plan_subscription_cost` 与 `plan_virtual_cost`,
 前端把月费加进总消费、把虚拟消费显示为"理论消费"。日志导出 30 天后清理，因此无法回填已清理的历史虚拟消费。
+
+## agent 账户与 Codex 用量导入
+
+`account_type = 'agent'` 代表 Agent 订阅(目前仅 Codex),计费与 plan 一致:
+
+- 订阅按月计费(`monthly_price` × 每账户一个"订阅"生命周期,`proxy_plan_summary` 以 `key_masked='subscription'` 存档),与 plan 的差异是**不绑定任何上游密钥**。
+- agent 账户**不能**作为本地密钥的上游目标(`create_key` 拒绝),路由快照也会跳过它;其用量全部来自后台导入,不是代理转发。
+- Python 看板启动后,后台线程每 60 秒扫描 `~/.codex/sessions`(递归 `YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl`,兼容 `.jsonl.gz`),把每个 `token_count` 事件的 `last_token_usage`(每轮增量)写一行 `request_log`(`account_id` 指向第一个 `agent_kind='codex'` 账户,`event_id` 幂等)。用量进入消费报告与看板,口径同 plan:真实成本 = 订阅费,api_cost = 虚拟/理论消费。
+- 导入游标存于本机 `codex_import_state` 表,不上云。
+
+## 币种与汇率(CNY / USD)
+
+- `model_pricing` 与 plan/agent 订阅价都可选币种,默认 CNY,可选 USD。输入的单价/月费是**原生币种**金额。
+- USD 计费在写时按**请求当天的 USD→CNY 汇率**换算成 CNY 后再进 `request_log.api_cost`(代理快照与 `tr_request_log_insert` 触发器同样处理)。
+- 订阅费换算到 CNY 按**行政月**取汇率:过去月份用月初最近存储的汇率(冻结),当前月用当天汇率。
+- 汇率来源 `GET https://api.frankfurter.dev/v2/rate/USD/CNY`。看板启动与首次使用时按 UTC 日拉取一次并存入本机 `fx_rate` 表;当天已有则直接用;拉取失败(或仍为旧数据)则用最近一条已存汇率,没有则按 1.0(等价不换算)。
+- `fx_rate` 与 `codex_import_state` 均**仅存本机**,同步到云时被剔除(`sync._RUNTIME_TABLES`)。

@@ -294,6 +294,11 @@ _RUNTIME_TABLES = [
     "sync_state",
     "upstream_keys",
     "session_key_log",
+    # Local-only: per-day exchange rates and the Codex import cursor must
+    # never leave the machine (fx_rate is machine-specific timing; the import
+    # state is meaningless elsewhere).
+    "fx_rate",
+    "codex_import_state",
 ]
 
 

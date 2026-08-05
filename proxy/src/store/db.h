@@ -225,6 +225,8 @@ private:
         double output_price = 0.0;
         double cache_read_price = 0.0;
         double multiplier = 1.0;
+        std::string currency = "CNY";
+        double fx_rate = 1.0;  // USD→CNY; 1.0 for CNY rows or when no rate stored
     };
 
     /// Apply pending versioned migrations (PRAGMA user_version-gated) from

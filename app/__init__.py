@@ -60,4 +60,34 @@ def create_app(proxy_db_path: str | None = None):
         except Exception:
             pass  # no dashboard archive yet / not migrated — ignore
 
+        # Background, best-effort threads (daemon, never affect the request
+        # path): pre-warm today's USD→CNY rate, then start the Codex session
+        # importer which scans ~/.codex/sessions every 60 s.
+        try:
+            from app import fx  # noqa: E402
+            def _fx_prewarm():
+                try:
+                    conn = pdb._connect()
+                    try:
+                        fx.ensure_rate(conn)
+                    finally:
+                        conn.close()
+                except Exception:
+                    pass
+            import threading
+            threading.Thread(target=_fx_prewarm, daemon=True,
+                             name="fx-prewarm").start()
+        except Exception:
+            pass
+
+        try:
+            from app.codex_import import run_import  # noqa: E402
+            import threading
+            stop_event = threading.Event()
+            flask_app.config["CODEX_IMPORT_STOP"] = stop_event
+            threading.Thread(target=run_import, args=(pdb, stop_event),
+                             daemon=True, name="codex-importer").start()
+        except Exception:
+            pass
+
     return flask_app

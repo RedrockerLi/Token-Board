@@ -16,6 +16,8 @@ import urllib.request
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 
+from app.fx import ensure_rate as _fx_ensure_rate, rate_for_month as _fx_rate_for_month
+
 
 def _generate_key() -> str:
     """Generate a local proxy key: 'tb-' + 32 random hex chars."""
@@ -150,14 +152,20 @@ class ProxyDatabase:
                 "  AND r.requested_at >= datetime('now', '-30 days')"
             ).fetchone()[0]
 
-            # Current plan subscriptions are independent of usage.  Use the
+            # Current plan/agent subscriptions are independent of usage.  Use the
             # same lifecycle/price-history resolver as dashboard export so a
             # key deleted after its grace window remains billed this period.
+            # Native (plan_price_history) prices are in the account's currency;
+            # USD subscriptions are converted to CNY at today's rate (fetch on
+            # demand; stale fallback handled inside fx).
             plan_subscription = 0.0
             now = _utc_now()
             for meta in self._plan_key_billing_meta(conn):
                 current_period = _billing_period_month(now, meta["anchor"].day)
-                plan_subscription += self._subscription_periods(conn, meta).get(current_period, 0.0)
+                native = self._subscription_periods(conn, meta).get(current_period, 0.0)
+                if native and meta.get("currency") == "USD":
+                    native *= _fx_ensure_rate(conn)
+                plan_subscription += native
             total_cost += plan_subscription
 
             # Today's consumption = api billed today + plan virtual cost today
@@ -214,6 +222,8 @@ class ProxyDatabase:
                 "COALESCE(is_aggregate,0) AS is_aggregate, "
                 "COALESCE(account_type,'api') AS account_type, "
                 "COALESCE(monthly_price,0) AS monthly_price, "
+                "COALESCE(currency,'CNY') AS currency, "
+                "COALESCE(agent_kind,'') AS agent_kind, "
                 "max_concurrency, created_at, "
                 "(SELECT COUNT(*) FROM upstream_keys k WHERE k.account_id = upstream_accounts.id "
                 " AND k.deleted_at IS NULL) AS key_count "
@@ -337,6 +347,12 @@ class ProxyDatabase:
         return active_values
 
     def create_account(self, data: dict) -> int:
+        account_type = data.get("account_type", "api")
+        if account_type not in ("api", "plan", "agent"):
+            raise ValueError("账户类型必须是 api / plan / agent")
+        currency = data.get("currency", "CNY")
+        if currency not in ("CNY", "USD"):
+            raise ValueError("币种必须是 CNY / USD")
         keys = self._normalize_keys(data)
         first = keys[0] if keys else ""
         conn = self._connect()
@@ -344,8 +360,8 @@ class ProxyDatabase:
             cursor = conn.execute(
                 "INSERT INTO upstream_accounts "
                 "(name, upstream_key, base_url, api_format, endpoint_path, auth_header, "
-                " account_type, monthly_price, max_concurrency) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " account_type, monthly_price, currency, max_concurrency) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     data["name"],
                     first,
@@ -353,17 +369,26 @@ class ProxyDatabase:
                     data.get("api_format", "openai"),
                     data.get("endpoint_path", ""),
                     data.get("auth_header", "bearer"),
-                    data.get("account_type", "api"),
+                    account_type,
                     float(data.get("monthly_price", 0) or 0),
+                    currency,
                     data.get("max_concurrency"),
                 ),
             )
             account_id = cursor.lastrowid
-            if keys:
+            if account_type == "agent" and data.get("agent_kind"):
+                conn.execute(
+                    "UPDATE upstream_accounts SET agent_kind=? WHERE id=?",
+                    (str(data["agent_kind"]), account_id),
+                )
+            # Agent accounts are subscription-only: never create upstream keys.
+            if keys and account_type != "agent":
                 self._set_upstream_keys(
                     conn, account_id, [], keys, new_valid_froms=data.get("new_valid_froms")
                 )
-            if data.get("account_type", "api") == "plan":
+            # Plan/agent accounts are subscription-billed: seed the baseline
+            # price history so _subscription_periods has a deterministic value.
+            if account_type in ("plan", "agent"):
                 conn.execute(
                     "INSERT INTO plan_price_history "
                     "(account_id,monthly_price,changed_at,effective_mode) VALUES (?,?,?,?)",
@@ -379,7 +404,7 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             original = conn.execute(
-                "SELECT account_type, monthly_price FROM upstream_accounts "
+                "SELECT account_type, monthly_price, currency FROM upstream_accounts "
                 "WHERE id=? AND deleted_at IS NULL", (account_id,)
             ).fetchone()
             if original is None:
@@ -388,13 +413,18 @@ class ProxyDatabase:
             values = []
             for key in ("name", "base_url", "api_format",
                         "endpoint_path", "auth_header", "account_type",
-                        "monthly_price", "max_concurrency"):
+                        "monthly_price", "currency", "agent_kind",
+                        "max_concurrency"):
                 if key not in data:
                     continue
                 if key == "monthly_price":
                     val = float(data[key] or 0)
                 elif key == "max_concurrency":
                     val = data[key] if data[key] not in (None, "") else None
+                elif key == "currency":
+                    val = data[key]
+                    if val not in ("CNY", "USD"):
+                        raise ValueError("币种必须是 CNY / USD")
                 else:
                     val = data[key]
                 fields.append(f"{key} = ?")
@@ -403,8 +433,10 @@ class ProxyDatabase:
             # Keys are only touched when the client explicitly edited them
             # (keys_edited=true) or sent a legacy non-empty `upstream_key`;
             # otherwise the existing key set is preserved (e.g. a rename-only
-            # edit must never wipe the keys).
-            replace_keys = bool(data.get("keys_edited")) or bool(data.get("upstream_key"))
+            # edit must never wipe the keys).  Agent accounts never carry
+            # upstream keys, so key replacement is ignored for them.
+            replace_keys = (bool(data.get("keys_edited")) or bool(data.get("upstream_key"))) \
+                and original["account_type"] != "agent"
             if replace_keys:
                 # Replace semantics: the final key set = kept existing keys (by
                 # id — the UI only ever sees masked values, never the real
@@ -429,8 +461,8 @@ class ProxyDatabase:
             )
             final_type = data.get("account_type", original["account_type"])
             final_price = float(data.get("monthly_price", original["monthly_price"]) or 0)
-            if final_type == "plan" and (
-                original["account_type"] != "plan" or
+            if final_type in ("plan", "agent") and (
+                original["account_type"] != final_type or
                 final_price != float(original["monthly_price"] or 0)
             ):
                 mode = data.get("price_effective")
@@ -647,11 +679,28 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    @staticmethod
+    def _assert_routable_account(conn: sqlite3.Connection, account_id):
+        """Reject binding a local key to an agent account.
+
+        Agent accounts are subscription-only (Codex etc.): they must never be
+        used as a routable upstream, so no local key may point at one.
+        """
+        if account_id is None:
+            return
+        row = conn.execute(
+            "SELECT COALESCE(account_type,'api') AS account_type FROM upstream_accounts "
+            "WHERE id=?", (account_id,)
+        ).fetchone()
+        if row is not None and row["account_type"] == "agent":
+            raise ValueError("Agent 账户不能作为本地密钥的上游")
+
     def create_key(self, data: dict) -> str:
         """Create a new local key. Returns the generated key value."""
         key_value = _generate_key()
         conn = self._connect()
         try:
+            self._assert_routable_account(conn, data.get("account_id"))
             conn.execute(
                 "INSERT INTO local_keys (key_value, label, account_id) "
                 "VALUES (?, ?, ?)",
@@ -665,6 +714,8 @@ class ProxyDatabase:
     def update_key(self, key_id: int, data: dict) -> bool:
         conn = self._connect()
         try:
+            if "account_id" in data:
+                self._assert_routable_account(conn, data["account_id"])
             fields = []
             values = []
             for key in ("label", "account_id"):
@@ -692,6 +743,66 @@ class ProxyDatabase:
             conn.execute("DELETE FROM local_keys WHERE id = ?", (key_id,))
             conn.commit()
             return conn.total_changes > 0
+        finally:
+            conn.close()
+
+    def get_agent_accounts(self) -> list[dict]:
+        """Agent (subscription-only) accounts, e.g. Codex.  Never routable."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, name, COALESCE(agent_kind,'') AS agent_kind, "
+                "COALESCE(currency,'CNY') AS currency, "
+                "COALESCE(monthly_price,0) AS monthly_price "
+                "FROM upstream_accounts "
+                "WHERE COALESCE(account_type,'api')='agent' "
+                "  AND COALESCE(is_aggregate,0)=0 AND deleted_at IS NULL "
+                "ORDER BY id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _insert_agent_usage_row(conn, account_id: int, model: str,
+                                prompt_tokens: int, completion_tokens: int,
+                                cache_read_tokens: int, total_tokens: int,
+                                requested_at: str, event_id: str) -> bool:
+        """Insert one agent (Codex) usage row on the caller's connection.
+
+        cost_frozen=0 so tr_request_log_insert computes api_cost (including USD
+        FX conversion).  event_id is UNIQUE → INSERT OR IGNORE makes the import
+        idempotent across crashes/restarts.  `requested_at` must be a SQLite UTC
+        timestamp "YYYY-MM-DD HH:MM:SS".  Returns True when a row was inserted.
+        """
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO request_log "
+            "(account_id, local_key_id, model, prompt_tokens, completion_tokens, "
+            " cache_read_tokens, total_tokens, api_cost, is_streaming, status_code, "
+            " duration_ms, upstream_key_id, requested_at, event_id, cost_frozen) "
+            "VALUES (?, NULL, ?, ?, ?, ?, ?, 0, 0, 200, 0, NULL, ?, ?, 0)",
+            (account_id, model, int(prompt_tokens), int(completion_tokens),
+             int(cache_read_tokens), int(total_tokens), requested_at, event_id),
+        )
+        return cur.rowcount > 0
+
+    def insert_agent_usage(self, account_id: int, model: str,
+                           prompt_tokens: int, completion_tokens: int,
+                           cache_read_tokens: int, total_tokens: int,
+                           requested_at: str, event_id: str) -> bool:
+        """Insert one imported agent (Codex) usage row into request_log.
+
+        Convenience wrapper opening its own connection (for manual/API use);
+        the background importer calls :meth:`_insert_agent_usage_row` on a
+        shared connection instead to avoid write-lock contention.
+        """
+        conn = self._connect()
+        try:
+            ok = self._insert_agent_usage_row(
+                conn, account_id, model, prompt_tokens, completion_tokens,
+                cache_read_tokens, total_tokens, requested_at, event_id)
+            conn.commit()
+            return ok
         finally:
             conn.close()
 
@@ -743,11 +854,14 @@ class ProxyDatabase:
     def create_pricing(self, data: dict) -> int:
         conn = self._connect()
         try:
+            currency = data.get("currency", "CNY")
+            if currency not in ("CNY", "USD"):
+                raise ValueError("币种必须是 CNY / USD")
             cursor = conn.execute(
-                "INSERT INTO model_pricing (model_pattern, input_price, output_price, cache_read_price) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO model_pricing (model_pattern, input_price, output_price, cache_read_price, currency) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (data["model_pattern"], data["input_price"], data["output_price"],
-                 data.get("cache_read_price")),
+                 data.get("cache_read_price"), currency),
             )
             pid = cursor.lastrowid
             # Cost is frozen at write time (tr_request_log_insert); time-slot
@@ -763,8 +877,11 @@ class ProxyDatabase:
         try:
             fields = []
             values = []
-            for key in ("model_pattern", "input_price", "output_price", "cache_read_price"):
+            for key in ("model_pattern", "input_price", "output_price",
+                        "cache_read_price", "currency"):
                 if key in data:
+                    if key == "currency" and data[key] not in ("CNY", "USD"):
+                        raise ValueError("币种必须是 CNY / USD")
                     fields.append(f"{key} = ?")
                     values.append(data[key])
             if not fields and "slots" not in data:
@@ -1169,15 +1286,20 @@ class ProxyDatabase:
         config = ProxyDatabase._billing_config_conn(conn)
         by_identity: dict[tuple[int, str], dict] = {}
         accounts = conn.execute(
-            "SELECT id, upstream_key, created_at, deleted_at FROM upstream_accounts "
-            "WHERE COALESCE(account_type,'api')='plan' AND COALESCE(is_aggregate,0)=0"
+            "SELECT id, upstream_key, created_at, deleted_at, "
+            "COALESCE(account_type,'api') AS account_type, "
+            "COALESCE(currency,'CNY') AS currency "
+            "FROM upstream_accounts "
+            "WHERE COALESCE(account_type,'api') IN ('plan','agent') "
+            "  AND COALESCE(is_aggregate,0)=0"
         ).fetchall()
         account_rows = {row["id"]: row for row in accounts}
         for row in conn.execute(
             "SELECT k.id,k.account_id,k.key_value,k.created_at,k.valid_from,k.deleted_at,"
             "k.cancellation_grace_hours,a.deleted_at AS account_deleted_at "
             "FROM upstream_keys k JOIN upstream_accounts a ON a.id=k.account_id "
-            "WHERE COALESCE(a.account_type,'api')='plan' AND COALESCE(a.is_aggregate,0)=0"
+            "WHERE COALESCE(a.account_type,'api') IN ('plan','agent') "
+            "  AND COALESCE(a.is_aggregate,0)=0"
         ):
             anchor = _parse_iso_date(row["valid_from"]) or _parse_utc_timestamp(row["created_at"]).date()
             key_end = _parse_utc_timestamp(row["deleted_at"])
@@ -1224,9 +1346,27 @@ class ProxyDatabase:
                     "key_masked": mask_key(account["upstream_key"]), "anchor": anchor,
                     "end": _parse_utc_timestamp(account["deleted_at"]), "grace": None,
                 }
+        # Agent accounts are subscription-only: no upstream keys exist, so
+        # synthesize exactly one lifecycle per account, keyed "subscription".
+        for account in accounts:
+            if account["account_type"] != "agent":
+                continue
+            anchor = _parse_utc_timestamp(account["created_at"]).date()
+            by_identity[(account["id"], "subscription")] = {
+                "account_id": account["id"], "key_id": None,
+                "key_masked": "subscription", "anchor": anchor,
+                "end": _parse_utc_timestamp(account["deleted_at"]),
+                "grace": config["cancellation_grace_hours"],
+                "currency": account["currency"] or "CNY",
+                "account_type": "agent",
+            }
         for meta in by_identity.values():
             if meta["grace"] is None:
                 meta["grace"] = config["cancellation_grace_hours"]
+            # Attach the account's native currency for FX conversion.
+            account_row = account_rows.get(meta["account_id"])
+            meta["currency"] = (account_row["currency"] or "CNY") if account_row else "CNY"
+            meta["account_type"] = (account_row["account_type"] or "plan") if account_row else "plan"
             meta["now"] = now
         return list(by_identity.values())
 
@@ -1300,9 +1440,14 @@ class ProxyDatabase:
                     COALESCE(SUM(r.api_cost), 0) AS cost,
                     COUNT(*) AS request_count
                 FROM request_log r
+                LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE r.id > ? AND r.id <= ?
                   AND LOWER(r.model) != 'unknown' AND r.model != ''
                   AND r.account_id IS NOT NULL
+                  -- Aggregate accounts are routing groupings, not real upstreams:
+                  -- a request they fail to serve is logged against the aggregate
+                  -- (zero tokens), which must never pollute the usage archive.
+                  AND COALESCE(a.is_aggregate, 0) = 0
                 GROUP BY date(r.requested_at), r.account_id, r.model
                 ORDER BY date(r.requested_at), r.account_id, r.model
             """, (mark, max_id)).fetchall()
@@ -1320,25 +1465,33 @@ class ProxyDatabase:
                     cost=r["cost"],
                 )
 
-            # B) Plan subscriptions are derived from key lifecycles, not from
-            # usage.  Reconcile every known lifecycle on every export so an
+            # B) Plan/agent subscriptions are derived from key lifecycles, not
+            # from usage.  Reconcile every known lifecycle on every export so an
             # edited start date, cancellation, or scheduled price cannot leave
-            # stale subscription rows behind.
+            # stale subscription rows behind.  Native prices are converted to
+            # CNY per month (past months frozen, current month at today's rate).
             metas = self._plan_key_billing_meta(conn)
             by_key_id = {meta["key_id"]: meta for meta in metas if meta["key_id"] is not None}
             by_account = {}
             for meta in metas:
                 by_account.setdefault(meta["account_id"], meta)
+                native_periods = self._subscription_periods(conn, meta)
+                if meta.get("currency") == "USD":
+                    native_periods = {
+                        month: native * _fx_rate_for_month(conn, month)
+                        for month, native in native_periods.items()
+                    }
                 dash_db.reconcile_plan_subscription(
                     meta["account_id"], meta["key_masked"],
-                    self._subscription_periods(conn, meta),
+                    native_periods,
                 )
 
             virtual_buckets: dict[tuple[str, int, str], float] = {}
             plan_logs = conn.execute(
                 "SELECT r.account_id,r.upstream_key_id,r.requested_at,r.api_cost "
                 "FROM request_log r JOIN upstream_accounts a ON a.id=r.account_id "
-                "WHERE r.id>? AND r.id<=? AND COALESCE(a.account_type,'api')='plan'",
+                "WHERE r.id>? AND r.id<=? "
+                "  AND COALESCE(a.account_type,'api') IN ('plan','agent')",
                 (mark, max_id),
             ).fetchall()
             for log in plan_logs:

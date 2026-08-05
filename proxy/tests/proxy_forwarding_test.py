@@ -189,7 +189,7 @@ def main() -> None:
 
             conn = sqlite3.connect(db_path)
             try:
-                assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+                assert conn.execute("PRAGMA user_version").fetchone()[0] == 14
                 assert conn.execute(
                     "SELECT account_id FROM request_attempts WHERE request_log_id=?",
                     (historical_log_id,),

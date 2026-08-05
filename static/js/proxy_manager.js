@@ -58,11 +58,43 @@ function closeModal(id) {
 
 // ── Accounts Page ────────────────────────────────────────────────────────
 
-/// Show/hide the plan monthly-price field based on the account type.
+/** Soft pastel pill for the account type column: API / Plan / Agent. */
+function accountTypeBadge(type) {
+    const t = type === 'plan' ? 'Plan' : type === 'agent' ? 'Agent' : 'API';
+    const cls = type === 'plan' ? 'badge--type-plan'
+              : type === 'agent' ? 'badge--type-agent'
+              : 'badge--type-api';
+    return `<span class="badge ${cls}">${t}</span>`;
+}
+
+/** Native currency symbol for plan/agent subscription prices. */
+function currencySymbol(currency) {
+    return currency === 'USD' ? '$' : '¥';
+}
+
+/** Accounts that can actually be *used as an upstream* (local-key binding,
+ * aggregate targets).  Agent accounts are subscription-only — they never
+ * appear in these "use as upstream" pickers. */
+function routableAccounts(accounts) {
+    return (accounts || []).filter(a => !a.is_aggregate && a.account_type !== 'agent');
+}
+
+/// Show/hide the subscription price + currency fields based on account type
+/// (shown for plan and agent; hidden for api).
 function togglePlanFields(sel) {
-    const field = document.getElementById('planPriceField');
-    if (!field) return;
-    field.style.display = (sel && sel.value === 'plan') ? '' : 'none';
+    const price = document.getElementById('planPriceField');
+    const cur = document.getElementById('currencyField');
+    const show = sel && (sel.value === 'plan' || sel.value === 'agent');
+    if (price) price.style.display = show ? '' : 'none';
+    if (cur) cur.style.display = show ? '' : 'none';
+    updatePlanPriceSymbol();
+}
+
+/// Refresh the price-label currency symbol from the chosen currency select.
+function updatePlanPriceSymbol() {
+    const sym = document.getElementById('planPriceSymbol');
+    const curSel = document.querySelector('#accountForm [name="currency"]');
+    if (sym && curSel) sym.textContent = currencySymbol(curSel.value);
 }
 
 // ── Multi-key form helpers ─────────────────────────────────────────────
@@ -167,8 +199,10 @@ async function loadAccountsTable() {
                 <td><code>${esc(maskKey(a.upstream_key))}</code>${a.key_count > 1 ? ` <span class="badge" title="${a.key_count} 把密钥（同一配置的多个并发槽位）">×${a.key_count}</span>` : ''}${!a.upstream_key && !a.key_count ? ' <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
-                <td>${a.account_type === 'plan' ? '<span class="badge badge--active">plan</span>' : '<span class="badge">api</span>'}</td>
-                <td>${a.account_type === 'plan' ? '¥' + (+(a.monthly_price || 0)).toFixed(2) + '/密钥·周期' : '-'}</td>
+                <td>${accountTypeBadge(a.account_type)}</td>
+                <td>${(a.account_type === 'plan' || a.account_type === 'agent')
+                    ? currencySymbol(a.currency) + (+(a.monthly_price || 0)).toFixed(2) + (a.account_type === 'plan' ? '/密钥·周期' : '/周期')
+                    : '-'}</td>
                 <td>${a.max_concurrency ? a.max_concurrency + ' 并发' : '无限制'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
@@ -199,6 +233,7 @@ async function saveAccount(e) {
                 auth_header: form['auth_header'].value || 'auto',
                 account_type: form['account_type'].value || 'api',
                 monthly_price: form['monthly_price'].value || 0,
+                currency: form['currency'] ? form['currency'].value : 'CNY',
                 max_concurrency: form['max_concurrency'].value || null,
             };
             // Only send the key set when the user actually edited it — a
@@ -229,6 +264,7 @@ async function saveAccount(e) {
                     auth_header: form['auth_header'].value || 'auto',
                     account_type: form['account_type'].value || 'api',
                     monthly_price: form['monthly_price'].value || 0,
+                    currency: form['currency'] ? form['currency'].value : 'CNY',
                     max_concurrency: form['max_concurrency'].value || null,
                 }),
             });
@@ -260,7 +296,8 @@ function editAccount(id) {
         form['endpoint_path'].value = acc.endpoint_path || '';
         form['auth_header'].value = acc.auth_header || 'auto';
         form['account_type'].value = acc.account_type || 'api';
-        form['monthly_price'].value = acc.account_type === 'plan' ? (acc.monthly_price || 0) : '';
+        form['monthly_price'].value = (acc.account_type === 'plan' || acc.account_type === 'agent') ? (acc.monthly_price || 0) : '';
+        if (form['currency']) form['currency'].value = acc.currency || 'CNY';
         form['max_concurrency'].value = acc.max_concurrency || '';
         togglePlanFields(form['account_type']);
         // Existing keys → masked keep-rows; user adds new rows as needed.
@@ -269,8 +306,12 @@ function editAccount(id) {
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
-        document.getElementById('accountModelBtn').style.display = '';
-        document.getElementById('accountTestConcBtn').style.display = '';
+        // Agent accounts have no real upstream → hide key / model / concurrency UI.
+        const isAgent = acc.account_type === 'agent';
+        const keySection = document.getElementById('accountKeySection');
+        if (keySection) keySection.style.display = isAgent ? 'none' : '';
+        document.getElementById('accountModelBtn').style.display = isAgent ? 'none' : '';
+        document.getElementById('accountTestConcBtn').style.display = isAgent ? 'none' : '';
         document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name); };
         document.getElementById('accountModelBtn').onclick = () => updateAccountModels(id, acc.name);
         document.getElementById('accountTestConcBtn').onclick = () => testConcurrency(id, acc.name, true);
@@ -360,6 +401,8 @@ function openAddAccountModal() {
     if (form) {
         form.reset();
         form.dataset.editId = '';
+        const keySection = document.getElementById('accountKeySection');
+        if (keySection) keySection.style.display = '';
         togglePlanFields(form['account_type']);
     }
     resetKeyList();
@@ -374,6 +417,36 @@ function openAddAccountModal() {
     openModal('accountModal');
 }
 
+function openAddAgentModal() {
+    const form = document.querySelector('#agentForm');
+    if (form) form.reset();
+    openModal('agentModal');
+}
+
+async function saveAgent(e) {
+    e.preventDefault();
+    const form = e.target;
+    try {
+        await proxyFetch('/api/proxy/accounts', {
+            method: 'POST',
+            body: JSON.stringify({
+                name: form['name'].value,
+                account_type: 'agent',
+                agent_kind: form['agent_kind'].value || 'codex',
+                monthly_price: form['monthly_price'].value || 0,
+                currency: form['currency'].value || 'CNY',
+            }),
+        });
+        showToast('Agent 已添加');
+        ConfigSync.markDirty();
+        form.reset();
+        closeModal('agentModal');
+        loadAccountsTable();
+    } catch (err) {
+        showToast(err.message, 'error');
+    }
+}
+
 function initAccountsPage() {
     const el = document.getElementById('page-proxy-accounts');
     if (!el || el.dataset.initialized) return;
@@ -383,9 +456,10 @@ function initAccountsPage() {
             <h1 class="page-title">上游账户管理</h1>
             <p class="page-subtitle">支持 OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 的上游服务</p>
             <button class="btn btn--primary" onclick="openAddAccountModal()">+ 添加账户</button>
+            <button class="btn btn--primary" onclick="openAddAgentModal()">+ 添加 Agent</button>
         </div>
         <table class="mgmt-table" id="accountsTable">
-            <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>类型</th><th>plan 月费</th><th>并发限额</th><th>操作</th></tr></thead>
+            <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>类型</th><th>订阅月费</th><th>并发限额</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
         <div class="modal-overlay" id="accountModal" style="display:none">
@@ -396,7 +470,7 @@ function initAccountsPage() {
                 </div>
                 <form id="accountForm" onsubmit="saveAccount(event)" data-edit-id="">
                     <label>名称 <input name="name" required></label>
-                    <div style="margin-bottom:10px;">
+                    <div id="accountKeySection" style="margin-bottom:10px;">
                         <label>上游 API Key（多把密钥 = 同一配置的多个槽位；仅存本机，不上传云端）</label>
                         <div id="keyList" style="margin:4px 0;"></div>
                         <button type="button" class="btn btn--sm" onclick="addKeyRow()">+ 添加密钥</button>
@@ -423,10 +497,17 @@ function initAccountsPage() {
                         <select name="account_type" onchange="togglePlanFields(this)">
                             <option value="api">api — 按调用量计费</option>
                             <option value="plan">plan — 订阅套餐，调用免费</option>
+                            <option value="agent">agent — Agent 订阅（如 Codex）</option>
                         </select>
                     </label>
-                    <label id="planPriceField" style="display:none;">plan 每月价格 (¥)
+                    <label id="planPriceField" style="display:none;"><span>订阅月费 (<span id="planPriceSymbol">¥</span>/周期)</span>
                         <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 99">
+                    </label>
+                    <label id="currencyField" style="display:none;">订阅币种
+                        <select name="currency" onchange="updatePlanPriceSymbol()">
+                            <option value="CNY">CNY</option>
+                            <option value="USD">USD</option>
+                        </select>
                     </label>
                     <label>并发限额（可选，留空 = 无限制）
                         <input name="max_concurrency" type="number" step="1" min="1" placeholder="如 3">
@@ -436,6 +517,34 @@ function initAccountsPage() {
                         <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
                         <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
                         <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:#EF4444;">删除账户</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <div class="modal-overlay" id="agentModal" style="display:none">
+            <div class="modal">
+                <div class="modal__header">
+                    <h3>添加 Agent</h3>
+                    <button class="modal__close" onclick="closeModal('agentModal')">&times;</button>
+                </div>
+                <form id="agentForm" onsubmit="saveAgent(event)">
+                    <label>名称 <input name="name" required placeholder="如 ChatGPT Plus"></label>
+                    <label>Agent 名称
+                        <select name="agent_kind">
+                            <option value="codex">codex</option>
+                        </select>
+                    </label>
+                    <label>订阅月费
+                        <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 20">
+                    </label>
+                    <label>订阅币种
+                        <select name="currency">
+                            <option value="CNY">CNY</option>
+                            <option value="USD" selected>USD</option>
+                        </select>
+                    </label>
+                    <div style="margin-top:8px;">
+                        <button type="submit" class="btn btn--primary">添加 Agent</button>
                     </div>
                 </form>
             </div>
@@ -536,7 +645,7 @@ async function openEditKeyModal(id) {
         const accountSel = document.getElementById('editKeyAccount');
         accountSel.innerHTML =
             `<option value="" ${key.account_id == null ? 'selected' : ''}>未分配</option>` +
-            accounts.map((a) =>
+            routableAccounts(accounts).map((a) =>
                 `<option value="${a.id}" ${a.id === key.account_id ? 'selected' : ''}>${esc(a.name)}</option>`
             ).join('');
 
@@ -574,7 +683,8 @@ async function loadAccountOptions() {
         const accounts = await proxyFetch('/api/proxy/accounts');
         const sel = document.getElementById('keyAccountSelect');
         if (!sel) return;
-        sel.innerHTML = accounts.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
+        sel.innerHTML = routableAccounts(accounts)
+            .map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
     } catch (err) {
         console.error('Failed to load accounts:', err);
     }
@@ -729,7 +839,7 @@ async function loadAggModels(sel) {
 async function loadAggAccountCache() {
     if (aggAccountsCache) return;
     const accounts = await proxyFetch('/api/proxy/accounts');
-    aggAccountsCache = accounts.filter(a => !a.is_aggregate);
+    aggAccountsCache = routableAccounts(accounts);
 }
 
 async function openAggregateModal(id) {
@@ -918,14 +1028,16 @@ async function loadPricingTable() {
             tbody.innerHTML = '<tr><td colspan="7" class="td-empty">暂无定价</td></tr>';
             return;
         }
-        tbody.innerHTML = pricing.map((p) => `
+        tbody.innerHTML = pricing.map((p) => {
+            const sym = currencySymbol(p.currency);
+            return `
             <tr>
                 <td><code>${esc(p.model_pattern)}</code></td>
-                <td>¥${p.input_price.toFixed(4)} / 1M tokens</td>
-                <td>¥${p.output_price.toFixed(4)} / 1M tokens</td>
-                <td>${p.cache_read_price != null ? '¥' + p.cache_read_price.toFixed(4) + ' / 1M tokens' : '<span style="color:var(--color-text-tertiary);">同输入价</span>'}</td>
+                <td>${sym}${p.input_price.toFixed(4)} / 1M tokens</td>
+                <td>${sym}${p.output_price.toFixed(4)} / 1M tokens</td>
+                <td>${p.cache_read_price != null ? sym + p.cache_read_price.toFixed(4) + ' / 1M tokens' : '<span style="color:var(--color-text-tertiary);">同输入价</span>'}</td>
                 <td>${slotsSummary(p.slots)}</td>
-                <td>${esc(p.currency)}</td>
+                <td><span class="badge ${p.currency === 'USD' ? 'badge--type-plan' : 'badge--type-api'}">${esc(p.currency)}</span></td>
                 <td>
                     <button class="btn btn--sm" onclick="reorderPricing(${p.id},'up')">▲</button>
                     <button class="btn btn--sm" onclick="reorderPricing(${p.id},'down')">▼</button>
@@ -933,10 +1045,17 @@ async function loadPricingTable() {
                     <button class="btn btn--sm" onclick="deletePricing(${p.id})">删除</button>
                 </td>
             </tr>
-        `).join('');
+        `;}).join('');
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="7" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
+}
+
+/// Refresh the pricing-form price labels' currency symbol.
+function updatePricingSymbols() {
+    const sel = document.querySelector('#pricingForm [name="currency"]');
+    const sym = currencySymbol(sel ? sel.value : 'CNY');
+    document.querySelectorAll('#pricingForm .price-sym').forEach((s) => { s.textContent = sym; });
 }
 
 async function savePricing(e) {
@@ -950,6 +1069,7 @@ async function savePricing(e) {
         input_price: parseFloat(data.input_price),
         output_price: parseFloat(data.output_price),
         cache_read_price: cacheRead,
+        currency: data.currency || 'CNY',
         slots: collectSlots(),
     };
     try {
@@ -981,6 +1101,7 @@ function editPricing(id) {
     form['input_price'].value = p.input_price;
     form['output_price'].value = p.output_price;
     form['cache_read_price'].value = p.cache_read_price == null ? '' : p.cache_read_price;
+    if (form['currency']) form['currency'].value = p.currency || 'CNY';
     // Populate time-slot editor (empty for new rows)
     const slotRows = document.getElementById('slotRows');
     if (slotRows) {
@@ -1019,7 +1140,7 @@ function initPricingPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">模型定价管理</h1>
-            <p class="page-subtitle">配置模型价格（百万元 token 价格，人民币）· 时段倍率按 UTC+8 时间设置</p>
+            <p class="page-subtitle">配置模型价格（百万元 token 价格，CNY 默认 / 可选 USD）· 时段倍率按 UTC+8 时间设置</p>
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
         <table class="mgmt-table" id="pricingTable">
@@ -1034,9 +1155,15 @@ function initPricingPage() {
                 </div>
                 <form id="pricingForm" onsubmit="savePricing(event)" data-edit-id="">
                     <label>模型匹配模式 <input name="model_pattern" required placeholder="例如: deepseek-v4*"></label>
-                    <label>输入价格 (¥/1M tokens) <input name="input_price" type="number" step="0.0001" required></label>
-                    <label>输出价格 (¥/1M tokens) <input name="output_price" type="number" step="0.0001" required></label>
-                    <label>缓存命中价格 (¥/1M tokens，可选) <input name="cache_read_price" type="number" step="0.0001" placeholder="留空 = 与输入价格相同"></label>
+                    <label><span>输入价格 (<span class="price-sym">¥</span>/1M tokens)</span> <input name="input_price" type="number" step="0.0001" required></label>
+                    <label><span>输出价格 (<span class="price-sym">¥</span>/1M tokens)</span> <input name="output_price" type="number" step="0.0001" required></label>
+                    <label><span>缓存命中价格 (<span class="price-sym">¥</span>/1M tokens，可选)</span> <input name="cache_read_price" type="number" step="0.0001" placeholder="留空 = 与输入价格相同"></label>
+                    <label>币种
+                        <select name="currency" onchange="updatePricingSymbols()">
+                            <option value="CNY">CNY</option>
+                            <option value="USD">USD</option>
+                        </select>
+                    </label>
                     <div style="margin:10px 0;">
                         <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:6px;">
                             时段倍率（每日生效，按 UTC+8 时间；倍率作用于输入/输出/缓存三档价格）
