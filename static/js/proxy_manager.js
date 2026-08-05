@@ -173,6 +173,9 @@ async function loadAccountsTable() {
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
                     <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${esc(a.name)}')">更新模型</button>
+                    ${a.max_concurrency
+                        ? `<button class="btn btn--sm" onclick="testConcurrency(${a.id}, '${esc(a.name)}')" title="按当前并发限额向真实上游并发测试">测试并发</button>`
+                        : `<button class="btn btn--sm" disabled title="该账户无并发限额（无限制），无需测试">测试并发</button>`}
                 </td>
             </tr>
         `).join('');
@@ -237,6 +240,7 @@ async function saveAccount(e) {
         form.dataset.editId = '';
         document.getElementById('accountDeleteBtn').style.display = 'none';
         document.getElementById('accountModelBtn').style.display = 'none';
+        document.getElementById('accountTestConcBtn').style.display = 'none';
         form.querySelector('[type=submit]').textContent = '添加账户';
         closeModal('accountModal');
         loadAccountsTable();
@@ -266,8 +270,10 @@ function editAccount(id) {
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
         document.getElementById('accountModelBtn').style.display = '';
+        document.getElementById('accountTestConcBtn').style.display = '';
         document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name); };
         document.getElementById('accountModelBtn').onclick = () => updateAccountModels(id, acc.name);
+        document.getElementById('accountTestConcBtn').onclick = () => testConcurrency(id, acc.name, true);
         openModal('accountModal');
     });
 }
@@ -325,6 +331,30 @@ async function updateAccountModels(id, name) {
     btns.forEach(b => { b.disabled = false; b.textContent = '更新模型'; });
 }
 
+async function testConcurrency(id, name, useFormValue) {
+    // useFormValue=true 时来自编辑弹窗：测「尚未保存」的输入值，否则用已保存的限额。
+    const btns = document.querySelectorAll('[onclick*="testConcurrency"], #accountTestConcBtn');
+    btns.forEach(b => { b.disabled = true; b.textContent = '测试中...'; });
+    let body = '{}';
+    if (useFormValue) {
+        const input = document.querySelector('#accountForm [name="max_concurrency"]');
+        const val = parseInt(input && input.value, 10);
+        if (!val || val < 1) {
+            showToast('请先填写有效的并发限额数值', 'error');
+            btns.forEach(b => { b.disabled = false; b.textContent = '测试并发'; });
+            return;
+        }
+        body = JSON.stringify({ concurrency: val });
+    }
+    try {
+        const result = await proxyFetch(`/api/proxy/accounts/${id}/test-concurrency`, { method: 'POST', body });
+        showToast(result.message, result.succeeded === result.concurrency ? 'success' : 'error');
+    } catch (err) {
+        showToast(err.message, 'error');
+    }
+    btns.forEach(b => { b.disabled = false; b.textContent = '测试并发'; });
+}
+
 function openAddAccountModal() {
     const form = document.querySelector('#accountForm');
     if (form) {
@@ -335,8 +365,10 @@ function openAddAccountModal() {
     resetKeyList();
     const delBtn = document.getElementById('accountDeleteBtn');
     const modelBtn = document.getElementById('accountModelBtn');
+    const testConcBtn = document.getElementById('accountTestConcBtn');
     if (delBtn) delBtn.style.display = 'none';
     if (modelBtn) modelBtn.style.display = 'none';
+    if (testConcBtn) testConcBtn.style.display = 'none';
     const submit = form && form.querySelector('[type=submit]');
     if (submit) submit.textContent = '添加账户';
     openModal('accountModal');
@@ -402,6 +434,7 @@ function initAccountsPage() {
                     <div style="display:flex; gap:8px;">
                         <button type="submit" class="btn btn--primary">添加账户</button>
                         <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
+                        <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
                         <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:#EF4444;">删除账户</button>
                     </div>
                 </form>

@@ -100,6 +100,138 @@ def get_account_models(account_id):
     return jsonify(_proxy_db().get_account_models(account_id))
 
 
+@bp_proxy.route("/accounts/<int:account_id>/test-concurrency", methods=["POST"])
+def test_account_concurrency(account_id):
+    """按账户并发限额，直连上游并行发 N 个极小聊天请求，检验该并发是否安全。
+
+    不经本机 C++ 代理：直接用该账户的 upstream_key 并发打上游，观察在该
+    并发下上游是否会报错（429 / 5xx / 超时）。自动挑选模型定价列表中最便宜
+    的、且该账户可用的模型，尽量压低测试成本。
+    """
+    import fnmatch
+    from collections import Counter
+    from concurrent.futures import ThreadPoolExecutor
+    import requests
+
+    db = _proxy_db()
+    acc = next((a for a in db.get_accounts() if a["id"] == account_id), None)
+    if not acc:
+        return jsonify({"error": "Account not found"}), 404
+    if acc.get("is_aggregate"):
+        return jsonify({"error": "聚合账户不支持并发测试"}), 400
+    key = acc.get("upstream_key") or ""
+    if not key:
+        return jsonify({"error": "该账户未配置上游 Key，请先在账户编辑中填写 Key"}), 400
+
+    # 并发数：请求体可覆盖（弹窗里测未保存的值），否则用已保存的限额。
+    data = request.get_json(silent=True) or {}
+    concurrency = data.get("concurrency") if data.get("concurrency") is not None else acc.get("max_concurrency")
+    try:
+        concurrency = int(concurrency)
+    except (TypeError, ValueError):
+        return jsonify({"error": "缺少并发数：该账户未设置并发限额，无法测试"}), 400
+    concurrency = max(1, min(concurrency, 50))
+
+    # ── 选最便宜的模型：定价 (input+output 总价) 升序，GLOB 匹配该账户可用模型 ──
+    models = db.get_account_models(account_id)
+    if not models:  # 复用 update_account_models 的实时拉取模式
+        try:
+            resp = requests.get(
+                acc["base_url"].rstrip("/") + "/models",
+                headers={"Authorization": "Bearer " + key},
+                timeout=15,
+            )
+            if resp.ok:
+                models = [m["id"] for m in resp.json().get("data", [])]
+                db.update_account_models(account_id, models)
+        except Exception:
+            pass
+    if not models:
+        return jsonify({"error": "该账户暂无模型，请先点击「更新模型」获取模型列表"}), 400
+
+    pricing = sorted(
+        db.get_pricing(),
+        key=lambda p: (p.get("input_price") or 0) + (p.get("output_price") or 0),
+    )
+    model_id = next(
+        (m for p in pricing for m in models
+         if fnmatch.fnmatch(m.lower(), p["model_pattern"].lower())),
+        None,
+    )
+    if not model_id:
+        return jsonify({"error": f"没有匹配的定价条目（账户模型如: {models[0]}），请先在「模型定价」配置匹配模式"}), 400
+
+    # ── 按账户格式拼 URL / body / headers（与 C++ resolve_upstream_target 对齐）──
+    fmt = acc.get("api_format") or "openai"
+    base = (acc.get("base_url") or "").rstrip("/")
+    ep = (acc.get("endpoint_path") or "").strip()
+
+    def _url():
+        if ep.startswith(("http://", "https://")):
+            return ep
+        scheme = base.split("://", 1)[0] + "://" if "://" in base else ""
+        host = base.split("://", 1)[1].split("/", 1)[0] if "://" in base else base
+        if ep:
+            return scheme + host + "/" + ep.lstrip("/")
+        if fmt == "anthropic":
+            return base + ("/messages" if base.endswith("/v1") else "/v1/messages")
+        if fmt == "openai_responses":
+            return base + "/responses"
+        return base + "/chat/completions"
+
+    def _body():
+        if fmt == "anthropic":
+            return {"model": model_id, "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "ping"}]}
+        if fmt == "openai_responses":
+            return {"model": model_id, "input": "ping", "max_output_tokens": 8}
+        return {"model": model_id, "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 8, "stream": False}
+
+    scheme = acc.get("auth_header") or "auto"
+    if scheme == "auto":
+        scheme = "x-api-key" if fmt == "anthropic" else "bearer"
+    headers = {"Content-Type": "application/json"}
+    if scheme == "x-api-key":
+        headers["x-api-key"] = key
+        headers["anthropic-version"] = "2023-06-01"
+    else:
+        headers["Authorization"] = "Bearer " + key
+
+    url, body = _url(), _body()
+
+    def _one(_i):
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=(10, 30))
+            if 200 <= resp.status_code < 300:
+                return (True, None)
+            return (False, f"HTTP {resp.status_code}")
+        except Exception as e:
+            return (False, f"{type(e).__name__}: {str(e)[:120]}")
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        results = [f.result() for f in (ex.submit(_one, i) for i in range(concurrency))]
+
+    succeeded = sum(1 for ok, _ in results if ok)
+    failures = [detail for ok, detail in results if not ok]
+    failed = len(failures)
+
+    if failed == 0:
+        message = f"并发 {concurrency} · 模型 {model_id} · {succeeded}/{concurrency} 成功，该并发安全"
+    else:
+        detail = "；".join(f"{n} 个失败({k})" for k, n in Counter(failures).most_common(3))
+        if all(d.startswith("HTTP 4") for d in failures):
+            message = (f"并发 {concurrency} · 模型 {model_id} · {succeeded}/{concurrency} 成功，"
+                       f"{failed} 个失败（{detail}）——全部为 4xx，多为模型/Key/鉴权问题，请检查配置")
+        else:
+            message = (f"并发 {concurrency} · 模型 {model_id} · {succeeded}/{concurrency} 成功，"
+                       f"{failed} 个失败（{detail}），建议降低并发或检查上游")
+
+    return jsonify({"status": "ok", "concurrency": concurrency, "model": model_id,
+                    "succeeded": succeeded, "failed": failed,
+                    "failures": failures[:10], "message": message})
+
+
 # ── Keys CRUD ──────────────────────────────────────────────────────────
 
 @bp_proxy.route("/keys", methods=["GET"])
