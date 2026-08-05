@@ -1489,6 +1489,44 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    def get_perf_speed(self, window_minutes: int = 60) -> list[dict]:
+        """Observed streaming output-speed (tokens/s) percentiles per bucket."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
+                "output_tps FROM request_log "
+                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "  AND status_code BETWEEN 200 AND 299 "
+                "  AND output_tps IS NOT NULL "
+                "ORDER BY bucket, output_tps",
+                (str(window_minutes),),
+            ).fetchall()
+            result = []
+            by_bucket = {}
+            for bucket, tps in rows:
+                by_bucket.setdefault(bucket, []).append(tps)
+            for bucket, vals in by_bucket.items():
+                if not vals:
+                    continue
+                n = len(vals)
+
+                def percentile(p):
+                    # Nearest-rank percentile: ceil(p*n/100)-1.
+                    k = max(0, min(n - 1, (p * n + 99) // 100 - 1))
+                    return vals[k]
+
+                result.append({
+                    "bucket": bucket,
+                    "p50": round(percentile(50), 2),
+                    "p95": round(percentile(95), 2),
+                    "p99": round(percentile(99), 2),
+                    "count": n,
+                })
+            return result
+        finally:
+            conn.close()
+
     def get_perf_throughput(self, window_minutes: int = 60) -> list[dict]:
         """Request count per 1-minute bucket (from request_log)."""
         conn = self._connect()
@@ -1507,14 +1545,29 @@ class ProxyDatabase:
         finally:
             conn.close()
 
-    def get_perf_models(self, window_minutes: int = 60) -> list[dict]:
-        """Per-model observed TTFT and weighted output speed."""
+    def get_perf_models(self, window_minutes: int = 60, max_samples: int = 100) -> list[dict]:
+        """Per-model observed TTFT and weighted output speed.
+
+        Samples only the *max_samples* most recent request_log rows per model
+        (within the window), so high-traffic models don't dominate the
+        averages; `ttft_samples`/`speed_samples` report how many of those rows
+        actually carried a TTFT / speed observation.
+        """
         conn = self._connect()
         try:
             rows = conn.execute(
+                "WITH ranked AS ("
+                "  SELECT model, status_code, ttft_ms, generation_ms, completion_tokens, "
+                "         ROW_NUMBER() OVER (PARTITION BY model "
+                "                            ORDER BY requested_at DESC, id DESC) AS rn "
+                "  FROM request_log "
+                "  WHERE requested_at >= datetime('now', '-' || ? || ' minutes')"
+                ") "
                 "SELECT model, COUNT(*) AS request_count, "
                 "AVG(CASE WHEN status_code BETWEEN 200 AND 299 THEN ttft_ms END) AS avg_ttft_ms, "
                 "MAX(CASE WHEN status_code BETWEEN 200 AND 299 THEN ttft_ms END) AS max_ttft_ms, "
+                "SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND ttft_ms IS NOT NULL "
+                "         THEN 1 ELSE 0 END) AS ttft_samples, "
                 "CASE WHEN SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND generation_ms > 0 "
                 "                              AND completion_tokens > 1 "
                 "                   THEN generation_ms ELSE 0 END) > 0 "
@@ -1526,13 +1579,12 @@ class ProxyDatabase:
                 "              THEN generation_ms ELSE 0 END) END AS avg_output_tps, "
                 "SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND generation_ms > 0 "
                 "         AND completion_tokens > 1 THEN 1 ELSE 0 END) AS speed_samples, "
-                "SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, "
-                "SUM(CASE WHEN status_code NOT BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS error_count "
-                "FROM request_log "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count "
+                "FROM ranked "
+                "WHERE rn <= ? "
                 "GROUP BY model "
                 "ORDER BY request_count DESC",
-                (str(window_minutes),)
+                (str(window_minutes), max_samples),
             ).fetchall()
 
             return [{
@@ -1542,9 +1594,10 @@ class ProxyDatabase:
                 # non-streaming request), not a zero-millisecond response.
                 "avg_ttft_ms": round(r[2], 1) if r[2] is not None else None,
                 "max_ttft_ms": r[3] if r[3] is not None else None,
-                "avg_output_tps": round(r[4], 2) if r[4] is not None else None,
-                "speed_samples": r[5] or 0,
-                "success_rate": round(r[6] / max(r[1], 1) * 100, 1),
+                "ttft_samples": r[4] or 0,
+                "avg_output_tps": round(r[5], 2) if r[5] is not None else None,
+                "speed_samples": r[6] or 0,
+                "success_rate": round(r[7] / max(r[1], 1) * 100, 1),
             } for r in rows]
         finally:
             conn.close()

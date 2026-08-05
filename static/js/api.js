@@ -104,6 +104,10 @@ async function fetchPerfLatency(minutes) {
     return fetchJSON(buildParams('/api/proxy/perf/latency', { minutes }));
 }
 
+async function fetchPerfSpeed(minutes) {
+    return fetchJSON(buildParams('/api/proxy/perf/speed', { minutes }));
+}
+
 async function fetchPerfThroughput(minutes) {
     return fetchJSON(buildParams('/api/proxy/perf/throughput', { minutes }));
 }

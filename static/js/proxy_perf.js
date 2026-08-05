@@ -9,6 +9,7 @@ let perfRefreshTimer = null;
 
 // Chart instances for cleanup
 let chartLatency = null;
+let chartSpeed = null;
 let chartRPM = null;
 let chartUpstreamSuccess = null;
 let chartModelLatency = null;
@@ -58,6 +59,14 @@ function buildPerfPageHTML() {
             <div class="chart-card">
                 <div class="chart-card__title">请求 TTFT 分布 (P50/P95/P99)</div>
                 <div class="chart-container chart-container--lg" id="chartLatency"></div>
+            </div>
+        </div>
+
+        <!-- Speed Distribution Chart -->
+        <div class="section">
+            <div class="chart-card">
+                <div class="chart-card__title">请求输出速度分布 (P50/P95/P99)</div>
+                <div class="chart-container chart-container--lg" id="chartSpeed"></div>
             </div>
         </div>
 
@@ -123,6 +132,59 @@ function renderLatencyChart(domId, data) {
         grid: { left: 60, right: 20, top: 20, bottom: 50 },
         xAxis: { type: 'category', data: labels, axisLabel: { rotate: 45, fontSize: 10 } },
         yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
+        series: [
+            {
+                name: 'P50', type: 'line',
+                data: data.map(function(d) { return d.p50; }),
+                smooth: true, symbol: 'none',
+                lineStyle: { color: '#0070F3', width: 2 },
+            },
+            {
+                name: 'P95', type: 'line',
+                data: data.map(function(d) { return d.p95; }),
+                smooth: true, symbol: 'none',
+                lineStyle: { color: '#F59E0B', width: 2 },
+            },
+            {
+                name: 'P99', type: 'line',
+                data: data.map(function(d) { return d.p99; }),
+                smooth: true, symbol: 'none',
+                lineStyle: { color: '#EF4444', width: 1.5 },
+            },
+        ],
+    });
+}
+
+function renderSpeedChart(domId, data) {
+    chartSpeed = initChart(domId);
+    if (!chartSpeed) return;
+    if (!data || !data.length) {
+        chartSpeed.setOption({
+            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+        });
+        return;
+    }
+    var labels = data.map(function(d) { return fmtUtc8HHMM(d.bucket); }); // HH:MM in UTC+8
+
+    chartSpeed.setOption({
+        tooltip: {
+            trigger: 'axis',
+            formatter: function(params) {
+                var s = params[0].name + '<br/>';
+                params.forEach(function(p) {
+                    s += p.marker + ' ' + p.seriesName + ': ' + p.value + ' tokens/s<br/>';
+                });
+                return s;
+            }
+        },
+        legend: {
+            data: ['P50', 'P95', 'P99'],
+            bottom: 0,
+            textStyle: { fontSize: 10 }
+        },
+        grid: { left: 60, right: 20, top: 20, bottom: 50 },
+        xAxis: { type: 'category', data: labels, axisLabel: { rotate: 45, fontSize: 10 } },
+        yAxis: { type: 'value', name: 'tokens/s', axisLabel: { fontSize: 10 } },
         series: [
             {
                 name: 'P50', type: 'line',
@@ -276,8 +338,9 @@ function renderModelLatencyChart(domId, models) {
             trigger: 'axis',
             axisPointer: { type: 'shadow' },
             formatter: function(params) {
-                var p = params[0];
-                return perfEsc(p.name) + '<br/>' + p.marker + ' ' + p.seriesName + ': <b>' + p.value + ' ms</b>';
+                var m = models[params[0].dataIndex];
+                return perfEsc(m.model) + '<br/>' + params[0].marker + ' TTFT: <b>'
+                    + params[0].value + ' ms</b><br/>样本数: ' + m.ttft_samples;
             }
         },
         grid: { left: 50, right: 20, top: 10, bottom: 60 },
@@ -331,6 +394,7 @@ async function loadAllPerfData() {
         var results = await Promise.all([
             fetchPerfSummary(15),
             fetchPerfLatency(60),
+            fetchPerfSpeed(60),
             fetchPerfThroughput(60),
             fetchPerfModels(60),
             fetchPerfRealtime(),
@@ -338,10 +402,11 @@ async function loadAllPerfData() {
         ]);
         var summary = results[0];
         var latency = results[1];
-        var throughput = results[2];
-        var models = results[3];
-        var realtime = results[4];
-        var upstreamSuccess = results[5];
+        var speed = results[2];
+        var throughput = results[3];
+        var models = results[4];
+        var realtime = results[5];
+        var upstreamSuccess = results[6];
 
         // Update stat cards
         var elConcurrent = document.getElementById('perfConcurrent');
@@ -362,6 +427,7 @@ async function loadAllPerfData() {
 
         // Render charts
         renderLatencyChart('chartLatency', latency);
+        renderSpeedChart('chartSpeed', speed);
         renderRPMChart('chartRPM', throughput, 60);
         renderUpstreamSuccessRateChart('chartUpstreamSuccess', upstreamSuccess);
         renderModelLatencyChart('chartModelLatency', models);
@@ -393,10 +459,10 @@ function destroyPerfPage() {
         perfRefreshTimer = null;
     }
     // Dispose chart instances to avoid memory leaks
-    [chartLatency, chartRPM, chartUpstreamSuccess, chartModelLatency, chartModelSpeed].forEach(function(c) {
+    [chartLatency, chartSpeed, chartRPM, chartUpstreamSuccess, chartModelLatency, chartModelSpeed].forEach(function(c) {
         if (c) { c.dispose(); }
     });
-    chartLatency = chartRPM = chartUpstreamSuccess = chartModelLatency = chartModelSpeed = null;
+    chartLatency = chartSpeed = chartRPM = chartUpstreamSuccess = chartModelLatency = chartModelSpeed = null;
 
     // Clean up DOM
     var el = document.getElementById('page-proxy-perf');

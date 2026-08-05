@@ -495,6 +495,12 @@ def perf_latency():
     return jsonify(_proxy_db().get_perf_latency(minutes))
 
 
+@bp_proxy.route("/perf/speed")
+def perf_speed():
+    minutes = request.args.get("minutes", 60, type=int)
+    return jsonify(_proxy_db().get_perf_speed(minutes))
+
+
 @bp_proxy.route("/perf/throughput")
 def perf_throughput():
     minutes = request.args.get("minutes", 60, type=int)
