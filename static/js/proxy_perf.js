@@ -146,15 +146,47 @@ function renderLatencyChart(domId, data) {
     });
 }
 
-function renderRPMChart(domId, data) {
+/** Date(UTC) → "YYYY-MM-DD HH:MM"（与后端 strftime bucket 格式一致） */
+function fmtUtcMinuteStr(d) {
+    return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0')
+         + '-' + String(d.getUTCDate()).padStart(2, '0')
+         + ' ' + String(d.getUTCHours()).padStart(2, '0')
+         + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+}
+
+/** "YYYY-MM-DD HH:MM"（UTC）→ 毫秒时间戳 */
+function parseUtcMinuteMs(s) {
+    return new Date(String(s).replace(' ', 'T') + ':00Z').getTime();
+}
+
+/**
+ * 把后端稀疏的按分钟数据补全为连续 *minutes* 个 1 分钟桶，
+ * 结束于当前 UTC 分钟（被 fmtUtc8HHMM 显示为 UTC+8 的「现在」），
+ * 缺的分钟用 0 请求数填充。
+ */
+function buildThroughputSeries(data, minutes) {
+    var now = new Date();
+    now.setUTCSeconds(0, 0);
+    var end = now.getTime();
+    data.forEach(function(d) {
+        var t = parseUtcMinuteMs(d.bucket);
+        if (!isNaN(t) && t > end) end = t;   // 防时钟偏差丢数据
+    });
+    var map = {};
+    data.forEach(function(d) { map[d.bucket] = d.requests; });
+    var out = [];
+    for (var i = minutes - 1; i >= 0; i--) {
+        var key = fmtUtcMinuteStr(new Date(end - i * 60000));
+        out.push({ bucket: key, requests: map[key] || 0 });
+    }
+    return out;
+}
+
+function renderRPMChart(domId, data, minutes) {
     chartRPM = initChart(domId);
     if (!chartRPM) return;
-    if (!data || !data.length) {
-        chartRPM.setOption({
-            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
-        });
-        return;
-    }
+    // Fill the full minute window — minutes without requests show 0.
+    data = buildThroughputSeries(data || [], minutes || 60);
     var labels = data.map(function(d) { return fmtUtc8HHMM(d.bucket); });
     var vals = data.map(function(d) { return d.requests; });
 
@@ -330,7 +362,7 @@ async function loadAllPerfData() {
 
         // Render charts
         renderLatencyChart('chartLatency', latency);
-        renderRPMChart('chartRPM', throughput);
+        renderRPMChart('chartRPM', throughput, 60);
         renderUpstreamSuccessRateChart('chartUpstreamSuccess', upstreamSuccess);
         renderModelLatencyChart('chartModelLatency', models);
         renderModelSpeedChart('chartModelSpeed', models);

@@ -58,18 +58,55 @@ async function loadTodayUpstreamTable() {
 
 let billingChart = null;
 
+/** Date(UTC) → "YYYY-MM-DD"（与后端 date(requested_at) 的 UTC 分桶一致） */
+function fmtUtcDateStr(d) {
+    return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0')
+         + '-' + String(d.getUTCDate()).padStart(2, '0');
+}
+
+/**
+ * 把后端稀疏的按日数据补全为连续 *days* 天的滚动窗口：
+ * 窗口结束 = max(今天, 数据最大日期)（防浏览器/服务器时钟偏差），
+ * 起点向前扩到数据最早日期，保证不丢任何有消费的天；
+ * 缺的天用全 0 记录填充。
+ */
+function buildDailySeries(data, days) {
+    var now = new Date();
+    var endStr = fmtUtcDateStr(now);
+    var minData = null;
+    data.forEach(function(d) {
+        if (d.date > endStr) endStr = d.date;
+        if (minData === null || d.date < minData) minData = d.date;
+    });
+    var end = new Date(endStr + 'T00:00:00Z');
+    var start = new Date(end.getTime() - (days - 1) * 86400000);
+    if (minData !== null && minData < fmtUtcDateStr(start)) {
+        start = new Date(minData + 'T00:00:00Z');
+    }
+    var map = {};
+    data.forEach(function(d) { map[d.date] = d; });
+    var out = [];
+    for (var t = new Date(start.getTime()); t <= end; t = new Date(t.getTime() + 86400000)) {
+        var key = fmtUtcDateStr(t);
+        var d = map[key];
+        out.push(d || {
+            date: key, input_tokens: 0, output_tokens: 0,
+            cache_hit_tokens: 0, cache_miss_tokens: 0, requests: 0, cost: 0
+        });
+    }
+    return out;
+}
+
 async function loadDailyBillingChart() {
     const dom = document.getElementById('chartBillingDaily');
     if (!dom) return;
 
     try {
         // Rolling 30-day window (no month selection).
-        const data = await proxyFetch('/api/proxy/billing/daily-by-model?days=30');
+        const raw = await proxyFetch('/api/proxy/billing/daily-by-model?days=30');
 
-        if (!data.length) {
-            dom.innerHTML = '<div class="loading" style="display:flex">近30天暂无数据</div>';
-            return;
-        }
+        // Fill the full 30-day window — days without usage show 0.
+        const data = buildDailySeries(raw, 30);
 
         const dates = data.map(d => d.date);
         const inputTokens = data.map(d => d.input_tokens);
