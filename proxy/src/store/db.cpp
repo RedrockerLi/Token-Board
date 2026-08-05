@@ -1365,7 +1365,8 @@ bool Database::log_request(int account_id, int local_key_id,
                            int ttft_ms, int generation_ms, double output_tps,
                            int upstream_ttft_ms, int upstream_duration_ms,
                            int attempt_count,
-                           const std::vector<AttemptInfo> &attempts) {
+                           const std::vector<AttemptInfo> &attempts,
+                           double *out_cost) {
     std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     LogRecord record;
     try {
@@ -1474,6 +1475,10 @@ bool Database::log_request(int account_id, int local_key_id,
         }
     }
     log_queue_cv_.notify_one();
+    // The frozen cost is the same figure the persist path writes (either
+    // snapshot_request_cost above or the legacy trigger), so surfacing it here
+    // lets the caller's in-memory ledger accumulate without a follow-up read.
+    if (out_cost) *out_cost = record.cost;
     return true;
 }
 

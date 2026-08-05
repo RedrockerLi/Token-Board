@@ -160,7 +160,8 @@ public:
                      double output_tps = -1.0,
                      int upstream_ttft_ms = -1, int upstream_duration_ms = -1,
                      int attempt_count = 1,
-                     const std::vector<AttemptInfo> &attempts = {});
+                     const std::vector<AttemptInfo> &attempts = {},
+                     double *out_cost = nullptr);
 
     // ── Pricing ─────────────────────────────────────────────────────────
 

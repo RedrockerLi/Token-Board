@@ -3,6 +3,7 @@
 #include "account_gate.h"
 #include "codec.h"
 #include "db.h"
+#include "key_cost_ledger.h"
 #include "router.h"
 #include "usage_tracker.h"
 
@@ -34,10 +35,17 @@ struct Response;
 ///
 /// The hot path is entirely in memory.  A successful fallback is rebound to
 /// the key that actually served it, and a bounded O(1) LRU keeps memory use
-/// predictable.  On a cold start, rendezvous hashing picks a stable key slot
-/// without the wholesale remapping caused by hash(session) % candidate_count.
+/// predictable.  On a cold start the least-cost key slot is preferred (in-
+/// memory ledger, fed by the accounting thread), so keys wear roughly evenly
+/// by spend; without a ledger it falls back to rendezvous hashing (stable
+/// regardless of candidate-list changes, unlike hash(session) % candidate_count).
 class SessionAffinity {
 public:
+    SessionAffinity() = default;
+    /// `ledger` (may be null) supplies the cold-start policy: without it the
+    /// unit-test/legacy behavior is rendezvous hashing.
+    explicit SessionAffinity(KeyCostLedger *ledger) : ledger_(ledger) {}
+
     /// Preferred candidate index. `scope` must isolate local credentials and
     /// wire formats; `key_slot_ids` are persistent DB identities, never vector
     /// offsets. Empty sessions deliberately use normal fill-first routing.
@@ -61,6 +69,11 @@ public:
                 }
             }
         }
+
+        // Cold start: prefer the key slot that has accrued the least cost
+        // (in-memory ledger, fed asynchronously by the accounting thread), so
+        // new sessions wear the account's keys roughly evenly by spend.
+        if (ledger_ != nullptr) return ledger_->lowest_cost_index(key_slot_ids);
 
         // Rendezvous hashing: choose the candidate with the greatest score.
         size_t best = 0;
@@ -121,6 +134,7 @@ private:
     std::mutex mutex_;
     std::list<std::string> lru_;
     std::unordered_map<std::string, Entry> bindings_;
+    KeyCostLedger *ledger_ = nullptr;  // cold-start policy; null = rendezvous
 };
 
 /// One real upstream target a request may be forwarded to.  Plain accounts
@@ -194,7 +208,7 @@ public:
     ProxyServer(Database &db, Router &router, UpstreamClient &upstream,
                 UsageTracker &tracker, CodecRegistry &codecs)
         : db_(db), router_(router), upstream_(upstream), tracker_(tracker),
-          codecs_(codecs) {}
+          codecs_(codecs), affinity_(&cost_ledger_) {}
 
     /// Stops and joins the accounting thread.  Idempotent; also invoked from
     /// the destructor.  Must be called BEFORE db_.close() in the owning main.
@@ -280,6 +294,7 @@ private:
     UsageTracker &tracker_;
     CodecRegistry &codecs_;
     AccountGate gate_;           // per-key-slot concurrency + plan cooldown
+    KeyCostLedger cost_ledger_;  // accrued cost per key slot (cold-start bias)
     SessionAffinity affinity_;   // session → preferred key (in-memory)
 
     struct CandidateCacheEntry {

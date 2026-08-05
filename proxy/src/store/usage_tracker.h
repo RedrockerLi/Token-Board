@@ -63,7 +63,8 @@ public:
                      int generation_ms = -1, double output_tps = -1.0,
                      int upstream_ttft_ms = -1, int upstream_duration_ms = -1,
                      int attempt_count = 1,
-                     const std::vector<Database::AttemptInfo> &attempts = {});
+                     const std::vector<Database::AttemptInfo> &attempts = {},
+                     double *out_cost = nullptr);
 
 private:
     Database &db_;

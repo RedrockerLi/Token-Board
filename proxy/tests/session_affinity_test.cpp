@@ -81,5 +81,18 @@ int main() {
     gate.mark_failure(101, false, 502);
     assert(!gate.try_acquire_eligible(101, 1));
 
+    // Cost-led cold start: with a ledger wired in, a session with no binding
+    // prefers the key slot that has accrued the least cost; ties (all-zero)
+    // resolve to the smallest index.  A binding still wins over ledger cost.
+    KeyCostLedger cost_ledger;
+    cost_ledger.add(202, 1.5);
+    SessionAffinity cost_affinity(&cost_ledger);
+    assert(cost_affinity.preferred_index(scope_a, "cold-session", slots) == 0);
+    cost_ledger.add(101, 2.0);
+    cost_ledger.add(303, 3.0);
+    assert(cost_affinity.preferred_index(scope_a, "cold-session", slots) == 1);
+    cost_affinity.bind(scope_a, "cold-session", 303);
+    assert(cost_affinity.preferred_index(scope_a, "cold-session", slots) == 2);
+
     std::cout << "session affinity tests passed\n";
 }

@@ -591,12 +591,19 @@ void ProxyServer::accounting_loop() {
         }
         for (const auto &job : batch) {
             try {
+                double cost = 0.0;
                 tracker_.log_request(
                     job.account_id, job.local_key_id, job.usage,
                     job.is_streaming, job.status_code, job.duration_ms,
                     job.upstream_key_id, job.ttft_ms, job.generation_ms,
                     job.output_tps, job.upstream_ttft_ms,
-                    job.upstream_duration_ms, job.attempt_count, job.attempts);
+                    job.upstream_duration_ms, job.attempt_count,
+                    job.attempts, &cost);
+                // Feed the cold-start cost ledger so new sessions prefer the
+                // key slot that has spent least.  `upstream_key_id` is the
+                // slot that actually served the request (used->key_slot_id).
+                if (job.upstream_key_id != 0 && cost > 0.0)
+                    cost_ledger_.add(job.upstream_key_id, cost);
             } catch (const std::exception &e) {
                 fprintf(stderr,
                         "[Proxy] accounting log error (account=%d status=%d): %s\n",

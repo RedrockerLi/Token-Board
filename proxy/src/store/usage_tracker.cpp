@@ -420,7 +420,8 @@ bool UsageTracker::log_request(int account_id, int local_key_id,
                                int ttft_ms, int generation_ms, double output_tps,
                                int upstream_ttft_ms, int upstream_duration_ms,
                                int attempt_count,
-                               const std::vector<Database::AttemptInfo> &attempts) {
+                               const std::vector<Database::AttemptInfo> &attempts,
+                               double *out_cost) {
     // Cost is computed automatically by the tr_request_log_insert SQLite
     // trigger, so we pass 0.0 here. The trigger reads model_pricing and
     // sets the correct api_cost immediately after insert.
@@ -432,7 +433,7 @@ bool UsageTracker::log_request(int account_id, int local_key_id,
         usage.cache_read_tokens, usage.total_tokens, cost,
         is_streaming, status_code, duration_ms, upstream_key_id,
         ttft_ms, generation_ms, output_tps, upstream_ttft_ms,
-        upstream_duration_ms, attempt_count, attempts);
+        upstream_duration_ms, attempt_count, attempts, out_cost);
     if (!accepted) {
         fprintf(stderr,
                 "[Tracker] request log rejected/failed: account=%d model=%s "
