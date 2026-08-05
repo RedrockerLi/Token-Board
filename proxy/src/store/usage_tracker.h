@@ -1,9 +1,9 @@
 #pragma once
 
+#include "db.h"
+
 #include <optional>
 #include <string>
-
-class Database;
 
 /// Extracts OpenAI-compatible usage info from responses and persists them.
 ///
@@ -55,18 +55,15 @@ public:
     static std::optional<UsageInfo> parse_stream_usage(const std::string &api_format,
                                                        const std::string &sse_data);
 
-    /// Compute cost and write a request-log entry.
-    void log_request(int account_id, int local_key_id, const UsageInfo &usage,
+    /// Compute cost and enqueue a request-log entry.  False means shutdown
+    /// rejected it or the saturated queue's synchronous fallback failed.
+    bool log_request(int account_id, int local_key_id, const UsageInfo &usage,
                      bool is_streaming, int status_code, int duration_ms,
-                     int upstream_key_id = 0);
-
-    /// Write a performance-metrics event (local-only, not synced).
-    void log_perf_event(const std::string &model, int upstream_latency_ms,
-                        int total_latency_ms, int status_code,
-                        bool is_error, int concurrent_count);
-
-    /// Update the `last_used_at` timestamp on the local key.
-    void mark_key_used(int local_key_id);
+                     int upstream_key_id = 0, int ttft_ms = -1,
+                     int generation_ms = -1, double output_tps = -1.0,
+                     int upstream_ttft_ms = -1, int upstream_duration_ms = -1,
+                     int attempt_count = 1,
+                     const std::vector<Database::AttemptInfo> &attempts = {});
 
 private:
     Database &db_;

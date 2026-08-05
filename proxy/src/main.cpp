@@ -75,8 +75,10 @@ int main(int argc, char *argv[]) {
     // ── Configure httplib server ──────────────────────────────────────
     httplib::Server server;
 
-    // Start with 8 threads; doubles on demand up to 2048.
-    auto *pool = new SemaphorePool(8, 2048);
+    // Start with 8 threads and grow only for a real backlog. A bounded ceiling
+    // prevents a stalled provider from turning queued requests into thousands
+    // of native thread stacks.
+    auto *pool = new SemaphorePool(8, 256);
     server.new_task_queue = [pool] { return pool; };
 
     proxy_server.setup_routes(server);
@@ -101,21 +103,26 @@ int main(int argc, char *argv[]) {
         auto now = std::chrono::steady_clock::now();
 
         // ── Auto-scale: double pool when saturated ───────────────────
-        int in_flight = db.get_in_flight_count();
+        int in_flight = proxy_server.in_flight_count();
         size_t cur_size = pool->size();
-        if (in_flight >= static_cast<int>(cur_size) && cur_size < pool->max_size()) {
+        // Long-lived streams legitimately occupy every current worker. Grow
+        // only when accepted requests are actually queued behind those workers;
+        // using in_flight alone doubled the pool every 200 ms during an outage
+        // even when there was no backlog.
+        if (pool->queued() > 0 && pool->active() >= cur_size &&
+            cur_size < pool->max_size()) {
             size_t new_size = std::min(cur_size * 2, pool->max_size());
             fprintf(stderr,
-                    "[Scale] %zu → %zu threads (in_flight=%d, saturated)\n",
-                    cur_size, new_size, in_flight);
+                    "[Scale] %zu → %zu threads (in_flight=%d, queued=%zu)\n",
+                    cur_size, new_size, in_flight, pool->queued());
             pool->resize(new_size);
         }
 
         // ── Periodic cleanup: every 5 min ────────────────────────────
         if (now >= cleanup_deadline) {
-            db.cleanup_old_perf_events(1440);  // keep last 24 hours
             db.cleanup_stale_in_flight(10);     // remove stuck records older than 10 min
-            db.prune_session_key_log();         // session→key bindings: keep 7 days
+            // Session affinity is process-local and no longer writes this
+            // legacy observability table on the request hot path.
             cleanup_deadline = now + std::chrono::minutes(5);
         }
     }
@@ -124,6 +131,8 @@ int main(int argc, char *argv[]) {
     server.stop();
     server_thread.join();
 
+    // Drain and join the accounting thread before closing the DB it writes to.
+    proxy_server.shutdown();
     db.close();
     printf("Goodbye.\n");
     return 0;

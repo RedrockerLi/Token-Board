@@ -2,10 +2,19 @@
 
 #include "ir.h"
 
+#include <cstddef>
 #include <optional>
 
 /// Shared helpers for the three wire-format codecs.
 namespace fmt {
+
+// Streaming wire/state limits.  They are deliberately larger than normal LLM
+// deltas while still preventing one unterminated SSE frame or tool call from
+// retaining an unbounded amount of memory.
+inline constexpr size_t kMaxSseFrameBytes = 4 * 1024 * 1024;
+inline constexpr size_t kMaxToolArgumentsBytes = 8 * 1024 * 1024;
+inline constexpr size_t kMaxEmitterStateBytes = 16 * 1024 * 1024;
+inline constexpr size_t kMaxStreamItems = 256;
 
 /// Parse an OpenAI-style `{type:"image_url", image_url:{url}}` part into an
 /// Image block.  Handles both http(s) URLs and `data:` URIs.
@@ -68,8 +77,17 @@ bool is_reasoning_vendor(const std::string &model);
 /// line).  Safe because SSE payloads never contain a literal blank line.
 class SseFrameBuffer {
 public:
+    explicit SseFrameBuffer(size_t max_bytes = kMaxSseFrameBytes)
+        : max_bytes_(max_bytes) {}
+
     template <typename F>
-    void feed(const char *data, size_t len, F &&on_frame) {
+    bool feed(const char *data, size_t len, F &&on_frame) {
+        if (failed_) return false;
+        if (len > max_bytes_ || buf_.size() > max_bytes_ - len) {
+            failed_ = true;
+            buf_.clear();
+            return false;
+        }
         buf_.append(data, len);
         size_t pos;
         while ((pos = find_sep(buf_)) != std::string::npos) {
@@ -79,15 +97,20 @@ public:
             if (!frame.empty() && frame.back() == '\r') frame.pop_back();
             on_frame(frame);
         }
+        return true;
     }
     template <typename F>
-    void finish(F &&on_frame) {
+    bool finish(F &&on_frame) {
+        if (failed_) return false;
         if (!buf_.empty()) {
             if (buf_.back() == '\r') buf_.pop_back();
             on_frame(buf_);
             buf_.clear();
         }
+        return true;
     }
+
+    bool failed() const noexcept { return failed_; }
 
 private:
     static size_t find_sep(const std::string &s) {
@@ -98,6 +121,8 @@ private:
         return a < b ? a : b;
     }
     std::string buf_;
+    size_t max_bytes_;
+    bool failed_ = false;
 };
 
 /// Parse a raw SSE frame into its optional event name and data payload.

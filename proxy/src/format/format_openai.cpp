@@ -11,8 +11,8 @@ namespace {
 // Keys consumed (mapped to IR fields) — the rest land in IR extras.
 const char *kConsumed[] = {
     "model", "messages", "system", "tools", "tool_choice", "stream",
-    "stream_options", "reasoning_effort", "reasoning", "max_tokens",
-    "max_completion_tokens", "temperature", "stop",
+    "reasoning_effort", "reasoning", "max_tokens", "max_completion_tokens",
+    "temperature", "stop",
 };
 
 // MiniMax requires `role=system` only in the first slot; DeepSeek/other
@@ -293,11 +293,11 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
         in.extras, {"seed", "user", "n", "top_p", "presence_penalty",
                     "frequency_penalty", "logprobs", "top_logprobs",
                     "response_format", "metadata", "store", "service_tier",
-                    "parallel_tool_calls", "web_search_options", "text"});
+                    "parallel_tool_calls", "web_search_options", "text",
+                    "stream_options"});
 
     body["model"] = in.model;
     body["stream"] = in.stream;
-    if (in.stream) body["stream_options"]["include_usage"] = true;
 
     if (!in.tool_choice.is_null() && !in.tool_choice.empty())
         body["tool_choice"] = fmt::normalize_tool_choice_to_openai(in.tool_choice);
@@ -750,7 +750,7 @@ public:
             ok = emit(ev);
             return ok;
         };
-        sse_.feed(data, len, [&](const std::string &frame) {
+        const bool buffered = sse_.feed(data, len, [&](const std::string &frame) {
             if (!ok) return;
             std::string event_name, payload;
             if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
@@ -763,7 +763,8 @@ public:
             }
             handle_frame(j, guard);
         });
-        return ok;
+        if (!buffered) emit_failure(guard, "SSE frame exceeds 4 MiB limit");
+        return ok && !failed_;
     }
 
     bool finish(const EmitFn &emit) override {
@@ -773,7 +774,7 @@ public:
             ok = emit(ev);
             return ok;
         };
-        sse_.finish([&](const std::string &frame) {
+        const bool buffered = sse_.finish([&](const std::string &frame) {
             if (!ok) return;
             std::string event_name, payload;
             if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
@@ -786,8 +787,9 @@ public:
             }
             handle_frame(j, guard);
         });
-        if (ok) flush_tool_done(guard);
-        return ok;
+        if (!buffered) emit_failure(guard, "SSE frame exceeds 4 MiB limit");
+        if (ok && !failed_) flush_tool_done(guard);
+        return ok && !failed_;
     }
 
 private:
@@ -799,6 +801,18 @@ private:
     std::map<int, ActiveTool> tool_calls_;
     std::string id_, model_;
     bool started_ = false;
+    bool failed_ = false;
+
+    void emit_failure(const EmitFn &emit, const std::string &message) {
+        if (failed_) return;
+        failed_ = true;
+        StreamEvent ev;
+        ev.type = StreamEventType::ErrorEvent;
+        ev.extra["error"] = json{{"message", message},
+                                  {"type", "stream_limit_error"},
+                                  {"code", 502}};
+        emit(ev);
+    }
 
     void flush_tool_done(const EmitFn &emit) {
         for (auto &kv : tool_calls_) {
@@ -832,6 +846,18 @@ private:
     }
 
     void handle_frame(const json &j, const EmitFn &emit) {
+        // OpenAI-compatible providers commonly return an HTTP 200 SSE stream
+        // whose terminal frame is a top-level {"error": ...} object.  Surface
+        // it as an IR error so the routing layer can retry an uncommitted
+        // request instead of treating the transport status as success.
+        if (j.is_object() && j.contains("error") && !j["error"].is_null()) {
+            StreamEvent ev;
+            ev.type = StreamEventType::ErrorEvent;
+            ev.extra["error"] = j["error"];
+            emit(ev);
+            return;
+        }
+
         if (j.contains("id") && j["id"].is_string())
             id_ = j["id"].get<std::string>();
         if (j.contains("model") && j["model"].is_string())
@@ -886,6 +912,18 @@ private:
                     if (!emit(ev)) return;
                 }
             }
+            // Refusal deltas are user-visible semantic output too.  Mapping
+            // them to text keeps cross-format streams meaningful and, for
+            // passthrough metrics parsing, lets the semantic-TTFT watchdog see
+            // that the upstream has begun responding.
+            if (d.contains("refusal") && d["refusal"].is_string() &&
+                !d["refusal"].get_ref<const std::string &>().empty()) {
+                StreamEvent ev;
+                ev.type = StreamEventType::ContentTextDelta;
+                ev.index = index;
+                ev.text = d["refusal"].get<std::string>();
+                if (!emit(ev)) return;
+            }
             if (d.contains("reasoning_content") && d["reasoning_content"].is_string()) {
                 StreamEvent ev;
                 ev.type = StreamEventType::ContentThinkingDelta;
@@ -906,7 +944,15 @@ private:
                 for (const auto &tc : d["tool_calls"]) {
                     if (!tc.is_object()) continue;
                     int tindex = tc.value("index", 0);
-                    auto &at = tool_calls_[tindex];
+                    auto found = tool_calls_.find(tindex);
+                    if (found == tool_calls_.end()) {
+                        if (tool_calls_.size() >= fmt::kMaxStreamItems) {
+                            emit_failure(emit, "too many streamed tool calls");
+                            return;
+                        }
+                        found = tool_calls_.emplace(tindex, ActiveTool{}).first;
+                    }
+                    auto &at = found->second;
                     // 1. identity
                     if (tc.contains("id") && tc["id"].is_string())
                         at.id = tc["id"].get<std::string>();
@@ -938,6 +984,13 @@ private:
                         const json &af = tc["function"]["arguments"];
                         std::string args = af.is_string() ? af.get<std::string>()
                                                           : af.dump();
+                        if (args.size() > fmt::kMaxToolArgumentsBytes ||
+                            at.arguments.size() >
+                                fmt::kMaxToolArgumentsBytes - args.size()) {
+                            emit_failure(emit,
+                                         "streamed tool arguments exceed 8 MiB limit");
+                            return;
+                        }
                         at.arguments += args;  // full accumulation for ToolCallDone
                         if (at.start_emitted && !args.empty()) {
                             StreamEvent ev;
@@ -962,6 +1015,7 @@ public:
             case StreamEventType::MessageStart:
                 id_ = ev.extra.value("id", id_);
                 model_ = ev.extra.value("model", model_);
+                last_usage_ = ev.usage;
                 return true;  // role chunk emitted lazily on first content
             case StreamEventType::ContentTextDelta:
                 if (!started_ && !emit_role_chunk(sink)) return false;
@@ -971,8 +1025,11 @@ public:
                 return sink("data: " + chunk({{"reasoning_content", ev.text}}, ev.index).dump() + "\n\n");
             case StreamEventType::ToolCallStart: {
                 if (!started_ && !emit_role_chunk(sink)) return false;
+                int tool_index = 0;
+                if (!tool_index_for(ev.index, tool_index))
+                    return emit_limit_error(sink, "too many streamed tool calls");
                 json tc;
-                tc["index"] = 0;
+                tc["index"] = tool_index;
                 tc["id"] = ev.text;
                 tc["type"] = "function";
                 tc["function"] = json::object();
@@ -980,17 +1037,20 @@ public:
                 tc["function"]["arguments"] = "";
                 json delta;
                 delta["tool_calls"] = json::array({std::move(tc)});
-                return sink("data: " + chunk(std::move(delta), ev.index).dump() + "\n\n");
+                return sink("data: " + chunk(std::move(delta), 0).dump() + "\n\n");
             }
             case StreamEventType::ToolCallArgumentDelta: {
                 if (!started_ && !emit_role_chunk(sink)) return false;
+                int tool_index = 0;
+                if (!tool_index_for(ev.index, tool_index))
+                    return emit_limit_error(sink, "too many streamed tool calls");
                 json tc;
-                tc["index"] = 0;
+                tc["index"] = tool_index;
                 tc["function"] = json::object();
                 tc["function"]["arguments"] = ev.arguments;
                 json delta;
                 delta["tool_calls"] = json::array({std::move(tc)});
-                return sink("data: " + chunk(std::move(delta), ev.index).dump() + "\n\n");
+                return sink("data: " + chunk(std::move(delta), 0).dump() + "\n\n");
             }
             case StreamEventType::ToolCallDone:
                 return true;  // no explicit done in OpenAI stream
@@ -998,10 +1058,11 @@ public:
                 deferred_finish_ = fmt::stop_reason_to_openai(ev.stop_reason);
                 return true;  // emitted after usage (or at finish)
             case StreamEventType::UsageEvent:
+                last_usage_ = ev.usage;
                 if (started_ && !deferred_finish_.empty() && !finish_emitted_) {
                     if (!emit_finish_chunk(sink)) return false;
                 }
-                return sink("data: " + usage_chunk(ev.usage).dump() + "\n\n");
+                return sink("data: " + usage_chunk(last_usage_).dump() + "\n\n");
             case StreamEventType::ErrorEvent: {
                 json err = json::object();
                 err["error"] = ev.extra.contains("error") ? ev.extra["error"]
@@ -1014,6 +1075,7 @@ public:
     }
 
     bool finish(const Sink &sink) override {
+        if (failed_) return true;
         if (!deferred_finish_.empty() && !finish_emitted_) {
             if (!emit_finish_chunk(sink)) return false;
         }
@@ -1028,6 +1090,34 @@ private:
     std::string deferred_finish_;
     bool finish_emitted_ = false;
     bool finished_ = false;
+    bool failed_ = false;
+    Usage last_usage_;
+    json failure_;
+    std::map<int, int> tool_indices_;
+    int next_tool_index_ = 0;
+
+    bool tool_index_for(int ir_index, int &index) {
+        auto existing = tool_indices_.find(ir_index);
+        if (existing != tool_indices_.end()) {
+            index = existing->second;
+            return true;
+        }
+        if (tool_indices_.size() >= fmt::kMaxStreamItems) return false;
+        auto inserted = tool_indices_.emplace(ir_index, next_tool_index_);
+        if (inserted.second) ++next_tool_index_;
+        index = inserted.first->second;
+        return true;
+    }
+
+    bool emit_limit_error(const Sink &sink, const std::string &message) {
+        if (failed_) return false;
+        failed_ = true;
+        finished_ = true;
+        failure_ = json{{"message", message},
+                        {"type", "stream_limit_error"},
+                        {"code", 502}};
+        return sink("data: " + json{{"error", failure_}}.dump() + "\n\n");
+    }
 
     json chunk(const json &extra, int index) {
         json body;

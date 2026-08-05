@@ -7,10 +7,12 @@ Thread-safe: each method opens its own connection (SQLite in WAL mode
 supports concurrent readers alongside a single writer).
 """
 
+import json
 import os
 import secrets
 import sqlite3
 import string
+import urllib.request
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 
@@ -981,10 +983,16 @@ class ProxyDatabase:
         model: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        include_attempts: bool = True,
     ) -> dict:
         """Paginated request log with filters."""
+        page = max(1, int(page))
+        per_page = max(1, min(int(per_page), 200))
         conn = self._connect()
         try:
+            # COUNT, page rows and optional attempt details must describe one
+            # WAL read snapshot while the proxy appends logs concurrently.
+            conn.execute("BEGIN")
             where = ["1=1"]
             params = []
 
@@ -1017,22 +1025,48 @@ class ProxyDatabase:
                     r.model, r.prompt_tokens, r.cache_read_tokens,
                     r.completion_tokens,
                     r.total_tokens, r.api_cost AS cost, r.is_streaming,
-                    r.status_code, r.duration_ms, r.requested_at
+                    r.status_code, r.ttft_ms, r.generation_ms, r.output_tps,
+                    r.upstream_ttft_ms, r.upstream_duration_ms,
+                    r.attempt_count, r.fallback_count,
+                    r.requested_at
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE {where_clause}
-                ORDER BY r.requested_at DESC
+                ORDER BY r.requested_at DESC, r.id DESC
                 LIMIT ? OFFSET ?""",
                 params + [per_page, offset],
             ).fetchall()
 
-            return {
+            items = [dict(r) for r in rows]
+            if items and include_attempts:
+                ids = [item["id"] for item in items]
+                placeholders = ",".join("?" for _ in ids)
+                attempt_rows = conn.execute(
+                    f"""SELECT t.request_log_id, t.attempt_index,
+                               t.account_id, COALESCE(a.name, 'unknown') AS account_name,
+                               t.upstream_key_id, t.status_code, t.duration_ms,
+                               t.ttft_ms, t.is_timeout, t.error
+                        FROM request_attempts t
+                        LEFT JOIN upstream_accounts a ON a.id = t.account_id
+                        WHERE t.request_log_id IN ({placeholders})
+                        ORDER BY t.request_log_id, t.attempt_index""",
+                    ids,
+                ).fetchall()
+                by_request = {request_id: [] for request_id in ids}
+                for attempt in attempt_rows:
+                    by_request[attempt["request_log_id"]].append(dict(attempt))
+                for item in items:
+                    item["attempts"] = by_request[item["id"]]
+
+            result = {
                 "total": total,
                 "page": page,
                 "per_page": per_page,
                 "total_pages": max(1, (total + per_page - 1) // per_page),
-                "items": [dict(r) for r in rows],
+                "items": items,
             }
+            conn.commit()
+            return result
         finally:
             conn.close()
 
@@ -1394,71 +1428,54 @@ class ProxyDatabase:
         """
         conn = self._connect()
         try:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM request_log "
+            total, successes, tokens, avg_ttft = conn.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(total_tokens), 0), "
+                "AVG(CASE WHEN status_code BETWEEN 200 AND 299 "
+                "              AND ttft_ms IS NOT NULL THEN ttft_ms END) "
+                "FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
-                (str(window_minutes),)
-            ).fetchone()[0]
-
-            errors = conn.execute(
-                "SELECT COUNT(*) FROM request_log "
-                "WHERE status_code >= 400 "
-                "  AND requested_at >= datetime('now', '-' || ? || ' minutes')",
-                (str(window_minutes),)
-            ).fetchone()[0]
-
-            tokens = conn.execute(
-                "SELECT COALESCE(SUM(total_tokens), 0) FROM request_log "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
-                (str(window_minutes),)
-            ).fetchone()[0]
-
-            avg_latency = conn.execute(
-                "SELECT COALESCE(AVG(duration_ms), 0) FROM request_log "
-                "WHERE status_code < 400 "
-                "  AND requested_at >= datetime('now', '-' || ? || ' minutes')",
-                (str(window_minutes),)
-            ).fetchone()[0]
+                (str(window_minutes),),
+            ).fetchone()
+            successes = successes or 0
+            errors = total - successes
 
             return {
                 "total_requests": total,
                 "error_count": errors,
-                "success_rate": round((total - errors) / max(total, 1) * 100, 1),
+                "success_rate": round(successes / max(total, 1) * 100, 1),
                 "total_tokens": tokens,
-                "avg_latency_ms": round(avg_latency, 1),
+                "avg_ttft_ms": round(avg_ttft, 1) if avg_ttft is not None else None,
             }
         finally:
             conn.close()
 
     def get_perf_latency(self, window_minutes: int = 60) -> list[dict]:
-        """Total-latency percentiles (P50/P95/P99 of duration_ms) per bucket.
-
-        request_log carries only the total duration (no upstream/proxy split).
-        """
+        """Observed streaming TTFT percentiles per bucket."""
         conn = self._connect()
         try:
-            buckets = conn.execute(
-                "SELECT DISTINCT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket "
-                "FROM request_log "
+            rows = conn.execute(
+                "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
+                "ttft_ms FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
-                "ORDER BY bucket",
-                (str(window_minutes),)
+                "  AND status_code BETWEEN 200 AND 299 "
+                "  AND ttft_ms IS NOT NULL "
+                "ORDER BY bucket, ttft_ms",
+                (str(window_minutes),),
             ).fetchall()
-
             result = []
-            for (bucket,) in buckets:
-                vals = [r[0] for r in conn.execute(
-                    "SELECT duration_ms FROM request_log "
-                    "WHERE strftime('%Y-%m-%d %H:%M', requested_at) = ? "
-                    "ORDER BY duration_ms",
-                    (bucket,)
-                )]
+            by_bucket = {}
+            for bucket, ttft_ms in rows:
+                by_bucket.setdefault(bucket, []).append(ttft_ms)
+            for bucket, vals in by_bucket.items():
                 if not vals:
                     continue
                 n = len(vals)
 
                 def percentile(p):
-                    k = max(0, min(n - 1, int(n * p / 100)))
+                    # Nearest-rank percentile: ceil(p*n/100)-1.
+                    k = max(0, min(n - 1, (p * n + 99) // 100 - 1))
                     return vals[k]
 
                 result.append({
@@ -1491,15 +1508,26 @@ class ProxyDatabase:
             conn.close()
 
     def get_perf_models(self, window_minutes: int = 60) -> list[dict]:
-        """Per-model performance breakdown for the last N minutes (from request_log)."""
+        """Per-model observed TTFT and weighted output speed."""
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT model, COUNT(*) AS request_count, "
-                "AVG(CASE WHEN status_code < 400 THEN duration_ms END) AS avg_latency_ms, "
-                "MAX(CASE WHEN status_code < 400 THEN duration_ms END) AS max_latency_ms, "
-                "SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) AS success_count, "
-                "SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count "
+                "AVG(CASE WHEN status_code BETWEEN 200 AND 299 THEN ttft_ms END) AS avg_ttft_ms, "
+                "MAX(CASE WHEN status_code BETWEEN 200 AND 299 THEN ttft_ms END) AS max_ttft_ms, "
+                "CASE WHEN SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND generation_ms > 0 "
+                "                              AND completion_tokens > 1 "
+                "                   THEN generation_ms ELSE 0 END) > 0 "
+                "THEN SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND generation_ms > 0 "
+                "                   AND completion_tokens > 1 "
+                "              THEN completion_tokens - 1 ELSE 0 END) * 1000.0 / "
+                "     SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND generation_ms > 0 "
+                "                   AND completion_tokens > 1 "
+                "              THEN generation_ms ELSE 0 END) END AS avg_output_tps, "
+                "SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND generation_ms > 0 "
+                "         AND completion_tokens > 1 THEN 1 ELSE 0 END) AS speed_samples, "
+                "SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, "
+                "SUM(CASE WHEN status_code NOT BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS error_count "
                 "FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "GROUP BY model "
@@ -1510,9 +1538,13 @@ class ProxyDatabase:
             return [{
                 "model": r[0],
                 "requests": r[1],
-                "avg_latency_ms": round(r[2] or 0, 1),
-                "max_latency_ms": r[3] or 0,
-                "success_rate": round(r[4] / max(r[1], 1) * 100, 1),
+                # NULL means no semantic TTFT was observed (for example a
+                # non-streaming request), not a zero-millisecond response.
+                "avg_ttft_ms": round(r[2], 1) if r[2] is not None else None,
+                "max_ttft_ms": r[3] if r[3] is not None else None,
+                "avg_output_tps": round(r[4], 2) if r[4] is not None else None,
+                "speed_samples": r[5] or 0,
+                "success_rate": round(r[6] / max(r[1], 1) * 100, 1),
             } for r in rows]
         finally:
             conn.close()
@@ -1521,28 +1553,40 @@ class ProxyDatabase:
         """Per real-upstream success rate for the last N minutes.
 
         'Real upstream' = non-aggregate accounts (is_aggregate via JOIN).
-        Success = status < 400. Sourced from request_log.
+        Success = HTTP 2xx.  Attempt rows are authoritative when present;
+        legacy request rows are used only for requests that reached an upstream.
         """
         conn = self._connect()
         try:
             rows = conn.execute(
+                "WITH observations(account_id, status_code, requested_at) AS ("
+                "  SELECT account_id, status_code, requested_at FROM request_attempts "
+                "  WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "  UNION ALL "
+                "  SELECT r.account_id, r.status_code, r.requested_at FROM request_log r "
+                "  WHERE COALESCE(r.attempt_count, 1) > 0 "
+                "    AND r.requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "    AND NOT EXISTS (SELECT 1 FROM request_attempts t "
+                "                    WHERE t.request_log_id = r.id)"
+                ") "
                 "SELECT COALESCE(a.name, 'unknown') AS account_name, "
                 "COUNT(*) AS total, "
-                "SUM(CASE WHEN r.status_code >= 400 THEN 1 ELSE 0 END) AS errors "
-                "FROM request_log r "
-                "LEFT JOIN upstream_accounts a ON a.id = r.account_id "
+                "SUM(CASE WHEN o.status_code BETWEEN 200 AND 299 "
+                "         THEN 1 ELSE 0 END) AS successes "
+                "FROM observations o "
+                "LEFT JOIN upstream_accounts a ON a.id = o.account_id "
                 "WHERE COALESCE(a.is_aggregate, 0) = 0 "
-                "  AND r.requested_at >= datetime('now', '-' || ? || ' minutes') "
-                "GROUP BY r.account_id "
+                "  AND o.status_code != 499 "
+                "GROUP BY o.account_id "
                 "ORDER BY total DESC",
-                (str(window_minutes),)
+                (str(window_minutes), str(window_minutes)),
             ).fetchall()
 
             return [{
                 "account_name": r[0],
                 "total": r[1],
-                "errors": r[2],
-                "success_rate": round((r[1] - r[2]) / max(r[1], 1) * 100, 1),
+                "errors": r[1] - (r[2] or 0),
+                "success_rate": round((r[2] or 0) / max(r[1], 1) * 100, 1),
             } for r in rows]
         finally:
             conn.close()
@@ -1550,8 +1594,11 @@ class ProxyDatabase:
     def get_perf_realtime(self, window_seconds: int = 60) -> dict:
         """Real-time metrics: current RPM estimate and live concurrency.
 
-        RPM is estimated from request_log; concurrency is read directly from
-        the in_flight_requests table maintained by the C++ proxy.
+        RPM is estimated from request_log.  Live concurrency comes from the
+        proxy's process-local counter so request forwarding never writes an
+        observability row before contacting the upstream.  An unreachable
+        proxy is reported as unavailable rather than the misleading zero from
+        the legacy table.
         """
         conn = self._connect()
         try:
@@ -1563,12 +1610,21 @@ class ProxyDatabase:
 
             rpm = round(recent_count / max(window_seconds / 60.0, 0.1), 1)
 
-            # Live concurrency: count rows currently in the in_flight_requests table
-            latest_concurrent = conn.execute(
-                "SELECT COUNT(*) FROM in_flight_requests"
-            ).fetchone()[0]
+            latest_concurrent = None
+            proxy_port = os.environ.get("TOKEN_PROXY_PORT", "8800")
+            health_url = os.environ.get(
+                "TOKEN_PROXY_HEALTH_URL", f"http://127.0.0.1:{proxy_port}/health"
+            )
+            try:
+                with urllib.request.urlopen(health_url, timeout=1.0) as response:
+                    health = json.loads(response.read().decode("utf-8"))
+                if isinstance(health.get("concurrency"), int):
+                    latest_concurrent = health["concurrency"]
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
 
-            # Also return the in-flight request details for richer dashboards
+            # Detailed rows only exist for legacy proxy versions. New versions
+            # deliberately keep request identities out of the shared database.
             in_flight = conn.execute(
                 "SELECT id, model, is_streaming, "
                 "ROUND((julianday('now') - julianday(started_at)) * 86400) AS elapsed_s "

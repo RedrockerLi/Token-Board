@@ -19,6 +19,14 @@ function initChart(domId) {
     const chart = echarts.init(dom, null, { renderer: 'svg' });
     const ro = new ResizeObserver(function () { chart.resize(); });
     ro.observe(dom);
+    // ECharts does not own external observers. Tie the observer to the chart's
+    // lifecycle so 15-second dashboard refreshes do not accumulate callbacks
+    // retaining disposed chart/DOM instances.
+    const dispose = chart.dispose.bind(chart);
+    chart.dispose = function () {
+        ro.disconnect();
+        dispose();
+    };
     return chart;
 }
 

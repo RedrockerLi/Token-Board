@@ -287,6 +287,7 @@ CONFIG_TABLES = [
 # key observability) are local secrets — never uploaded.
 _RUNTIME_TABLES = [
     "request_log",
+    "request_attempts",
     "perf_events",
     "sync_config",
     "in_flight_requests",
@@ -440,9 +441,9 @@ def restore_config_snapshot(db_path: str) -> bool:
     upstream_accounts does NOT detach request_log (ON DELETE SET NULL would
     null every historical account_id). Deletes children before parents and
     inserts parents before children, so the config tables stay FK-consistent.
-    After the swap, request_log rows pointing at an account that was discarded
-    (created after the snapshot, then rolled back) are detached — account_id
-    becomes NULL, which the dashboard renders as "unknown".
+    After the swap, historical request/attempt rows pointing at discarded
+    accounts or local keys are detached to NULL.  The transaction is committed
+    only after SQLite reports that no foreign-key violations remain.
     """
     snap_path = _snapshot_path(db_path)
     if not os.path.exists(snap_path):
@@ -455,8 +456,8 @@ def restore_config_snapshot(db_path: str) -> bool:
         local.execute("PRAGMA foreign_keys=OFF")
         local.execute("BEGIN IMMEDIATE")
         children = ["aggregate_entries", "account_models", "local_keys",
-                    "pricing_slots", "proxy_timeout_config", "plan_price_history",
-                    "upstream_keys", "upstream_keys_cloud"]
+                    "pricing_slots", "proxy_timeout_config", "plan_billing_config",
+                    "plan_price_history", "upstream_keys", "upstream_keys_cloud"]
         parents = ["upstream_accounts", "model_pricing"]
         # Delete child-first, then parents.
         for table in children + parents:
@@ -483,8 +484,30 @@ def restore_config_snapshot(db_path: str) -> bool:
                 "  SELECT 1 FROM upstream_accounts "
                 "  WHERE upstream_accounts.id = request_log.account_id)"
             )
+            local.execute(
+                "UPDATE request_log SET local_key_id = NULL "
+                "WHERE local_key_id IS NOT NULL AND NOT EXISTS ("
+                "  SELECT 1 FROM local_keys "
+                "  WHERE local_keys.id = request_log.local_key_id)"
+            )
+        if _table_exists(local, "request_attempts"):
+            local.execute(
+                "UPDATE request_attempts SET account_id = NULL "
+                "WHERE account_id IS NOT NULL AND NOT EXISTS ("
+                "  SELECT 1 FROM upstream_accounts "
+                "  WHERE upstream_accounts.id = request_attempts.account_id)"
+            )
+        violation = local.execute("PRAGMA foreign_key_check").fetchone()
+        if violation is not None:
+            raise sqlite3.IntegrityError(
+                "config snapshot restore left a foreign-key violation: "
+                f"{tuple(violation)}"
+            )
         local.commit()
         return True
+    except Exception:
+        local.rollback()
+        raise
     finally:
         snap.close()
         local.close()

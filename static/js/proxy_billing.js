@@ -220,11 +220,12 @@ let logsFilters = {};
 async function loadLogsTable() {
     const tbody = document.querySelector('#logsTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="td-loading">加载中...</td></tr>';
 
     const params = new URLSearchParams({
         page: logsPage,
         per_page: 50,
+        include_attempts: 0,
         ...logsFilters,
     });
 
@@ -234,7 +235,7 @@ async function loadLogsTable() {
             `第 ${data.page} 页 / 共 ${data.total_pages} 页（${data.total} 条记录）`;
 
         if (!data.items.length) {
-            tbody.innerHTML = '<tr><td colspan="8" class="td-empty">暂无日志记录</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="9" class="td-empty">暂无日志记录</td></tr>';
             return;
         }
 
@@ -245,9 +246,10 @@ async function loadLogsTable() {
                 <td><code>${esc(r.model)}</code></td>
                 <td>${fmtNum(r.prompt_tokens)} / ${fmtNum(r.cache_read_tokens || 0)} / ${fmtNum(r.completion_tokens)} / ${fmtNum(r.total_tokens)}</td>
                 <td>¥${(r.cost || 0).toFixed(4)}</td>
-                <td>${r.duration_ms}ms</td>
+                <td>${r.ttft_ms == null ? '—' : `${r.ttft_ms}ms`}</td>
+                <td>${r.output_tps == null ? '—' : `${Number(r.output_tps).toFixed(2)} tokens/s`}</td>
                 <td>${r.is_streaming ? 'SSE' : 'REST'}</td>
-                <td><span class="badge ${r.status_code < 300 ? 'badge--active' : 'badge--inactive'}">${r.status_code}</span></td>
+                <td><span class="badge ${r.status_code >= 200 && r.status_code < 300 ? 'badge--active' : 'badge--inactive'}">${r.status_code}</span></td>
             </tr>
         `).join('');
 
@@ -255,7 +257,7 @@ async function loadLogsTable() {
         document.getElementById('btnLogsPrev').disabled = data.page <= 1;
         document.getElementById('btnLogsNext').disabled = data.page >= data.total_pages;
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="8" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="9" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -298,7 +300,7 @@ function initLogsPage() {
 
         <!-- Log Table -->
         <table class="mgmt-table" id="logsTable">
-            <thead><tr><th>时间</th><th>账户</th><th>模型</th><th>Tokens (输入/命中/输出/总计)</th><th>消费</th><th>延迟</th><th>模式</th><th>状态</th></tr></thead>
+            <thead><tr><th>时间</th><th>账户</th><th>模型</th><th>Tokens (输入/命中/输出/总计)</th><th>消费</th><th>TTFT</th><th>输出速度</th><th>模式</th><th>状态</th></tr></thead>
             <tbody></tbody>
         </table>
 

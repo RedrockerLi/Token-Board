@@ -422,6 +422,12 @@ json ResponsesCodec::serialize_response(const ir::ChatResponse &in) const {
             case ContentKind::Thinking:
                 reasoning_items.push_back(json{{"type", "summary_text"}, {"text", b.text}});
                 break;
+            case ContentKind::Image:
+                // The Responses API has no generic assistant output-image
+                // content item corresponding to an OpenAI/Anthropic image
+                // input block. Do not invent a wire shape clients cannot
+                // parse; image-generation output uses a separate tool item.
+                break;
             case ContentKind::ToolUse: {
                 json item;
                 item["type"] = "function_call";
@@ -522,7 +528,9 @@ private:
     fmt::SseFrameBuffer sse_;
 
     void handle_frame(const json &j, const EmitFn &emit) {
-        std::string type = j.value("type", "");
+        std::string type;
+        if (j.is_object() && j.contains("type") && j["type"].is_string())
+            type = j["type"].get<std::string>();
         if (type == "response.created") {
             StreamEvent ev;
             ev.type = StreamEventType::MessageStart;
@@ -554,6 +562,17 @@ private:
             ev.type = StreamEventType::ContentTextDelta;
             ev.index = index;
             ev.text = j.value("delta", "");
+            if (!emit(ev)) return;
+        } else if (type == "response.refusal.delta") {
+            // Refusals are semantic, user-visible output.  Treat the delta as
+            // text in the format-neutral IR so converted streams preserve it
+            // and passthrough TTFT detection does not wait until EOF.
+            int index = j.value("output_index", 0);
+            StreamEvent ev;
+            ev.type = StreamEventType::ContentTextDelta;
+            ev.index = index;
+            if (j.contains("delta") && j["delta"].is_string())
+                ev.text = j["delta"].get<std::string>();
             if (!emit(ev)) return;
         } else if (type == "response.reasoning_text.delta" ||
                    type == "response.reasoning_summary_text.delta") {
@@ -596,7 +615,8 @@ private:
                     if (!emit(u)) return;
                 }
             }
-        } else if (type == "response.failed" || type == "response.error") {
+        } else if (type == "response.failed" || type == "response.error" ||
+                   type == "error") {
             StreamEvent ev;
             ev.type = StreamEventType::ErrorEvent;
             if (j.contains("response") && j["response"].is_object() &&
@@ -604,6 +624,10 @@ private:
                 ev.extra["error"] = j["response"]["error"];
             else if (j.contains("error"))
                 ev.extra["error"] = j["error"];
+            else if (type == "error")
+                // Native Responses error events keep code/message/param at
+                // the top level rather than under an `error` member.
+                ev.extra["error"] = j;
             else
                 ev.extra["error"] = json{{"message", "upstream error"}};
             if (!emit(ev)) return;
@@ -713,7 +737,6 @@ public:
                     return emit_completed(sink);
                 return true;
             case StreamEventType::ErrorEvent: {
-                if (!started_ && !emit_response_created(sink)) return false;
                 finished_ = true;
                 json err = ev.extra.contains("error") ? ev.extra["error"]
                                                       : json{{"message", ev.extra.value("message", "upstream error")}};

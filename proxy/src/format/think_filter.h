@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <string>
 
 // Forward-declare json from nlohmann
@@ -26,25 +27,44 @@ void sanitize_message(json &msg);
 /// On parse error, returns the original body unchanged.
 std::string sanitize_response_body(const std::string &body);
 
-/// Check whether raw SSE chunk data contains non-empty reasoning_content
-/// or reasoning fields. Used by streaming path to decide whether to skip
-/// think-tag filtering.
-bool sse_chunk_has_reasoning(const char *data, size_t len);
-
 // ── ThinkStreamFilter ─────────────────────────────────────────────────────
 
 /// State machine that filters <think>...</think> blocks from SSE streams.
 /// Handles tags that span multiple SSE delta chunks.
 struct ThinkStreamFilter {
-    enum State { NORMAL, IN_THINK };
-    State state = NORMAL;
-
     /// Feed raw bytes from upstream, return filtered bytes ready to forward.
     /// Returns empty when data is being buffered or suppressed.
     std::string feed(const char *data, size_t len);
 
-private:
-    std::string buf_;  // buffer for partial / incomplete SSE lines
+    /// Flush a final SSE line when the upstream closes without a trailing
+    /// newline. The returned bytes have gone through the same think filter.
+    std::string finish();
 
-    std::string process_line(const std::string &line);
+    bool ok() const noexcept { return error_.empty(); }
+    const std::string &error() const noexcept { return error_; }
+
+private:
+    enum class State { Normal, InThink };
+    struct ChoiceState {
+        State state = State::Normal;
+        // At most sizeof("</think>")-2 bytes: a suffix which may become a tag
+        // when the next content delta arrives.
+        std::string pending;
+        json frame_template = json::object();
+        json choice_template = json::object();
+        bool has_template = false;
+    };
+
+    std::string buf_;  // buffer for partial / incomplete SSE lines
+    bool bypass_ = false;  // upstream already supplies native reasoning fields
+    bool finished_ = false;
+    std::string error_;
+    std::map<int, ChoiceState> choices_;
+
+    std::string process_line(const std::string &line, bool terminal_hint = false);
+    std::string flush_pending();
+    static void filter_fragment(ChoiceState &choice, const std::string &input,
+                                std::string &content, std::string &reasoning,
+                                bool allow_pending);
+    void fail(const std::string &message);
 };

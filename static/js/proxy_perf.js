@@ -12,6 +12,13 @@ let chartLatency = null;
 let chartRPM = null;
 let chartUpstreamSuccess = null;
 let chartModelLatency = null;
+let chartModelSpeed = null;
+
+function perfEsc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) {
+        return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
+    });
+}
 
 // ── Page HTML Builder ──────────────────────────────────────────────────
 
@@ -37,19 +44,19 @@ function buildPerfPageHTML() {
             <div class="stat-card">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#22C55E;"></span> 成功率</div>
                 <div class="stat-card__value number-lg" id="perfSuccessRate">--</div>
-                <div class="stat-card__sub">最近 1 分钟</div>
+                <div class="stat-card__sub">最近 15 分钟</div>
             </div>
             <div class="stat-card stat-card--cyan">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#F59E0B;"></span> 平均延迟</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#F59E0B;"></span> 平均 TTFT</div>
                 <div class="stat-card__value number-lg" id="perfAvgLatency">--</div>
-                <div class="stat-card__sub">最近 15 分钟 (成功请求)</div>
+                <div class="stat-card__sub">最近 15 分钟 (可观测流式成功请求)</div>
             </div>
         </div>
 
         <!-- Latency Distribution Chart -->
         <div class="section">
             <div class="chart-card">
-                <div class="chart-card__title">请求总延迟分布 (P50/P95/P99)</div>
+                <div class="chart-card__title">请求 TTFT 分布 (P50/P95/P99)</div>
                 <div class="chart-container chart-container--lg" id="chartLatency"></div>
             </div>
         </div>
@@ -72,8 +79,12 @@ function buildPerfPageHTML() {
         <div class="section">
             <div class="charts-grid charts-grid--2col">
                 <div class="chart-card">
-                    <div class="chart-card__title">各模型平均延迟</div>
+                    <div class="chart-card__title">各模型平均 TTFT</div>
                     <div class="chart-container chart-container--lg" id="chartModelLatency"></div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-card__title">各模型平均输出速度</div>
+                    <div class="chart-container chart-container--lg" id="chartModelSpeed"></div>
                 </div>
             </div>
         </div>
@@ -185,7 +196,7 @@ function renderUpstreamSuccessRateChart(domId, data) {
             trigger: 'item',
             formatter: function(params) {
                 var d = data[params.dataIndex];
-                return d.account_name + '<br/>成功率: <b>' + d.success_rate + '%</b><br/>'
+                return perfEsc(d.account_name) + '<br/>成功率: <b>' + d.success_rate + '%</b><br/>'
                     + '总请求: ' + d.total + ' | 失败: ' + d.errors;
             }
         },
@@ -215,10 +226,17 @@ function renderModelLatencyChart(domId, models) {
         });
         return;
     }
-    // Sort by latency descending
-    models.sort(function(a, b) { return b.avg_latency_ms - a.avg_latency_ms; });
+    // Sort by observed TTFT descending.
+    models = models.filter(function(m) { return m.avg_ttft_ms != null; });
+    if (!models.length) {
+        chartModelLatency.setOption({
+            title: { text: '暂无可观测流式 TTFT 数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+        });
+        return;
+    }
+    models.sort(function(a, b) { return b.avg_ttft_ms - a.avg_ttft_ms; });
     var names = models.map(function(m) { return m.model; });
-    var latencies = models.map(function(m) { return m.avg_latency_ms; });
+    var latencies = models.map(function(m) { return m.avg_ttft_ms; });
     var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#0070F3','#00CEF3','#22C55E','#F59E0B','#8B5CF6','#EF4444','#EC4899','#6366F1'])[i % 8]; });
 
     chartModelLatency.setOption({
@@ -227,7 +245,7 @@ function renderModelLatencyChart(domId, models) {
             axisPointer: { type: 'shadow' },
             formatter: function(params) {
                 var p = params[0];
-                return p.name + '<br/>' + p.marker + ' ' + p.seriesName + ': <b>' + p.value + ' ms</b>';
+                return perfEsc(p.name) + '<br/>' + p.marker + ' ' + p.seriesName + ': <b>' + p.value + ' ms</b>';
             }
         },
         grid: { left: 50, right: 20, top: 10, bottom: 60 },
@@ -243,12 +261,43 @@ function renderModelLatencyChart(domId, models) {
     });
 }
 
+function renderModelSpeedChart(domId, models) {
+    chartModelSpeed = initChart(domId);
+    if (!chartModelSpeed) return;
+    models = (models || []).filter(function(m) { return m.avg_output_tps != null; });
+    if (!models.length) {
+        chartModelSpeed.setOption({
+            title: { text: '暂无可观测流式速度数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+        });
+        return;
+    }
+    models.sort(function(a, b) { return b.avg_output_tps - a.avg_output_tps; });
+    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#0070F3','#00CEF3','#22C55E','#F59E0B','#8B5CF6','#EF4444','#EC4899','#6366F1'])[i % 8]; });
+    chartModelSpeed.setOption({
+        tooltip: {
+            trigger: 'axis', axisPointer: { type: 'shadow' },
+            formatter: function(params) {
+                var m = models[params[0].dataIndex];
+                return perfEsc(m.model) + '<br/>' + params[0].marker + ' 输出速度: <b>'
+                    + params[0].value.toFixed(2) + ' tokens/s</b><br/>样本数: ' + m.speed_samples;
+            }
+        },
+        grid: { left: 55, right: 20, top: 10, bottom: 60 },
+        xAxis: { type: 'category', data: models.map(function(m) { return m.model; }), axisLabel: { rotate: 30, fontSize: 10 } },
+        yAxis: { type: 'value', name: 'tokens/s', axisLabel: { fontSize: 10 } },
+        series: [{
+            name: '输出速度', type: 'bar', barMaxWidth: 28,
+            data: models.map(function(m, i) { return { value: m.avg_output_tps, itemStyle: { color: colors[i] } }; }),
+        }],
+    });
+}
+
 // ── Data Loading ───────────────────────────────────────────────────────
 
 async function loadAllPerfData() {
     try {
         var results = await Promise.all([
-            fetchPerfSummary(1),
+            fetchPerfSummary(15),
             fetchPerfLatency(60),
             fetchPerfThroughput(60),
             fetchPerfModels(60),
@@ -268,16 +317,23 @@ async function loadAllPerfData() {
         var elSuccess = document.getElementById('perfSuccessRate');
         var elLatency = document.getElementById('perfAvgLatency');
 
-        if (elConcurrent) elConcurrent.textContent = realtime.latest_concurrent;
+        if (elConcurrent) {
+            elConcurrent.textContent = realtime.latest_concurrent == null
+                ? '--' : realtime.latest_concurrent;
+        }
         if (elRPM) elRPM.textContent = realtime.rpm;
         if (elSuccess) elSuccess.textContent = (summary.success_rate || 0) + '%';
-        if (elLatency) elLatency.textContent = (summary.avg_latency_ms || 0) + ' ms';
+        if (elLatency) {
+            elLatency.textContent = summary.avg_ttft_ms != null
+                ? summary.avg_ttft_ms + ' ms' : '--';
+        }
 
         // Render charts
         renderLatencyChart('chartLatency', latency);
         renderRPMChart('chartRPM', throughput);
         renderUpstreamSuccessRateChart('chartUpstreamSuccess', upstreamSuccess);
         renderModelLatencyChart('chartModelLatency', models);
+        renderModelSpeedChart('chartModelSpeed', models);
     } catch (err) {
         console.error('Failed to load perf data:', err);
     }
@@ -305,10 +361,10 @@ function destroyPerfPage() {
         perfRefreshTimer = null;
     }
     // Dispose chart instances to avoid memory leaks
-    [chartLatency, chartRPM, chartUpstreamSuccess, chartModelLatency].forEach(function(c) {
+    [chartLatency, chartRPM, chartUpstreamSuccess, chartModelLatency, chartModelSpeed].forEach(function(c) {
         if (c) { c.dispose(); }
     });
-    chartLatency = chartRPM = chartUpstreamSuccess = chartModelLatency = null;
+    chartLatency = chartRPM = chartUpstreamSuccess = chartModelLatency = chartModelSpeed = null;
 
     // Clean up DOM
     var el = document.getElementById('page-proxy-perf');

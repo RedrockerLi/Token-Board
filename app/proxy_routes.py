@@ -469,6 +469,8 @@ def request_logs():
             model=request.args.get("model"),
             date_from=request.args.get("from"),
             date_to=request.args.get("to"),
+            include_attempts=request.args.get("include_attempts", "1").lower()
+            in {"1", "true", "yes"},
         )
     )
 

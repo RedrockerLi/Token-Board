@@ -406,7 +406,7 @@ public:
             ok = emit(ev);
             return ok;
         };
-        sse_.feed(data, len, [&](const std::string &frame) {
+        const bool buffered = sse_.feed(data, len, [&](const std::string &frame) {
             if (!ok) return;
             std::string event_name, payload;
             if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
@@ -419,7 +419,8 @@ public:
             }
             handle_frame(event_name, j, guard);
         });
-        return ok;
+        if (!buffered) emit_failure(guard, "SSE frame exceeds 4 MiB limit");
+        return ok && !failed_;
     }
 
     bool finish(const EmitFn &emit) override {
@@ -429,7 +430,7 @@ public:
             ok = emit(ev);
             return ok;
         };
-        sse_.finish([&](const std::string &frame) {
+        const bool buffered = sse_.finish([&](const std::string &frame) {
             if (!ok) return;
             std::string event_name, payload;
             if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
@@ -442,13 +443,39 @@ public:
             }
             handle_frame(event_name, j, guard);
         });
-        return ok;
+        if (!buffered) emit_failure(guard, "SSE frame exceeds 4 MiB limit");
+        return ok && !failed_;
     }
 
 private:
     fmt::SseFrameBuffer sse_;
     std::map<int, std::string> tool_args_;
     std::map<int, bool> open_tool_;
+    Usage usage_;
+    bool failed_ = false;
+
+    void emit_failure(const EmitFn &emit, const std::string &message) {
+        if (failed_) return;
+        failed_ = true;
+        StreamEvent ev;
+        ev.type = StreamEventType::ErrorEvent;
+        ev.extra["error"] = json{{"message", message},
+                                  {"type", "stream_limit_error"},
+                                  {"code", 502}};
+        emit(ev);
+    }
+
+    void merge_usage(const json &u) {
+        const Usage delta = fmt::parse_usage_json(u);
+        if (u.contains("input_tokens")) usage_.prompt_tokens = delta.prompt_tokens;
+        if (u.contains("output_tokens"))
+            usage_.completion_tokens = delta.completion_tokens;
+        if (u.contains("cache_read_input_tokens"))
+            usage_.cache_read_tokens = delta.cache_read_tokens;
+        if (u.contains("cache_creation_input_tokens"))
+            usage_.cache_creation_tokens = delta.cache_creation_tokens;
+        usage_.total_tokens = usage_.prompt_tokens + usage_.completion_tokens;
+    }
 
     void handle_frame(const std::string &event_name, const json &j,
                       const EmitFn &emit) {
@@ -462,8 +489,10 @@ private:
                     ev.extra["id"] = m["id"];
                 if (m.contains("model") && m["model"].is_string())
                     ev.extra["model"] = m["model"];
-                if (m.contains("usage") && m["usage"].is_object())
-                    ev.usage = fmt::parse_usage_json(m["usage"]);
+                if (m.contains("usage") && m["usage"].is_object()) {
+                    merge_usage(m["usage"]);
+                    ev.usage = usage_;
+                }
             }
             if (!emit(ev)) return;
         } else if (type == "content_block_start") {
@@ -472,6 +501,11 @@ private:
                 const json &cb = j["content_block"];
                 std::string ctype = cb.value("type", "");
                 if (ctype == "tool_use") {
+                    if (!open_tool_.count(index) &&
+                        open_tool_.size() >= fmt::kMaxStreamItems) {
+                        emit_failure(emit, "too many streamed tool calls");
+                        return;
+                    }
                     open_tool_[index] = true;
                     tool_args_[index] = "";
                     StreamEvent ev;
@@ -501,7 +535,15 @@ private:
                     if (!emit(ev)) return;
                 } else if (dtype == "input_json_delta" && d.contains("partial_json") && d["partial_json"].is_string()) {
                     std::string frag = d["partial_json"].get<std::string>();
-                    tool_args_[index] += frag;
+                    auto &arguments = tool_args_[index];
+                    if (frag.size() > fmt::kMaxToolArgumentsBytes ||
+                        arguments.size() >
+                            fmt::kMaxToolArgumentsBytes - frag.size()) {
+                        emit_failure(emit,
+                                     "streamed tool arguments exceed 8 MiB limit");
+                        return;
+                    }
+                    arguments += frag;
                     StreamEvent ev;
                     ev.type = StreamEventType::ToolCallArgumentDelta;
                     ev.index = index;
@@ -532,9 +574,10 @@ private:
                 }
             }
             if (j.contains("usage") && j["usage"].is_object()) {
+                merge_usage(j["usage"]);
                 StreamEvent ev;
                 ev.type = StreamEventType::UsageEvent;
-                ev.usage = fmt::parse_usage_json(j["usage"]);
+                ev.usage = usage_;
                 if (!emit(ev)) return;
             }
         } else if (type == "error") {
@@ -555,6 +598,7 @@ public:
             case StreamEventType::MessageStart:
                 id_ = ev.extra.value("id", id_);
                 model_ = ev.extra.value("model", model_);
+                last_usage_ = ev.usage;
                 if (!started_) return emit_message_start(sink);
                 return true;
             case StreamEventType::ContentTextDelta:
@@ -614,7 +658,6 @@ public:
                 }
                 return true;
             case StreamEventType::ErrorEvent: {
-                if (!started_ && !emit_message_start(sink)) return false;
                 finished_ = true;
                 json err = ev.extra.contains("error") ? ev.extra["error"]
                                                       : json{{"message", ev.extra.value("message", "upstream error")}};
@@ -625,6 +668,7 @@ public:
     }
 
     bool finish(const Sink &sink) override {
+        if (failed_) return true;
         if (!started_) return true;
         if (!finished_) {
             if (!close_open_blocks(sink)) return false;
@@ -650,6 +694,8 @@ private:
     std::map<int, OpenBlock> open_blocks_;  // source index → open Anthropic block
     int next_index_ = 0;                    // monotonically increasing Anthropic block index
     bool seen_finish_ = false;              // a MessageFinish has been seen
+    bool failed_ = false;
+    json failure_;
 
     std::string frame(const std::string &event, const json &data) {
         return "event: " + event + "\ndata: " + data.dump() + "\n\n";
@@ -663,7 +709,13 @@ private:
         msg["role"] = "assistant";
         msg["model"] = model_;
         msg["content"] = json::array();
-        msg["usage"] = {{"input_tokens", 0}, {"output_tokens", 0}};
+        int input = last_usage_.prompt_tokens;
+        msg["usage"] = {{"input_tokens", input < 0 ? 0 : input},
+                        {"output_tokens", last_usage_.completion_tokens},
+                        {"cache_read_input_tokens",
+                         last_usage_.cache_read_tokens},
+                        {"cache_creation_input_tokens",
+                         last_usage_.cache_creation_tokens}};
         return sink(frame("message_start", json{{"type", "message_start"}, {"message", msg}}));
     }
 
@@ -679,6 +731,8 @@ private:
             if (it->second.kind == kind) return true;
             if (!stop_block(sink, src_index)) return false;
         }
+        if (open_blocks_.size() >= fmt::kMaxStreamItems)
+            return emit_limit_error(sink, "too many streamed content blocks");
         int idx = next_index_++;
         open_blocks_[src_index] = {idx, kind};
         return sink(frame("content_block_start", json{
@@ -724,6 +778,18 @@ private:
         d["stop_sequence"] = nullptr;
         return sink(frame("message_delta", json{
             {"type", "message_delta"}, {"delta", d}, {"usage", usage}}));
+    }
+
+    bool emit_limit_error(const Sink &sink, const std::string &message) {
+        if (failed_) return false;
+        failed_ = true;
+        finished_ = true;
+        failure_ = json{{"message", message},
+                        {"type", "stream_limit_error"},
+                        {"code", 502}};
+        sink(frame("error", json{{"type", "error"},
+                                  {"error", failure_}}));
+        return false;
     }
 };
 

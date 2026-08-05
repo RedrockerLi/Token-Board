@@ -1,9 +1,16 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 struct sqlite3;
@@ -12,8 +19,9 @@ struct sqlite3_stmt;
 /// RAII wrapper around a SQLite3 database connection.
 ///
 /// Opens with WAL mode and foreign keys enabled.  Prepared statements are
-/// cached internally for performance; all public methods are thread-safe
-/// (guarded by a single mutex — only one query runs at a time per connection).
+/// cached internally for performance; all public methods are thread-safe.
+/// Read and write statements use separate SQLite connections so a writer
+/// waiting on WAL's busy timeout cannot convoy unrelated route lookups.
 class Database {
 public:
     Database() = default;
@@ -59,6 +67,13 @@ public:
     };
     std::optional<AccountInfo> get_account(int account_id);
 
+    struct RouteInfo {
+        KeyInfo key;
+        AccountInfo account;
+    };
+    /// Authenticate a local key and read its account in one snapshot/query.
+    std::optional<RouteInfo> lookup_route(const std::string &key_value);
+
     // ── Upstream keys (multi-key per account, local-only) ───────────────
 
     /// One API key slot of an account (child of upstream_accounts).  The key
@@ -72,6 +87,23 @@ public:
     /// account has no keys configured (caller falls back to the account's
     /// legacy single upstream_key).
     std::vector<KeySlot> get_upstream_keys(int account_id);
+
+    /// One fully resolved real-upstream target from a routing snapshot.
+    /// `keys` and `account` are read by the same SQLite statement, so callers
+    /// cannot combine credentials from one config revision with an endpoint
+    /// from another.  Empty `keys` means the caller may use the account's
+    /// legacy `upstream_key`.
+    struct RoutingTarget {
+        AccountInfo account;
+        std::vector<KeySlot> keys;
+        std::string upstream_model;
+        int priority_group = 0;
+    };
+    /// Resolve a plain or aggregate account for `model` in one consistent
+    /// read snapshot.  Aggregate targets are ordered by (sort_order, id), and
+    /// missing or soft-deleted accounts are omitted.
+    std::vector<RoutingTarget> resolve_routing_snapshot(
+        int account_id, const std::string &model);
 
     // ── Timeout config (per client wire format) ────────────────────────
 
@@ -105,21 +137,30 @@ public:
 
     // ── Usage logging ───────────────────────────────────────────────────
 
-    void log_request(int account_id, int local_key_id, const std::string &model,
+    struct AttemptInfo {
+        int account_id = 0;
+        int upstream_key_id = 0;
+        int status_code = 0;
+        int duration_ms = 0;
+        int ttft_ms = -1;          // semantic TTFT; -1 when not observed
+        bool is_timeout = false;
+        std::string error;
+    };
+
+    /// Durably append one request and all of its attempts to the local spool.
+    /// A dedicated writer replays the spool into SQLite atomically. Request
+    /// threads never fall back to SQLite when the writer is busy; false means
+    /// the spool append failed or shutdown has stopped accepting new records.
+    bool log_request(int account_id, int local_key_id, const std::string &model,
                      int prompt_tokens, int completion_tokens,
                      int cache_read_tokens, int total_tokens,
                      double cost, bool is_streaming, int status_code,
-                     int duration_ms, int upstream_key_id = 0);
-
-    void update_key_last_used(int local_key_id);
-
-    // ── Session-affinity log (local, 7-day rolling, never synced) ───────
-
-    /// Record a (session → key) binding when it is established or changed.
-    void log_session_key(const std::string &session_id, int account_id,
-                         int key_id);
-    /// Delete session→key bindings older than 7 days.
-    void prune_session_key_log();
+                     int duration_ms, int upstream_key_id = 0,
+                     int ttft_ms = -1, int generation_ms = -1,
+                     double output_tps = -1.0,
+                     int upstream_ttft_ms = -1, int upstream_duration_ms = -1,
+                     int attempt_count = 1,
+                     const std::vector<AttemptInfo> &attempts = {});
 
     // ── Pricing ─────────────────────────────────────────────────────────
 
@@ -132,15 +173,6 @@ public:
 
     std::vector<PricingEntry> get_all_pricing();
 
-    // ── Performance metrics (local-only, not synced) ────────────────────
-
-    void log_perf_event(const std::string &model, int upstream_latency_ms,
-                        int total_latency_ms, int status_code,
-                        bool is_error, int concurrent_count);
-
-    /// Delete perf events older than `max_age_minutes` (default 24h).
-    void cleanup_old_perf_events(int max_age_minutes = 1440);
-
     // ── In-flight request tracking ──────────────────────────────────────
 
     /// Record a request that has just started. Returns the row ID to use
@@ -151,38 +183,124 @@ public:
     /// Mark a request as completed (delete its in-flight record).
     void request_end(int row_id);
 
-    /// Return the current number of in-flight requests.
-    int get_in_flight_count();
-
     /// Remove in-flight records older than `max_age_minutes` (stuck/crashed).
     void cleanup_stale_in_flight(int max_age_minutes = 10);
 
 private:
+    struct LogRecord {
+        int account_id = 0;
+        int local_key_id = 0;
+        std::string model;
+        int prompt_tokens = 0;
+        int completion_tokens = 0;
+        int cache_read_tokens = 0;
+        int total_tokens = 0;
+        double cost = 0.0;
+        bool is_streaming = false;
+        int status_code = 0;
+        int duration_ms = 0;
+        int upstream_key_id = 0;
+        int ttft_ms = -1;
+        int generation_ms = -1;
+        double output_tps = -1.0;
+        int upstream_ttft_ms = -1;
+        int upstream_duration_ms = -1;
+        int attempt_count = 1;
+        std::vector<AttemptInfo> attempts;
+        std::int64_t requested_at_unix = 0;
+        std::string event_id;
+        bool cost_frozen = false;
+    };
+
+    struct SpoolRecord {
+        LogRecord record;
+        std::uint64_t end_offset = 0;
+        std::size_t frame_bytes = 0;
+    };
+
+    struct FrozenRate {
+        bool matched = false;
+        double input_price = 0.0;
+        double output_price = 0.0;
+        double cache_read_price = 0.0;
+        double multiplier = 1.0;
+    };
+
     /// Apply pending versioned migrations (PRAGMA user_version-gated) from
     /// `schema_dir`.  Returns false on failure (transaction rolled back).
     bool run_migrations(const std::string &schema_dir);
-    void prepare_statements();
+    bool prepare_statements();
     void finalize_statements();
 
-    sqlite3 *db_ = nullptr;
-    std::string db_path_;  // used to derive the "<db>.migrate.lock" filename
-    std::mutex mutex_;
+    bool start_log_writer();
+    void stop_log_writer();
+    void log_writer_loop();
+    bool persist_log_records(const LogRecord *records, std::size_t count);
+    bool write_log_record_in_transaction(const LogRecord &record);
+    bool snapshot_request_cost(const std::string &model, int prompt_tokens,
+                               int completion_tokens, int cache_read_tokens,
+                               std::int64_t requested_at_unix,
+                               double &cost);
+    bool append_log_spool_locked(const std::string &payload);
+    bool read_log_spool_batch_locked(std::vector<SpoolRecord> &batch);
+    bool compact_log_spool_locked(bool force);
+    static std::string serialize_log_record(const LogRecord &record);
+    static bool deserialize_log_record(const std::string &payload,
+                                       LogRecord &record);
 
-    // Prepared statements (protected by mutex_)
+    static constexpr std::size_t kLogBatchSize = 64;
+    static constexpr std::size_t kLogBatchBytes = 1024 * 1024;
+    static constexpr std::size_t kLogRecordMaxBytes = 256 * 1024;
+    static constexpr std::size_t kLogModelMaxBytes = 512;
+    static constexpr std::size_t kLogErrorMaxBytes = 2048;
+    static constexpr std::size_t kLogAttemptsMax = 64;
+    static constexpr std::uint64_t kLogCompactThreshold = 8 * 1024 * 1024;
+    // Hard cap on the durable request-log spool file.  Appends past this are
+    // rejected so a wedged/unavailable writer can never grow the spool without
+    // bound on disk.  Not a data-loss-free guard: once hit, new records drop
+    // until the writer drains (log_accepting_ is the first line of defense).
+    static constexpr std::uint64_t kLogSpoolHardLimit = 256 * 1024 * 1024;
+    static constexpr int kShutdownRetryLimit = 3;
+
+    sqlite3 *write_db_ = nullptr;
+    sqlite3 *read_db_ = nullptr;
+    sqlite3 *pricing_db_ = nullptr;
+    std::string db_path_;  // used to derive the "<db>.migrate.lock" filename
+    mutable std::shared_mutex lifecycle_mutex_;
+    std::mutex write_mutex_;
+    std::mutex read_mutex_;
+    std::mutex pricing_mutex_;
+
+    // The append-only spool is the durable queue. Request threads only serialize
+    // and fdatasync a bounded record; SQLite I/O belongs to log_writer_thread_.
+    std::mutex log_queue_mutex_;
+    std::condition_variable log_queue_cv_;
+    std::thread log_writer_thread_;
+    bool log_accepting_ = false;
+    bool log_stop_ = false;
+    int log_spool_fd_ = -1;
+    std::uint64_t log_spool_read_offset_ = 0;
+    std::uint64_t log_spool_write_offset_ = 0;
+    std::atomic<std::uint64_t> log_persist_failures_{0};
+    std::unordered_map<std::string, FrozenRate> frozen_rate_cache_;
+
+    // Read statements (read_db_, protected by read_mutex_)
     sqlite3_stmt *stmt_lookup_key_ = nullptr;
     sqlite3_stmt *stmt_get_account_ = nullptr;
+    sqlite3_stmt *stmt_lookup_route_ = nullptr;
     sqlite3_stmt *stmt_get_upstream_keys_ = nullptr;
-    sqlite3_stmt *stmt_insert_log_ = nullptr;
-    sqlite3_stmt *stmt_insert_session_key_ = nullptr;
-    sqlite3_stmt *stmt_prune_session_key_ = nullptr;
+    sqlite3_stmt *stmt_resolve_routing_snapshot_ = nullptr;
     sqlite3_stmt *stmt_get_aggregate_entries_ = nullptr;
     sqlite3_stmt *stmt_get_pricing_ = nullptr;
+    sqlite3_stmt *stmt_snapshot_price_ = nullptr;
     sqlite3_stmt *stmt_get_timeout_config_ = nullptr;
+
+    // Mutating statements (write_db_, protected by write_mutex_)
+    sqlite3_stmt *stmt_insert_log_ = nullptr;
+    sqlite3_stmt *stmt_find_log_event_ = nullptr;
+    sqlite3_stmt *stmt_insert_attempt_ = nullptr;
     sqlite3_stmt *stmt_update_last_used_ = nullptr;
-    sqlite3_stmt *stmt_insert_perf_event_ = nullptr;
-    sqlite3_stmt *stmt_cleanup_perf_events_ = nullptr;
     sqlite3_stmt *stmt_insert_in_flight_ = nullptr;
     sqlite3_stmt *stmt_delete_in_flight_ = nullptr;
-    sqlite3_stmt *stmt_count_in_flight_ = nullptr;
     sqlite3_stmt *stmt_cleanup_in_flight_ = nullptr;
 };

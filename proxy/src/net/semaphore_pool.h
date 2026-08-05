@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <functional>
 #include <list>
 #include <mutex>
@@ -51,7 +52,9 @@ class SemaphorePool final : public httplib::TaskQueue {
     bool enqueue(std::function<void()> fn) override {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (shutdown_.load(std::memory_order_acquire)) return false;
             jobs_.push_back(std::move(fn));
+            queued_.fetch_add(1, std::memory_order_release);
         }
         // Post outside the lock: the woken thread can enter the critical
         // section immediately instead of blocking on `mutex_`.
@@ -60,12 +63,15 @@ class SemaphorePool final : public httplib::TaskQueue {
     }
 
     void shutdown() override {
-        shutdown_.store(true, std::memory_order_release);
+        bool expected = false;
+        if (!shutdown_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel))
+            return;
 
-        // Post exactly N times — one per worker.
-        // `sem_post` atomically increments the counter.  Workers that are
-        // still executing a job will consume their post when they loop
-        // back to `sem_wait`, so no post is lost.
+        // Post exactly N times — one per worker. Existing queued jobs keep
+        // their own semaphore permits and are drained before a worker consumes
+        // one of these shutdown permits. This mirrors httplib::ThreadPool:
+        // accepted sockets are not silently abandoned during graceful stop.
         for (size_t i = 0; i < num_threads_; ++i) {
             sem_post(&sem_);
         }
@@ -83,6 +89,7 @@ class SemaphorePool final : public httplib::TaskQueue {
     /// Grow the pool to @p new_size workers (only grows — never shrinks).
     /// Clamped to max_threads_.  New threads start immediately.
     void resize(size_t new_size) {
+        if (shutdown_.load(std::memory_order_acquire)) return;
         if (new_size > max_threads_) new_size = max_threads_;
         if (new_size <= num_threads_) return;
         for (size_t i = num_threads_; i < new_size; ++i) {
@@ -95,6 +102,12 @@ class SemaphorePool final : public httplib::TaskQueue {
 
     size_t size() const { return num_threads_; }
     size_t max_size() const { return max_threads_; }
+    size_t queued() const noexcept {
+        return queued_.load(std::memory_order_acquire);
+    }
+    size_t active() const noexcept {
+        return active_.load(std::memory_order_acquire);
+    }
 
   private:
     void worker() {
@@ -103,20 +116,32 @@ class SemaphorePool final : public httplib::TaskQueue {
             int rc = sem_wait(&sem_);
             if (rc == -1 && errno == EINTR) continue; // signal interrupt — retry
 
-            // Check shutdown *before* touching the queue.
-            if (shutdown_.load(std::memory_order_acquire)) return;
-
             std::function<void()> fn;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!jobs_.empty()) {
                     fn = std::move(jobs_.front());
                     jobs_.pop_front();
+                    queued_.fetch_sub(1, std::memory_order_release);
                 }
             }
 
+            // During shutdown, process every job that was already accepted.
+            // Once the queue is empty, this wakeup is one of the explicit
+            // shutdown permits and the worker may exit.
+            if (!fn && shutdown_.load(std::memory_order_acquire)) return;
+
             if (fn) {
-                fn();
+                active_.fetch_add(1, std::memory_order_release);
+                try {
+                    fn();
+                } catch (const std::exception &e) {
+                    fprintf(stderr, "[Pool] uncaught request exception: %s\n",
+                            e.what());
+                } catch (...) {
+                    fprintf(stderr, "[Pool] uncaught request exception\n");
+                }
+                active_.fetch_sub(1, std::memory_order_release);
             } else {
                 // spurious wakeup from shutdown post during init race
             }
@@ -130,4 +155,6 @@ class SemaphorePool final : public httplib::TaskQueue {
     size_t num_threads_;
     const size_t max_threads_;
     std::atomic<bool> shutdown_{false};
+    std::atomic<size_t> queued_{0};
+    std::atomic<size_t> active_{0};
 };
