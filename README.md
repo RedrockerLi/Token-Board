@@ -8,7 +8,7 @@
 - 多账户路由:一个本地密钥绑定一个上游账户;聚合账户把多个上游合并成一个模型列表,同一模型可配置多个账户自动回退
 - 峰谷定价:按时段给模型定价配倍率,成本在请求写入时按当时价格固化,改价不回溯
 - 用量看板:模型趋势、Token 类型分布、按用户分摊费用;存档只存用量与总价,改价不回溯
-- 性能监控:成功率、延迟分布(P50/P95/P99)、吞吐、实时并发
+- 性能监控:成功率、延迟分布(P50/P95/P99)、输出速度分布、吞吐、实时并发
 - WebDAV 同步:配置与聚合用量跨机器同步,明细数据不上传
 
 技术细节(架构、数据库、计费、格式转换、代理内部、同步协议、API 参考、开发)见 [doc/](doc/) 目录下的专题文档。
@@ -103,7 +103,7 @@ export OPENAI_API_KEY=<本地密钥>
 | 本地密钥 | 生成 / 复制 / 编辑 / 删除密钥,密钥列表打码显示 |
 | 模型定价 | 单价与峰谷时段编辑器 |
 | 请求日志 | 分页请求明细,按日期 / 模型 / 账户筛选 |
-| 性能监控 | 当前并发、RPM、成功率、平均延迟、P50/P95/P99、每分钟请求数、各上游成功率、各模型延迟,15 秒自动刷新 |
+| 性能监控 | 当前并发、RPM、成功率、平均延迟、P50/P95/P99、输出速度分布(P50/P95/P99)、每分钟请求数、各上游成功率、各模型延迟与 TTFT/速度采样,15 秒自动刷新 |
 | 设置 | 代理超时配置(按客户端线格式分组)与 WebDAV 同步设置 |
 
 ### 数据看板与代理导出
@@ -196,6 +196,7 @@ bash scripts/status.sh
 | [doc/database.md](doc/database.md) | 两个 SQLite 库的表结构、索引、触发器、计费公式 |
 | [doc/database-migrations.md](doc/database-migrations.md) | schema 迁移机制与升级步骤 |
 | [doc/billing-pricing.md](doc/billing-pricing.md) | 定价、峰谷档位、写时计价固化、plan 虚拟消费 |
+| [doc/upstream-concepts.md](doc/upstream-concepts.md) | 上游账户模型：api/plan/agent 类型、单上游多密钥、聚合上游，及其在代理-保存-导出链路的行为 |
 | [doc/format-conversion.md](doc/format-conversion.md) | 三格式转换、IR 与 codec、流式处理、think 抽取 |
 | [doc/proxy-internals.md](doc/proxy-internals.md) | 路由、并发闸门、超时、回退、性能监控 |
 | [doc/sync.md](doc/sync.md) | WebDAV 同步协议、云端权威事务、高水位检查点、追加模式 |

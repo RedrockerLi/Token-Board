@@ -14,7 +14,7 @@ schema/
 
 - **版本号**：每个库用 `PRAGMA user_version` 记录已应用的迁移编号。`0` = 未迁移。
 - **迁移文件**：`schema/<库名>/NNNN_描述.sql`，`NNNN` 为 4 位数字（如 `0001`、`0002`），按数字升序应用。允许跳号。
-- **谁执行**：C++ 代理启动时（`proxy/src/db.cpp::run_migrations`）与 Python 看板启动时（`app/migrations.py`）各跑一次。两处实现相同协议：读取 `user_version`，仅应用编号大于它的步骤，每步设置 `user_version` 在**同一次事务**里。
+- **谁执行**：C++ 代理启动时（`proxy/src/store/db.cpp::run_migrations`）与 Python 看板启动时（`app/migrations.py`）各跑一次。两处实现相同协议：读取 `user_version`，仅应用编号大于它的步骤，每步设置 `user_version` 在**同一次事务**里。
 - **并发安全**：执行前先对 `<数据库>.migrate.lock` 加 `flock` 互斥锁（C++ 与 Python 使用同一把锁），每步再包 `BEGIN IMMEDIATE … COMMIT`。因此 proxy 与 dashboard 谁先启动、是否同时重启都安全：后执行者看到版本已到位则空转。
 - **原子性**：一个迁移文件 = 一个事务。执行失败自动回滚，`user_version` 不变，并 **fail-fast**（代理启动失败退出、看板拒绝启动）——不会带着半成品 schema 运行。
 - **幂等**：版本已到位时每次启动是空操作，开销可忽略。

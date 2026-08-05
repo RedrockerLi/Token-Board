@@ -15,6 +15,8 @@
 - `request_log` 明细(只同步聚合结果,明细仅存本地)
 - `upstream_keys.key_value` 与 `upstream_accounts.upstream_key` 的完整明文
 - `perf_events` 性能事件
+- `upstream_keys` 与 `session_key_log`(上游密钥本身、会话→密钥分配观测)
+- `fx_rate` 与 `codex_import_state`(汇率与 Codex 导入游标,仅本机)
 - `in_flight_requests` 在途请求
 - `sync_config`(WebDAV 账号密码)
 
@@ -59,7 +61,7 @@
 
 配置走独立的 `proxy_config_*.db` 文件,采用**云端权威镜像**(改名/编辑/删除跨机传播):
 
-- **上传**(一次事务):看板在用户**退出设置界面**时调 `POST /api/proxy/sync/config/upload` → `sync_config_upload`。副本先删掉 `request_log` / `perf_events` / `sync_config` / `in_flight_requests` / `sync_state`,并把 `upstream_accounts.upstream_key` 置空(**上游 API Key 绝不上传,每台机器各自填写的 Key 只存本机**),`VACUUM` 后上传。上传前先拉取最新云端文件算 config hash,与 `sync_state.config_hash` 比对:不一致(云端被其他机器改过,或本机尚未下载过)返回 `conflict` 拒绝覆盖,防止用落后配置冲掉云端新配置。
+- **上传**(一次事务):看板在用户**退出设置界面**时调 `POST /api/proxy/sync/config/upload` → `sync_config_upload`。副本先删掉运行时表(见 `sync._RUNTIME_TABLES`:请求明细 `request_log` / `request_attempts`、`perf_events`、`sync_config`、`in_flight_requests`、`sync_state`、上游密钥 `upstream_keys`、会话分配观测 `session_key_log`,以及仅本机的 `fx_rate` / `codex_import_state`),并把 `upstream_accounts.upstream_key` 置空(**上游 API Key 绝不上传,每台机器各自填写的 Key 只存本机**),`VACUUM` 后上传。上传前先拉取最新云端文件算 config hash,与 `sync_state.config_hash` 比对:不一致(云端被其他机器改过,或本机尚未下载过)返回 `conflict` 拒绝覆盖,防止用落后配置冲掉云端新配置。
 - **下载**(启动时):`create_app` 调 `sync_config_download`,取云端最新配置按**云端权威**合入本地:账户按 id upsert(保留本机非空上游 Key)、密钥按 key_value upsert、定价按 id upsert,聚合/账户模型/时段/超时整表替换,本地不在云端的行删除(delete-stale)。
 - **回滚**:每台机在成功下载/上传的提交点维护本地快照 `data/config_snapshot.db`(含本机 Key,本地独有)。上传失败后用户选「丢弃设置」→ `POST /api/proxy/sync/config/discard` 从快照单事务回滚,不需要网络。
 

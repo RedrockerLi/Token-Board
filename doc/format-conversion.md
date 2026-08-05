@@ -45,7 +45,7 @@ usage 的解析,非流式直接 parse 响应体;流式从累积的 SSE 中取最
 - `parse_data_uri` / `build_data_uri`:图片 content 在 data URI 与 base64 字段之间互转。
 - `parse_sse_frame`:SSE 分帧,兼容 `data:` 有无空格、事件名、注释行。
 - `read_cache_hit_tokens`:从各格式的缓存字段里取命中 token 数(deepseek 的 `prompt_cache_hit_tokens`、OpenAI 的 `prompt_tokens_details.cached_tokens`、Responses 的 `input_tokens_details.cached_tokens`,或由 miss 推导),minimax 这类不报缓存的返回 0。
-- 超时错误帧:上游读超时(100s 无数据)时按客户端格式发终止错误帧——Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`,而不是静默断连。
+- 超时错误帧:上游读超时(按客户端线格式的三档超时配置触发,见 [proxy-internals.md](proxy-internals.md))时按客户端格式发终止错误帧——Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`,而不是静默断连。
 
 ## 自测
 

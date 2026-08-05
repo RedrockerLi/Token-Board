@@ -765,18 +765,18 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
             _safe_copy_db(dash_db_path, shadow_path)
 
         # 2. Bring the shadow up to the current schema (cloud may be older).
-        from app.migrations import migrate, schema_dir_for
+        from app.db.migrations import migrate, schema_dir_for
         migrate(shadow_path, schema_dir_for(dash_db_path, "dashboard"))
 
         # 2b. Reconcile: mirror upstream_accounts (id → name/type/deleted_at)
         #     into the shadow's `accounts` table and backfill any legacy
         #     name-keyed buckets to their account_id. Runs before export so the
         #     fresh rows and the archive both key on account_id.
-        from app.dashboard_db import reconcile_accounts
+        from app.db.dashboard_db import reconcile_accounts
         reconcile_accounts(shadow_path, proxy_db_path)
 
         # 3. Export: request_log rows in (mark, max_id] → shadow, additively.
-        from app.proxy_db import ProxyDatabase
+        from app.db.proxy_db import ProxyDatabase
         proxy_db = ProxyDatabase(proxy_db_path)
         mark = proxy_db.get_export_mark()
         max_id = proxy_db.get_max_log_id()

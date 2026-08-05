@@ -27,33 +27,38 @@
 
 ## 写时计价固化
 
-计费触发器 `tr_request_log_insert` 只在新请求插入 `request_log` 时执行一次:按当时的 `model_pricing` 单价、当时的档位配置,算出 `cost`(api 账户)或 `virtual_cost`(plan 账户)写进当行。迁移 `0002` 同时删掉了 `tr_pricing_insert/update/delete` 三个改价回溯触发器,所以:
+计费载体是 `request_log` 的**单列 `api_cost`**(0007 起 `cost` + `virtual_cost` 合并——api 账户记真实账单,plan/agent 记虚拟口径,统一落这一列)。两种写时计价路径:
 
-- 改价、增删档位、调整优先级,都不再重算历史 `request_log`。
+- **第三方/老写入**(`cost_frozen=0`):由触发器 `tr_request_log_insert` 在插入时按当时的 `model_pricing` 单价、档位配置与汇率算好写进当行(0014 版本,USD 定价按请求当天汇率折 CNY)。
+- **代理自身**(`cost_frozen=1`):C++ 在请求**入队时刻**用 `snapshot_request_cost` 快照定价写入,排队延迟不改账;`event_id` 保证本地 spool 重放幂等。
+
+迁移 `0002` 删掉了 `tr_pricing_insert/update/delete` 三个改价回溯触发器,所以:
+
+- 改价、增删档位、调整优先级、改汇率,都不再重算历史 `request_log`。
 - 历史行在迁移时用"当前配置 + 各记录时刻的档位倍率"回填过一次,此后保持冻结。
-- `request_log.cost` 是唯一可信的记账值,导出到 `dashboard.db` 时直接按它聚合。
+- `request_log.api_cost` 是唯一可信的记账值,导出到 `dashboard.db` 时直接按它聚合。
 
 ## plan 账户与虚拟消费
 
 `account_type = 'plan'` 的账户代表订阅套餐,调用本身不按量收费。计费规则:
 
-- `cost = 0`(真实成本),`virtual_cost` 按 api 口径公式算出——即"这笔流量不买套餐的话要花多少钱"。
+- `api_cost` 就是虚拟口径——即"这笔流量不买套餐的话要花多少钱"。真实成本不计入 `api_cost` 聚合(见下)。
 - 每把上游密钥独立拥有 `valid_from` 起的行政月周期。锚点日为起始日的日号，短月取月末；密钥不需要产生用量也会产生每周期一次的订阅费。
 - 所有边界使用 UTC+0。删除密钥或账户时，本期通常仍收费；若删除时间早于本期起点加“取消宽限小时数”，则该期不收费。宽限在删除时快照，之后修改设置不追溯历史。
 - 月费修改会写入价格历史。设置页可选择默认从本期或下一期生效；不同锚点日的密钥会在各自对应的周期边界切换价格。
 - plan 单把上游密钥收到 HTTP 429 后冷却 5 小时，同账户其他密钥仍可回退接管(见 [proxy-internals.md](proxy-internals.md))。
 
-`virtual_cost` 的意义是衡量套餐划不划算:实际花的钱是月费,虚拟消费是省下来的按量金额。
+plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实际花的钱是月费,虚拟消费是省下来的按量金额。
 
 ## 看板上的消费口径
 
-数据来源:代理导出的数据按 `request_log.cost`(写时固化)聚合写入 `cost_entry`。CSV 导入已弃用,
+数据来源:代理导出的数据按 `request_log.api_cost`(写时固化)聚合写入 `cost_entry`。CSV 导入已弃用,
 存量 CSV 数据已并入 DeepSeek 账户,`cost_entry` 不再有 `source` 列。
 
-- **总消费(真实)**:api 按量费用 + plan 月费。主看板为存档全量口径;代理账单页为**近 30 天滚动**口径
-  (近30天 `SUM(cost)` + 当前仍应收费的每把 plan 密钥的本期月费)。
-- **今日消费**:今日 api 按量 + 今日 plan 虚拟消费(`get_stats` 中 `SUM(cost + virtual_cost)` 限今日)。
-- **理论消费**:api 按量 + plan 虚拟消费,即完全不买 plan 全按 api 计费应花的金额。
+- **总消费(真实)**:api 账户按量费用 + plan/agent 月费。主看板为存档全量口径;代理账单页为**近 30 天滚动**口径
+  (近30天 api 账户 `SUM(api_cost)` + 当前仍应收费的每把 plan 密钥的本期月费;USD 订阅费按当日汇率折 CNY)。
+- **今日消费**:今日全部 `SUM(api_cost)`(api 真实账单 + plan/agent 虚拟口径,`get_stats` 限今日)。
+- **理论消费**:api 按量 + plan/agent 虚拟消费,即完全不买 plan 全按 api 计费应花的金额。
 
 `proxy_plan_summary` 表按“行政月 × 账户 × masked 密钥”保存。订阅费由生命周期和价格历史校准，
 虚拟消费仍是追加式归档。`/api/summary` 据此返回 `plan_subscription_cost` 与 `plan_virtual_cost`,

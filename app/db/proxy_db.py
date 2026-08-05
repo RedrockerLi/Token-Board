@@ -16,7 +16,7 @@ import urllib.request
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 
-from app.fx import ensure_rate as _fx_ensure_rate, rate_for_month as _fx_rate_for_month
+from app.services.fx import ensure_rate as _fx_ensure_rate, rate_for_month as _fx_rate_for_month
 
 
 def _generate_key() -> str:
@@ -104,7 +104,7 @@ class ProxyDatabase:
         self.db_path = db_path
         # Schema is owned by versioned migrations (schema/proxy/*.sql); apply
         # once at construction. Fails fast (create_app aborts) on error.
-        from app.migrations import migrate, schema_dir_for
+        from app.db.migrations import migrate, schema_dir_for
         migrate(self.db_path, schema_dir_for(self.db_path, "proxy"))
 
     def _connect(self) -> sqlite3.Connection:
@@ -1415,8 +1415,8 @@ class ProxyDatabase:
         on every export regardless of the batch window (Requirement 4: price
         edits affect only the current month).
         """
-        from app.dashboard_db import DashboardDatabase
-        from app.migrations import schema_dir_for
+        from app.db.dashboard_db import DashboardDatabase
+        from app.db.migrations import schema_dir_for
 
         conn = self._connect()
         try:

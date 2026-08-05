@@ -15,7 +15,7 @@
 | `/v1/models` | GET | 模型列表:聚合账户返回其模型目录;带 `anthropic-version` 头的 Anthropic 客户端返回空目录 `{"models":[]}`;其余透传上游 |
 | `/v1/v1/chat/completions` 等 | 同上 | 双 `/v1` 前缀别名 |
 | `/v1/*` | OPTIONS | CORS 预检,返回 204 |
-| `/health` | GET | 健康检查,返回 `{"status":"ok","service":"token-board-proxy"}` |
+| `/health` | GET | 健康检查,返回 `{"status":"ok","service":"token-board-proxy","concurrency":N}`(concurrency 为进程内实时并发数) |
 
 ## 仪表板数据 API
 
@@ -38,7 +38,7 @@
 
 ## 代理管理 API
 
-前缀 `/api/proxy`,仅在 `server.py --proxy-db` 传入 `proxy.db` 时启用。账户、密钥、定价等写操作会自动触发 3 秒 debounce 的配置云同步(见 [sync.md](sync.md))。
+前缀 `/api/proxy`,仅在 `server.py --proxy-db` 传入 `proxy.db` 时启用。账户、密钥、定价等配置在**退出设置类页面**时作为一次事务上传云端(见 [sync.md](sync.md))。
 
 ### 账户与密钥
 
@@ -51,6 +51,7 @@
 | `/api/proxy/accounts/<id>` | DELETE | 删除账户(有关联密钥或日志时拒绝) |
 | `/api/proxy/accounts/<id>/models` | GET | 账户模型目录 |
 | `/api/proxy/accounts/<id>/models` | POST | 从上游 `GET /models` 拉取并整体替换模型目录 |
+| `/api/proxy/accounts/<id>/test-concurrency` | POST | 并发测试:不经本机代理、直连上游并行发 N 个极小请求(body 可传 `concurrency` 覆盖已保存限额,上限 50),自动挑选定价最便宜的可用模型,返回各档成功的统计与失败原因 |
 | `/api/proxy/aggregates` | GET | 聚合账户列表(含模型映射) |
 | `/api/proxy/aggregates` | POST | 新建聚合账户(至少一条映射,pattern 禁止通配符) |
 | `/api/proxy/aggregates/<id>` | PUT | 更新聚合账户与映射 |
@@ -81,6 +82,13 @@
 
 配置存 `proxy_timeout_config` 表,代理每次转发按客户端线格式读取,保存后即时生效、无需重启。超时机制见 [proxy-internals.md](proxy-internals.md)。
 
+### plan 计费设置
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/proxy/billing-config` | GET | plan 计费设置:`price_change_effective`(改价默认本期/下期)、`cancellation_grace_hours`(取消宽限小时数) |
+| `/api/proxy/billing-config` | PUT | 整体保存 plan 计费设置 |
+
 ### 消费与日志
 
 | 端点 | 方法 | 说明 |
@@ -100,16 +108,19 @@
 | `/api/proxy/sync/config` | GET | 读取 WebDAV 配置(密码脱敏) |
 | `/api/proxy/sync/config` | PUT | 保存 WebDAV 配置 |
 | `/api/proxy/sync/test` | POST | 测试 WebDAV 连接 |
+| `/api/proxy/sync/config/upload` | POST | 配置上传事务:hash 校验 → 副本剥离密钥/运行时表 → 上传 → 记录 config_hash 与本地快照(见 [sync.md](sync.md)) |
+| `/api/proxy/sync/config/discard` | POST | 丢弃未保存的设置,从本地快照 config_snapshot.db 单事务回滚(见 [sync.md](sync.md)) |
 
 ### 性能监控
 
-性能数据源是 `request_log`(每次请求的结局)与 `perf_events`。
+性能数据源是 `request_log`(含 TTFT/生成耗时/输出速度列)与 `request_attempts`(每次上游尝试的明细)。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/proxy/perf/summary` | GET | 最近 N 分钟(默认 15)请求数、错误数、成功率、token、平均延迟 |
 | `/api/proxy/perf/upstream-success-rate` | GET | 最近 N 分钟各真实上游成功率 |
 | `/api/proxy/perf/latency` | GET | 最近 N 分钟按分钟桶的 P50/P95/P99 延迟 |
+| `/api/proxy/perf/speed` | GET | 最近 N 分钟(默认 60)按分钟桶的输出速度(token/s)P50/P95/P99 分布(读 request_log.output_tps) |
 | `/api/proxy/perf/throughput` | GET | 最近 N 分钟每分钟请求数 |
 | `/api/proxy/perf/models` | GET | 最近 N 分钟按模型的请求数/平均延迟/成功率 |
 | `/api/proxy/perf/realtime` | GET | 实时:RPM 估计、`in_flight_requests` 中的当前并发、在途明细 |
@@ -123,7 +134,7 @@
 | `--db` | `data/proxy.db` | SQLite 数据库路径 |
 | `--schema-dir` | 由 `--db` 推导(`<db目录>/../schema/proxy`) | 迁移文件目录 |
 | `--port` | `8800` | 监听端口 |
-| `--host` | `0.0.0.0` | 绑定地址 |
+| `--host` | `127.0.0.1` | 绑定地址(默认仅本机可访问) |
 | `--log-level` | `info` | 日志级别(debug/info/warn/error) |
 | `--help` | — | 显示帮助 |
 
@@ -132,4 +143,5 @@
 | 参数 | 必填 | 说明 |
 |------|------|------|
 | `--port` | 是 | 监听端口 |
+| `--host` | 否 | 绑定地址,默认 `127.0.0.1`(仅本机可访问) |
 | `--proxy-db` | 否 | 传入 `data/proxy.db` 时启用代理管理功能与云端配置拉取 |

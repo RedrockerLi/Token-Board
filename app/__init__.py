@@ -4,7 +4,7 @@ from pathlib import Path
 
 from flask import Flask
 
-from app.data_loader import DataStore
+from app.services.data_loader import DataStore
 
 
 def create_app(proxy_db_path: str | None = None):
@@ -28,13 +28,13 @@ def create_app(proxy_db_path: str | None = None):
     )
     flask_app.config["DATA_STORE"] = DataStore(root / "data")
 
-    from app.routes import bp  # noqa: E402
+    from app.routes.routes import bp  # noqa: E402
     flask_app.register_blueprint(bp)
 
     # ── Proxy management (optional) ──
     if proxy_db_path:
-        from app.proxy_db import ProxyDatabase  # noqa: E402
-        from app.proxy_routes import bp_proxy  # noqa: E402
+        from app.db.proxy_db import ProxyDatabase  # noqa: E402
+        from app.routes.proxy_routes import bp_proxy  # noqa: E402
 
         pdb = ProxyDatabase(proxy_db_path)
         flask_app.config["PROXY_DB"] = pdb
@@ -42,7 +42,7 @@ def create_app(proxy_db_path: str | None = None):
         print(f" * Proxy management enabled (DB: {proxy_db_path})")
 
         # Pull latest config from cloud on startup
-        from app.sync import sync_config_download  # noqa: E402
+        from app.services.sync import sync_config_download  # noqa: E402
         try:
             if sync_config_download(proxy_db_path):
                 print(" * Config synced from cloud")
@@ -54,7 +54,7 @@ def create_app(proxy_db_path: str | None = None):
         # name-keyed buckets to account_id. Runs before the DataStore loads
         # (server.py calls .load() after create_app), so names display right.
         try:
-            from app.dashboard_db import reconcile_accounts  # noqa: E402
+            from app.db.dashboard_db import reconcile_accounts  # noqa: E402
             dash_db_path = str(Path(proxy_db_path).parent / "dashboard.db")
             reconcile_accounts(dash_db_path, proxy_db_path)
         except Exception:
@@ -64,7 +64,7 @@ def create_app(proxy_db_path: str | None = None):
         # path): pre-warm today's USD→CNY rate, then start the Codex session
         # importer which scans ~/.codex/sessions every 60 s.
         try:
-            from app import fx  # noqa: E402
+            from app.services import fx  # noqa: E402
             def _fx_prewarm():
                 try:
                     conn = pdb._connect()
@@ -81,7 +81,7 @@ def create_app(proxy_db_path: str | None = None):
             pass
 
         try:
-            from app.codex_import import run_import  # noqa: E402
+            from app.services.codex_import import run_import  # noqa: E402
             import threading
             stop_event = threading.Event()
             flask_app.config["CODEX_IMPORT_STOP"] = stop_event

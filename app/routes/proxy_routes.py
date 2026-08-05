@@ -466,7 +466,7 @@ def export_data():
     Full pipeline: pull remote dashboard → export local → push back.
     """
     import os as _os
-    from app.sync import sync_dashboard
+    from app.services.sync import sync_dashboard
 
     db_path = current_app.config["PROXY_DB"].db_path
     dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
@@ -484,7 +484,7 @@ def export_data():
 
 @bp_proxy.route("/sync/config", methods=["GET"])
 def get_sync_config():
-    from app.sync import load_sync_config
+    from app.services.sync import load_sync_config
 
     db_path = current_app.config["PROXY_DB"].db_path
     cfg = load_sync_config(db_path)
@@ -501,7 +501,7 @@ def get_sync_config():
 
 @bp_proxy.route("/sync/config", methods=["PUT"])
 def save_sync_config():
-    from app.sync import SyncConfig, save_sync_config as save_cfg
+    from app.services.sync import SyncConfig, save_sync_config as save_cfg
 
     data = request.get_json(force=True)
     if not data.get("base_url") or not data.get("username"):
@@ -515,7 +515,7 @@ def save_sync_config():
 
     # If password is masked placeholder, preserve the existing one
     if data.get("password", "").startswith("••••"):
-        from app.sync import load_sync_config
+        from app.services.sync import load_sync_config
         existing = load_sync_config(db_path)
         password = existing.password if existing else ""
     else:
@@ -533,7 +533,7 @@ def save_sync_config():
 
 @bp_proxy.route("/sync/test", methods=["POST"])
 def test_sync_connection():
-    from app.sync import SyncConfig, _webdav_test
+    from app.services.sync import SyncConfig, _webdav_test
 
     data = request.get_json(force=True)
     db_path = current_app.config["PROXY_DB"].db_path
@@ -545,7 +545,7 @@ def test_sync_connection():
     password = data.get("password", "")
 
     if password.startswith("••••"):
-        from app.sync import load_sync_config
+        from app.services.sync import load_sync_config
         existing = load_sync_config(db_path)
         password = existing.password if existing else ""
 
@@ -568,7 +568,7 @@ def upload_config():
     Never uploads upstream API keys or the WebDAV credentials. Refuses
     (conflict) if the cloud moved past this machine's last sync.
     """
-    from app.sync import sync_config_upload
+    from app.services.sync import sync_config_upload
 
     db_path = current_app.config["PROXY_DB"].db_path
     result = sync_config_upload(db_path)
@@ -582,7 +582,7 @@ def discard_config():
     Called when the user chooses "丢弃设置" after a failed upload — local
     edits are reverted (including per-machine upstream keys) without network.
     """
-    from app.sync import restore_config_snapshot
+    from app.services.sync import restore_config_snapshot
 
     db_path = current_app.config["PROXY_DB"].db_path
     if not restore_config_snapshot(db_path):

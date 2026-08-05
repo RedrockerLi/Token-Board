@@ -4,9 +4,10 @@ from collections import defaultdict
 
 from flask import Blueprint, current_app, jsonify, render_template, request
 
-from app.cost_allocator import (compute_proportional_cost,
-                                compute_proportional_cost_by_model)
-from app.data_loader import safe_float
+from app.services.cost_allocator import (compute_proportional_cost,
+                                         compute_proportional_cost_by_model,
+                                         compute_proportional_cost_by_month,
+                                         compute_proportional_cost_by_day)
 
 
 bp = Blueprint("dashboard", __name__)
@@ -29,7 +30,7 @@ def index():
 
 @bp.route("/api/refresh")
 def api_refresh():
-    """Re-scan the data directory for new/modified CSV files."""
+    """Rebuild the in-memory store from the dashboard archive."""
     _store().load()
     return jsonify({
         "status": "ok",
@@ -55,14 +56,14 @@ def api_models():
     """
     model_map: dict[str, dict] = {}
     for tu in _store().token_usages:
-        if tu.model not in model_map:
-            model_map[tu.model] = {"platform": tu.platform}
+        if tu["model"] not in model_map:
+            model_map[tu["model"]] = {"platform": tu["platform"]}
     for ru in _store().request_usages:
-        if ru.model not in model_map:
-            model_map[ru.model] = {"platform": ru.platform}
+        if ru["model"] not in model_map:
+            model_map[ru["model"]] = {"platform": ru["platform"]}
     for ce in _store().cost_entries:
-        if ce.model not in model_map:
-            model_map[ce.model] = {"platform": ce.platform}
+        if ce["model"] not in model_map:
+            model_map[ce["model"]] = {"platform": ce["platform"]}
     return jsonify(model_map)
 
 
@@ -84,28 +85,28 @@ def api_summary():
     })
 
     for tu in _store().token_usages:
-        if api_key_name and tu.api_key_name != api_key_name:
+        if api_key_name and tu["api_key_name"] != api_key_name:
             continue
-        if platform_filter and tu.platform != platform_filter:
+        if platform_filter and tu["platform"] != platform_filter:
             continue
-        if tu.token_type == "output":
-            total_output += tu.amount
-            model_tokens[tu.model]["output"] += tu.amount
-        elif tu.token_type == "input_cache_hit":
-            total_input_hit += tu.amount
-            model_tokens[tu.model]["input_hit"] += tu.amount
-        elif tu.token_type == "input_cache_miss":
-            total_input_miss += tu.amount
-            model_tokens[tu.model]["input_miss"] += tu.amount
+        if tu["token_type"] == "output":
+            total_output += tu["amount"]
+            model_tokens[tu["model"]]["output"] += tu["amount"]
+        elif tu["token_type"] == "input_cache_hit":
+            total_input_hit += tu["amount"]
+            model_tokens[tu["model"]]["input_hit"] += tu["amount"]
+        elif tu["token_type"] == "input_cache_miss":
+            total_input_miss += tu["amount"]
+            model_tokens[tu["model"]]["input_miss"] += tu["amount"]
 
     total_requests = 0
     for ru in _store().request_usages:
-        if api_key_name and ru.api_key_name != api_key_name:
+        if api_key_name and ru["api_key_name"] != api_key_name:
             continue
-        if platform_filter and ru.platform != platform_filter:
+        if platform_filter and ru["platform"] != platform_filter:
             continue
-        total_requests += ru.count
-        model_tokens[ru.model]["requests"] += ru.count
+        total_requests += ru["count"]
+        model_tokens[ru["model"]]["requests"] += ru["count"]
 
     total_tokens = total_output + total_input_hit + total_input_miss
 
@@ -121,7 +122,7 @@ def api_summary():
     }
 
     def _non_plan(ces):
-        return [ce for ce in ces if ce.cost_group_key not in plan_account_names]
+        return [ce for ce in ces if ce["cost_group_key"] not in plan_account_names]
 
     if api_key_name:
         total_cost = compute_proportional_cost(
@@ -134,10 +135,10 @@ def api_summary():
         total_cost = 0.0
         model_cost: dict[str, float] = defaultdict(float)
         for ce in _non_plan(_store().cost_entries):
-            if platform_filter and ce.platform != platform_filter:
+            if platform_filter and ce["platform"] != platform_filter:
                 continue
-            total_cost += ce.cost
-            model_cost[ce.model] += ce.cost
+            total_cost += ce["cost"]
+            model_cost[ce["model"]] += ce["cost"]
         total_cost = round(total_cost, 4)
 
     # Plan economics (proxy-exported data). When a specific user is selected,
@@ -208,71 +209,55 @@ def api_monthly():
                                           "input_miss": 0, "requests": 0}),
     })
     for tu in _store().token_usages:
-        if api_key_name and tu.api_key_name != api_key_name:
+        if api_key_name and tu["api_key_name"] != api_key_name:
             continue
-        if model_filter and tu.model != model_filter:
+        if model_filter and tu["model"] != model_filter:
             continue
-        if platform_filter and tu.platform != platform_filter:
+        if platform_filter and tu["platform"] != platform_filter:
             continue
-        key = (tu._year, tu._month)
-        if tu.token_type == "output":
-            monthly_amount[key]["output_tokens"] += tu.amount
-            monthly_amount[key]["by_model"][tu.model]["output"] += tu.amount
-        elif tu.token_type == "input_cache_hit":
-            monthly_amount[key]["input_cache_hit"] += tu.amount
-            monthly_amount[key]["by_model"][tu.model]["input_hit"] += tu.amount
-        elif tu.token_type == "input_cache_miss":
-            monthly_amount[key]["input_cache_miss"] += tu.amount
-            monthly_amount[key]["by_model"][tu.model]["input_miss"] += tu.amount
+        key = (tu["_year"], tu["_month"])
+        if tu["token_type"] == "output":
+            monthly_amount[key]["output_tokens"] += tu["amount"]
+            monthly_amount[key]["by_model"][tu["model"]]["output"] += tu["amount"]
+        elif tu["token_type"] == "input_cache_hit":
+            monthly_amount[key]["input_cache_hit"] += tu["amount"]
+            monthly_amount[key]["by_model"][tu["model"]]["input_hit"] += tu["amount"]
+        elif tu["token_type"] == "input_cache_miss":
+            monthly_amount[key]["input_cache_miss"] += tu["amount"]
+            monthly_amount[key]["by_model"][tu["model"]]["input_miss"] += tu["amount"]
 
     for ru in _store().request_usages:
-        if api_key_name and ru.api_key_name != api_key_name:
+        if api_key_name and ru["api_key_name"] != api_key_name:
             continue
-        if model_filter and ru.model != model_filter:
+        if model_filter and ru["model"] != model_filter:
             continue
-        if platform_filter and ru.platform != platform_filter:
+        if platform_filter and ru["platform"] != platform_filter:
             continue
-        key = (ru._year, ru._month)
-        monthly_amount[key]["requests"] += ru.count
-        monthly_amount[key]["by_model"][ru.model]["requests"] += ru.count
+        key = (ru["_year"], ru["_month"])
+        monthly_amount[key]["requests"] += ru["count"]
+        monthly_amount[key]["by_model"][ru["model"]]["requests"] += ru["count"]
 
     # Aggregate cost entries by month + model
     if api_key_name:
-        # Proportional cost allocation — compute shares from ALL token_usages
-        all_tokens = _store().token_usages
-        group_tokens = defaultdict(lambda: defaultdict(int))
-        for tu in all_tokens:
-            gk = (tu.cost_group_key, tu.date, tu.model)
-            group_tokens[gk][tu.api_key_name] += tu.amount
-
-        share = {}
-        for gk, kt in group_tokens.items():
-            total = sum(kt.values())
-            selected = kt.get(api_key_name, 0)
-            share[gk] = selected / total if total > 0 else 0.0
-
-        monthly_cost = defaultdict(float)
-        monthly_cost_by_model = defaultdict(lambda: defaultdict(float))
-        for ce in _store().cost_entries:
-            if model_filter and ce.model != model_filter:
-                continue
-            if platform_filter and ce.platform != platform_filter:
-                continue
-            key = (ce._year, ce._month)
-            fraction = share.get((ce.cost_group_key, ce.date, ce.model), 0.0)
-            monthly_cost[key] += ce.cost * fraction
-            monthly_cost_by_model[key][ce.model] += ce.cost * fraction
+        # Proportional cost allocation — shares from ALL token_usages
+        monthly_cost, monthly_cost_by_model = compute_proportional_cost_by_month(
+            _store().token_usages,
+            [ce for ce in _store().cost_entries
+             if (not model_filter or ce["model"] == model_filter)
+             and (not platform_filter or ce["platform"] == platform_filter)],
+            api_key_name,
+        )
     else:
         monthly_cost = defaultdict(float)
         monthly_cost_by_model = defaultdict(lambda: defaultdict(float))
         for ce in _store().cost_entries:
-            if model_filter and ce.model != model_filter:
+            if model_filter and ce["model"] != model_filter:
                 continue
-            if platform_filter and ce.platform != platform_filter:
+            if platform_filter and ce["platform"] != platform_filter:
                 continue
-            key = (ce._year, ce._month)
-            monthly_cost[key] += ce.cost
-            monthly_cost_by_model[key][ce.model] += ce.cost
+            key = (ce["_year"], ce["_month"])
+            monthly_cost[key] += ce["cost"]
+            monthly_cost_by_model[key][ce["model"]] += ce["cost"]
 
     result = []
     for m in _store().available_months:
@@ -331,81 +316,66 @@ def api_daily():
     })
 
     for tu in _store().token_usages:
-        if tu._year != year or tu._month != month:
+        if tu["_year"] != year or tu["_month"] != month:
             continue
-        if api_key_name and tu.api_key_name != api_key_name:
+        if api_key_name and tu["api_key_name"] != api_key_name:
             continue
-        if model_filter and tu.model != model_filter:
+        if model_filter and tu["model"] != model_filter:
             continue
-        if platform_filter and tu.platform != platform_filter:
+        if platform_filter and tu["platform"] != platform_filter:
             continue
-        day = tu.date
-        if tu.token_type == "output":
-            daily_tokens[day]["output_tokens"] += tu.amount
-            daily_tokens[day]["by_model"][tu.model]["output"] += tu.amount
-        elif tu.token_type == "input_cache_hit":
-            daily_tokens[day]["input_cache_hit"] += tu.amount
-            daily_tokens[day]["by_model"][tu.model]["input_hit"] += tu.amount
-        elif tu.token_type == "input_cache_miss":
-            daily_tokens[day]["input_cache_miss"] += tu.amount
-            daily_tokens[day]["by_model"][tu.model]["input_miss"] += tu.amount
+        day = tu["date"]
+        if tu["token_type"] == "output":
+            daily_tokens[day]["output_tokens"] += tu["amount"]
+            daily_tokens[day]["by_model"][tu["model"]]["output"] += tu["amount"]
+        elif tu["token_type"] == "input_cache_hit":
+            daily_tokens[day]["input_cache_hit"] += tu["amount"]
+            daily_tokens[day]["by_model"][tu["model"]]["input_hit"] += tu["amount"]
+        elif tu["token_type"] == "input_cache_miss":
+            daily_tokens[day]["input_cache_miss"] += tu["amount"]
+            daily_tokens[day]["by_model"][tu["model"]]["input_miss"] += tu["amount"]
 
     for ru in _store().request_usages:
-        if ru._year != year or ru._month != month:
+        if ru["_year"] != year or ru["_month"] != month:
             continue
-        if api_key_name and ru.api_key_name != api_key_name:
+        if api_key_name and ru["api_key_name"] != api_key_name:
             continue
-        if model_filter and ru.model != model_filter:
+        if model_filter and ru["model"] != model_filter:
             continue
-        if platform_filter and ru.platform != platform_filter:
+        if platform_filter and ru["platform"] != platform_filter:
             continue
-        day = ru.date
-        daily_tokens[day]["requests"] += ru.count
-        daily_tokens[day]["by_model"][ru.model]["requests"] += ru.count
+        day = ru["date"]
+        daily_tokens[day]["requests"] += ru["count"]
+        daily_tokens[day]["by_model"][ru["model"]]["requests"] += ru["count"]
 
     # Daily cost aggregation
     if api_key_name:
-        # Proportional cost allocation for the selected month
+        # Proportional cost allocation for the selected month — shares from
+        # that month's tokens only
         month_tokens = [tu for tu in _store().token_usages
-                        if tu._year == year and tu._month == month]
+                        if tu["_year"] == year and tu["_month"] == month]
         month_costs = [ce for ce in _store().cost_entries
-                       if ce._year == year and ce._month == month]
-
-        group_tokens = defaultdict(lambda: defaultdict(int))
-        for tu in month_tokens:
-            gk = (tu.cost_group_key, tu.date, tu.model)
-            group_tokens[gk][tu.api_key_name] += tu.amount
-
-        share = {}
-        for gk, kt in group_tokens.items():
-            total = sum(kt.values())
-            selected = kt.get(api_key_name, 0)
-            share[gk] = selected / total if total > 0 else 0.0
-
-        daily_cost = defaultdict(float)
-        daily_cost_by_model = defaultdict(lambda: defaultdict(float))
-        for ce in month_costs:
-            if model_filter and ce.model != model_filter:
-                continue
-            if platform_filter and ce.platform != platform_filter:
-                continue
-            day = ce.date
-            fraction = share.get((ce.cost_group_key, ce.date, ce.model), 0.0)
-            daily_cost[day] += ce.cost * fraction
-            daily_cost_by_model[day][ce.model] += ce.cost * fraction
+                       if ce["_year"] == year and ce["_month"] == month]
+        daily_cost, daily_cost_by_model = compute_proportional_cost_by_day(
+            month_tokens,
+            [ce for ce in month_costs
+             if (not model_filter or ce["model"] == model_filter)
+             and (not platform_filter or ce["platform"] == platform_filter)],
+            api_key_name,
+        )
     else:
         daily_cost = defaultdict(float)
         daily_cost_by_model = defaultdict(lambda: defaultdict(float))
         for ce in _store().cost_entries:
-            if ce._year != year or ce._month != month:
+            if ce["_year"] != year or ce["_month"] != month:
                 continue
-            if model_filter and ce.model != model_filter:
+            if model_filter and ce["model"] != model_filter:
                 continue
-            if platform_filter and ce.platform != platform_filter:
+            if platform_filter and ce["platform"] != platform_filter:
                 continue
-            day = ce.date
-            daily_cost[day] += ce.cost
-            daily_cost_by_model[day][ce.model] += ce.cost
+            day = ce["date"]
+            daily_cost[day] += ce["cost"]
+            daily_cost_by_model[day][ce["model"]] += ce["cost"]
 
     # Build sorted daily result
     sorted_days = sorted(set(daily_tokens.keys()) | set(daily_cost.keys()))
@@ -454,14 +424,14 @@ def api_token_types():
     total_input_miss = 0
 
     for tu in _store().token_usages:
-        if api_key_name and tu.api_key_name != api_key_name:
+        if api_key_name and tu["api_key_name"] != api_key_name:
             continue
-        if tu.token_type == "output":
-            total_output += tu.amount
-        elif tu.token_type == "input_cache_hit":
-            total_input_hit += tu.amount
-        elif tu.token_type == "input_cache_miss":
-            total_input_miss += tu.amount
+        if tu["token_type"] == "output":
+            total_output += tu["amount"]
+        elif tu["token_type"] == "input_cache_hit":
+            total_input_hit += tu["amount"]
+        elif tu["token_type"] == "input_cache_miss":
+            total_input_miss += tu["amount"]
 
     return jsonify([
         {"name": "输出Token", "value": total_output},
@@ -485,27 +455,27 @@ def api_model_breakdown():
     })
 
     for tu in _store().token_usages:
-        if year and tu._year != year:
+        if year and tu["_year"] != year:
             continue
-        if month and tu._month != month:
+        if month and tu["_month"] != month:
             continue
-        if api_key_name and tu.api_key_name != api_key_name:
+        if api_key_name and tu["api_key_name"] != api_key_name:
             continue
-        if tu.token_type == "output":
-            model_tokens[tu.model]["output"] += tu.amount
-        elif tu.token_type == "input_cache_hit":
-            model_tokens[tu.model]["input_hit"] += tu.amount
-        elif tu.token_type == "input_cache_miss":
-            model_tokens[tu.model]["input_miss"] += tu.amount
+        if tu["token_type"] == "output":
+            model_tokens[tu["model"]]["output"] += tu["amount"]
+        elif tu["token_type"] == "input_cache_hit":
+            model_tokens[tu["model"]]["input_hit"] += tu["amount"]
+        elif tu["token_type"] == "input_cache_miss":
+            model_tokens[tu["model"]]["input_miss"] += tu["amount"]
 
     for ru in _store().request_usages:
-        if year and ru._year != year:
+        if year and ru["_year"] != year:
             continue
-        if month and ru._month != month:
+        if month and ru["_month"] != month:
             continue
-        if api_key_name and ru.api_key_name != api_key_name:
+        if api_key_name and ru["api_key_name"] != api_key_name:
             continue
-        model_tokens[ru.model]["requests"] += ru.count
+        model_tokens[ru["model"]]["requests"] += ru["count"]
 
     if api_key_name:
         model_cost = compute_proportional_cost_by_model(
@@ -514,11 +484,11 @@ def api_model_breakdown():
     else:
         model_cost = defaultdict(float)
         for ce in _store().cost_entries:
-            if year and ce._year != year:
+            if year and ce["_year"] != year:
                 continue
-            if month and ce._month != month:
+            if month and ce["_month"] != month:
                 continue
-            model_cost[ce.model] += ce.cost
+            model_cost[ce["model"]] += ce["cost"]
 
     result = {}
     all_models = set(model_tokens.keys()) | set(model_cost.keys())
@@ -550,18 +520,18 @@ def api_token_types_by_month():
     total_input_miss = 0
 
     for tu in _store().token_usages:
-        if year and tu._year != year:
+        if year and tu["_year"] != year:
             continue
-        if month and tu._month != month:
+        if month and tu["_month"] != month:
             continue
-        if api_key_name and tu.api_key_name != api_key_name:
+        if api_key_name and tu["api_key_name"] != api_key_name:
             continue
-        if tu.token_type == "output":
-            total_output += tu.amount
-        elif tu.token_type == "input_cache_hit":
-            total_input_hit += tu.amount
-        elif tu.token_type == "input_cache_miss":
-            total_input_miss += tu.amount
+        if tu["token_type"] == "output":
+            total_output += tu["amount"]
+        elif tu["token_type"] == "input_cache_hit":
+            total_input_hit += tu["amount"]
+        elif tu["token_type"] == "input_cache_miss":
+            total_input_miss += tu["amount"]
 
     return jsonify([
         {"name": "输出Token", "value": total_output},

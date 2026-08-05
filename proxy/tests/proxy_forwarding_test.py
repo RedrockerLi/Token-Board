@@ -112,7 +112,7 @@ def main() -> None:
     schema_dir = Path(sys.argv[2]).resolve()
     project_root = Path(sys.argv[3]).resolve()
     sys.path.insert(0, str(project_root))
-    from app.migrations import migrate
+    from app.db.migrations import migrate
 
     upstream_port = free_port()
     upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), FakeUpstream)

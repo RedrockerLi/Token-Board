@@ -4,10 +4,6 @@ Stores daily-aggregated usage records with indexes for fast queries.
 """
 
 import sqlite3
-from collections import defaultdict
-
-from app.data_loader import safe_float, safe_int
-from app.ir import CostEntry, RequestUsage, TokenUsage
 
 
 # Model display order — lower number = first.  Models not listed default to 99.
@@ -28,7 +24,7 @@ class DashboardDatabase:
         # apply once at construction. Fails fast (caller aborts) on error.
         # schema_dir may be passed explicitly when db_path is a shadow/temp
         # copy outside the standard data/ layout (schema_dir_for would mis-derive).
-        from app.migrations import migrate, schema_dir_for
+        from app.db.migrations import migrate, schema_dir_for
         migrate(self.db_path, schema_dir or schema_dir_for(self.db_path, "dashboard"))
 
     def _connect(self) -> sqlite3.Connection:
@@ -186,14 +182,14 @@ class DashboardDatabase:
         finally:
             conn.close()
 
-    # ── Load to IR lists ──────────────────────────────────────────────
+    # ── Load rows ─────────────────────────────────────────────────────
 
-    def load_to_ir(self):
+    def load_rows(self):
         conn = self._connect()
         try:
-            token_usages: list[TokenUsage] = []
-            request_usages: list[RequestUsage] = []
-            cost_entries: list[CostEntry] = []
+            token_usages: list[dict] = []
+            request_usages: list[dict] = []
+            cost_entries: list[dict] = []
             plan_summary: list[dict] = []
             months_set: set[tuple[int, int]] = set()
             api_key_names_set: set[str] = set()
@@ -216,17 +212,17 @@ class DashboardDatabase:
                 if y == 0:
                     continue
                 name = row["_display_name"]
-                tu = TokenUsage(
-                    platform="",
-                    date=date,
-                    model=row["model"],
-                    api_key_name=name,
-                    token_type=row["token_type"],
-                    amount=row["amount"],
-                    cost_group_key=name,
-                )
-                tu._year = y
-                tu._month = m
+                tu = {
+                    "platform": "",
+                    "date": date,
+                    "model": row["model"],
+                    "api_key_name": name,
+                    "token_type": row["token_type"],
+                    "amount": row["amount"],
+                    "cost_group_key": name,
+                    "_year": y,
+                    "_month": m,
+                }
                 token_usages.append(tu)
                 months_set.add((y, m))
                 api_key_names_set.add(name)
@@ -243,15 +239,15 @@ class DashboardDatabase:
                 if y == 0:
                     continue
                 name = row["_display_name"]
-                ru = RequestUsage(
-                    platform="",
-                    date=date,
-                    model=row["model"],
-                    api_key_name=name,
-                    count=row["count"],
-                )
-                ru._year = y
-                ru._month = m
+                ru = {
+                    "platform": "",
+                    "date": date,
+                    "model": row["model"],
+                    "api_key_name": name,
+                    "count": row["count"],
+                    "_year": y,
+                    "_month": m,
+                }
                 request_usages.append(ru)
                 months_set.add((y, m))
                 api_key_names_set.add(name)
@@ -268,15 +264,15 @@ class DashboardDatabase:
                 if y == 0:
                     continue
                 name = row["_display_name"]
-                ce = CostEntry(
-                    platform="",
-                    date=date,
-                    model=row["model"],
-                    cost=row["cost"],
-                    cost_group_key=name,
-                )
-                ce._year = y
-                ce._month = m
+                ce = {
+                    "platform": "",
+                    "date": date,
+                    "model": row["model"],
+                    "cost": row["cost"],
+                    "cost_group_key": name,
+                    "_year": y,
+                    "_month": m,
+                }
                 cost_entries.append(ce)
                 months_set.add((y, m))
                 models_set.add(row["model"])
