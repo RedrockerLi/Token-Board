@@ -60,7 +60,9 @@ public:
         std::string endpoint_path;   // "" = derive from api_format
         std::string auth_header;     // "bearer" | "x-api-key"
         bool is_aggregate = false;   // aggregate account (routes by model)
-        std::string account_type;    // "api" | "plan"
+        std::string account_type;    // spec identity: "api" | "plan" | "agent"
+                                     // (semantics in app/domain/account_types.py
+                                     // + proxy/src/core/account_types.h)
         double monthly_price = 0;    // plan monthly price
         int max_concurrency = 0;     // 0 = unlimited
         bool deleted = false;        // soft-deleted with a PAST deleted_at

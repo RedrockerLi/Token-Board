@@ -16,6 +16,18 @@ import urllib.request
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 
+from app.domain.account_types import (
+    ACCOUNT_TYPES,
+    deletion_policy,
+    holds_keys as type_holds_keys,
+    import_types,
+    is_routable,
+    is_subscription,
+    spec,
+    sql_in,
+    subscription_types,
+    usage_billed_types,
+)
 from app.services.fx import ensure_rate as _fx_ensure_rate, rate_for_month as _fx_rate_for_month
 
 
@@ -102,7 +114,7 @@ def _cancellation_end(config: sqlite3.Row, now: datetime, anchor_day: int,
     """`deleted_at` a plan/agent key or account should receive on cancellation.
 
     api accounts are always terminated immediately (no subscription lifecycle).
-    For plan/agent the configured default deletion operation decides:
+    For subscription types the configured default deletion operation decides:
       'immediate'     → deleted_at = now (本期计费, 立即停止路由).
       'end_of_period' → deleted_at = end of the current billing period
                         (本期计费, 下期不计费); the entity keeps routing until
@@ -110,7 +122,7 @@ def _cancellation_end(config: sqlite3.Row, now: datetime, anchor_day: int,
     `_billing_period_month(end, anchor_day)` must still equal the current
     period, hence the -1s before the next period's start.
     """
-    if account_type == "api" or config["cancellation_mode"] == "immediate":
+    if deletion_policy(account_type) == "immediate" or config["cancellation_mode"] == "immediate":
         return now
     current = _billing_period_month(now, anchor_day)
     return _period_start(_next_month(current), anchor_day) - timedelta(seconds=1)
@@ -139,11 +151,12 @@ class ProxyDatabase:
     def get_stats(self) -> dict:
         """Proxy billing overview — 30-day rolling window.
 
-        total_cost (real) = api accounts' billed usage in the last 30 days
-        (SUM(api_cost) where account_type='api'; plan carries virtual only in
-        api_cost) + current month's plan subscription fees. Plan subscription
-        = monthly_price × key count per plan account used this month. Past
-        months' fees live frozen in the archive and are NOT recomputed here.
+        total_cost (real) = usage-billed accounts' billed usage in the last 30
+        days (SUM(api_cost) where account_type is a usage-billed type;
+        subscription accounts carry virtual only in api_cost) + current month's
+        subscription fees. Plan subscription = monthly_price × key count per
+        plan account used this month. Past months' fees live frozen in the
+        archive and are NOT recomputed here.
         today_cost (theoretical) = SUM(api_cost) today (api bill + plan's
         api-equivalent amount the plan covered).
         """
@@ -161,14 +174,15 @@ class ProxyDatabase:
                 (today,),
             ).fetchone()[0]
 
-            # Real billed usage: api accounts only (plan accounts' api_cost is
-            # their virtual/theoretical bill — never counted as real, which
-            # would double-count their subscription).
+            # Real billed usage: usage-billed accounts only (subscription
+            # accounts' api_cost is their virtual/theoretical bill — never
+            # counted as real, which would double-count their subscription).
             total_cost = conn.execute(
-                "SELECT COALESCE(SUM(r.api_cost), 0) FROM request_log r "
+                f"SELECT COALESCE(SUM(r.api_cost), 0) FROM request_log r "
                 "JOIN upstream_accounts a ON a.id = r.account_id "
-                "WHERE COALESCE(a.account_type, 'api') = 'api' "
-                "  AND r.requested_at >= datetime('now', '-30 days')"
+                f"WHERE COALESCE(a.account_type, 'api') IN ({sql_in(usage_billed_types())}) "
+                "  AND r.requested_at >= datetime('now', '-30 days')",
+                usage_billed_types(),
             ).fetchone()[0]
 
             # Current plan/agent subscriptions are independent of usage.  Use the
@@ -327,11 +341,11 @@ class ProxyDatabase:
         retain its first active fallback key.  This function is called inside
         the same transaction that updates the cloud-safe metadata mirror.
 
-        Removed keys get `deleted_at` per the account type and the plan-billing
-        default operation (see _cancellation_end): api keys stop immediately;
-        plan keys either stop now ('immediate') or at the end of their current
-        billing period ('end_of_period').  An end-of-period key keeps routing
-        until then, so the "active" set includes future-deleted keys.
+        Removed keys get `deleted_at` per the account type's deletion policy
+        (see _cancellation_end): usage-billed keys stop immediately;
+        subscription keys either stop now ('immediate') or at the end of their
+        current billing period ('end_of_period').  An end-of-period key keeps
+        routing until then, so the "active" set includes future-deleted keys.
         """
         keep_valid_froms = keep_valid_froms or {}
         new_valid_froms = new_valid_froms or []
@@ -388,13 +402,14 @@ class ProxyDatabase:
 
     def create_account(self, data: dict) -> int:
         account_type = data.get("account_type", "api")
-        if account_type not in ("api", "plan", "agent"):
-            raise ValueError("账户类型必须是 api / plan / agent")
+        if account_type not in ACCOUNT_TYPES:
+            raise ValueError("账户类型必须是 " + " / ".join(ACCOUNT_TYPES))
         currency = data.get("currency", "CNY")
         if currency not in ("CNY", "USD"):
             raise ValueError("币种必须是 CNY / USD")
         keys = self._normalize_keys(data)
         first = keys[0] if keys else ""
+        type_spec = spec(account_type)
         conn = self._connect()
         try:
             cursor = conn.execute(
@@ -416,20 +431,20 @@ class ProxyDatabase:
                 ),
             )
             account_id = cursor.lastrowid
-            if account_type == "agent" and data.get("agent_kind"):
+            if type_spec.usage_source == "import" and data.get("agent_kind"):
                 conn.execute(
                     "UPDATE upstream_accounts SET agent_kind=? WHERE id=?",
                     (str(data["agent_kind"]), account_id),
                 )
-            # Agent accounts are subscription-only: never create upstream keys.
-            if keys and account_type != "agent":
+            # Import-driven types are subscription-only: never create keys.
+            if keys and type_spec.holds_keys:
                 self._set_upstream_keys(
                     conn, account_id, [], keys, new_valid_froms=data.get("new_valid_froms"),
                     account_type=account_type,
                 )
-            # Plan/agent accounts are subscription-billed: seed the baseline
-            # price history so _subscription_periods has a deterministic value.
-            if account_type in ("plan", "agent"):
+            # Subscription-billed types seed the baseline price history so
+            # _subscription_periods has a deterministic value.
+            if is_subscription(account_type):
                 conn.execute(
                     "INSERT INTO plan_price_history "
                     "(account_id,monthly_price,changed_at,effective_mode) VALUES (?,?,?,?)",
@@ -466,6 +481,10 @@ class ProxyDatabase:
                     val = data[key]
                     if val not in ("CNY", "USD"):
                         raise ValueError("币种必须是 CNY / USD")
+                elif key == "account_type":
+                    val = data[key]
+                    if val not in ACCOUNT_TYPES:
+                        raise ValueError("账户类型必须是 " + " / ".join(ACCOUNT_TYPES))
                 else:
                     val = data[key]
                 fields.append(f"{key} = ?")
@@ -474,10 +493,10 @@ class ProxyDatabase:
             # Keys are only touched when the client explicitly edited them
             # (keys_edited=true) or sent a legacy non-empty `upstream_key`;
             # otherwise the existing key set is preserved (e.g. a rename-only
-            # edit must never wipe the keys).  Agent accounts never carry
-            # upstream keys, so key replacement is ignored for them.
+            # edit must never wipe the keys).  Types that don't hold upstream
+            # keys (e.g. agent) never get key replacement.
             replace_keys = (bool(data.get("keys_edited")) or bool(data.get("upstream_key"))) \
-                and original["account_type"] != "agent"
+                and type_holds_keys(original["account_type"])
             if replace_keys:
                 # Replace semantics: the final key set = kept existing keys (by
                 # id — the UI only ever sees masked values, never the real
@@ -503,7 +522,7 @@ class ProxyDatabase:
             )
             final_type = data.get("account_type", original["account_type"])
             final_price = float(data.get("monthly_price", original["monthly_price"]) or 0)
-            if final_type in ("plan", "agent") and (
+            if is_subscription(final_type) and (
                 original["account_type"] != final_type or
                 final_price != float(original["monthly_price"] or 0)
             ):
@@ -540,7 +559,7 @@ class ProxyDatabase:
         aggregate_entries referencing this account are deleted so an aggregate
         chain never routes to a dead account.
 
-        api accounts are always terminated immediately.  plan/agent accounts
+        api accounts are always terminated immediately.  subscription accounts
         follow the configured default deletion operation:
           'immediate'     — deleted_at = now; local keys & aggregates cleaned up
                             right here.
@@ -569,7 +588,8 @@ class ProxyDatabase:
                 "WHERE account_id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
                 (account_id,),
             ).fetchall()
-            end_of_period = account_type != "api" and config["cancellation_mode"] == "end_of_period"
+            end_of_period = deletion_policy(account_type) == "configurable" \
+                and config["cancellation_mode"] == "end_of_period"
 
             if end_of_period:
                 # Keep routing until the period end; defer the local-key and
@@ -806,10 +826,11 @@ class ProxyDatabase:
 
     @staticmethod
     def _assert_routable_account(conn: sqlite3.Connection, account_id):
-        """Reject binding a local key to an agent account.
+        """Reject binding a local key to a non-routable account.
 
-        Agent accounts are subscription-only (Codex etc.): they must never be
-        used as a routable upstream, so no local key may point at one.
+        Non-routable types (e.g. agent / Codex) are subscription-only: they
+        must never be used as a routable upstream, so no local key may point
+        at one.
         """
         if account_id is None:
             return
@@ -817,7 +838,7 @@ class ProxyDatabase:
             "SELECT COALESCE(account_type,'api') AS account_type FROM upstream_accounts "
             "WHERE id=?", (account_id,)
         ).fetchone()
-        if row is not None and row["account_type"] == "agent":
+        if row is not None and not is_routable(row["account_type"]):
             raise ValueError("Agent 账户不能作为本地密钥的上游")
 
     def create_key(self, data: dict) -> str:
@@ -872,7 +893,11 @@ class ProxyDatabase:
             conn.close()
 
     def get_agent_accounts(self) -> list[dict]:
-        """Agent (subscription-only) accounts, e.g. Codex.  Never routable."""
+        """Agent (subscription-only, import-driven) accounts, e.g. Codex.
+
+        Never routable.  The import-driven type set comes from the spec so a
+        future import-driven type flows through automatically.
+        """
         conn = self._connect()
         try:
             rows = conn.execute(
@@ -880,10 +905,11 @@ class ProxyDatabase:
                 "COALESCE(currency,'CNY') AS currency, "
                 "COALESCE(monthly_price,0) AS monthly_price "
                 "FROM upstream_accounts "
-                "WHERE COALESCE(account_type,'api')='agent' "
+                f"WHERE COALESCE(account_type,'api') IN ({sql_in(import_types())}) "
                 "  AND COALESCE(is_aggregate,0)=0 "
                 "  AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
-                "ORDER BY id"
+                "ORDER BY id",
+                import_types(),
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -1176,7 +1202,8 @@ class ProxyDatabase:
         """
         conn = self._connect()
         try:
-            sql = """
+            usage_billed = sql_in(usage_billed_types())
+            sql = f"""
                 SELECT
                     COALESCE(a.name, 'unknown') AS account_name,
                     r.account_id,
@@ -1190,9 +1217,9 @@ class ProxyDatabase:
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE COALESCE(a.is_aggregate, 0) = 0
-                  AND COALESCE(a.account_type, 'api') = 'api'
+                  AND COALESCE(a.account_type, 'api') IN ({usage_billed})
             """
-            params = []
+            params = list(usage_billed_types())
             if account_id:
                 sql += " AND r.account_id = ?"
                 params.append(account_id)
@@ -1314,7 +1341,8 @@ class ProxyDatabase:
         """Daily billing breakdown for the last *days* days (rolling window)."""
         conn = self._connect()
         try:
-            rows = conn.execute("""
+            usage_billed = sql_in(usage_billed_types())
+            rows = conn.execute(f"""
                 SELECT
                     date(r.requested_at) AS date,
                     COALESCE(a.name, 'unknown') AS account_name,
@@ -1324,11 +1352,11 @@ class ProxyDatabase:
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE COALESCE(a.is_aggregate, 0) = 0
-                  AND COALESCE(a.account_type, 'api') = 'api'
+                  AND COALESCE(a.account_type, 'api') IN ({usage_billed})
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at), r.account_id
                 ORDER BY date, r.account_id
-            """, (str(days),)).fetchall()
+            """, (*usage_billed_types(), str(days))).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
@@ -1337,7 +1365,8 @@ class ProxyDatabase:
         """Daily billing breakdown with input/output token split (for stacked bar chart)."""
         conn = self._connect()
         try:
-            rows = conn.execute("""
+            usage_billed = sql_in(usage_billed_types())
+            rows = conn.execute(f"""
                 SELECT
                     date(r.requested_at) AS date,
                     COALESCE(SUM(r.prompt_tokens), 0) AS input_tokens,
@@ -1349,11 +1378,11 @@ class ProxyDatabase:
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE COALESCE(a.is_aggregate, 0) = 0
-                  AND COALESCE(a.account_type, 'api') = 'api'
+                  AND COALESCE(a.account_type, 'api') IN ({usage_billed})
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at)
                 ORDER BY date
-            """, (str(days),)).fetchall()
+            """, (*usage_billed_types(), str(days))).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
@@ -1382,9 +1411,10 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            rows = conn.execute("""
+            usage_billed = sql_in(usage_billed_types())
+            rows = conn.execute(f"""
                 SELECT COALESCE(a.name, 'unknown') AS account_name,
-                       COALESCE(SUM(CASE WHEN COALESCE(a.account_type, 'api') = 'api'
+                       COALESCE(SUM(CASE WHEN COALESCE(a.account_type, 'api') IN ({usage_billed})
                                          THEN r.api_cost ELSE 0 END), 0) AS real_cost,
                        COALESCE(SUM(r.api_cost), 0) AS theoretical_cost,
                        COALESCE(SUM(r.total_tokens), 0) AS tokens,
@@ -1395,7 +1425,7 @@ class ProxyDatabase:
                   AND date(r.requested_at) = ?
                 GROUP BY r.account_id
                 ORDER BY theoretical_cost DESC
-            """, (today,)).fetchall()
+            """, (*usage_billed_types(), today)).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
@@ -1407,21 +1437,24 @@ class ProxyDatabase:
         """Build billable key lifecycles, including cloud-only masked keys."""
         now = _utc_now()
         by_identity: dict[tuple[int, str], dict] = {}
+        sub_types = subscription_types()
         accounts = conn.execute(
             "SELECT id, upstream_key, created_at, deleted_at, "
             "COALESCE(account_type,'api') AS account_type, "
             "COALESCE(currency,'CNY') AS currency "
             "FROM upstream_accounts "
-            "WHERE COALESCE(account_type,'api') IN ('plan','agent') "
-            "  AND COALESCE(is_aggregate,0)=0"
+            f"WHERE COALESCE(account_type,'api') IN ({sql_in(sub_types)}) "
+            "  AND COALESCE(is_aggregate,0)=0",
+            sub_types,
         ).fetchall()
         account_rows = {row["id"]: row for row in accounts}
         for row in conn.execute(
             "SELECT k.id,k.account_id,k.key_value,k.created_at,k.valid_from,k.deleted_at,"
             "a.deleted_at AS account_deleted_at "
             "FROM upstream_keys k JOIN upstream_accounts a ON a.id=k.account_id "
-            "WHERE COALESCE(a.account_type,'api') IN ('plan','agent') "
-            "  AND COALESCE(a.is_aggregate,0)=0"
+            f"WHERE COALESCE(a.account_type,'api') IN ({sql_in(sub_types)}) "
+            "  AND COALESCE(a.is_aggregate,0)=0",
+            sub_types,
         ):
             anchor = _parse_iso_date(row["valid_from"]) or _parse_utc_timestamp(row["created_at"]).date()
             key_end = _parse_utc_timestamp(row["deleted_at"])
@@ -1465,10 +1498,10 @@ class ProxyDatabase:
                     "key_masked": mask_key(account["upstream_key"]), "anchor": anchor,
                     "end": _parse_utc_timestamp(account["deleted_at"]),
                 }
-        # Agent accounts are subscription-only: no upstream keys exist, so
+        # Per-account subscription types (agent): no upstream keys exist, so
         # synthesize exactly one lifecycle per account, keyed "subscription".
         for account in accounts:
-            if account["account_type"] != "agent":
+            if spec(account["account_type"]).subscription_unit != "per_account":
                 continue
             anchor = _parse_utc_timestamp(account["created_at"]).date()
             by_identity[(account["id"], "subscription")] = {
@@ -1476,7 +1509,7 @@ class ProxyDatabase:
                 "key_masked": "subscription", "anchor": anchor,
                 "end": _parse_utc_timestamp(account["deleted_at"]),
                 "currency": account["currency"] or "CNY",
-                "account_type": "agent",
+                "account_type": account["account_type"],
             }
         for meta in by_identity.values():
             # Attach the account's native currency for FX conversion.
@@ -1600,12 +1633,13 @@ class ProxyDatabase:
                 )
 
             virtual_buckets: dict[tuple[str, int, str], float] = {}
+            sub_types = subscription_types()
             plan_logs = conn.execute(
                 "SELECT r.account_id,r.upstream_key_id,r.requested_at,r.api_cost "
                 "FROM request_log r JOIN upstream_accounts a ON a.id=r.account_id "
-                "WHERE r.id>? AND r.id<=? "
-                "  AND COALESCE(a.account_type,'api') IN ('plan','agent')",
-                (mark, max_id),
+                f"WHERE r.id>? AND r.id<=? "
+                f"  AND COALESCE(a.account_type,'api') IN ({sql_in(sub_types)})",
+                (mark, max_id, *sub_types),
             ).fetchall()
             for log in plan_logs:
                 meta = by_key_id.get(log["upstream_key_id"]) or by_account.get(log["account_id"])

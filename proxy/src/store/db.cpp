@@ -1,5 +1,6 @@
 #include "db.h"
 #include "json.hpp"
+#include "core/account_types.h"
 
 #include <algorithm>
 #include <array>
@@ -353,16 +354,22 @@ bool Database::prepare_statements() {
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
 
-    PREPARE_ON(read_db_, "SELECT k.id, k.key_value, k.account_id, COALESCE(k.label,''), "
+    {
+        // Route filter excludes non-routable account types (see
+        // account_types::routable_filter_sql — built once at startup).
+        std::string route_sql =
+            "SELECT k.id, k.key_value, k.account_id, COALESCE(k.label,''), "
             "a.id, a.name, a.upstream_key, a.base_url, a.api_format, "
             "COALESCE(a.endpoint_path,''), COALESCE(a.auth_header,'bearer'), "
             "COALESCE(a.is_aggregate,0), COALESCE(a.account_type,'api'), "
             "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), "
             "(a.deleted_at IS NOT NULL AND a.deleted_at <= datetime('now')) AS a_deleted "
             "FROM local_keys k JOIN upstream_accounts a ON a.id=k.account_id "
-            "WHERE k.key_value=?1 AND COALESCE(a.account_type,'api') <> 'agent' "
-            "  AND (a.deleted_at IS NULL OR a.deleted_at > datetime('now'))",
-            stmt_lookup_route_);
+            "WHERE k.key_value=?1"
+            + account_types::routable_filter_sql("a.account_type")
+            + " AND (a.deleted_at IS NULL OR a.deleted_at > datetime('now'))";
+        PREPARE_ON(read_db_, route_sql.c_str(), stmt_lookup_route_);
+    }
 
     PREPARE_ON(read_db_, "SELECT id, key_value, position "
             "FROM upstream_keys WHERE account_id = ?1 "
@@ -373,13 +380,14 @@ bool Database::prepare_statements() {
     // A single statement gives the account metadata, aggregate mapping and
     // key set one SQLite snapshot.  In particular, a concurrent config sync
     // cannot produce an old base_url paired with a newly committed key.
-    PREPARE_ON(read_db_,
+    {
+        std::string snapshot_sql =
             "WITH root AS ("
             "  SELECT id, COALESCE(is_aggregate,0) AS is_aggregate "
             "  FROM upstream_accounts WHERE id=?1 "
             "    AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
-            "    AND COALESCE(account_type,'api') <> 'agent'"
-            "), targets(target_id, upstream_model, priority_group, "
+            + account_types::routable_filter_sql("account_type")
+            + "), targets(target_id, upstream_model, priority_group, "
             "          priority_sort, priority_id) AS ("
             "  SELECT r.id, ?2, 0, 0, 0 FROM root r WHERE r.is_aggregate=0 "
             "  UNION ALL "
@@ -398,13 +406,14 @@ bool Database::prepare_statements() {
             "FROM targets JOIN upstream_accounts a "
             "  ON a.id=targets.target_id "
             " AND (a.deleted_at IS NULL OR a.deleted_at > datetime('now')) "
-            " AND COALESCE(a.account_type,'api') <> 'agent' "
-            "LEFT JOIN upstream_keys k "
+            + account_types::routable_filter_sql("a.account_type")
+            + "LEFT JOIN upstream_keys k "
             "  ON k.account_id=a.id "
             " AND (k.deleted_at IS NULL OR k.deleted_at > datetime('now')) "
             "ORDER BY targets.priority_sort, targets.priority_id, "
-            "         k.position, k.id",
-            stmt_resolve_routing_snapshot_);
+            "         k.position, k.id";
+        PREPARE_ON(read_db_, snapshot_sql.c_str(), stmt_resolve_routing_snapshot_);
+    }
 
     PREPARE_ON(write_db_, "INSERT INTO request_log "
             "(account_id, local_key_id, model, prompt_tokens, "

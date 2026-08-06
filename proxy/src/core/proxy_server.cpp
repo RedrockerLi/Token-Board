@@ -1,4 +1,5 @@
 #include "proxy_server.h"
+#include "account_types.h"
 #include "db.h"
 #include "format_common.h"
 #include "router.h"
@@ -1134,7 +1135,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             gate_.mark_success(c.key_slot_id);
         else if (!downstream_gone &&
                  candidate_failure_retryable(fwd.status_code))
-            gate_.mark_failure(c.key_slot_id, c.account.account_type == "plan",
+            gate_.mark_failure(c.key_slot_id,
+                               account_types::cooldown_class(c.account.account_type),
                                fwd.status_code);
         // Publish success/cooldown before making the slot acquirable, otherwise
         // a sibling request can race into a key whose 401/429/5xx is already
@@ -1666,7 +1668,7 @@ void ProxyServer::handle_streaming(
                            candidate_failure_retryable(result.status_code)) {
                     gate_.mark_failure(
                         candidate.key_slot_id,
-                        candidate.account.account_type == "plan",
+                        account_types::cooldown_class(candidate.account.account_type),
                         result.status_code);
                 }
                 // State is published before the slot becomes available. All
@@ -1950,7 +1952,7 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         }
         if (!downstream_gone && candidate_failure_retryable(fwd.status_code))
             gate_.mark_failure(candidate.key_slot_id,
-                               candidate.account.account_type == "plan",
+                               account_types::cooldown_class(candidate.account.account_type),
                                fwd.status_code);
         gate_lease.release();
         if (downstream_gone || !candidate_failure_retryable(fwd.status_code)) {
@@ -2082,7 +2084,8 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
             gate_.mark_success(c.key_slot_id);
         else if (!downstream_gone &&
                  candidate_failure_retryable(fwd.status_code))
-            gate_.mark_failure(c.key_slot_id, c.account.account_type == "plan",
+            gate_.mark_failure(c.key_slot_id,
+                               account_types::cooldown_class(c.account.account_type),
                                fwd.status_code);
         gate_lease.release();
 

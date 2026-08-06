@@ -19,6 +19,38 @@ async function proxyFetch(url, options = {}) {
     return resp.json();
 }
 
+// ── Upstream account-type spec (mirror of app/domain/account_types.py) ──
+// The backend owns the type semantics; the frontend fetches the spec table
+// once and asks it (billing / routable / holds_keys / …) instead of comparing
+// type strings.  Adding an upstream type is a backend change only.
+let TYPE_SPECS = null;
+
+/** Fetch the account-type spec table once; cached for the session. */
+async function ensureTypeSpecs() {
+    if (TYPE_SPECS) return TYPE_SPECS;
+    TYPE_SPECS = await proxyFetch('/api/proxy/account-types');
+    return TYPE_SPECS;
+}
+
+/** Spec for a type string; unknown/empty falls back to api. */
+function typeSpec(type) {
+    return (TYPE_SPECS && TYPE_SPECS[type]) || (TYPE_SPECS && TYPE_SPECS.api)
+        || { billing: 'usage', routable: true, holds_keys: true,
+             usage_source: 'proxy', deletion: 'immediate', cooldown: 'transient',
+             subscription_unit: null, label: '', short_label: '' };
+}
+
+/** Render the account-type <select> options from the spec (labels). */
+function _populateTypeOptions(select) {
+    if (!select || !TYPE_SPECS) return;
+    const current = select.value;
+    select.innerHTML = Object.entries(TYPE_SPECS)
+        .map(([t, s]) => `<option value="${esc(t)}">${esc(s.label)}</option>`)
+        .join('');
+    // Preserve the previously-selected type if it exists in the spec.
+    if (TYPE_SPECS[current]) select.value = current;
+}
+
 function showToast(msg, type = 'success') {
     const toast = document.createElement('div');
     toast.className = `toast toast--${type}`;
@@ -58,13 +90,10 @@ function closeModal(id) {
 
 // ── Accounts Page ────────────────────────────────────────────────────────
 
-/** Soft pastel pill for the account type column: API / Plan / Agent. */
+/** Soft pastel pill for the account type column (label from the spec). */
 function accountTypeBadge(type) {
-    const t = type === 'plan' ? 'Plan' : type === 'agent' ? 'Agent' : 'API';
-    const cls = type === 'plan' ? 'badge--type-plan'
-              : type === 'agent' ? 'badge--type-agent'
-              : 'badge--type-api';
-    return `<span class="badge ${cls}">${t}</span>`;
+    const s = typeSpec(type);
+    return `<span class="badge badge--type-${esc(type) || 'api'}">${esc(s.short_label || type || 'API')}</span>`;
 }
 
 /** Native currency symbol for plan/agent subscription prices. */
@@ -73,18 +102,18 @@ function currencySymbol(currency) {
 }
 
 /** Accounts that can actually be *used as an upstream* (local-key binding,
- * aggregate targets).  Agent accounts are subscription-only — they never
- * appear in these "use as upstream" pickers. */
+ * aggregate targets).  Non-routable types (e.g. agent) never appear in these
+ * "use as upstream" pickers. */
 function routableAccounts(accounts) {
-    return (accounts || []).filter(a => !a.is_aggregate && a.account_type !== 'agent');
+    return (accounts || []).filter(a => !a.is_aggregate && typeSpec(a.account_type).routable);
 }
 
 /// Show/hide the subscription price + currency fields based on account type
-/// (shown for plan and agent; hidden for api).
+/// (shown for subscription-billed types; hidden for usage-billed).
 function togglePlanFields(sel) {
     const price = document.getElementById('planPriceField');
     const cur = document.getElementById('currencyField');
-    const show = sel && (sel.value === 'plan' || sel.value === 'agent');
+    const show = sel && typeSpec(sel.value).billing === 'subscription';
     if (price) price.style.display = show ? '' : 'none';
     if (cur) cur.style.display = show ? '' : 'none';
     updatePlanPriceSymbol();
@@ -187,6 +216,7 @@ async function loadAccountsTable() {
     if (!tbody) return;
     tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
     try {
+        await ensureTypeSpecs();
         const accounts = await proxyFetch('/api/proxy/accounts');
         const real = accounts.filter(a => !a.is_aggregate);
         if (!real.length) {
@@ -200,16 +230,18 @@ async function loadAccountsTable() {
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
                 <td>${accountTypeBadge(a.account_type)}</td>
-                <td>${(a.account_type === 'plan' || a.account_type === 'agent')
-                    ? currencySymbol(a.currency) + (+(a.monthly_price || 0)).toFixed(2) + (a.account_type === 'plan' ? '/密钥·周期' : '/周期')
+                <td>${typeSpec(a.account_type).billing === 'subscription'
+                    ? currencySymbol(a.currency) + (+(a.monthly_price || 0)).toFixed(2) + (typeSpec(a.account_type).subscription_unit === 'per_key' ? '/密钥·周期' : '/周期')
                     : '-'}</td>
                 <td>${a.max_concurrency ? a.max_concurrency + ' 并发' : '无限制'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
                     <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${esc(a.name)}')">更新模型</button>
-                    ${a.max_concurrency
-                        ? `<button class="btn btn--sm" onclick="testConcurrency(${a.id}, '${esc(a.name)}')" title="按当前并发限额向真实上游并发测试">测试并发</button>`
-                        : `<button class="btn btn--sm" disabled title="该账户无并发限额（无限制），无需测试">测试并发</button>`}
+                    ${typeSpec(a.account_type).holds_keys
+                        ? (a.max_concurrency
+                            ? `<button class="btn btn--sm" onclick="testConcurrency(${a.id}, '${esc(a.name)}')" title="按当前并发限额向真实上游并发测试">测试并发</button>`
+                            : `<button class="btn btn--sm" disabled title="该账户无并发限额（无限制），无需测试">测试并发</button>`)
+                        : `<button class="btn btn--sm" disabled title="该账户类型无直连上游密钥，不支持并发测试">测试并发</button>`}
                 </td>
             </tr>
         `).join('');
@@ -285,18 +317,21 @@ async function saveAccount(e) {
     }
 }
 
-function editAccount(id) {
-    proxyFetch('/api/proxy/accounts').then((accounts) => {
+async function editAccount(id) {
+    try {
+        await ensureTypeSpecs();
+        const accounts = await proxyFetch('/api/proxy/accounts');
         const acc = accounts.find((a) => a.id === id);
         if (!acc) return;
         const form = document.querySelector('#accountForm');
+        _populateTypeOptions(form['account_type']);
         form['name'].value = acc.name;
         form['base_url'].value = acc.base_url;
         form['api_format'].value = acc.api_format || 'openai';
         form['endpoint_path'].value = acc.endpoint_path || '';
         form['auth_header'].value = acc.auth_header || 'auto';
         form['account_type'].value = acc.account_type || 'api';
-        form['monthly_price'].value = (acc.account_type === 'plan' || acc.account_type === 'agent') ? (acc.monthly_price || 0) : '';
+        form['monthly_price'].value = typeSpec(acc.account_type).billing === 'subscription' ? (acc.monthly_price || 0) : '';
         if (form['currency']) form['currency'].value = acc.currency || 'CNY';
         form['max_concurrency'].value = acc.max_concurrency || '';
         togglePlanFields(form['account_type']);
@@ -306,26 +341,29 @@ function editAccount(id) {
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
-        // Agent accounts have no real upstream → hide key / model / concurrency UI.
-        const isAgent = acc.account_type === 'agent';
+        // Types without upstream keys (e.g. agent) have no real upstream →
+        // hide key / model / concurrency UI.
+        const holdsKeys = typeSpec(acc.account_type).holds_keys;
         const keySection = document.getElementById('accountKeySection');
-        if (keySection) keySection.style.display = isAgent ? 'none' : '';
-        document.getElementById('accountModelBtn').style.display = isAgent ? 'none' : '';
-        document.getElementById('accountTestConcBtn').style.display = isAgent ? 'none' : '';
+        if (keySection) keySection.style.display = holdsKeys ? '' : 'none';
+        document.getElementById('accountModelBtn').style.display = holdsKeys ? '' : 'none';
+        document.getElementById('accountTestConcBtn').style.display = holdsKeys ? '' : 'none';
         document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name, acc.account_type); };
         document.getElementById('accountModelBtn').onclick = () => updateAccountModels(id, acc.name);
         document.getElementById('accountTestConcBtn').onclick = () => testConcurrency(id, acc.name, true);
         openModal('accountModal');
-    });
+    } catch (err) {
+        showToast(err.message, 'error');
+    }
 }
 
 let _deleteAccountPendingId = null;
 let _deleteAccountPendingSub = false;
 
 /** Return a hint showing the configured default deletion operation for
- *  plan/agent accounts (api is always immediate). */
+ *  subscription accounts (usage-billed types are always immediate). */
 async function _deletionOpNote(accountType) {
-    if (accountType !== 'plan' && accountType !== 'agent') return '';
+    if (typeSpec(accountType).deletion !== 'configurable') return '';
     try {
         const cfg = await proxyFetch('/api/proxy/billing-config');
         return cfg.cancellation_mode === 'end_of_period'
@@ -337,7 +375,8 @@ async function _deletionOpNote(accountType) {
 }
 
 async function deleteAccount(id, name, accountType) {
-    const isSubscription = accountType === 'plan' || accountType === 'agent';
+    await ensureTypeSpecs();
+    const isSubscription = typeSpec(accountType).billing === 'subscription';
     const opNote = await _deletionOpNote(accountType);
     // Count local keys bound to this account.
     let keys = [];
@@ -421,9 +460,16 @@ async function testConcurrency(id, name, useFormValue) {
     btns.forEach(b => { b.disabled = false; b.textContent = '测试并发'; });
 }
 
-function openAddAccountModal() {
+async function openAddAccountModal() {
+    try {
+        await ensureTypeSpecs();
+    } catch (err) {
+        showToast(`无法加载账户类型定义: ${err.message}`, 'error');
+        return;
+    }
     const form = document.querySelector('#accountForm');
     if (form) {
+        _populateTypeOptions(form['account_type']);
         form.reset();
         form.dataset.editId = '';
         const keySection = document.getElementById('accountKeySection');
@@ -519,11 +565,9 @@ function initAccountsPage() {
                         </select>
                     </label>
                     <label>账户类型
-                        <select name="account_type" onchange="togglePlanFields(this)">
-                            <option value="api">api — 按调用量计费</option>
-                            <option value="plan">plan — 订阅套餐，调用免费</option>
-                            <option value="agent">agent — Agent 订阅（如 Codex）</option>
-                        </select>
+                        <!-- options rendered from /api/proxy/account-types by
+                             _populateTypeOptions() on modal open -->
+                        <select name="account_type" onchange="togglePlanFields(this)"></select>
                     </label>
                     <label id="planPriceField" style="display:none;"><span>订阅月费 (<span id="planPriceSymbol">¥</span>/周期)</span>
                         <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 99">
@@ -658,6 +702,7 @@ async function deleteKey(id, label) {
 
 async function openEditKeyModal(id) {
     try {
+        await ensureTypeSpecs();
         const [keys, accounts] = await Promise.all([
             proxyFetch('/api/proxy/keys'),
             proxyFetch('/api/proxy/accounts'),
@@ -705,6 +750,7 @@ async function saveKeyEdit(e) {
 
 async function loadAccountOptions() {
     try {
+        await ensureTypeSpecs();
         const accounts = await proxyFetch('/api/proxy/accounts');
         const sel = document.getElementById('keyAccountSelect');
         if (!sel) return;
@@ -863,6 +909,7 @@ async function loadAggModels(sel) {
 
 async function loadAggAccountCache() {
     if (aggAccountsCache) return;
+    await ensureTypeSpecs();
     const accounts = await proxyFetch('/api/proxy/accounts');
     aggAccountsCache = routableAccounts(accounts);
 }

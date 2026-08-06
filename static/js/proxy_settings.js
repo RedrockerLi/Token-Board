@@ -240,7 +240,7 @@ function initSettingsPage() {
                             <option value="next_period">下一计费周期生效</option>
                         </select>
                     </label>
-                    <label>删除 Plan / Agent 的默认操作
+                    <label>删除订阅类账户（Plan / Agent）的默认操作
                         <select id="billingCancellationMode">
                             <option value="immediate">本期立即删除（本期计费）</option>
                             <option value="end_of_period">到期立即删除（本期计费，下期不计费）</option>
@@ -248,7 +248,7 @@ function initSettingsPage() {
                     </label>
                 </div>
                 <div style="margin-top:10px; font-size:13px; color:var(--color-text-secondary);">
-                    删除 plan 账户/密钥或 agent 账户时按此操作执行（api 类型始终立即删除）。「本期立即删除」即刻停用但本期照收月费；
+                    删除订阅类账户/密钥时按此操作执行（按量计费的 api 类型始终立即删除）。「本期立即删除」即刻停用但本期照收月费；
                     「到期立即删除」可继续使用至本期最后一天，本期照收、下期不再计费。所有边界均按 UTC+0，密钥各自的订阅周期独立计算。
                 </div>
                 <div style="display:flex; justify-content:flex-end; margin-top:12px;">

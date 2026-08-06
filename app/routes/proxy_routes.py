@@ -22,6 +22,17 @@ def stats():
     return jsonify(_proxy_db().get_stats())
 
 
+# ── Account types (behavioral spec) ─────────────────────────────────────
+
+@bp_proxy.route("/account-types")
+def account_types():
+    """The upstream account-type spec table — frontend's single source of
+    truth for type behavior (routable / subscription / holds_keys / …)."""
+    from app.domain.account_types import as_payload
+
+    return jsonify(as_payload())
+
+
 # ── Accounts CRUD ──────────────────────────────────────────────────────
 
 @bp_proxy.route("/accounts", methods=["GET"])
@@ -121,6 +132,9 @@ def test_account_concurrency(account_id):
         return jsonify({"error": "Account not found"}), 404
     if acc.get("is_aggregate"):
         return jsonify({"error": "聚合账户不支持并发测试"}), 400
+    from app.domain.account_types import spec as _type_spec
+    if not _type_spec(acc.get("account_type") or "api").holds_keys:
+        return jsonify({"error": "该账户类型不持有上游密钥，不支持并发测试"}), 400
     key = acc.get("upstream_key") or ""
     if not key:
         return jsonify({"error": "该账户未配置上游 Key，请先在账户编辑中填写 Key"}), 400

@@ -21,7 +21,7 @@
 
 ## 二、账户类型：api / plan / agent
 
-三种类型在 `upstream_accounts.account_type` 上区分，默认为 `api`。创建时校验只允许这三种取值([app/proxy_db.py:349](app/proxy_db.py#L349))。
+三种类型在 `upstream_accounts.account_type` 上区分，默认为 `api`。**类型的行为语义（能不能路由、怎么计费、429 冷却、删除语义、用量来源等）统一收敛在规格表 `app/domain/account_types.py` 的 `ACCOUNT_TYPES`**（[app/domain/account_types.py:47](app/domain/account_types.py#L47)），创建/修改账户的类型校验也以该表为准（未知类型回退 api，与 SQL 的 `COALESCE(account_type,'api')` 同口径）。下面的比较表是这三行规格的「人话」展开。
 
 | 维度 | api(按量) | plan(订阅套餐) | agent(Agent 订阅) |
 |------|-----------|----------------|-------------------|
@@ -37,7 +37,7 @@
 
 - 常规形态：`base_url` + `api_format` + 一把或多把上游密钥，`max_concurrency` 控制并发。
 - 每一笔请求按写时固化的单价算出 `api_cost`，这是**真实账单**。
-- 消费报告与导出按 `account_type='api'` 的 `api_cost` 统计真实消费（[app/proxy_db.py:148](app/proxy_db.py#L148)）。
+- 消费报告与导出按**按量计费类型**（`account_type` 属于 `usage_billed_types()`，目前仅 `api`）的 `api_cost` 统计真实消费（[app/db/proxy_db.py:183](app/db/proxy_db.py#L183)）。
 
 ### plan 账户（订阅套餐）
 
@@ -48,8 +48,8 @@
 
 ### agent 账户（Agent 订阅，目前仅 Codex）
 
-- **只计费、不路由**：`create_key` 拒绝把本地密钥绑到 agent 账户（`Agent 账户不能作为本地密钥的上游`，[app/proxy_db.py:682-696](app/proxy_db.py#L682-L696)）；`resolve_routing_snapshot` 的 SQL 也显式排除 `account_type='agent'`（[proxy/src/store/db.cpp:372-399](proxy/src/store/db.cpp#L372-L399)）。所以它永远不会收到代理转发来的请求。
-- 用量全部来自**后台导入**：仪表板启动后每 60s 扫描 `~/.codex/sessions`，把 Codex 会话文件里的 `token_count` 事件写成 `request_log` 行，`account_id` 指向第一个 `agent_kind='codex'` 的账户（[app/codex_import.py](app/codex_import.py)）。`event_id` 幂等，断点续传不重复计数。
+- **只计费、不路由**：`create_key` 拒绝把本地密钥绑到不可路由类型（`Agent 账户不能作为本地密钥的上游`，判定见 [app/db/proxy_db.py:828-842](app/db/proxy_db.py#L828-L842) 的 `_assert_routable_account`，由规格表 `routable` 驱动）；路由快照的 SQL 也用 `account_types::routable_filter_sql` 统一排除不可路由类型（[proxy/src/store/db.cpp:359-409](proxy/src/store/db.cpp#L359-L409)）。所以它永远不会收到代理转发来的请求。
+- 用量全部来自**后台导入**：仪表板启动后每 60s 扫描 `~/.codex/sessions`，把 Codex 会话文件里的 `token_count` 事件写成 `request_log` 行，`account_id` 指向第一个 `agent_kind='codex'` 的账户（[app/services/codex_import.py](app/services/codex_import.py)）。`event_id` 幂等，断点续传不重复计数。
 - 计费口径与 plan 一致：订阅费按月存入 `proxy_plan_summary`（`key_masked='subscription'`），导入的用量在 `request_log.api_cost` 记虚拟消费。
 - `agent_kind` 字段标记具体 Agent（当前仅 `codex`）。
 
@@ -139,30 +139,30 @@
 
 ### 哪些不上云
 
-`upstream_keys`（真实 Key 本身）、`session_key_log`、`fx_rate`、`codex_import_state` 都在同步时的 `_RUNTIME_TABLES` 里被剥离（[app/sync.py:288-302](app/sync.py#L288-L302)）；`upstream_keys_cloud` 只含 masked 元数据随配置同步。
+`upstream_keys`（真实 Key 本身）、`session_key_log`、`fx_rate`、`codex_import_state` 都在同步时的 `_RUNTIME_TABLES` 里被剥离（[app/services/sync.py:288-302](app/services/sync.py#L288-L302)）；`upstream_keys_cloud` 只含 masked 元数据随配置同步。
 
 ## 七、数据导出链路行为
 
-「导出数据」（或 WebDAV 同步里的导出步骤）把 `request_log` 中 `(高水位 mark, max_id]` 的增量聚合成 `dashboard.db` 存档（[app/proxy_db.py:1405-1517](app/proxy_db.py#L1405-L1517)）。
+「导出数据」（或 WebDAV 同步里的导出步骤）把 `request_log` 中 `(高水位 mark, max_id]` 的增量聚合成 `dashboard.db` 存档（[app/db/proxy_db.py:1551-1662](app/db/proxy_db.py#L1551-L1662)）。
 
 ### 用量：日×账户×模型 → 存档
 
 - 按 `(date, account_id, model)` 聚合：token 分三种类型进 `token_usage`（output / input_cache_hit / input_cache_miss），请求数进 `request_usage`，`SUM(api_cost)` 进 `cost_entry`。
 - **过滤条件**：
   - 排除 `model='unknown'` / 空模型；
-  - **排除 `is_aggregate=0` 以外的聚合账户**——聚合产生的零 token 失败行绝不允许污染用量存档（[app/proxy_db.py:1446-1450](app/proxy_db.py#L1446-L1450)）。
+  - **排除聚合账户**——聚合产生的零 token 失败行绝不允许污染用量存档（[app/db/proxy_db.py:1590-1596](app/db/proxy_db.py#L1590-L1596)）。
 - `api_cost` 是**写时固化**的值，导出直接加总，不再重算——改价不影响已导出金额。
 - 存档按 `account_id` 分桶，显示名来自 `accounts` 镜像（账户改名回放见 [sync.md](sync.md)）。
 
 ### plan / agent 经济账 → proxy_plan_summary
 
-- **订阅费**是派生状态：每次导出按每把 Key（plan）或每账户（agent）的**生命周期 + 价格历史**重算行政月订阅费，`reconcile_plan_subscription` 保证改起始日/取消/调价能清掉旧周期；过去月份冻结、当前月按当月汇率刷新（[app/dashboard_db.py:154-187](app/dashboard_db.py#L154-L187)）。
-- **虚拟消费**是追加式：plan/agent 的 `request_log` 行按 `(行政月, 账户, masked Key)` 累加进 `virtual_cost`，30 天后日志清理无法回填（[app/proxy_db.py:1489-1510](app/proxy_db.py#L1489-L1510)）。
-- USD 订阅按行政月取 USD→CNY 汇率换算（[app/fx.py:81-93](app/fx.py#L81-L93)）。
+- **订阅费**是派生状态：每次导出按每把 Key（plan）或每账户（agent）的**生命周期 + 价格历史**重算行政月订阅费，`reconcile_plan_subscription` 保证改起始日/取消/调价能清掉旧周期；过去月份冻结、当前月按当月汇率刷新（[app/db/dashboard_db.py:154-187](app/db/dashboard_db.py#L154-L187)）。
+- **虚拟消费**是追加式：订阅类型的 `request_log` 行按 `(行政月, 账户, masked Key)` 累加进 `virtual_cost`，30 天后日志清理无法回填（[app/db/proxy_db.py:1635-1652](app/db/proxy_db.py#L1635-L1652)）。
+- USD 订阅按行政月取 USD→CNY 汇率换算（[app/services/fx.py:81-93](app/services/fx.py#L81-L93)）。
 
 ### 高水位与云同步
 
-- 导出只取 `id > mark` 的行；`mark`（`last_exported_log_id`）在**整个 pull-export-upload 事务成功后才推进**，失败则丢弃 shadow、分毫不动（[app/sync.py:736-815](app/sync.py#L736-L815)）。
+- 导出只取 `id > mark` 的行；`mark`（`last_exported_log_id`）在**整个 pull-export-upload 事务成功后才推进**，失败则丢弃 shadow、分毫不动（[app/services/sync.py:736-815](app/services/sync.py#L736-L815)）。
 - 30 天后清理已归档(`id <= mark`)的 `request_log` 行；未导出的行永不清理。
 
 ## 八、常见误区速查
@@ -175,3 +175,39 @@
 | 一个聚合模型配了 3 个账户，请求先试哪个？ | 先试 `sort_order` 最小的 entry（及其账户的多把 Key，按 position），该 entry 全不可用才轮到下一个。 |
 | 请求日志里 account_id 是谁？ | 实际服务的**真实账户**；只有「全候选都忙/冷却」的零 token 失败行才挂在聚合账户下，导出时会排除。 |
 | 真实上游 Key 会上云吗？ | 不会。本地 `upstream_keys` 是机密，云端只有 masked 元数据。 |
+
+## 九、添加一种新的上游类型
+
+新版约定：**给上游加一个「类型」不是到处加 if/else，而是加一行规格**。`account_type` 只是身份字符串，它的行为由三处声明式规格共同描述——Python 为主、C++ 镜像、前端经 API 读取：
+
+| 声明位置 | 内容 | 加类型时 |
+|---------|------|---------|
+| `app/domain/account_types.py` 的 `ACCOUNT_TYPES`（[app/domain/account_types.py:47](app/domain/account_types.py#L47)） | **唯一权威**：`billing` / `routable` / `holds_keys` / `usage_source` / `deletion` / `cooldown` / `subscription_unit` / `label` | 加一行 |
+| `proxy/src/core/account_types.h`（[proxy/src/core/account_types.h:22-50](proxy/src/core/account_types.h#L22-L50)） | C++ 请求时行为镜像：`non_routable_types()`（路由排除）+ `cooldown_class()`（429 冷却类别） | 同步两个列表 |
+| `GET /api/proxy/account-types` | 前端拉取整个规格表；类型下拉、徽章、价格字段显隐、删除流全部由它驱动，**前端不再硬编码类型** | 自动，无需改前端 |
+
+### 一个上游类型的 7 个属性
+
+定义一种新类型，就是回答这 7 个问题：
+
+| 属性 | 取值 | 它决定什么 | 现在谁在消费 |
+|------|------|-----------|-------------|
+| `billing` | `usage` / `subscription` | `api_cost` 是真实账单还是虚拟消费；真实成本统计是否包含它 | proxy_db 的计费/导出查询、`_plan_key_billing_meta` |
+| `routable` | true / false | 本地密钥能否绑它、代理能否转发给它 | `_assert_routable_account`、C++ 路由快照 SQL、前端 `routableAccounts`/并发测试 |
+| `holds_keys` | true / false | 建不建上游密钥；编辑弹窗显不显示密钥区 | `create_account`/`update_account` 的 key 分支、前端字段隐藏 |
+| `usage_source` | `proxy` / `import` | 用量来自转发自动记账还是后台导入 | `get_agent_accounts`、Codex 导入器（按 `agent_kind` 归账） |
+| `deletion` | `immediate` / `configurable` | 删除是永远立即（api）还是跟随设置页「删除默认操作」 | `_cancellation_end`、`delete_account`、前端删除流 |
+| `cooldown` | `transient` / `subscription_5h` | 429 走 5s/30s/2min 瞬时退避还是该密钥冷却 5 小时 | C++ `account_gate::mark_failure` 的冷却类别 |
+| `subscription_unit` | `per_key` / `per_account` | 订阅按每把密钥算一个生命周期（plan），还是每账户一条（agent） | `_plan_key_billing_meta` 合成生命周期 |
+
+### 添加步骤（三步 + 两个按需）
+
+1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label` 是设置页类型下拉文案、`short_label` 是账户列表徽章。
+2. **`account_types.h` 同步两个列表**：若新类型不可路由，加进 `non_routable_types()`；若 429 应冷却 5 小时，在 `cooldown_class()` 加分支。
+3. **若 `usage_source='import'`**：仿照 `codex_import.py` 写一个导入器，按你的 `agent_kind` 归账（当前只有 codex 一个导入器，注册表在第 4 个类型真出现时再抽象）。
+
+两个按需的 if：
+- **schema**：`account_type` 列无 CHECK 约束，新取值天然兼容，**一般不需要迁移**；仅当需要新列时仿 0013（`agent_kind`/`currency`）或 0015（`cancellation_mode`）。
+- **前端徽章配色**：`badge--type-<type>` 的 CSS 类缺省落到默认样式，想要专属配色就在 `static/css/dashboard.css` 加一个类。
+
+前端类型下拉、价格字段显隐、删除提示、并发测试守卫都经 `/api/proxy/account-types` 读规格自动适配——**加类型后前端一行都不用改**。校验也以规格表为准：`create_account` / `update_account` 拒绝未知类型，未知类型统一回退 api 语义（与 SQL `COALESCE(account_type,'api')` 同口径）。
