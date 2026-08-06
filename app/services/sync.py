@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import sqlite3
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -628,6 +629,45 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
         local.close()
 
 
+def _strip_url_credentials(url: str) -> str:
+    """Remove embedded credentials from a URL (userinfo, query, fragment).
+
+    `https://user:token@host/path?token=…` → `https://host/path`.  The scheme
+    and path (routing config) are preserved so the cloud copy still routes;
+    only the parts that can carry a literal secret are dropped.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        hostport = parts.netloc.rsplit("@", 1)[-1]  # drop userinfo, keep host:port
+        return urllib.parse.urlunsplit(
+            (parts.scheme, hostport, parts.path, "", ""))
+    except ValueError:
+        return ""
+
+
+def _sanitize_upload_columns(dst: sqlite3.Connection) -> None:
+    """Blank/mask config columns that can carry literal secrets.
+
+    upstream_key is blanked; auth_header keeps only its scheme token
+    ('bearer'/'x-api-key'/'auto', never a literal "Bearer sk-…" override);
+    base_url/endpoint_path keep routing info but lose embedded credentials.
+    """
+    dst.execute("UPDATE upstream_accounts SET upstream_key = ''")
+    rows = dst.execute(
+        "SELECT id, COALESCE(auth_header,''), COALESCE(base_url,''), "
+        "COALESCE(endpoint_path,'') FROM upstream_accounts").fetchall()
+    for row_id, auth, base, endpoint in rows:
+        auth = (auth or "").strip().split()[0] if (auth or "").strip() else ""
+        base = _strip_url_credentials(base)
+        endpoint = (endpoint or "").split("?")[0].split("#")[0]
+        dst.execute(
+            "UPDATE upstream_accounts SET auth_header=?, base_url=?, "
+            "endpoint_path=? WHERE id=?",
+            (auth, base, endpoint, row_id))
+
+
 def sync_config_upload(db_path: str) -> dict:
     """Upload local config to cloud as one conflict-checked transaction.
 
@@ -680,7 +720,7 @@ def sync_config_upload(db_path: str) -> dict:
             for table in _RUNTIME_TABLES:
                 if _table_exists(dst, table):
                     dst.execute(f"DELETE FROM {table}")
-            dst.execute("UPDATE upstream_accounts SET upstream_key = ''")
+            _sanitize_upload_columns(dst)
             dst.commit()
         finally:
             dst.close()

@@ -7,7 +7,7 @@ from flask import Flask
 from app.services.data_loader import DataStore
 
 
-def create_app(proxy_db_path: str | None = None):
+def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1"):
     """Flask application factory.
 
     Explicitly sets template_folder and static_folder because Flask
@@ -18,6 +18,8 @@ def create_app(proxy_db_path: str | None = None):
         proxy_db_path: If provided, enables proxy management features
                        by attaching a ProxyDatabase instance to the app
                        config and registering the proxy blueprint.
+        host: The bind address.  A non-loopback address (or a configured
+              TB_DASHBOARD_TOKEN) activates the access-token auth guard.
     """
     root = Path(__file__).resolve().parent.parent  # project root
 
@@ -115,5 +117,13 @@ def create_app(proxy_db_path: str | None = None):
                              daemon=True, name="deletion-finalizer").start()
         except Exception:
             pass
+
+    # ── Access-token auth (off-loopback or TB_DASHBOARD_TOKEN) ──
+    from app import dashboard_auth  # noqa: E402
+    token = dashboard_auth.resolve_token(host, root / "data")
+    if token:
+        dashboard_auth.install_auth(flask_app, token)
+        print(" * Dashboard access token required: /login (loopback bypassed "
+              "only when not exposed)")
 
     return flask_app

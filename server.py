@@ -30,7 +30,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    app = create_app(proxy_db_path=args.proxy_db)
+    app = create_app(proxy_db_path=args.proxy_db, host=args.host)
     app.config["DATA_STORE"].load()
 
     print(f" * Starting on http://{args.host}:{args.port}")

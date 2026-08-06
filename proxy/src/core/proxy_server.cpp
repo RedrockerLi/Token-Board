@@ -2255,12 +2255,18 @@ void ProxyServer::setup_routes(httplib::Server &server) {
                });
 
     // Health check
-    server.Get("/health", [this](const httplib::Request &, httplib::Response &res) {
+    server.Get("/health", [this](const httplib::Request &req, httplib::Response &res) {
         add_cors_headers(res);
         json j;
         j["status"] = "ok";
         j["service"] = "token-board-proxy";
-        j["concurrency"] = in_flight_count();
+        // Live concurrency is a useful local signal (status.sh, dashboard
+        // realtime view) but a mild info leak if /health is reachable
+        // off-loopback — only report it to loopback clients.
+        const std::string &ip = req.remote_addr;
+        if (ip == "127.0.0.1" || ip == "::1" ||
+            ip.rfind("127.", 0) == 0 || ip.rfind("::ffff:127.", 0) == 0)
+            j["concurrency"] = in_flight_count();
         res.set_content(j.dump(), "application/json");
     });
 }
