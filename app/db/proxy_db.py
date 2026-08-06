@@ -262,6 +262,7 @@ class ProxyDatabase:
                 "COALESCE(monthly_price,0) AS monthly_price, "
                 "COALESCE(currency,'CNY') AS currency, "
                 "COALESCE(agent_kind,'') AS agent_kind, "
+                "COALESCE(valid_from,'') AS valid_from, "
                 "max_concurrency, created_at, deleted_at, "
                 "(SELECT COUNT(*) FROM upstream_keys k WHERE k.account_id = upstream_accounts.id "
                 " AND (k.deleted_at IS NULL OR k.deleted_at > datetime('now'))) AS key_count "
@@ -276,15 +277,28 @@ class ProxyDatabase:
                 # never leave the server in plaintext).  ids let the frontend
                 # reference kept keys without ever sending the real values.
                 key_rows = conn.execute(
-                    "SELECT id, key_value, COALESCE(valid_from, date(created_at)) AS valid_from "
+                    "SELECT id, key_value, COALESCE(valid_from, date(created_at)) AS valid_from, "
+                    "deleted_at "
                     "FROM upstream_keys WHERE account_id = ? "
                     "  AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
                     "ORDER BY position, id",
                     (acc["id"],),
                 ).fetchall()
                 acc["keys"] = [{"id": k[0], "masked": mask_key(k[1]),
-                                "valid_from": k[2]}
+                                "valid_from": k[2], "deleted_at": k[3]}
                                for k in key_rows] if key_rows else []
+                # cloud-only 密钥：云端镜像里有、本机没有明文，无法使用/路由/计费。
+                # 前端展示输入框让用户补填明文（POST cloud-keys 确认后变成本地 key）。
+                cloud_rows = conn.execute(
+                    "SELECT key_masked, valid_from FROM upstream_keys_cloud "
+                    "WHERE account_id = ?",
+                    (acc["id"],),
+                ).fetchall()
+                local_masked = {k["masked"] for k in acc["keys"]}
+                acc["cloud_keys"] = [
+                    {"masked": r[0], "valid_from": r[1]}
+                    for r in cloud_rows if r[0] not in local_masked
+                ] if cloud_rows else []
                 accounts.append(acc)
             return accounts
         finally:
@@ -400,6 +414,50 @@ class ProxyDatabase:
         ProxyDatabase._refresh_upstream_keys_cloud(conn, account_id)
         return active_values
 
+    def confirm_cloud_key(self, account_id: int, masked: str, key_value: str) -> bool:
+        """把 cloud-only 密钥补填明文，变成这台机器的本地 key。
+
+        校验该打码 identity 确在云端镜像、且本机还没有这把 key 的明文后，写入
+        ``upstream_keys`` 并刷新云端镜像——此后它正常路由 / 计费。返回 False 表示
+        云端没有该记录。
+        """
+        key_value = (key_value or "").strip()
+        if not key_value:
+            raise ValueError("请输入密钥明文")
+        conn = self._connect()
+        try:
+            cloud = conn.execute(
+                "SELECT valid_from FROM upstream_keys_cloud "
+                "WHERE account_id=? AND key_masked=?",
+                (account_id, masked),
+            ).fetchone()
+            if cloud is None:
+                return False
+            existing = conn.execute(
+                "SELECT 1 FROM upstream_keys WHERE account_id=? AND key_value=?",
+                (account_id, key_value),
+            ).fetchone()
+            if existing is not None:
+                # 明文已在本机存在 → 无需重复插入，刷新镜像即可。
+                ProxyDatabase._refresh_upstream_keys_cloud(conn, account_id)
+                conn.commit()
+                return True
+            position = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM upstream_keys "
+                "WHERE account_id=?",
+                (account_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO upstream_keys "
+                "(account_id, key_value, position, valid_from) VALUES (?,?,?,?)",
+                (account_id, key_value, position, cloud["valid_from"]),
+            )
+            ProxyDatabase._refresh_upstream_keys_cloud(conn, account_id)
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
     def create_account(self, data: dict) -> int:
         account_type = data.get("account_type", "api")
         if account_type not in ACCOUNT_TYPES:
@@ -410,13 +468,14 @@ class ProxyDatabase:
         keys = self._normalize_keys(data)
         first = keys[0] if keys else ""
         type_spec = spec(account_type)
+        valid_from = _parse_iso_date(data.get("valid_from"))
         conn = self._connect()
         try:
             cursor = conn.execute(
                 "INSERT INTO upstream_accounts "
                 "(name, upstream_key, base_url, api_format, endpoint_path, auth_header, "
-                " account_type, monthly_price, currency, max_concurrency) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " account_type, monthly_price, currency, max_concurrency, valid_from) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     data["name"],
                     first,
@@ -428,6 +487,7 @@ class ProxyDatabase:
                     float(data.get("monthly_price", 0) or 0),
                     currency,
                     data.get("max_concurrency"),
+                    valid_from.isoformat() if valid_from else None,
                 ),
             )
             account_id = cursor.lastrowid
@@ -470,13 +530,16 @@ class ProxyDatabase:
             for key in ("name", "base_url", "api_format",
                         "endpoint_path", "auth_header", "account_type",
                         "monthly_price", "currency", "agent_kind",
-                        "max_concurrency"):
+                        "max_concurrency", "valid_from"):
                 if key not in data:
                     continue
                 if key == "monthly_price":
                     val = float(data[key] or 0)
                 elif key == "max_concurrency":
                     val = data[key] if data[key] not in (None, "") else None
+                elif key == "valid_from":
+                    parsed = _parse_iso_date(data[key])
+                    val = parsed.isoformat() if parsed else None
                 elif key == "currency":
                     val = data[key]
                     if val not in ("CNY", "USD"):
@@ -574,7 +637,7 @@ class ProxyDatabase:
         try:
             config = self._billing_config_conn(conn)
             account = conn.execute(
-                "SELECT account_type, created_at FROM upstream_accounts "
+                "SELECT account_type, created_at, valid_from FROM upstream_accounts "
                 "WHERE id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
                 (account_id,),
             ).fetchone()
@@ -582,7 +645,8 @@ class ProxyDatabase:
                 return {"ok": False, "error": "Account not found"}
             account_type = account["account_type"] or "api"
             cancelled_at = _utc_now()
-            account_anchor = _parse_utc_timestamp(account["created_at"]).date()
+            account_anchor = (_parse_iso_date(account["valid_from"])
+                              or _parse_utc_timestamp(account["created_at"]).date())
             active_keys = conn.execute(
                 "SELECT id, valid_from, created_at FROM upstream_keys "
                 "WHERE account_id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
@@ -1439,7 +1503,7 @@ class ProxyDatabase:
         by_identity: dict[tuple[int, str], dict] = {}
         sub_types = subscription_types()
         accounts = conn.execute(
-            "SELECT id, upstream_key, created_at, deleted_at, "
+            "SELECT id, upstream_key, created_at, valid_from, deleted_at, "
             "COALESCE(account_type,'api') AS account_type, "
             "COALESCE(currency,'CNY') AS currency "
             "FROM upstream_accounts "
@@ -1470,29 +1534,29 @@ class ProxyDatabase:
             if row["account_id"] not in account_rows:
                 continue
             identity = (row["account_id"], row["key_masked"])
-            anchor = _parse_iso_date(row["valid_from"]) or _parse_utc_timestamp(
-                account_rows[row["account_id"]]["created_at"]
-            ).date()
+            if identity not in by_identity:
+                # cloud-only 密钥：本机没有该 key 的明文，无法使用/路由 →
+                # 不计费。等用户在本机补填明文、变成本地 key 后才进入计费。
+                continue
+            meta = by_identity[identity]
+            # 每把密钥独立计费：锚点永远是该 key 自己的 valid_from → 自己的
+            # created_at（本地 loop 已算好）。云端镜像只合并删除边界，让跨
+            # 机器的删除生效；绝不改本地 key 的锚点。
             cloud_end = _parse_utc_timestamp(row["deleted_at"])
             account_end = _parse_utc_timestamp(account_rows[row["account_id"]]["deleted_at"])
             end = min((v for v in (cloud_end, account_end) if v is not None), default=None)
-            if identity in by_identity:
-                meta = by_identity[identity]
-                meta["anchor"] = min(meta["anchor"], anchor)
-                if end is not None:
-                    meta["end"] = min((v for v in (meta["end"], end) if v is not None), default=end)
-            else:
-                by_identity[identity] = {
-                    "account_id": row["account_id"], "key_id": None,
-                    "key_masked": row["key_masked"], "anchor": anchor, "end": end,
-                }
+            if end is not None:
+                meta["end"] = min((v for v in (meta["end"], end) if v is not None), default=end)
         # Old databases may contain a plan account with a legacy key but no
         # key row.  An empty cloud-synced account is not a billable key.
         for account in accounts:
             if account["upstream_key"] and not any(
                 meta["account_id"] == account["id"] for meta in by_identity.values()
             ):
-                anchor = _parse_utc_timestamp(account["created_at"]).date()
+                # 遗留单密钥没有独立 upstream_keys 行：订阅单位是账户，锚点 =
+                # 账户 valid_from → 账户 created_at（与 per_account agent 同一套规则）。
+                anchor = (_parse_iso_date(account["valid_from"])
+                          or _parse_utc_timestamp(account["created_at"]).date())
                 by_identity[(account["id"], mask_key(account["upstream_key"]))] = {
                     "account_id": account["id"], "key_id": None,
                     "key_masked": mask_key(account["upstream_key"]), "anchor": anchor,
@@ -1503,7 +1567,8 @@ class ProxyDatabase:
         for account in accounts:
             if spec(account["account_type"]).subscription_unit != "per_account":
                 continue
-            anchor = _parse_utc_timestamp(account["created_at"]).date()
+            anchor = (_parse_iso_date(account["valid_from"])
+                      or _parse_utc_timestamp(account["created_at"]).date())
             by_identity[(account["id"], "subscription")] = {
                 "account_id": account["id"], "key_id": None,
                 "key_masked": "subscription", "anchor": anchor,

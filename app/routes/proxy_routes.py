@@ -77,6 +77,26 @@ def delete_account(account_id):
                     "deferred": result.get("deferred", False)})
 
 
+@bp_proxy.route("/accounts/<int:account_id>/cloud-keys", methods=["POST"])
+def confirm_cloud_key(account_id):
+    """补填 cloud-only 密钥的明文：云端镜像里有、本机没有 → 写入 upstream_keys。
+
+    body: ``{"masked": "sk-abc…wxyz", "key_value": "sk-...真实明文"}``
+    """
+    data = request.get_json(force=True)
+    try:
+        ok = _proxy_db().confirm_cloud_key(
+            account_id,
+            (data.get("masked") or "").strip(),
+            (data.get("key_value") or "").strip(),
+        )
+        if not ok:
+            return jsonify({"error": "云端没有该密钥记录"}), 404
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
 # ── Account Models ───────────────────────────────────────────────────
 
 @bp_proxy.route("/accounts/<int:account_id>/models", methods=["POST"])

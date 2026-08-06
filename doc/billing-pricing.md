@@ -78,5 +78,5 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 - `model_pricing` 与 plan/agent 订阅价都可选币种,默认 CNY,可选 USD。输入的单价/月费是**原生币种**金额。
 - USD 计费在写时按**请求当天的 USD→CNY 汇率**换算成 CNY 后再进 `request_log.api_cost`(代理快照与 `tr_request_log_insert` 触发器同样处理)。
 - 订阅费换算到 CNY 按**行政月**取汇率:过去月份用月初最近存储的汇率(冻结),当前月用当天汇率。
-- 汇率来源 `GET https://api.frankfurter.dev/v2/rate/USD/CNY`。看板启动与首次使用时按 UTC 日拉取一次并存入本机 `fx_rate` 表;当天已有则直接用;拉取失败(或仍为旧数据)则用最近一条已存汇率,没有则按 1.0(等价不换算)。
+- 汇率来源 `GET https://api.frankfurter.dev/v2/rate/USD/CNY`。看板启动与首次使用时按 UTC 日拉取一次并存入本机 `fx_rate` 表;当天已有则直接用;拉取失败(或仍为旧数据)则用最近一条已存汇率。请求日期早于所有已存记录(如过去月份早于首次拉取)时用**最早一条已存汇率**,避免 USD 订阅被按 1.0 低估;只有该币种对从未存储过任何记录才按 1.0(等价不换算)。
 - `fx_rate` 与 `codex_import_state` 均**仅存本机**,同步到云时被剔除(`sync._RUNTIME_TABLES`)。

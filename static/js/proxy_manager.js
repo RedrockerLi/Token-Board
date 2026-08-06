@@ -108,15 +108,45 @@ function routableAccounts(accounts) {
     return (accounts || []).filter(a => !a.is_aggregate && typeSpec(a.account_type).routable);
 }
 
-/// Show/hide the subscription price + currency fields based on account type
-/// (shown for subscription-billed types; hidden for usage-billed).
-function togglePlanFields(sel) {
+/// Show/hide account-form fields based on the selected account type.
+/// Mirrors the backend type spec (app/domain/account_types.py):
+///   billing 'subscription'  → 订阅月费 + 币种
+///   routable                → Base URL / API 格式 / 上游路径 / 认证方式 / 并发限额
+///   holds_keys              → 上游密钥区
+///   usage_source 'import'   → Agent 名称 (agent_kind)
+///   subscription_unit 'per_key'     → 每把密钥行的订阅起始日（plan）
+///   subscription_unit 'per_account' → 账户级订阅起始日（agent）
+function toggleTypeFields(sel) {
+    const s = sel && typeSpec(sel.value);
+    const showSub = s && s.billing === 'subscription';
     const price = document.getElementById('planPriceField');
     const cur = document.getElementById('currencyField');
-    const show = sel && typeSpec(sel.value).billing === 'subscription';
-    if (price) price.style.display = show ? '' : 'none';
-    if (cur) cur.style.display = show ? '' : 'none';
+    if (price) price.style.display = showSub ? '' : 'none';
+    if (cur) cur.style.display = showSub ? '' : 'none';
+    const routing = document.getElementById('routingFields');
+    if (routing) routing.style.display = (s && s.routable) ? '' : 'none';
+    const keySection = document.getElementById('accountKeySection');
+    if (keySection) keySection.style.display = (s && s.holds_keys) ? '' : 'none';
+    const kind = document.getElementById('agentKindField');
+    if (kind) kind.style.display = (s && s.usage_source === 'import') ? '' : 'none';
+    const vf = document.getElementById('agentValidFromField');
+    if (vf) vf.style.display = (s && s.subscription_unit === 'per_account') ? '' : 'none';
     updatePlanPriceSymbol();
+    applyKeyDateVisibility();
+}
+
+/// Current display value for a per-key 订阅起始日 date picker: only per_key
+/// subscription types (plan) use them; api/agent don't.
+function keyDateDisplay() {
+    const sel = document.querySelector('#accountForm [name="account_type"]');
+    return sel && typeSpec(sel.value).subscription_unit === 'per_key' ? '' : 'none';
+}
+
+/// Refresh every key-row date picker's visibility after a type switch or an
+/// addKeyRow / addExistingKeyRow insert.
+function applyKeyDateVisibility() {
+    document.querySelectorAll('#keyList .key-valid-from')
+        .forEach(el => { el.style.display = keyDateDisplay(); });
 }
 
 /// Refresh the price-label currency symbol from the chosen currency select.
@@ -145,6 +175,8 @@ function addKeyRow(value, validFrom) {
     input.addEventListener('input', () => { _keyRowsEdited = true; });
     const date = document.createElement('input');
     date.type = 'date';
+    date.className = 'key-valid-from';
+    date.style.display = keyDateDisplay();
     date.name = 'upstream_valid_froms[]';
     date.title = '订阅起始日（UTC，留空=创建日期）';
     date.value = validFrom || '';
@@ -160,7 +192,7 @@ function addKeyRow(value, validFrom) {
     list.appendChild(div);
 }
 
-function addExistingKeyRow(keepId, masked, validFrom) {
+function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion) {
     const list = document.getElementById('keyList');
     if (!list) return;
     const div = document.createElement('div');
@@ -169,18 +201,28 @@ function addExistingKeyRow(keepId, masked, validFrom) {
     div.dataset.keepId = keepId;
     const span = document.createElement('span');
     span.style.cssText = 'flex:1; font-family:monospace; background:#f3f4f6; padding:4px 8px; border-radius:4px; color:var(--color-text-secondary, #6b7280);';
-    span.textContent = masked + '（已配置，如需删除点“移除”）';
+    span.textContent = masked + (pendingDeletion
+        ? '（已安排本期期末自动删除）'
+        : '（已配置，如需删除点“移除”）');
     const date = document.createElement('input');
     date.type = 'date';
-    date.className = 'existing-key-valid-from';
+    date.className = 'existing-key-valid-from key-valid-from';
+    date.style.display = keyDateDisplay();
     date.title = '订阅起始日（UTC，留空=创建日期）';
     date.value = validFrom || '';
     date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'btn btn--sm';
-    del.textContent = '移除';
-    del.onclick = () => { _keyRowsEdited = true; div.remove(); };
+    if (pendingDeletion) {
+        del.textContent = '下周期自动删除';
+        del.disabled = true;
+        del.style.opacity = '0.5';
+        del.title = '该密钥已安排本期期末自动删除，无需手动移除';
+    } else {
+        del.textContent = '移除';
+        del.onclick = () => { _keyRowsEdited = true; div.remove(); };
+    }
     div.appendChild(span);
     div.appendChild(date);
     div.appendChild(del);
@@ -190,23 +232,76 @@ function addExistingKeyRow(keepId, masked, validFrom) {
 function resetKeyList() {
     const list = document.getElementById('keyList');
     if (list) list.innerHTML = '';
+    const cloud = document.getElementById('cloudKeyList');
+    if (cloud) cloud.innerHTML = '';
     _keyRowsEdited = false;
 }
 
+/// 渲染一条 cloud-only 密钥的补填行：输入框（占位显示云端 mask 版本）+ 确定。
+/// 用户填入明文点「确定」→ POST 到 /cloud-keys 变成本地 key。
+function addCloudKeyRow(accountId, ck) {
+    const list = document.getElementById('cloudKeyList');
+    if (!list) return;
+    const div = document.createElement('div');
+    div.style.cssText = 'display:flex; gap:6px; margin:6px 0; align-items:center;';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = ck.masked + '（云端密钥，请输入明文）';
+    input.style.flex = '1';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn btn--sm';
+    btn.textContent = '确定';
+    btn.onclick = () => confirmCloudKey(accountId, ck.masked, input, btn);
+    div.appendChild(input);
+    div.appendChild(btn);
+    list.appendChild(div);
+}
+
+async function confirmCloudKey(accountId, masked, input, btn) {
+    const keyValue = input.value.trim();
+    if (!keyValue) {
+        showToast('请输入该云端密钥的明文', 'error');
+        return;
+    }
+    btn.disabled = true;
+    btn.textContent = '保存中...';
+    try {
+        await proxyFetch(`/api/proxy/accounts/${accountId}/cloud-keys`, {
+            method: 'POST',
+            body: JSON.stringify({ masked, key_value: keyValue }),
+        });
+        showToast('密钥已配置，可正常计费/路由');
+        ConfigSync.markDirty();
+        // 重载编辑弹窗：新 key 进入「已配置」列表，云端补填行消失。
+        editAccount(accountId);
+    } catch (err) {
+        showToast(err.message, 'error');
+        btn.disabled = false;
+        btn.textContent = '确定';
+    }
+}
+
 function collectKeyRows(form) {
+    const type = form['account_type'] ? form['account_type'].value : 'api';
+    // 仅 per_key 订阅类型（plan）携带每把密钥的订阅起始日；api/agent 一律不带，
+    // 避免隐藏的旧日期输入值被误提交到非订阅类型。
+    const useKeyDates = typeSpec(type).subscription_unit === 'per_key';
     const keyInputs = [...form.querySelectorAll('#keyList input[name="upstream_keys[]"]')];
     const upstream_keys = [];
     const new_valid_froms = [];
     keyInputs.forEach((input) => {
         if (!input.value.trim()) return;
         upstream_keys.push(input.value.trim());
-        new_valid_froms.push(input.parentElement.querySelector('[name="upstream_valid_froms[]"]').value || null);
+        new_valid_froms.push(useKeyDates
+            ? (input.parentElement.querySelector('[name="upstream_valid_froms[]"]').value || null)
+            : null);
     });
     const keepRows = [...form.querySelectorAll('#keyList .existing-key')];
     const keep_key_ids = keepRows.map(r => r.dataset.keepId);
     const keep_valid_froms = Object.fromEntries(keepRows.map(r => [
         r.dataset.keepId,
-        r.querySelector('.existing-key-valid-from').value || null,
+        useKeyDates ? (r.querySelector('.existing-key-valid-from').value || null) : null,
     ]));
     return { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms };
 }
@@ -254,20 +349,33 @@ async function saveAccount(e) {
     e.preventDefault();
     const form = e.target;
     const id = form.dataset.editId;
+    const type = form['account_type'].value || 'api';
+    const s = typeSpec(type);
     const { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms } = collectKeyRows(form);
+    // 按类型组装 payload：非路由类型（agent）不带 Base URL 等路由字段，import 类型
+    // 带 agent_kind，per_account 类型带账户级订阅起始日。缺省字段由后端默认值兜底。
+    const common = {
+        name: form['name'].value,
+        account_type: type,
+        monthly_price: form['monthly_price'] ? (form['monthly_price'].value || 0) : 0,
+        currency: form['currency'] ? form['currency'].value : 'CNY',
+    };
+    if (s.routable) {
+        common.base_url = form['base_url'].value;
+        common.api_format = form['api_format'].value;
+        common.endpoint_path = form['endpoint_path'].value || '';
+        common.auth_header = form['auth_header'].value || 'auto';
+        common.max_concurrency = form['max_concurrency'].value || null;
+    }
+    if (s.usage_source === 'import') {
+        common.agent_kind = form['agent_kind'] ? (form['agent_kind'].value || 'codex') : 'codex';
+    }
+    if (s.subscription_unit === 'per_account') {
+        common.valid_from = form['valid_from'] ? (form['valid_from'].value || null) : null;
+    }
     try {
         if (id) {
-            const payload = {
-                name: form['name'].value,
-                base_url: form['base_url'].value,
-                api_format: form['api_format'].value,
-                endpoint_path: form['endpoint_path'].value || '',
-                auth_header: form['auth_header'].value || 'auto',
-                account_type: form['account_type'].value || 'api',
-                monthly_price: form['monthly_price'].value || 0,
-                currency: form['currency'] ? form['currency'].value : 'CNY',
-                max_concurrency: form['max_concurrency'].value || null,
-            };
+            const payload = { ...common };
             // Only send the key set when the user actually edited it — a
             // rename-only save must never wipe the existing keys.
             if (_keyRowsEdited) {
@@ -287,17 +395,9 @@ async function saveAccount(e) {
             await proxyFetch('/api/proxy/accounts', {
                 method: 'POST',
                 body: JSON.stringify({
-                    name: form['name'].value,
+                    ...common,
                     upstream_keys,
                     new_valid_froms,
-                    base_url: form['base_url'].value,
-                    api_format: form['api_format'].value,
-                    endpoint_path: form['endpoint_path'].value || '',
-                    auth_header: form['auth_header'].value || 'auto',
-                    account_type: form['account_type'].value || 'api',
-                    monthly_price: form['monthly_price'].value || 0,
-                    currency: form['currency'] ? form['currency'].value : 'CNY',
-                    max_concurrency: form['max_concurrency'].value || null,
                 }),
             });
             showToast('账户已创建');
@@ -334,18 +434,28 @@ async function editAccount(id) {
         form['monthly_price'].value = typeSpec(acc.account_type).billing === 'subscription' ? (acc.monthly_price || 0) : '';
         if (form['currency']) form['currency'].value = acc.currency || 'CNY';
         form['max_concurrency'].value = acc.max_concurrency || '';
-        togglePlanFields(form['account_type']);
+        if (form['agent_kind']) form['agent_kind'].value = acc.agent_kind || 'codex';
+        if (form['valid_from']) form['valid_from'].value = acc.valid_from || '';
+        toggleTypeFields(form['account_type']);
         // Existing keys → masked keep-rows; user adds new rows as needed.
         resetKeyList();
-        (acc.keys || []).forEach((k) => addExistingKeyRow(k.id, k.masked, k.valid_from));
+        // Existing keys → masked keep-rows; user adds new rows as needed.
+        // 已安排本期期末删除的 key（deleted_at 在未来）移除键灰置。
+        resetKeyList();
+        const nowUtc = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        (acc.keys || []).forEach((k) => {
+            addExistingKeyRow(k.id, k.masked, k.valid_from,
+                              !!(k.deleted_at && k.deleted_at > nowUtc));
+        });
+        // cloud-only 密钥（云端有、本机无明文）→ 补填明文的输入框。
+        (acc.cloud_keys || []).forEach((ck) => addCloudKeyRow(id, ck));
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
         // Types without upstream keys (e.g. agent) have no real upstream →
-        // hide key / model / concurrency UI.
+        // hide the model / concurrency buttons (the key section itself is
+        // handled by toggleTypeFields via holds_keys).
         const holdsKeys = typeSpec(acc.account_type).holds_keys;
-        const keySection = document.getElementById('accountKeySection');
-        if (keySection) keySection.style.display = holdsKeys ? '' : 'none';
         document.getElementById('accountModelBtn').style.display = holdsKeys ? '' : 'none';
         document.getElementById('accountTestConcBtn').style.display = holdsKeys ? '' : 'none';
         document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name, acc.account_type); };
@@ -472,9 +582,9 @@ async function openAddAccountModal() {
         _populateTypeOptions(form['account_type']);
         form.reset();
         form.dataset.editId = '';
-        const keySection = document.getElementById('accountKeySection');
-        if (keySection) keySection.style.display = '';
-        togglePlanFields(form['account_type']);
+        // Field visibility follows the selected type (default api); the key
+        // section is toggled by toggleTypeFields via holds_keys.
+        toggleTypeFields(form['account_type']);
     }
     resetKeyList();
     const delBtn = document.getElementById('accountDeleteBtn');
@@ -488,36 +598,6 @@ async function openAddAccountModal() {
     openModal('accountModal');
 }
 
-function openAddAgentModal() {
-    const form = document.querySelector('#agentForm');
-    if (form) form.reset();
-    openModal('agentModal');
-}
-
-async function saveAgent(e) {
-    e.preventDefault();
-    const form = e.target;
-    try {
-        await proxyFetch('/api/proxy/accounts', {
-            method: 'POST',
-            body: JSON.stringify({
-                name: form['name'].value,
-                account_type: 'agent',
-                agent_kind: form['agent_kind'].value || 'codex',
-                monthly_price: form['monthly_price'].value || 0,
-                currency: form['currency'].value || 'CNY',
-            }),
-        });
-        showToast('Agent 已添加');
-        ConfigSync.markDirty();
-        form.reset();
-        closeModal('agentModal');
-        loadAccountsTable();
-    } catch (err) {
-        showToast(err.message, 'error');
-    }
-}
-
 function initAccountsPage() {
     const el = document.getElementById('page-proxy-accounts');
     if (!el || el.dataset.initialized) return;
@@ -527,7 +607,6 @@ function initAccountsPage() {
             <h1 class="page-title">上游账户管理</h1>
             <p class="page-subtitle">支持 OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 的上游服务</p>
             <button class="btn btn--primary" onclick="openAddAccountModal()">+ 添加账户</button>
-            <button class="btn btn--primary" onclick="openAddAgentModal()">+ 添加 Agent</button>
         </div>
         <table class="mgmt-table" id="accountsTable">
             <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>类型</th><th>订阅月费</th><th>并发限额</th><th>操作</th></tr></thead>
@@ -544,30 +623,41 @@ function initAccountsPage() {
                     <div id="accountKeySection" style="margin-bottom:10px;">
                         <label>上游 API Key（多把密钥 = 同一配置的多个槽位；仅存本机，不上传云端）</label>
                         <div id="keyList" style="margin:4px 0;"></div>
+                        <div id="cloudKeyList" style="margin:4px 0;"></div>
                         <button type="button" class="btn btn--sm" onclick="addKeyRow()">+ 添加密钥</button>
                     </div>
-                    <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1"></label>
-                    <label>API 格式
-                        <select name="api_format">
-                            <option value="openai">OpenAI 兼容</option>
-                            <option value="openai_responses">OpenAI Responses</option>
-                            <option value="anthropic">Anthropic 兼容</option>
-                        </select>
-                    </label>
-                    <label>上游路径（可选）
-                        <input name="endpoint_path" placeholder="留空自动推导，如 /v1/messages 或 /responses">
-                    </label>
-                    <label>认证方式
-                        <select name="auth_header">
-                            <option value="auto">自动（按 API 格式推导）</option>
-                            <option value="bearer">Authorization: Bearer</option>
-                            <option value="x-api-key">x-api-key + anthropic-version</option>
-                        </select>
-                    </label>
+                    <div id="routingFields">
+                        <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1"></label>
+                        <label>API 格式
+                            <select name="api_format">
+                                <option value="openai">OpenAI 兼容</option>
+                                <option value="openai_responses">OpenAI Responses</option>
+                                <option value="anthropic">Anthropic 兼容</option>
+                            </select>
+                        </label>
+                        <label>上游路径（可选）
+                            <input name="endpoint_path" placeholder="留空自动推导，如 /v1/messages 或 /responses">
+                        </label>
+                        <label>认证方式
+                            <select name="auth_header">
+                                <option value="auto">自动（按 API 格式推导）</option>
+                                <option value="bearer">Authorization: Bearer</option>
+                                <option value="x-api-key">x-api-key + anthropic-version</option>
+                            </select>
+                        </label>
+                        <label>并发限额（可选，留空 = 无限制）
+                            <input name="max_concurrency" type="number" step="1" min="1" placeholder="如 3">
+                        </label>
+                    </div>
                     <label>账户类型
                         <!-- options rendered from /api/proxy/account-types by
                              _populateTypeOptions() on modal open -->
-                        <select name="account_type" onchange="togglePlanFields(this)"></select>
+                        <select name="account_type" onchange="toggleTypeFields(this)"></select>
+                    </label>
+                    <label id="agentKindField" style="display:none;">Agent 名称
+                        <select name="agent_kind">
+                            <option value="codex">codex</option>
+                        </select>
                     </label>
                     <label id="planPriceField" style="display:none;"><span>订阅月费 (<span id="planPriceSymbol">¥</span>/周期)</span>
                         <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 99">
@@ -578,42 +668,14 @@ function initAccountsPage() {
                             <option value="USD">USD</option>
                         </select>
                     </label>
-                    <label>并发限额（可选，留空 = 无限制）
-                        <input name="max_concurrency" type="number" step="1" min="1" placeholder="如 3">
+                    <label id="agentValidFromField" style="display:none;">订阅起始日（UTC，留空=创建日期）
+                        <input name="valid_from" type="date">
                     </label>
                     <div style="display:flex; gap:8px;">
                         <button type="submit" class="btn btn--primary">添加账户</button>
                         <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
                         <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
                         <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:#EF4444;">删除账户</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-        <div class="modal-overlay" id="agentModal" style="display:none">
-            <div class="modal">
-                <div class="modal__header">
-                    <h3>添加 Agent</h3>
-                    <button class="modal__close" onclick="closeModal('agentModal')">&times;</button>
-                </div>
-                <form id="agentForm" onsubmit="saveAgent(event)">
-                    <label>名称 <input name="name" required placeholder="如 ChatGPT Plus"></label>
-                    <label>Agent 名称
-                        <select name="agent_kind">
-                            <option value="codex">codex</option>
-                        </select>
-                    </label>
-                    <label>订阅月费
-                        <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 20">
-                    </label>
-                    <label>订阅币种
-                        <select name="currency">
-                            <option value="CNY">CNY</option>
-                            <option value="USD" selected>USD</option>
-                        </select>
-                    </label>
-                    <div style="margin-top:8px;">
-                        <button type="submit" class="btn btn--primary">添加 Agent</button>
                     </div>
                 </form>
             </div>

@@ -28,6 +28,7 @@
 | `currency` | 订阅价原生币种 `CNY` / `USD`,默认 CNY |
 | `agent_kind` | agent 账户的子类型,目前仅 `codex` |
 | `max_concurrency` | 并发限额,NULL=不限;达到限额的请求返回 429(聚合链内自动切下一个) |
+| `valid_from` | UTC 日期,per_account 订阅(agent)的订阅起始日;NULL 回落 `created_at` 的日期 |
 
 `upstream_key` 列保留作为"legacy 单密钥"的退路(0007 起密钥改为存 `upstream_keys` 子表,见下)。
 

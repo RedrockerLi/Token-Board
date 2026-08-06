@@ -8,8 +8,9 @@ Fetch-on-demand rule (per requirements):
 
 The table lives in proxy.db (fx_rate) and is excluded from cloud sync
 (app/sync.py _RUNTIME_TABLES).  Every function is best-effort and never raises
-into the request path; missing data degrades to the last known rate (1.0 when
-no rate has ever been stored).
+into the request path; missing data degrades to the nearest stored rate (the
+earliest one when the requested date precedes every row; 1.0 only when the
+pair has never been stored).
 """
 
 from datetime import datetime, timezone
@@ -32,15 +33,25 @@ def get_rate(conn, base: str = "USD", quote: str = "CNY",
              date: str | None = None) -> float:
     """Nearest-latest stored rate for ``date`` (default today UTC), read-only.
 
-    Matches the requirement "如果拉取后依然是旧数据，就直接用旧数据": a rate that
-    is not exactly for *date* falls back to the most recent earlier row.  1.0
-    when nothing is stored (no failure — CNY prices are unaffected).
+    A rate that is not exactly for *date* falls back to the most recent earlier
+    row.  When *date* precedes every stored rate (e.g. a past month before the
+    first fetch), uses the earliest stored rate so past USD subscriptions are
+    not silently undervalued.  Only when the pair has never been stored does it
+    return 1.0 (no failure — CNY prices are unaffected).
     """
     date = date or _utc_date()
     row = conn.execute(
         "SELECT rate FROM fx_rate WHERE base=? AND quote=? AND date<=? "
         "ORDER BY date DESC LIMIT 1",
         (base, quote, date),
+    ).fetchone()
+    if row is not None:
+        return float(row["rate"])
+    # 请求日期早于所有已存汇率（如过去月份早于首次拉取）→ 用最早一条。
+    row = conn.execute(
+        "SELECT rate FROM fx_rate WHERE base=? AND quote=? "
+        "ORDER BY date ASC LIMIT 1",
+        (base, quote),
     ).fetchone()
     return float(row["rate"]) if row is not None else 1.0
 
