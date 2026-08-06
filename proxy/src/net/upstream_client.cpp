@@ -1115,6 +1115,18 @@ private:
 
 }  // namespace
 
+/// Detect a genuine upstream quota-exhaustion error body (opencode.ai
+/// "Console Go" returns HTTP 429 with
+///   {"type":"error","error":{"type":"GoUsageLimitError",…},
+///    "metadata":{"limitName":"5 hour"|"weekly"}}
+/// Substring matching (not a JSON parse) keeps this cheap and safe even if a
+/// peer returns a large or truncated error body.
+bool is_usage_limit_error(const std::string &body) {
+    if (body.empty()) return false;
+    return body.find("GoUsageLimitError") != std::string::npos ||
+           body.find("\"limitName\"") != std::string::npos;
+}
+
 UpstreamClient::ForwardResult
 UpstreamClient::forward(const std::string &method,
                         const std::string &base_url,
@@ -1382,6 +1394,8 @@ UpstreamClient::forward(const std::string &method,
                 result.error = truncated
                     ? "Upstream stream truncated before terminal event"
                     : "Upstream returned " + std::to_string(upstream_res.status);
+            if (upstream_res.status >= 400)
+                result.usage_limit = is_usage_limit_error(result.body);
         } else {
             result.is_timeout = watch->expired.load(std::memory_order_acquire) ||
                                 err == httplib::Error::ConnectionTimeout;
@@ -1448,6 +1462,8 @@ UpstreamClient::forward(const std::string &method,
             result.status_code = upstream_res->status;
             result.body = upstream_res->body;
             result.success = (upstream_res->status >= 200 && upstream_res->status < 300);
+            if (upstream_res->status >= 400)
+                result.usage_limit = is_usage_limit_error(result.body);
             if (opts.non_streaming_body_limit > 0 &&
                 result.body.size() > opts.non_streaming_body_limit) {
                 // The response exceeded the documented hard limit: treat it as

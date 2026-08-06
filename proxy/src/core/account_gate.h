@@ -83,14 +83,26 @@ public:
             std::chrono::steady_clock::now() + PLAN_COOLDOWN;
     }
 
+    /// Route a failed upstream attempt.  A genuine quota exhaustion on a
+    /// subscription-class key (usage_limit=true, e.g. GoUsageLimitError) cools
+    /// that key down (per-key); every other failure — including a plain
+    /// transient 429 — backs off 5s → 30s → 2min instead of locking the key
+    /// for the whole cooldown window.
+    void record_failure(int key_slot_id, account_types::CooldownClass cls,
+                        bool usage_limit, int status_code) {
+        if (usage_limit && cls == account_types::CooldownClass::kSubscription5h) {
+            mark_cooldown(key_slot_id);
+            return;
+        }
+        mark_failure(key_slot_id, status_code);
+    }
+
     /// Short circuit breaker for unusable/transient provider responses.
-    /// Subscription-class accounts get their contractual 5h cooldown on a 429
-    /// (see account_types::cooldown_class); 401/403/other 429/5xx and network
-    /// failures back off 5s → 30s → 2min. A success clears it.
-    void mark_failure(int key_slot_id, account_types::CooldownClass cls,
-                      int status_code) {
-        if (cls == account_types::CooldownClass::kSubscription5h &&
-            status_code == 429) { mark_cooldown(key_slot_id); return; }
+    /// Non-quota failures back off 5s → 30s → 2min; a success clears it.  A
+    /// genuine quota exhaustion is routed to mark_cooldown() by
+    /// record_failure() — a transient 429 must never lock a key for 5h.
+    void mark_failure(int key_slot_id, int status_code) {
+        (void)status_code;  // reserved: error-code-graded backoff in a later phase
         std::lock_guard<std::mutex> lock(mutex_);
         int &streak = failure_streak_[key_slot_id];
         ++streak;

@@ -102,3 +102,13 @@ add_test(
             ${CMAKE_SOURCE_DIR}/..
             --requests 40 --concurrency 8
 )
+# GoUsageLimitError cooldown discrimination (#4 root B): quota-exhaustion 429
+# cools a plan key down; a plain transient 429 only backs off briefly.
+add_test(
+    NAME cooldown_discrimination
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/cooldown_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/..
+)

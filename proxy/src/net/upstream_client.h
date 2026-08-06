@@ -85,6 +85,12 @@ public:
         // semantic TTFT). Non-streaming: full response duration; it is never
         // displayed or persisted as user-visible TTFT.
         int ttft_ms = 0;
+        // Set when a non-2xx error body identifies a genuine quota-exhaustion
+        // (opencode.ai "Console Go" sends {"type":"error",
+        // "error":{"type":"GoUsageLimitError",...},"metadata":{"limitName":…}}).
+        // The caller uses it to distinguish "subscription exhausted — cool this
+        // key down" from a transient 429 (rate limit), which only backs off.
+        bool usage_limit = false;
     };
 
     /// Forward a request to the upstream API.

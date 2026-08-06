@@ -78,7 +78,7 @@ int main() {
     AccountGate gate;
     assert(gate.try_acquire_eligible(101, 1));
     gate.release(101);
-    gate.mark_failure(101, account_types::CooldownClass::kTransient, 502);
+    gate.mark_failure(101, 502);
     assert(!gate.try_acquire_eligible(101, 1));
 
     // Cost-led cold start: with a ledger wired in, a session with no binding
