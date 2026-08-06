@@ -44,7 +44,7 @@
 - 计费与调用量解耦：**每把上游密钥**按 `valid_from`(订阅起始日) 锚定的**行政月周期**收一次月费；同一账户多把密钥 = 多个独立订阅。
 - 调用照常被代理转发、照常记 `request_log`，但 `api_cost` 记的是**虚拟消费**（不买套餐按量算要花多少钱），用于衡量套餐划不划算。
 - 429 冷却也是**按密钥**：一把 plan 密钥被限流只冷却它自己，同账户其他密钥立即接管（[proxy/src/core/account_gate.h:18-21](proxy/src/core/account_gate.h#L18-L21)）。
-- 订阅周期、价格历史、取消宽限见 [billing-pricing.md](billing-pricing.md)「plan 账户与虚拟消费」。
+- 订阅周期、价格历史、删除默认操作见 [billing-pricing.md](billing-pricing.md)「plan 账户与虚拟消费」。
 
 ### agent 账户（Agent 订阅，目前仅 Codex）
 
@@ -64,7 +64,7 @@
 - **固定填充顺序**：`upstream_keys.position` 决定优先顺序，会话亲和与溢流都按 `(position, id)` 走（[proxy/src/core/proxy_server.cpp:462-496](proxy/src/core/proxy_server.cpp#L462-L496)）。
 - **会话亲和(session affinity)**：同一会话（`x-session-id` / OpenAI `user` / Anthropic `metadata.user_id` / Responses `previous_response_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/proxy_server.h:42-138](proxy/src/core/proxy_server.h#L42-L138)）。
 - **冷启动成本平衡**：新会话没有绑定记录时，优先选**累计消费最少**的 Key（进程内 `KeyCostLedger`，由记账线程异步喂数据），让多把 Key 按花费磨损得更均匀（[proxy/src/core/key_cost_ledger.h](proxy/src/core/key_cost_ledger.h)）。
-- **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `deleted_at` / `cancellation_grace_hours`，月费按「锚点日」各自切周期。
+- **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `deleted_at`，月费按「锚点日」各自切周期。删除密钥/账户按设置页「删除默认操作」执行：`immediate`（本期立即删除，本期计费）或 `end_of_period`（到期立即删除，本期计费、下期不计费——`deleted_at` 设为本期期末，到期前仍保持可路由）。agent 同理，api 始终立即删除。
 - **观测**：会话→密钥分配记在本地 `session_key_log`（7 天滚动，不上云）。
 
 ### 兼容旧形态

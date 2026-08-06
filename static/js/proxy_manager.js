@@ -195,7 +195,7 @@ async function loadAccountsTable() {
         }
         tbody.innerHTML = real.map((a) => `
             <tr>
-                <td>${esc(a.name)}</td>
+                <td>${esc(a.name)}${a.deleted_at ? ` <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="到期删除：${esc(a.deleted_at)} UTC">到期 ${esc(a.deleted_at.slice(0, 10))}</span>` : ''}</td>
                 <td><code>${esc(maskKey(a.upstream_key))}</code>${a.key_count > 1 ? ` <span class="badge" title="${a.key_count} 把密钥（同一配置的多个并发槽位）">×${a.key_count}</span>` : ''}${!a.upstream_key && !a.key_count ? ' <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
@@ -312,7 +312,7 @@ function editAccount(id) {
         if (keySection) keySection.style.display = isAgent ? 'none' : '';
         document.getElementById('accountModelBtn').style.display = isAgent ? 'none' : '';
         document.getElementById('accountTestConcBtn').style.display = isAgent ? 'none' : '';
-        document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name); };
+        document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name, acc.account_type); };
         document.getElementById('accountModelBtn').onclick = () => updateAccountModels(id, acc.name);
         document.getElementById('accountTestConcBtn').onclick = () => testConcurrency(id, acc.name, true);
         openModal('accountModal');
@@ -320,29 +320,54 @@ function editAccount(id) {
 }
 
 let _deleteAccountPendingId = null;
+let _deleteAccountPendingSub = false;
 
-async function deleteAccount(id, name) {
+/** Return a hint showing the configured default deletion operation for
+ *  plan/agent accounts (api is always immediate). */
+async function _deletionOpNote(accountType) {
+    if (accountType !== 'plan' && accountType !== 'agent') return '';
+    try {
+        const cfg = await proxyFetch('/api/proxy/billing-config');
+        return cfg.cancellation_mode === 'end_of_period'
+            ? '\n\n默认操作：到期立即删除 —— 可继续使用至本期最后一天（本期计费，下期不计费）。'
+            : '\n\n默认操作：本期立即删除 —— 删除即刻生效，本期仍计费。';
+    } catch (_) {
+        return '';
+    }
+}
+
+async function deleteAccount(id, name, accountType) {
+    const isSubscription = accountType === 'plan' || accountType === 'agent';
+    const opNote = await _deletionOpNote(accountType);
     // Count local keys bound to this account.
     let keys = [];
     try { keys = await proxyFetch('/api/proxy/keys'); } catch (_) {}
     const bound = keys.filter((k) => k.account_id === id).length;
 
     if (bound === 0) {
-        if (!confirm(`确定删除账户 "${name}"？`)) return;
-        await _doDeleteAccount(id, 'detach');
+        if (!confirm(`确定删除账户 "${name}"？${opNote}`)) return;
+        await _doDeleteAccount(id, 'detach', isSubscription);
         return;
     }
     // Has bound keys → let the user choose cascade vs detach.
     _deleteAccountPendingId = id;
+    _deleteAccountPendingSub = isSubscription;
     document.getElementById('deleteAccountMsg').textContent =
-        `账户 "${name}" 有 ${bound} 个关联本地密钥，选择删除方式：`;
+        `账户 "${name}" 有 ${bound} 个关联本地密钥，选择删除方式：${opNote}`;
     openModal('deleteAccountModal');
 }
 
-async function _doDeleteAccount(id, mode) {
+async function _doDeleteAccount(id, mode, isSubscription) {
     try {
-        await proxyFetch(`/api/proxy/accounts/${id}?mode=${mode}`, { method: 'DELETE' });
-        showToast('账户已删除');
+        const resp = await proxyFetch(`/api/proxy/accounts/${id}?mode=${mode}`, { method: 'DELETE' });
+        if (resp && resp.deferred) {
+            const until = (resp.effective_deleted_at || '').slice(0, 10);
+            showToast(`已安排到期删除，可继续使用至 ${until}（本期仍计费，下期不计费）`);
+        } else if (isSubscription) {
+            showToast('账户已删除（本期已计费）');
+        } else {
+            showToast('账户已删除');
+        }
         ConfigSync.markDirty();
         closeModal('deleteAccountModal');
         loadAccountsTable();
@@ -352,11 +377,11 @@ async function _doDeleteAccount(id, mode) {
 }
 
 function deleteAccountCascade() {
-    if (_deleteAccountPendingId != null) _doDeleteAccount(_deleteAccountPendingId, 'cascade');
+    if (_deleteAccountPendingId != null) _doDeleteAccount(_deleteAccountPendingId, 'cascade', _deleteAccountPendingSub);
 }
 
 function deleteAccountDetach() {
-    if (_deleteAccountPendingId != null) _doDeleteAccount(_deleteAccountPendingId, 'detach');
+    if (_deleteAccountPendingId != null) _doDeleteAccount(_deleteAccountPendingId, 'detach', _deleteAccountPendingSub);
 }
 
 async function updateAccountModels(id, name) {

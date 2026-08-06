@@ -86,7 +86,7 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/proxy/billing-config` | GET | plan 计费设置:`price_change_effective`(改价默认本期/下期)、`cancellation_grace_hours`(取消宽限小时数) |
+| `/api/proxy/billing-config` | GET | plan 计费设置:`price_change_effective`(改价默认本期/下期)、`cancellation_mode`(删除默认操作:`immediate` 本期立即删除(本期计费) / `end_of_period` 到期立即删除(本期计费、下期不计费)) |
 | `/api/proxy/billing-config` | PUT | 整体保存 plan 计费设置 |
 
 ### 消费与日志

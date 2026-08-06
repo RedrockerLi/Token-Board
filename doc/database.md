@@ -37,15 +37,15 @@
 
 ### upstream_keys — 本地上游密钥生命周期
 
-一行代表一把本机上游密钥。`valid_from` 是 UTC 日期（NULL 回落 `created_at` 的日期）；`deleted_at` 是 UTC 时间。移除密钥不会物理删除该行，而是写入删除时间和当时的 `cancellation_grace_hours`，因此已归档账单能够稳定重算。明文 `key_value` 永远不上传。
+一行代表一把本机上游密钥。`valid_from` 是 UTC 日期（NULL 回落 `created_at` 的日期）；`deleted_at` 是 UTC 时间（`immediate` 删除=删除时刻，`end_of_period` 删除=本期期末，未来时间，到期前仍可路由）。移除密钥不会物理删除该行，而是写入 `deleted_at`，因此已归档账单能够稳定重算。明文 `key_value` 永远不上传。
 
-`upstream_keys_cloud` 只保存 `key_masked`、起始日、位置、删除标记和宽限快照，供多机把同一物理密钥的账单归并；不含可用密钥材料。
+`upstream_keys_cloud` 只保存 `key_masked`、起始日、位置、删除标记，供多机把同一物理密钥的账单归并；不含可用密钥材料。
 
 每把密钥是一个独立的**并发槽位**(`max_concurrency` 按密钥计数,一把打满可溢出到同账户下一把)与独立**plan 订阅**——plan 月费 = 单价 × 本机密钥数。密钥收到 429 只冷却自己这把,同账户其他密钥可立即接管(见 [proxy-internals.md](proxy-internals.md))。
 
 ### plan_billing_config 与 plan_price_history — plan 计费设置
 
-`plan_billing_config` 单行全局设置:`price_change_effective`(改价默认从本期还是下期生效)、`cancellation_grace_hours`(取消宽限小时数,默认 24)。`plan_price_history` 记录每次月费变更:`account_id`、`monthly_price`、`changed_at`、`effective_mode`;订阅费由生命周期 + 价格历史重建,历史月份冻结、当月按当前设置刷新。
+`plan_billing_config` 单行全局设置:`price_change_effective`(改价默认从本期还是下期生效)、`cancellation_mode`(删除 plan/agent 的默认操作:`immediate` 本期立即删除(本期计费) / `end_of_period` 到期立即删除(本期计费、下期不计费),默认 `immediate`)。`upstream_accounts.deferred_cleanup_mode` 记录 end_of_period 账户删除的延迟清理意图(detach/cascade)，由删除 finalizer 在 `deleted_at` 到期后执行。`plan_price_history` 记录每次月费变更:`account_id`、`monthly_price`、`changed_at`、`effective_mode`;订阅费由生命周期 + 价格历史重建,历史月份冻结、当月按当前设置刷新。
 
 ### request_log — 请求日志与计费载体
 
@@ -135,7 +135,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。�
 
 ### proxy_plan_summary
 
-每个”行政月 × 账户 × masked 上游密钥”一行:`subscription_cost` 是该密钥无论使用与否都产生的周期月费,`virtual_cost` 是该密钥所承载请求的 api 口径金额。订阅费由 `valid_from`、删除宽限和 `plan_price_history` 重建;虚拟消费仍按导出批次增量持久化。
+每个”行政月 × 账户 × masked 上游密钥”一行:`subscription_cost` 是该密钥无论使用与否都产生的周期月费,`virtual_cost` 是该密钥所承载请求的 api 口径金额。订阅费由 `valid_from`、`deleted_at`(删除默认操作)和 `plan_price_history` 重建;虚拟消费仍按导出批次增量持久化。
 
 ### model_pricing / pricing_slots / account_types
 

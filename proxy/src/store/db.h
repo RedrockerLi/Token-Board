@@ -63,7 +63,9 @@ public:
         std::string account_type;    // "api" | "plan"
         double monthly_price = 0;    // plan monthly price
         int max_concurrency = 0;     // 0 = unlimited
-        bool deleted = false;        // soft-deleted (deleted_at set)
+        bool deleted = false;        // soft-deleted with a PAST deleted_at
+                                     // (a future deleted_at = end_of_period
+                                     // cancellation, still routable until then)
     };
     std::optional<AccountInfo> get_account(int account_id);
 

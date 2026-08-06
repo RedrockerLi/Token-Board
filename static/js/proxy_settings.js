@@ -96,7 +96,7 @@ async function loadBillingConfig() {
     try {
         const cfg = await proxyFetch('/api/proxy/billing-config');
         document.getElementById('billingPriceEffective').value = cfg.price_change_effective || 'current_period';
-        document.getElementById('billingGraceHours').value = cfg.cancellation_grace_hours ?? 24;
+        document.getElementById('billingCancellationMode').value = cfg.cancellation_mode || 'immediate';
     } catch (err) {
         showToast('加载 Plan 计费设置失败: ' + err.message, 'error');
     }
@@ -110,7 +110,7 @@ async function saveBillingConfig() {
             method: 'PUT',
             body: JSON.stringify({
                 price_change_effective: document.getElementById('billingPriceEffective').value,
-                cancellation_grace_hours: document.getElementById('billingGraceHours').value,
+                cancellation_mode: document.getElementById('billingCancellationMode').value,
             }),
         });
         showToast('Plan 计费设置已保存');
@@ -231,7 +231,7 @@ function initSettingsPage() {
             <div class="chart-card">
                 <div class="chart-card__title" style="margin-bottom:12px;">Plan 订阅计费</div>
                 <p style="margin:0 0 12px; font-size:13px; color:var(--color-text-secondary);">
-                    所有订阅起止、价格变更与宽限判断均使用 UTC+0。密钥有各自的订阅周期，因此“本月/下月”分别表示该密钥的本期/下期。
+                    所有订阅起止、价格变更与删除边界均使用 UTC+0。密钥有各自的订阅周期，因此“本月/下月”分别表示该密钥的本期/下期。
                 </p>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
                     <label>修改月费的默认生效时间
@@ -240,12 +240,16 @@ function initSettingsPage() {
                             <option value="next_period">下一计费周期生效</option>
                         </select>
                     </label>
-                    <label>取消订阅免收当期费用的宽限（小时）
-                        <input id="billingGraceHours" type="number" min="0" max="744" step="1">
+                    <label>删除 Plan / Agent 的默认操作
+                        <select id="billingCancellationMode">
+                            <option value="immediate">本期立即删除（本期计费）</option>
+                            <option value="end_of_period">到期立即删除（本期计费，下期不计费）</option>
+                        </select>
                     </label>
                 </div>
                 <div style="margin-top:10px; font-size:13px; color:var(--color-text-secondary);">
-                    填 0 关闭宽限。删除密钥或账户时会记录当时的宽限值，之后修改设置不会改写历史账单。
+                    删除 plan 账户/密钥或 agent 账户时按此操作执行（api 类型始终立即删除）。「本期立即删除」即刻停用但本期照收月费；
+                    「到期立即删除」可继续使用至本期最后一天，本期照收、下期不再计费。所有边界均按 UTC+0，密钥各自的订阅周期独立计算。
                 </div>
                 <div style="display:flex; justify-content:flex-end; margin-top:12px;">
                     <button class="btn btn--primary" id="btnBillingConfigSave" onclick="saveBillingConfig()">保存 Plan 计费设置</button>

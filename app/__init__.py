@@ -90,4 +90,30 @@ def create_app(proxy_db_path: str | None = None):
         except Exception:
             pass
 
+        # End-of-period account deletions (plan/agent scheduled to end at the
+        # close of their current billing period) keep routing until deleted_at
+        # passes, then the deletion finalizer completes the deferred local-key
+        # and aggregate cleanup.  Routing stop does NOT depend on this thread
+        # (queries treat a past deleted_at as gone); this only finishes cleanup.
+        try:
+            import threading
+
+            def _finalizer_loop(stop_event):
+                # Sweep once at startup (catches anything that came due while
+                # the app was down), then every 60 s.
+                while True:
+                    try:
+                        pdb.finalize_deferred_deletions()
+                    except Exception:
+                        pass  # best-effort, never affect the request path
+                    if stop_event.wait(60):
+                        break
+
+            stop_event = threading.Event()
+            flask_app.config["DEFERRED_DELETE_STOP"] = stop_event
+            threading.Thread(target=_finalizer_loop, args=(stop_event,),
+                             daemon=True, name="deletion-finalizer").start()
+        except Exception:
+            pass
+
     return flask_app

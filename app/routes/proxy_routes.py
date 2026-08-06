@@ -59,9 +59,11 @@ def delete_account(account_id):
     result = _proxy_db().delete_account(account_id, mode=mode)
     if not result["ok"]:
         return jsonify({"error": result["error"] or "Account not found"}), 400
-    return jsonify({"status": "ok", "cancelled_at": result.get("cancelled_at"),
-                    "cancellation_grace_hours": result.get("cancellation_grace_hours"),
-                    "cancellation_effects": result.get("cancellation_effects", [])})
+    return jsonify({"status": "ok",
+                    "cancellation_mode": result.get("cancellation_mode"),
+                    "cancelled_at": result.get("cancelled_at"),
+                    "effective_deleted_at": result.get("effective_deleted_at"),
+                    "deferred": result.get("deferred", False)})
 
 
 # ── Account Models ───────────────────────────────────────────────────

@@ -97,6 +97,25 @@ def _iter_months(first: str, last: str):
         month = _next_month(month)
 
 
+def _cancellation_end(config: sqlite3.Row, now: datetime, anchor_day: int,
+                      account_type: str) -> datetime:
+    """`deleted_at` a plan/agent key or account should receive on cancellation.
+
+    api accounts are always terminated immediately (no subscription lifecycle).
+    For plan/agent the configured default deletion operation decides:
+      'immediate'     → deleted_at = now (本期计费, 立即停止路由).
+      'end_of_period' → deleted_at = end of the current billing period
+                        (本期计费, 下期不计费); the entity keeps routing until
+                        then because a future deleted_at is treated as active.
+    `_billing_period_month(end, anchor_day)` must still equal the current
+    period, hence the -1s before the next period's start.
+    """
+    if account_type == "api" or config["cancellation_mode"] == "immediate":
+        return now
+    current = _billing_period_month(now, anchor_day)
+    return _period_start(_next_month(current), anchor_day) - timedelta(seconds=1)
+
+
 class ProxyDatabase:
     """Manages the proxy SQLite database from the Flask side."""
 
@@ -154,10 +173,12 @@ class ProxyDatabase:
 
             # Current plan/agent subscriptions are independent of usage.  Use the
             # same lifecycle/price-history resolver as dashboard export so a
-            # key deleted after its grace window remains billed this period.
-            # Native (plan_price_history) prices are in the account's currency;
-            # USD subscriptions are converted to CNY at today's rate (fetch on
-            # demand; stale fallback handled inside fx).
+            # deleted key remains billed for the current period it touched
+            # (no grace window anymore; an end-of-period deletion simply ends
+            # the lifecycle at this period's end).  Native (plan_price_history)
+            # prices are in the account's currency; USD subscriptions are
+            # converted to CNY at today's rate (fetch on demand; stale fallback
+            # handled inside fx).
             plan_subscription = 0.0
             now = _utc_now()
             for meta in self._plan_key_billing_meta(conn):
@@ -183,19 +204,22 @@ class ProxyDatabase:
 
             # "Active upstreams" = real (non-aggregate) accounts with a request
             # today. account_id is the identity; is_aggregate comes from a JOIN
-            # (soft-deleted accounts are excluded — they are no longer routed).
+            # (soft-deleted accounts are excluded — a future deleted_at from an
+            # end-of-period cancellation is still routing, so it stays counted).
             active_upstreams = conn.execute(
                 "SELECT COUNT(DISTINCT r.account_id) FROM request_log r "
                 "JOIN upstream_accounts a ON a.id = r.account_id "
                 "WHERE COALESCE(a.is_aggregate, 0) = 0 "
-                "  AND a.deleted_at IS NULL AND date(r.requested_at) = ? "
+                "  AND (a.deleted_at IS NULL OR a.deleted_at > datetime('now')) "
+                "  AND date(r.requested_at) = ? "
                 "  AND r.account_id IS NOT NULL",
                 (today,),
             ).fetchone()[0]
 
             total_accounts = conn.execute(
                 "SELECT COUNT(*) FROM upstream_accounts "
-                "WHERE is_aggregate = 0 AND deleted_at IS NULL"
+                "WHERE is_aggregate = 0 "
+                "  AND (deleted_at IS NULL OR deleted_at > datetime('now'))"
             ).fetchone()[0]
 
             return {
@@ -224,10 +248,12 @@ class ProxyDatabase:
                 "COALESCE(monthly_price,0) AS monthly_price, "
                 "COALESCE(currency,'CNY') AS currency, "
                 "COALESCE(agent_kind,'') AS agent_kind, "
-                "max_concurrency, created_at, "
+                "max_concurrency, created_at, deleted_at, "
                 "(SELECT COUNT(*) FROM upstream_keys k WHERE k.account_id = upstream_accounts.id "
-                " AND k.deleted_at IS NULL) AS key_count "
-                "FROM upstream_accounts WHERE deleted_at IS NULL ORDER BY id"
+                " AND (k.deleted_at IS NULL OR k.deleted_at > datetime('now'))) AS key_count "
+                "FROM upstream_accounts "
+                "WHERE (deleted_at IS NULL OR deleted_at > datetime('now')) "
+                "ORDER BY id"
             ).fetchall()
             accounts = []
             for r in rows:
@@ -237,7 +263,9 @@ class ProxyDatabase:
                 # reference kept keys without ever sending the real values.
                 key_rows = conn.execute(
                     "SELECT id, key_value, COALESCE(valid_from, date(created_at)) AS valid_from "
-                    "FROM upstream_keys WHERE account_id = ? AND deleted_at IS NULL ORDER BY position, id",
+                    "FROM upstream_keys WHERE account_id = ? "
+                    "  AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
+                    "ORDER BY position, id",
                     (acc["id"],),
                 ).fetchall()
                 acc["keys"] = [{"id": k[0], "masked": mask_key(k[1]),
@@ -267,7 +295,7 @@ class ProxyDatabase:
     @staticmethod
     def _billing_config_conn(conn: sqlite3.Connection) -> sqlite3.Row:
         return conn.execute(
-            "SELECT price_change_effective, cancellation_grace_hours "
+            "SELECT price_change_effective, cancellation_mode "
             "FROM plan_billing_config WHERE id=1"
         ).fetchone()
 
@@ -276,45 +304,57 @@ class ProxyDatabase:
         """Mirror local key lifecycle metadata without ever copying a secret."""
         conn.execute("DELETE FROM upstream_keys_cloud WHERE account_id=?", (account_id,))
         for row in conn.execute(
-            "SELECT key_value, position, valid_from, deleted_at, cancellation_grace_hours "
+            "SELECT key_value, position, valid_from, deleted_at "
             "FROM upstream_keys WHERE account_id=?", (account_id,)
         ):
             conn.execute(
                 "INSERT INTO upstream_keys_cloud "
-                "(account_id,key_masked,position,valid_from,deleted_at,cancellation_grace_hours) "
-                "VALUES (?,?,?,?,?,?)",
+                "(account_id,key_masked,position,valid_from,deleted_at) "
+                "VALUES (?,?,?,?,?)",
                 (account_id, mask_key(row["key_value"]), row["position"],
-                 row["valid_from"], row["deleted_at"], row["cancellation_grace_hours"]),
+                 row["valid_from"], row["deleted_at"]),
             )
 
     @staticmethod
     def _set_upstream_keys(conn: sqlite3.Connection, account_id: int,
                            keep_ids: list[int], new_keys: list[str],
                            keep_valid_froms: dict[str, object] | None = None,
-                           new_valid_froms: list[object] | None = None) -> list[str]:
+                           new_valid_froms: list[object] | None = None,
+                           account_type: str = "api") -> list[str]:
         """Diff an account's local keys, preserving soft-deleted lifecycles.
 
         Returns active plaintext values only so the legacy account column can
         retain its first active fallback key.  This function is called inside
         the same transaction that updates the cloud-safe metadata mirror.
+
+        Removed keys get `deleted_at` per the account type and the plan-billing
+        default operation (see _cancellation_end): api keys stop immediately;
+        plan keys either stop now ('immediate') or at the end of their current
+        billing period ('end_of_period').  An end-of-period key keeps routing
+        until then, so the "active" set includes future-deleted keys.
         """
         keep_valid_froms = keep_valid_froms or {}
         new_valid_froms = new_valid_froms or []
         active = {
             row["id"]: row for row in conn.execute(
-                "SELECT id,key_value,valid_from FROM upstream_keys "
-                "WHERE account_id=? AND deleted_at IS NULL", (account_id,)
+                "SELECT id,key_value,valid_from,created_at FROM upstream_keys "
+                "WHERE account_id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
+                (account_id,)
             )
         }
         retained = [key_id for key_id in keep_ids if key_id in active]
         config = ProxyDatabase._billing_config_conn(conn)
-        now = _utc_now().strftime("%Y-%m-%d %H:%M:%S")
+        now = _utc_now()
         for key_id in active:
             if key_id not in retained:
+                row = active[key_id]
+                anchor = _parse_iso_date(row["valid_from"]) or _parse_utc_timestamp(
+                    row["created_at"]
+                ).date()
+                end = _cancellation_end(config, now, anchor.day, account_type)
                 conn.execute(
-                    "UPDATE upstream_keys SET deleted_at=?, cancellation_grace_hours=? "
-                    "WHERE id=?",
-                    (now, config["cancellation_grace_hours"], key_id),
+                    "UPDATE upstream_keys SET deleted_at=? WHERE id=?",
+                    (end.strftime("%Y-%m-%d %H:%M:%S"), key_id),
                 )
 
         active_values: list[str] = []
@@ -384,7 +424,8 @@ class ProxyDatabase:
             # Agent accounts are subscription-only: never create upstream keys.
             if keys and account_type != "agent":
                 self._set_upstream_keys(
-                    conn, account_id, [], keys, new_valid_froms=data.get("new_valid_froms")
+                    conn, account_id, [], keys, new_valid_froms=data.get("new_valid_froms"),
+                    account_type=account_type,
                 )
             # Plan/agent accounts are subscription-billed: seed the baseline
             # price history so _subscription_periods has a deterministic value.
@@ -405,7 +446,7 @@ class ProxyDatabase:
         try:
             original = conn.execute(
                 "SELECT account_type, monthly_price, currency FROM upstream_accounts "
-                "WHERE id=? AND deleted_at IS NULL", (account_id,)
+                "WHERE id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))", (account_id,)
             ).fetchone()
             if original is None:
                 return False
@@ -446,6 +487,7 @@ class ProxyDatabase:
                     conn, account_id, keep_ids, self._normalize_keys(data),
                     keep_valid_froms=data.get("keep_valid_froms"),
                     new_valid_froms=data.get("new_valid_froms"),
+                    account_type=original["account_type"],
                 )
                 first = final_keys[0] if final_keys else ""
                 fields.append("upstream_key = ?")
@@ -486,65 +528,148 @@ class ProxyDatabase:
 
         The row is kept (id is permanent, never recycled) and flagged with
         deleted_at. The account stops being routed and disappears from lists
-        (all queries filter deleted_at IS NULL), but its historical
+        (queries treat a past deleted_at as gone), but its historical
         request_log rows keep their account_id and the dashboard archive keeps
         showing the name (the accounts mirror preserves soft-deleted entries).
         request_log rows are NOT touched; they are cleaned 30 days after
         export by the normal high-water-mark cleanup.
 
         mode:
-          "cascade" — also hard-delete this account's local keys.
+          "cascade" — also delete this account's local keys.
           "detach"  — unbind the keys (account_id → NULL, keys stay for reuse).
         aggregate_entries referencing this account are deleted so an aggregate
         chain never routes to a dead account.
+
+        api accounts are always terminated immediately.  plan/agent accounts
+        follow the configured default deletion operation:
+          'immediate'     — deleted_at = now; local keys & aggregates cleaned up
+                            right here.
+          'end_of_period' — deleted_at = end of each key's current billing
+                            period (the account keeps routing until then; local
+                            keys & aggregates are kept so clients can still
+                            reach it).  The cleanup intent is recorded in
+                            deferred_cleanup_mode and performed by the deletion
+                            finalizer once deleted_at has passed.
         """
         conn = self._connect()
         try:
             config = self._billing_config_conn(conn)
+            account = conn.execute(
+                "SELECT account_type, created_at FROM upstream_accounts "
+                "WHERE id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                return {"ok": False, "error": "Account not found"}
+            account_type = account["account_type"] or "api"
             cancelled_at = _utc_now()
+            account_anchor = _parse_utc_timestamp(account["created_at"]).date()
             active_keys = conn.execute(
                 "SELECT id, valid_from, created_at FROM upstream_keys "
-                "WHERE account_id=? AND deleted_at IS NULL", (account_id,)
+                "WHERE account_id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
+                (account_id,),
             ).fetchall()
-            cancellation_effects = []
-            for key in active_keys:
-                anchor = _parse_iso_date(key["valid_from"]) or _parse_utc_timestamp(key["created_at"]).date()
-                current = _billing_period_month(cancelled_at, anchor.day)
-                waived = cancelled_at < _period_start(current, anchor.day) + timedelta(
-                    hours=config["cancellation_grace_hours"]
+            end_of_period = account_type != "api" and config["cancellation_mode"] == "end_of_period"
+
+            if end_of_period:
+                # Keep routing until the period end; defer the local-key and
+                # aggregate cleanup to the deletion finalizer.
+                key_ends = []
+                for key in active_keys:
+                    anchor = _parse_iso_date(key["valid_from"]) or _parse_utc_timestamp(
+                        key["created_at"]
+                    ).date()
+                    key_ends.append(_cancellation_end(config, cancelled_at, anchor.day,
+                                                      account_type))
+                account_end = max(key_ends) if key_ends else _cancellation_end(
+                    config, cancelled_at, account_anchor.day, account_type
                 )
-                cancellation_effects.append({"upstream_key_id": key["id"],
-                                             "current_period_waived": waived})
-            if mode == "cascade":
-                conn.execute("DELETE FROM local_keys WHERE account_id = ?", (account_id,))
-            else:
+                effective = account_end
                 conn.execute(
-                    "UPDATE local_keys SET account_id = NULL WHERE account_id = ?",
+                    "UPDATE upstream_accounts SET deleted_at=?, deferred_cleanup_mode=? "
+                    "WHERE id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
+                    (account_end.strftime("%Y-%m-%d %H:%M:%S"), mode, account_id),
+                )
+                for key, end in zip(active_keys, key_ends):
+                    conn.execute(
+                        "UPDATE upstream_keys SET deleted_at=? WHERE id=?",
+                        (end.strftime("%Y-%m-%d %H:%M:%S"), key["id"]),
+                    )
+            else:
+                # Immediate: clean up local keys and aggregates right now.
+                effective = cancelled_at
+                if mode == "cascade":
+                    conn.execute("DELETE FROM local_keys WHERE account_id = ?", (account_id,))
+                else:
+                    conn.execute(
+                        "UPDATE local_keys SET account_id = NULL WHERE account_id = ?",
+                        (account_id,),
+                    )
+                conn.execute("DELETE FROM aggregate_entries WHERE account_id = ?", (account_id,))
+                conn.execute(
+                    "DELETE FROM aggregate_entries WHERE upstream_account_id = ?",
                     (account_id,),
                 )
-            conn.execute("DELETE FROM aggregate_entries WHERE account_id = ?", (account_id,))
-            conn.execute(
-                "DELETE FROM aggregate_entries WHERE upstream_account_id = ?",
-                (account_id,),
-            )
-            conn.execute(
-                "UPDATE upstream_accounts SET deleted_at = ? "
-                "WHERE id = ? AND deleted_at IS NULL",
-                (cancelled_at.strftime("%Y-%m-%d %H:%M:%S"), account_id),
-            )
-            conn.execute(
-                "UPDATE upstream_keys SET deleted_at=?, "
-                "cancellation_grace_hours=? "
-                "WHERE account_id=? AND deleted_at IS NULL",
-                (cancelled_at.strftime("%Y-%m-%d %H:%M:%S"),
-                 config["cancellation_grace_hours"], account_id),
-            )
+                conn.execute(
+                    "UPDATE upstream_accounts SET deleted_at=?, deferred_cleanup_mode=NULL "
+                    "WHERE id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
+                    (cancelled_at.strftime("%Y-%m-%d %H:%M:%S"), account_id),
+                )
+                conn.execute(
+                    "UPDATE upstream_keys SET deleted_at=? "
+                    "WHERE account_id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
+                    (cancelled_at.strftime("%Y-%m-%d %H:%M:%S"), account_id),
+                )
             self._refresh_upstream_keys_cloud(conn, account_id)
             conn.commit()
             return {"ok": conn.total_changes > 0, "error": "",
+                    "cancellation_mode": config["cancellation_mode"],
                     "cancelled_at": cancelled_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "cancellation_grace_hours": config["cancellation_grace_hours"],
-                    "cancellation_effects": cancellation_effects}
+                    "effective_deleted_at": effective.strftime("%Y-%m-%d %H:%M:%S"),
+                    "deferred": effective > cancelled_at}
+        finally:
+            conn.close()
+
+    def finalize_deferred_deletions(self) -> int:
+        """Complete end-of-period account deletions whose time has come.
+
+        Routing already stopped at deleted_at (queries treat a past
+        deleted_at as gone); this only finishes the cleanup that was deferred
+        at delete time — detach/cascade the local keys and drop aggregate
+        references — and clears the marker.  Idempotent, safe to call on every
+        sweep.
+        """
+        conn = self._connect()
+        try:
+            now = _utc_now().strftime("%Y-%m-%d %H:%M:%S")
+            pending = conn.execute(
+                "SELECT id, deferred_cleanup_mode FROM upstream_accounts "
+                "WHERE deleted_at IS NOT NULL AND deleted_at <= ? "
+                "  AND deferred_cleanup_mode IS NOT NULL",
+                (now,),
+            ).fetchall()
+            for row in pending:
+                account_id = row["id"]
+                if row["deferred_cleanup_mode"] == "cascade":
+                    conn.execute("DELETE FROM local_keys WHERE account_id = ?", (account_id,))
+                else:
+                    conn.execute(
+                        "UPDATE local_keys SET account_id = NULL WHERE account_id = ?",
+                        (account_id,),
+                    )
+                conn.execute(
+                    "DELETE FROM aggregate_entries WHERE account_id = ?", (account_id,)
+                )
+                conn.execute(
+                    "DELETE FROM aggregate_entries WHERE upstream_account_id = ?",
+                    (account_id,),
+                )
+                conn.execute(
+                    "UPDATE upstream_accounts SET deferred_cleanup_mode = NULL WHERE id = ?",
+                    (account_id,),
+                )
+            conn.commit()
+            return len(pending)
         finally:
             conn.close()
 
@@ -756,7 +881,8 @@ class ProxyDatabase:
                 "COALESCE(monthly_price,0) AS monthly_price "
                 "FROM upstream_accounts "
                 "WHERE COALESCE(account_type,'api')='agent' "
-                "  AND COALESCE(is_aggregate,0)=0 AND deleted_at IS NULL "
+                "  AND COALESCE(is_aggregate,0)=0 "
+                "  AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
                 "ORDER BY id"
             ).fetchall()
             return [dict(r) for r in rows]
@@ -1009,7 +1135,7 @@ class ProxyDatabase:
             row = self._billing_config_conn(conn)
             return {
                 "price_change_effective": row["price_change_effective"],
-                "cancellation_grace_hours": row["cancellation_grace_hours"],
+                "cancellation_mode": row["cancellation_mode"],
                 "timezone": "UTC",
             }
         finally:
@@ -1019,18 +1145,15 @@ class ProxyDatabase:
         mode = data.get("price_change_effective")
         if mode not in ("current_period", "next_period"):
             raise ValueError("价格生效方式必须是 current_period 或 next_period")
-        try:
-            grace = int(data.get("cancellation_grace_hours"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("取消宽限必须是整数小时") from exc
-        if not 0 <= grace <= 744:
-            raise ValueError("取消宽限范围为 0-744 小时")
+        cancellation = data.get("cancellation_mode")
+        if cancellation not in ("immediate", "end_of_period"):
+            raise ValueError("删除默认操作必须是 immediate 或 end_of_period")
         conn = self._connect()
         try:
             conn.execute(
                 "UPDATE plan_billing_config SET price_change_effective=?, "
-                "cancellation_grace_hours=? WHERE id=1",
-                (mode, grace),
+                "cancellation_mode=? WHERE id=1",
+                (mode, cancellation),
             )
             conn.commit()
             return conn.total_changes > 0
@@ -1283,7 +1406,6 @@ class ProxyDatabase:
     def _plan_key_billing_meta(conn: sqlite3.Connection) -> list[dict]:
         """Build billable key lifecycles, including cloud-only masked keys."""
         now = _utc_now()
-        config = ProxyDatabase._billing_config_conn(conn)
         by_identity: dict[tuple[int, str], dict] = {}
         accounts = conn.execute(
             "SELECT id, upstream_key, created_at, deleted_at, "
@@ -1296,7 +1418,7 @@ class ProxyDatabase:
         account_rows = {row["id"]: row for row in accounts}
         for row in conn.execute(
             "SELECT k.id,k.account_id,k.key_value,k.created_at,k.valid_from,k.deleted_at,"
-            "k.cancellation_grace_hours,a.deleted_at AS account_deleted_at "
+            "a.deleted_at AS account_deleted_at "
             "FROM upstream_keys k JOIN upstream_accounts a ON a.id=k.account_id "
             "WHERE COALESCE(a.account_type,'api') IN ('plan','agent') "
             "  AND COALESCE(a.is_aggregate,0)=0"
@@ -1309,7 +1431,7 @@ class ProxyDatabase:
             by_identity[identity] = {
                 "account_id": row["account_id"], "key_id": row["id"],
                 "key_masked": identity[1], "anchor": anchor,
-                "end": end, "grace": row["cancellation_grace_hours"],
+                "end": end,
             }
         for row in conn.execute("SELECT * FROM upstream_keys_cloud"):
             if row["account_id"] not in account_rows:
@@ -1326,13 +1448,10 @@ class ProxyDatabase:
                 meta["anchor"] = min(meta["anchor"], anchor)
                 if end is not None:
                     meta["end"] = min((v for v in (meta["end"], end) if v is not None), default=end)
-                if row["cancellation_grace_hours"] is not None:
-                    meta["grace"] = row["cancellation_grace_hours"]
             else:
                 by_identity[identity] = {
                     "account_id": row["account_id"], "key_id": None,
                     "key_masked": row["key_masked"], "anchor": anchor, "end": end,
-                    "grace": row["cancellation_grace_hours"],
                 }
         # Old databases may contain a plan account with a legacy key but no
         # key row.  An empty cloud-synced account is not a billable key.
@@ -1344,7 +1463,7 @@ class ProxyDatabase:
                 by_identity[(account["id"], mask_key(account["upstream_key"]))] = {
                     "account_id": account["id"], "key_id": None,
                     "key_masked": mask_key(account["upstream_key"]), "anchor": anchor,
-                    "end": _parse_utc_timestamp(account["deleted_at"]), "grace": None,
+                    "end": _parse_utc_timestamp(account["deleted_at"]),
                 }
         # Agent accounts are subscription-only: no upstream keys exist, so
         # synthesize exactly one lifecycle per account, keyed "subscription".
@@ -1356,13 +1475,10 @@ class ProxyDatabase:
                 "account_id": account["id"], "key_id": None,
                 "key_masked": "subscription", "anchor": anchor,
                 "end": _parse_utc_timestamp(account["deleted_at"]),
-                "grace": config["cancellation_grace_hours"],
                 "currency": account["currency"] or "CNY",
                 "account_type": "agent",
             }
         for meta in by_identity.values():
-            if meta["grace"] is None:
-                meta["grace"] = config["cancellation_grace_hours"]
             # Attach the account's native currency for FX conversion.
             account_row = account_rows.get(meta["account_id"])
             meta["currency"] = (account_row["currency"] or "CNY") if account_row else "CNY"
@@ -1393,14 +1509,11 @@ class ProxyDatabase:
         last = _billing_period_month(meta["end"] or now, meta["anchor"].day)
         if first > last:
             return {}
-        periods = {month: cls._price_for_period(conn, meta["account_id"], month,
-                                                 meta["anchor"].day)
-                   for month in _iter_months(first, last)}
-        if meta["end"] is not None:
-            start = _period_start(last, meta["anchor"].day)
-            if meta["end"] < start + timedelta(hours=int(meta["grace"])):
-                periods.pop(last, None)
-        return periods
+        # Every admin month the lifecycle touches is billed in full — there is
+        # no grace free-window anymore (uniform new rule, see 0015).
+        return {month: cls._price_for_period(conn, meta["account_id"], month,
+                                             meta["anchor"].day)
+                for month in _iter_months(first, last)}
 
     def export_to_dashboard(self, target_path: str, mark: int, max_id: int) -> dict:
         """Export request_log rows (id in (mark, max_id]) into a dashboard archive.

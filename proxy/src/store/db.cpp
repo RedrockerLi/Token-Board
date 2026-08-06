@@ -348,7 +348,8 @@ bool Database::prepare_statements() {
     PREPARE_ON(read_db_, "SELECT id, name, upstream_key, base_url, api_format, "
             "COALESCE(endpoint_path,''), COALESCE(auth_header,'bearer'), "
             "COALESCE(is_aggregate,0), COALESCE(account_type,'api'), "
-            "COALESCE(monthly_price,0), COALESCE(max_concurrency,0), deleted_at "
+            "COALESCE(monthly_price,0), COALESCE(max_concurrency,0), "
+            "(deleted_at IS NOT NULL AND deleted_at <= datetime('now')) AS deleted_at "
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
 
@@ -356,13 +357,16 @@ bool Database::prepare_statements() {
             "a.id, a.name, a.upstream_key, a.base_url, a.api_format, "
             "COALESCE(a.endpoint_path,''), COALESCE(a.auth_header,'bearer'), "
             "COALESCE(a.is_aggregate,0), COALESCE(a.account_type,'api'), "
-            "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), a.deleted_at "
+            "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), "
+            "(a.deleted_at IS NOT NULL AND a.deleted_at <= datetime('now')) AS a_deleted "
             "FROM local_keys k JOIN upstream_accounts a ON a.id=k.account_id "
-            "WHERE k.key_value=?1 AND COALESCE(a.account_type,'api') <> 'agent'",
+            "WHERE k.key_value=?1 AND COALESCE(a.account_type,'api') <> 'agent' "
+            "  AND (a.deleted_at IS NULL OR a.deleted_at > datetime('now'))",
             stmt_lookup_route_);
 
     PREPARE_ON(read_db_, "SELECT id, key_value, position "
-            "FROM upstream_keys WHERE account_id = ?1 AND deleted_at IS NULL "
+            "FROM upstream_keys WHERE account_id = ?1 "
+            "  AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
             "ORDER BY position, id",
             stmt_get_upstream_keys_);
 
@@ -372,7 +376,8 @@ bool Database::prepare_statements() {
     PREPARE_ON(read_db_,
             "WITH root AS ("
             "  SELECT id, COALESCE(is_aggregate,0) AS is_aggregate "
-            "  FROM upstream_accounts WHERE id=?1 AND deleted_at IS NULL "
+            "  FROM upstream_accounts WHERE id=?1 "
+            "    AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
             "    AND COALESCE(account_type,'api') <> 'agent'"
             "), targets(target_id, upstream_model, priority_group, "
             "          priority_sort, priority_id) AS ("
@@ -387,13 +392,16 @@ bool Database::prepare_statements() {
             "COALESCE(a.endpoint_path,''), COALESCE(a.auth_header,'bearer'), "
             "COALESCE(a.is_aggregate,0), COALESCE(a.account_type,'api'), "
             "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), "
-            "a.deleted_at, targets.upstream_model, targets.priority_group, "
+            "(a.deleted_at IS NOT NULL AND a.deleted_at <= datetime('now')) AS a_deleted, "
+            "targets.upstream_model, targets.priority_group, "
             "k.id, k.key_value, k.position "
             "FROM targets JOIN upstream_accounts a "
-            "  ON a.id=targets.target_id AND a.deleted_at IS NULL "
+            "  ON a.id=targets.target_id "
+            " AND (a.deleted_at IS NULL OR a.deleted_at > datetime('now')) "
             " AND COALESCE(a.account_type,'api') <> 'agent' "
             "LEFT JOIN upstream_keys k "
-            "  ON k.account_id=a.id AND k.deleted_at IS NULL "
+            "  ON k.account_id=a.id "
+            " AND (k.deleted_at IS NULL OR k.deleted_at > datetime('now')) "
             "ORDER BY targets.priority_sort, targets.priority_id, "
             "         k.position, k.id",
             stmt_resolve_routing_snapshot_);
@@ -557,7 +565,7 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
         if (info.account_type.empty()) info.account_type = "api";
         info.monthly_price = sqlite3_column_double(stmt_get_account_, 9);
         info.max_concurrency = sqlite3_column_int(stmt_get_account_, 10);
-        info.deleted = sqlite3_column_text(stmt_get_account_, 11) != nullptr;
+        info.deleted = sqlite3_column_int(stmt_get_account_, 11) != 0;
         result = std::move(info);
     }
     sqlite3_reset(stmt_get_account_);
@@ -593,7 +601,7 @@ std::optional<Database::RouteInfo> Database::lookup_route(
         a.account_type = atype ? atype : "api";
         a.monthly_price = sqlite3_column_double(stmt_lookup_route_, 13);
         a.max_concurrency = sqlite3_column_int(stmt_lookup_route_, 14);
-        a.deleted = sqlite3_column_text(stmt_lookup_route_, 15) != nullptr;
+        a.deleted = sqlite3_column_int(stmt_lookup_route_, 15) != 0;
         result = std::move(route);
     }
     sqlite3_reset(stmt_lookup_route_);
@@ -671,8 +679,8 @@ std::vector<Database::RoutingTarget> Database::resolve_routing_snapshot(
                 stmt_resolve_routing_snapshot_, 9);
             account.max_concurrency = sqlite3_column_int(
                 stmt_resolve_routing_snapshot_, 10);
-            account.deleted = sqlite3_column_type(
-                stmt_resolve_routing_snapshot_, 11) != SQLITE_NULL;
+            account.deleted = sqlite3_column_int(
+                stmt_resolve_routing_snapshot_, 11) != 0;
             target.upstream_model = upstream_model;
             target.priority_group = priority_group;
             result.push_back(std::move(target));

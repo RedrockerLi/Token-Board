@@ -338,18 +338,15 @@ def _merge_upstream_keys_cloud(remote_path: str, local_path: str) -> None:
                 continue
             valid_values = [v for v in (current["valid_from"], incoming["valid_from"]) if v]
             deleted_values = [v for v in (current["deleted_at"], incoming["deleted_at"]) if v]
-            # Keep the grace value attached to the earliest cancellation.
+            # A deletion is a tombstone: the earliest one wins.  A future
+            # deleted_at (end-of-period cancellation) is merged as-is so the
+            # cross-machine billing lifecycle ends at the same period boundary.
             deleted_at = min(deleted_values) if deleted_values else None
-            grace = current["cancellation_grace_hours"]
-            if incoming["deleted_at"] and (
-                not current["deleted_at"] or incoming["deleted_at"] <= current["deleted_at"]
-            ):
-                grace = incoming["cancellation_grace_hours"]
             local.execute(
-                "UPDATE upstream_keys_cloud SET position=?, valid_from=?, deleted_at=?, "
-                "cancellation_grace_hours=? WHERE account_id=? AND key_masked=?",
+                "UPDATE upstream_keys_cloud SET position=?, valid_from=?, deleted_at=? "
+                "WHERE account_id=? AND key_masked=?",
                 (min(current["position"], incoming["position"]),
-                 min(valid_values) if valid_values else None, deleted_at, grace,
+                 min(valid_values) if valid_values else None, deleted_at,
                  incoming["account_id"], incoming["key_masked"]),
             )
         local.commit()
@@ -653,6 +650,15 @@ def sync_config_upload(db_path: str) -> dict:
         # ── 1. Conflict check: refuse if the cloud moved past our last sync. ──
         has_remote = _download_latest(config, remote_path, base="proxy_config")
         if has_remote:
+            # Hash on the same schema basis as sync_config_download: the cloud
+            # copy may predate the current migration (e.g. still carrying a
+            # dropped column like cancellation_grace_hours), which would make
+            # its row-hash differ from the stored one purely by schema, not by
+            # content — causing a permanent conflict.  Upgrade it here so the
+            # comparison (and the _merge_upstream_keys_cloud below) is
+            # column-consistent.
+            from app.db.migrations import migrate, schema_dir_for
+            migrate(remote_path, schema_dir_for(db_path, "proxy"))
             last_hash = _get_sync_state(db_path, "config_hash")
             cloud_hash = _config_hash_of_db(remote_path)
             if last_hash is None or cloud_hash != last_hash:
@@ -718,6 +724,13 @@ def sync_config_download(db_path: str) -> bool:
         has_remote = _download_latest(config, remote_path, base="proxy_config")
         if not has_remote:
             return False
+        # The cloud copy is a full-schema snapshot uploaded via _safe_copy_db
+        # (backup API) and therefore carries user_version.  Upgrade it to the
+        # local schema — exactly like the local DB — before merging, so a cloud
+        # file from an older release (e.g. one still carrying a now-dropped
+        # column like cancellation_grace_hours) cannot fight the local schema.
+        from app.db.migrations import migrate, schema_dir_for
+        migrate(remote_path, schema_dir_for(db_path, "proxy"))
         _merge_config_tables(remote_path, db_path)
         _set_sync_state(db_path, "config_hash", _config_hash_of_db(remote_path))
         snapshot_config(db_path)
