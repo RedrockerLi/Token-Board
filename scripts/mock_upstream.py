@@ -35,6 +35,14 @@ Response selection:
     returned instead (error-path testing; bypasses strict validation).
   - "mock_status_by_key": {"sk-key1": 429, "sk-key2": 200} selects a
     status from the incoming Authorization key, for fallback tests.
+  - Error-body control (non-2xx responses): "mock_error_type" sets error.type
+    (emitting the real {"type":"error","error":{…},"metadata":{…}} envelope when
+    "GoUsageLimitError"); "mock_error_type_by_key" keys that by Authorization
+    key; "mock_error_body" is a verbatim body override; "mock_retry_after" adds
+    a Retry-After header; "mock_limit_name" sets metadata.limitName.
+  - Streaming timing: "mock_chunk_delay" sleeps between SSE frames;
+    "mock_stall_after" pauses after that frame index (post-commit stall);
+    "mock_stall_secs" the pause length; "mock_stall_forever" stalls forever.
   - "mock_simple_stream": true returns the plain content-only stream (no
     reasoning_content / cost frames).
   - Streaming: request body "stream": true returns an SSE stream.
@@ -44,6 +52,7 @@ Usage:
 """
 import argparse
 import json
+import socket
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -92,6 +101,16 @@ def validate_chat_completions(req):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        # Real upstreams run TCP_NODELAY; without it the proxy's pooled
+        # keep-alive connections stall ~40ms per request (Nagle + delayed ACK)
+        # and the perf tests would measure an artifact, not production.
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -152,13 +171,14 @@ class Handler(BaseHTTPRequestHandler):
         # Explicit status override (error-path testing) wins; otherwise the
         # strict chat-completions validation behaves like the real upstream.
         if status != 200:
-            body = {
-                "error": {"message": "mock error", "type": "mock_error", "code": status},
-            }
+            body = self._error_body(req, status, auth_key)
             payload = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
+            retry_after = req.get("mock_retry_after")
+            if retry_after is not None:
+                self.send_header("Retry-After", str(retry_after))
             self.end_headers()
             self.wfile.write(payload)
             return
@@ -181,17 +201,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            chunks = self._stream_chunks(fmt, model, req)
-            for c in chunks:
-                if isinstance(c, str):
-                    c = c.encode()
-                # Proper HTTP/1.1 chunk framing.
-                self.wfile.write(b"%x\r\n" % len(c))
-                self.wfile.write(c)
-                self.wfile.write(b"\r\n")
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            self._emit_stream(fmt, model, req)
             return
 
         body = self._nonstream_body(fmt, model, req)
@@ -201,6 +211,95 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _error_body(self, req, status, auth_key):
+        """Error body for a non-2xx mock response.
+
+        Realistic shape for the opencode.ai "Console Go" quota-exhausted 429:
+            {"type":"error","error":{"type":"GoUsageLimitError","message":…},
+             "metadata":{"limitName":"5 hour"}}
+        Control:
+          * mock_error_body:        verbatim object (highest priority).
+          * mock_error_type:        error.type; when "GoUsageLimitError" the
+                                    {"type":"error",…,"metadata":{…}} envelope
+                                    is emitted, matching the real upstream.
+          * mock_error_type_by_key: {"sk-…": "GoUsageLimitError"} selected by
+                                    the incoming Authorization key.
+          * mock_limit_name:        metadata.limitName value (default "5 hour").
+        Default (no override) keeps the plain {"error":{…}} shape, so tests
+        that don't opt in see the historical body.
+        """
+        if req.get("mock_error_body") is not None:
+            return req["mock_error_body"]
+        etype = req.get("mock_error_type")
+        by_key = req.get("mock_error_type_by_key")
+        if isinstance(by_key, dict) and auth_key in by_key:
+            etype = by_key[auth_key]
+        if etype:
+            return {
+                "type": "error",
+                "error": {"type": etype, "message": "mock " + etype},
+                "metadata": {
+                    "workspace": "wrk_mock",
+                    "limitName": req.get("mock_limit_name", "5 hour"),
+                },
+            }
+        return {
+            "error": {"message": "mock error", "type": "mock_error", "code": status},
+        }
+
+    def _emit_stream(self, fmt, model, req):
+        """Write the SSE stream with optional inter-chunk delay / stall.
+
+        Stall scenario (the "commit then go silent" upstream death):
+          * mock_stall_after:  frame index at which to pause.  The proxy has
+                               already forwarded this frame downstream, so any
+                               later timeout is a *post-commit* semantic idle
+                               timeout — the exact shape of review issue #5.
+          * mock_stall_secs:   how long the pause lasts before resuming.
+          * mock_stall_forever: keep the connection open and send nothing more
+                               (terminal silence; proxy cancels on idle).
+          * mock_chunk_delay:  sleep between consecutive frames, for the
+                               "slowly trickles then stops" shape.
+        """
+        chunks = self._stream_chunks(fmt, model, req)
+        stall_after = req.get("mock_stall_after")
+        stall_secs = float(req.get("mock_stall_secs", 5))
+        stall_forever = bool(req.get("mock_stall_forever"))
+        chunk_delay = float(req.get("mock_chunk_delay", 0))
+        for idx, c in enumerate(chunks):
+            if stall_after is not None and idx == int(stall_after):
+                if stall_forever:
+                    while True:
+                        time.sleep(1)
+                deadline = time.monotonic() + stall_secs
+                while time.monotonic() < deadline:
+                    time.sleep(0.05)
+            if chunk_delay:
+                time.sleep(chunk_delay)
+            if not self._write_chunk(c):
+                return  # client (proxy) cancelled / timed out mid-stream
+        # Terminating chunk is exactly "0\r\n\r\n" — NOT a framed chunk (a
+        # 5-byte "0\r\n\r\n" written via _write_chunk would be framed as
+        # "5\r\n0\r\n\r\n\r\n", an invalid terminator that hangs the reader).
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except OSError:
+            pass
+
+    def _write_chunk(self, c):
+        """Write one HTTP/1.1 chunked-encoding frame; False if client closed."""
+        if isinstance(c, str):
+            c = c.encode()
+        try:
+            self.wfile.write(b"%x\r\n" % len(c))
+            self.wfile.write(c)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+            return True
+        except OSError:
+            return False
 
     def _openai_chunk(self, cid, model, delta, finish_reason=None):
         return {

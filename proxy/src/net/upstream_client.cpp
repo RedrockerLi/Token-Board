@@ -715,6 +715,41 @@ private:
     std::list<Idle> idle_;
 };
 
+/// RAII lease for a pooled client.  The client leaves the pool while leased,
+/// gets its per-request configuration re-applied, and returns on scope exit.
+/// Call discard() when the connection is suspect (timeout / cancel / connect
+/// failure) instead of returning it.
+class PooledLease {
+public:
+    explicit PooledLease(std::optional<PooledClient> value)
+        : value_(std::move(value)) {}
+    ~PooledLease() { release(); }
+    PooledLease(PooledLease &&other) noexcept : value_(std::move(other.value_)) {}
+    PooledLease &operator=(PooledLease &&other) noexcept {
+        release();
+        value_ = std::move(other.value_);
+        return *this;
+    }
+    PooledLease(const PooledLease &) = delete;
+    PooledLease &operator=(const PooledLease &) = delete;
+
+    httplib::Client *client() const {
+        return value_ ? value_->client.get() : nullptr;
+    }
+    const std::string &address() const { return value_->address; }
+    bool valid() const { return value_ && value_->client; }
+
+    void discard() { value_.reset(); }
+
+private:
+    void release() {
+        if (!value_ || !value_->client) return;
+        ClientPool::instance().put(std::move(*value_));
+        value_.reset();
+    }
+    std::optional<PooledClient> value_;
+};
+
 std::optional<PooledClient>
 make_client(const OriginParts &origin, const std::string &address,
             std::string &error) {
@@ -729,6 +764,11 @@ make_client(const OriginParts &origin, const std::string &address,
         // certificate hostname verification.
         client->set_hostname_addr_map({{origin.hostname, address}});
         client->set_keep_alive(true);
+        // httplib defaults TCP_NODELAY to OFF (CPPHTTPLIB_TCP_NODELAY=false).
+        // On a reused keep-alive connection, Nagle + delayed ACK stalls each
+        // small request/response round-trip for ~40ms on Linux loopback and
+        // similarly on real networks; a proxy must never pay that per request.
+        client->set_tcp_nodelay(true);
         client->enable_server_certificate_verification(true);
         client->enable_server_hostname_verification(true);
         return PooledClient{std::move(client), origin.origin,
@@ -790,6 +830,15 @@ struct ForwardWatch {
         if (expired.load(std::memory_order_acquire) ||
             client_disconnected.load(std::memory_order_acquire))
             shutdown_socket_copy(cancel_socket);
+    }
+
+    /// Register the transport client so cancel() can fall back to
+    /// Client::stop() when the watchdog has no socket duplicate (the common
+    /// case on a REUSED keep-alive connection — set_socket_options only fires
+    /// on a fresh connect).  Must be re-called for every lease before send.
+    void attach_client(httplib::Client *client) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        cancel_client = client;
     }
 
     void cancel() {
@@ -1113,26 +1162,60 @@ UpstreamClient::forward(const std::string &method,
     const TimeoutChoice connection_timeout =
         connection_timeout_for(streaming, opts);
 
-    // Create client
-    httplib::Client cli(scheme_host);
-    // Connection establishment participates in the same attempt budget as
-    // first byte / total response.  A fixed 10-second cap used to terminate a
-    // request earlier than its configured deadline and report the wrong value.
-    cli.set_connection_timeout(connection_timeout.seconds, 0);
-    cli.set_write_timeout(30, 0);
-    cli.enable_server_certificate_verification(true);
+    // Normalized origin: the connection pool and DNS cache are keyed by it.
+    // parse_origin is stricter than the scheme check above; reject anything it
+    // cannot represent (unexpected characters, non-http(s) schemes).
+    const OriginParts origin_parts = parse_origin(scheme_host);
+    if (!origin_parts.valid) {
+        result.status_code = 502;
+        result.error = "Invalid upstream origin";
+        return result;
+    }
 
     auto watch = std::make_shared<ForwardWatch>();
     watch->semantic_seen = opts.semantic_seen;
     watch->semantic_progress = opts.semantic_progress;
     watch->terminal_seen = opts.terminal_seen;
     watch->downstream_socket = opts.downstream_socket;
-    cli.set_socket_options([watch](::socket_t sock) {
-        // The watchdog owns a duplicate.  If httplib closes its descriptor
-        // and the OS immediately reuses that number, a later cancellation can
-        // therefore never shutdown an unrelated connection.
-        watch->install_socket(sock);
-    });
+
+    // Resolve the host once per request via the cached async resolver.  The
+    // returned addresses are rotated and filtered against the per-address
+    // backoff, so the first usable address is the healthy one.  Numeric hosts
+    // short-circuit.  The DNS wait shares the connection-establishment budget.
+    std::vector<std::string> dns_addresses;
+    if (numeric_host(origin_parts.hostname)) {
+        dns_addresses.push_back(origin_parts.hostname);
+    } else {
+        const int64_t dns_deadline_ms = deadline_after(
+            deadline_started_ms, connection_timeout.seconds * 1000LL);
+        auto dns = DnsResolver::instance().resolve(
+            origin_parts.hostname, dns_deadline_ms,
+            [&watch] {
+                return !watch->running.load(std::memory_order_acquire) ||
+                       watch->expired.load(std::memory_order_acquire);
+            });
+        switch (dns.status) {
+            case DnsResolution::Status::Ok:
+                dns_addresses = std::move(dns.addresses);
+                break;
+            case DnsResolution::Status::TimedOut:
+                result.status_code = 504;
+                result.is_timeout = true;
+                result.timeout_secs = connection_timeout.seconds;
+                result.error = "Upstream DNS deadline exceeded";
+                return result;
+            default:  // Failed / Canceled / Saturated
+                result.status_code = 502;
+                result.error = dns.error.empty() ? "Upstream DNS lookup failed"
+                                                 : dns.error;
+                return result;
+        }
+    }
+    if (dns_addresses.empty()) {
+        result.status_code = 502;
+        result.error = "Upstream DNS returned no usable addresses";
+        return result;
+    }
 
     // Build headers.  Anthropic-native upstreams use x-api-key instead of
     // Authorization: Bearer.
@@ -1150,7 +1233,68 @@ UpstreamClient::forward(const std::string &method,
         };
     }
 
+    // Deadlines are armed once per request; a connect-level retry to another
+    // address shares the same absolute budget.
     if (streaming) {
+        watch->set_initial_deadlines(deadline_started_ms,
+                                     opts.streaming_first_byte_timeout,
+                                     opts.streaming_semantic_timeout,
+                                     opts.streaming_idle_timeout);
+    } else {
+        watch->set_initial_deadlines(deadline_started_ms,
+                                     opts.non_streaming_total_timeout, 0, 0);
+    }
+    const bool need_watchdog = streaming
+        ? (opts.streaming_first_byte_timeout > 0 ||
+           opts.streaming_semantic_timeout > 0 ||
+           opts.streaming_idle_timeout > 0)
+        : opts.non_streaming_total_timeout > 0;
+    const int backstop_sec = streaming
+        ? (need_watchdog
+               ? std::max({3600, opts.streaming_first_byte_timeout,
+                           opts.streaming_semantic_timeout,
+                           opts.streaming_idle_timeout})
+               : NO_TIMEOUT_SECS)
+        : (opts.non_streaming_timeout > 0 ? opts.non_streaming_timeout
+                                          : NO_TIMEOUT_SECS);
+    if (need_watchdog || opts.downstream_socket >= 0)
+        ForwardWatchdog::instance().add(watch);
+
+    // Per-lease configuration: cpp-httplib's Client members retain the previous
+    // request's settings, so every lease re-applies timeouts and callbacks.
+    auto configure_client = [&](httplib::Client *cli) {
+        // Connection establishment participates in the same attempt budget as
+        // first byte / total response.  A fixed 10-second cap used to terminate
+        // a request earlier than its configured deadline and report the wrong
+        // value.
+        cli->set_connection_timeout(connection_timeout.seconds, 0);
+        cli->set_write_timeout(30, 0);
+        cli->enable_server_certificate_verification(true);
+        cli->set_read_timeout(backstop_sec, 0);
+        cli->set_socket_options([watch](::socket_t sock) {
+            // The watchdog owns a duplicate.  If httplib closes its descriptor
+            // and the OS immediately reuses that number, a later cancellation
+            // can therefore never shutdown an unrelated connection.
+            watch->install_socket(sock);
+        });
+        // On a reused connection no socket_options callback fires (no new
+        // socket), so the watchdog cancels through Client::stop() — the client
+        // pointer must be current for this lease.
+        watch->attach_client(cli);
+    };
+
+    auto is_connect_error = [](httplib::Error e) {
+        return e == httplib::Error::Connection ||
+               e == httplib::Error::SSLConnection ||
+               e == httplib::Error::ConnectionTimeout;
+    };
+
+    // One send attempt against a leased client.  Fills `result` completely;
+    // returns true when the transport never reached the peer (dead address) and
+    // another address should be tried.
+    auto attempt = [&](httplib::Client &cli) -> bool {
+        result = ForwardResult{};
+        if (streaming) {
         // ── Streaming path: use Request::content_receiver ─────────
         BoundedTailBuffer accumulated(opts.streaming_body_buffer_limit);
         SseProgressFallback progress_fallback;
@@ -1165,27 +1309,6 @@ UpstreamClient::forward(const std::string &method,
         // `accumulated` instead, so the caller can fall back to the next
         // candidate without anything having reached the client.
         int upstream_status = 0;
-
-        // Phase-aware streaming timeouts (see ForwardWatch): httplib's
-        // read timeout is select-based and fixed for the connection, so it
-        // cannot express "first-byte timeout, then idle timeout".  The shared
-        // watchdog shuts the socket at each deadline; the socket's own timeout
-        // is only a large backstop.
-        watch->set_initial_deadlines(deadline_started_ms,
-                                     opts.streaming_first_byte_timeout,
-                                     opts.streaming_semantic_timeout,
-                                     opts.streaming_idle_timeout);
-        bool need_watchdog = opts.streaming_first_byte_timeout > 0 ||
-                             opts.streaming_semantic_timeout > 0 ||
-                             opts.streaming_idle_timeout > 0;
-        int backstop_sec = need_watchdog
-            ? std::max({3600, opts.streaming_first_byte_timeout,
-                        opts.streaming_semantic_timeout,
-                        opts.streaming_idle_timeout})
-            : NO_TIMEOUT_SECS;
-        cli.set_read_timeout(backstop_sec, 0);
-        if (need_watchdog || opts.downstream_socket >= 0)
-            ForwardWatchdog::instance().add(watch);
 
         // ContentReceiverWithProgress: (data, len, offset, total) -> bool
         auto receiver = [&](const char *data, size_t len,
@@ -1226,9 +1349,6 @@ UpstreamClient::forward(const std::string &method,
         httplib::Response upstream_res;
         httplib::Error err;
         bool ok = cli.send(req, upstream_res, err);
-
-        watch->finish();
-        ForwardWatchdog::instance().changed();
 
         auto t1 = std::chrono::steady_clock::now();
         result.duration_ms = static_cast<int>(
@@ -1297,30 +1417,21 @@ UpstreamClient::forward(const std::string &method,
             else
                 result.error = "Upstream request failed: " +
                                std::string(httplib::to_string(err));
+            return !ok && !watch->expired.load(std::memory_order_acquire) &&
+                   !watch->client_disconnected.load(std::memory_order_acquire) &&
+                   is_connect_error(err);
         }
     } else {
         // ── Non-streaming: use GET or POST based on method ─────
         // Bounded by non_streaming_timeout (idle semantics: a read that gets no
         // data for N seconds fails).  NO_TIMEOUT_SECS when disabled (a 0 read
         // timeout would be a non-blocking poll, failing every read instantly).
-        cli.set_read_timeout(opts.non_streaming_timeout > 0
-                                 ? opts.non_streaming_timeout : NO_TIMEOUT_SECS, 0);
-        // The httplib read timeout is idle-based.  A second watchdog enforces
-        // an absolute attempt deadline so trickled response bytes cannot keep
-        // a non-streaming retry alive past the shared request budget.
-        watch->set_initial_deadlines(deadline_started_ms,
-                                     opts.non_streaming_total_timeout, 0, 0);
-        if (opts.non_streaming_total_timeout > 0 || opts.downstream_socket >= 0)
-            ForwardWatchdog::instance().add(watch);
-
         httplib::Result upstream_res;
         if (method == "GET") {
             upstream_res = cli.Get(full_path, headers);
         } else {
             upstream_res = cli.Post(full_path, headers, body, content_type.c_str());
         }
-        watch->finish();
-        ForwardWatchdog::instance().changed();
 
         auto t1 = std::chrono::steady_clock::now();
         result.duration_ms = static_cast<int>(
@@ -1378,8 +1489,66 @@ UpstreamClient::forward(const std::string &method,
             else
                 result.error = "Upstream request failed: " +
                     std::string(httplib::to_string(upstream_res.error()));
+            return !upstream_res &&
+                   !watch->expired.load(std::memory_order_acquire) &&
+                   !watch->client_disconnected.load(std::memory_order_acquire) &&
+                   is_connect_error(upstream_res.error());
         }
     }
+        return false;
+    };
+
+    // Leased client acquisition: prefer an idle pooled client; otherwise dial a
+    // fresh one for the next untried DNS address.
+    std::set<std::string> tried_addresses;
+    size_t addr_index = 0;
+    auto acquire = [&]() -> PooledLease {
+        if (auto pooled = ClientPool::instance().take(origin_parts.origin))
+            return PooledLease(std::move(*pooled));
+        for (size_t i = addr_index; i < dns_addresses.size(); ++i) {
+            if (tried_addresses.count(dns_addresses[i])) continue;
+            std::string error;
+            auto made = make_client(origin_parts, dns_addresses[i], error);
+            if (made) return PooledLease(std::move(*made));
+        }
+        return PooledLease(std::nullopt);
+    };
+
+    PooledLease lease(std::nullopt);
+    for (;;) {
+        if (!lease.valid()) {
+            lease = acquire();
+            if (!lease.valid()) {
+                result.status_code = 502;
+                result.error = "Unable to establish upstream client";
+                return result;
+            }
+            configure_client(lease.client());
+        }
+        const bool retry = attempt(*lease.client());
+        if (retry && addr_index < dns_addresses.size()) {
+            const std::string &dead = lease.address();
+            tried_addresses.insert(dead);
+            DnsResolver::instance().mark_failed(origin_parts.hostname, dead);
+            ClientPool::instance().invalidate(origin_parts.origin, dead);
+            // No dangling cancel target while the watchdog may still poll this
+            // watch between the discard and the next acquire.
+            watch->attach_client(nullptr);
+            lease.discard();
+            while (addr_index < dns_addresses.size() &&
+                   tried_addresses.count(dns_addresses[addr_index]))
+                ++addr_index;
+            if (addr_index < dns_addresses.size()) continue;
+        }
+        break;
+    }
+
+    watch->finish();
+    ForwardWatchdog::instance().changed();
+
+    if (result.success && !numeric_host(origin_parts.hostname) && lease.valid())
+        DnsResolver::instance().mark_success(origin_parts.hostname,
+                                             lease.address());
 
     return result;
 }

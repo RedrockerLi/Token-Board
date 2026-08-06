@@ -3,6 +3,12 @@
 # CMakeLists.txt). Every target here is a test executable; none of them link
 # into the production token_proxy binary.
 
+# Tests must actually assert: the parent Release build adds -DNDEBUG, which
+# compiles assert() out and silently disables every check in this suite.
+# -UNDEBUG here re-enables assertions for the test executables regardless of
+# the outer build type.
+add_compile_options(-UNDEBUG)
+
 set(TEST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/net
@@ -47,6 +53,30 @@ target_link_libraries(upstream_client_test PRIVATE
 )
 target_compile_features(upstream_client_test PRIVATE cxx_std_17)
 
+# Connection-reuse gate: sequential forward() calls against one origin must
+# reuse a pooled keep-alive connection (accepted connections << requests).
+# "fresh" mode remains available on the binary for Before/After comparison;
+# the committed gate asserts reuse (fails on a pre-wiring build).
+add_executable(upstream_client_perf
+    upstream_client_perf.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/upstream_client.cpp
+)
+target_include_directories(upstream_client_perf PRIVATE
+    ${TEST_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
+)
+target_link_libraries(upstream_client_perf PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+)
+target_compile_features(upstream_client_perf PRIVATE cxx_std_17)
+add_test(
+    NAME upstream_client_perf_reuse
+    COMMAND upstream_client_perf reuse
+)
+
+
 # ── Test registration ────────────────────────────────────────────────────
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME format_conversion COMMAND format_conv_test)
@@ -59,4 +89,16 @@ add_test(
             $<TARGET_FILE:token_proxy>
             ${CMAKE_SOURCE_DIR}/../schema/proxy
             ${CMAKE_SOURCE_DIR}/..
+)
+# End-to-end load smoke: drives the real proxy against mock_upstream and
+# asserts every request is a 200.  Run perf_stress_test.py directly with
+# --requests/--concurrency for the full Before/After measurement.
+add_test(
+    NAME perf_stress
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/perf_stress_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/..
+            --requests 40 --concurrency 8
 )
