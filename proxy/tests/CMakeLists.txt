@@ -112,3 +112,14 @@ add_test(
             ${CMAKE_SOURCE_DIR}/../schema/proxy
             ${CMAKE_SOURCE_DIR}/..
 )
+# Fallback-matrix experiments A3/A4/B1/B2/B3 (no-fallback 429, fallback
+# backoff recovery, non-streaming 5xx, streaming pre-commit 429, and the
+# commit-then-stall #5 baseline).
+add_test(
+    NAME fallback_matrix
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/fallback_matrix_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/..
+)
