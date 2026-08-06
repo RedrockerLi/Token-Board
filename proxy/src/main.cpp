@@ -120,9 +120,6 @@ int main(int argc, char *argv[]) {
 
         // ── Periodic cleanup: every 5 min ────────────────────────────
         if (now >= cleanup_deadline) {
-            db.cleanup_stale_in_flight(10);     // remove stuck records older than 10 min
-            // Session affinity is process-local and no longer writes this
-            // legacy observability table on the request hot path.
             cleanup_deadline = now + std::chrono::minutes(5);
         }
     }

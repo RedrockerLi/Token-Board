@@ -457,42 +457,24 @@ static void apply_body_model(std::string &body, const std::string &model) {
 /// candidate (priority = sort_order, id).  Plain accounts yield one
 /// candidate.  Returns an empty list when an aggregate has no match.
 /// Expand one real account into candidates — one per configured key slot
-/// (ordered by position,id) or a single legacy candidate using the account's
-/// upstream_key when it has no upstream_keys rows.  `model` is the model name
-/// forwarded upstream.
+/// (ordered by position,id); upstream_keys is the only key source.  `model`
+/// is the model name forwarded upstream.
 static void push_account_candidates(std::vector<UpstreamCandidate> &cands,
                                     const Database::AccountInfo &acct,
                                     const std::vector<Database::KeySlot> &keys,
                                     const std::string &model,
                                     int priority_group) {
-    if (keys.empty()) {
-        // Legacy single-key fallback: use the account's upstream_key as a
-        // single candidate.  Concurrency slot = -account_id (negative, unique
-        // per account — never collides with real upstream_keys.id which is
-        // always positive), so legacy accounts keep independent budgets.
-        // An account whose multi-key set was emptied also has an empty legacy
-        // value; it is unavailable, not a candidate with a blank credential.
-        if (acct.upstream_key.empty()) return;
+    // One candidate per key slot, same account config, ordered by
+    // (position, id) so overflow follows a fixed fill order.
+    for (const auto &k : keys) {
+        if (k.key_value.empty()) continue;
         UpstreamCandidate c;
-        c.account = acct;
-        c.key = acct.upstream_key;
-        c.key_slot_id = -acct.id;
+        c.account = acct;          // keys share the account config
+        c.key = k.key_value;
+        c.key_slot_id = k.id;
         c.upstream_model = model;
         c.priority_group = priority_group;
         cands.push_back(std::move(c));
-    } else {
-        // One candidate per key slot, same account config, ordered by
-        // (position, id) so overflow follows a fixed fill order.
-        for (const auto &k : keys) {
-            if (k.key_value.empty()) continue;
-            UpstreamCandidate c;
-            c.account = acct;          // keys share the account config
-            c.key = k.key_value;
-            c.key_slot_id = k.id;
-            c.upstream_model = model;
-            c.priority_group = priority_group;
-            cands.push_back(std::move(c));
-        }
     }
 }
 

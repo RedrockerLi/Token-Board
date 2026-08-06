@@ -289,9 +289,7 @@ CONFIG_TABLES = [
 _RUNTIME_TABLES = [
     "request_log",
     "request_attempts",
-    "perf_events",
     "sync_config",
-    "in_flight_requests",
     "sync_state",
     "upstream_keys",
     "session_key_log",
@@ -370,8 +368,6 @@ def _config_hash_of_db(db_path: str) -> str:
             if not _table_exists(conn, table):
                 continue
             cols = [d[0] for d in conn.execute(f"SELECT * FROM {table} LIMIT 0").description]
-            if table == "upstream_accounts":
-                cols = [c for c in cols if c != "upstream_key"]
             if not cols:
                 continue
             h.update(table.encode())
@@ -520,9 +516,9 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
     """Cloud-authoritative merge of CONFIG_TABLES from *remote_path* into
     *local_path* in one transaction.
 
-    - upstream_accounts: upsert by id; preserve this machine's non-empty
-      upstream_key (the cloud never carries keys); delete local rows absent
-      from the cloud (delete-stale).
+    - upstream_accounts: upsert by id; keys live in upstream_keys which is a
+      local-only runtime table (never in the cloud), so the merge only touches
+      the non-secret account columns; delete local rows absent from the cloud.
     - local_keys: upsert by key_value (globally unique), delete-stale.
     - model_pricing: upsert by id, delete-stale.
     - account_models / aggregate_entries / pricing_slots /
@@ -561,22 +557,25 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
             if _table_exists(local, table) and _table_exists(remote, table):
                 local.execute(f"DELETE FROM {table}")
 
-        # ── upstream_accounts: upsert by id, preserve local key, delete-stale ──
+        # ── upstream_accounts: upsert by id, delete-stale ──
+        # Keys live in upstream_keys (a local-only runtime table), so the merge
+        # touches only the intersection of remote/local account columns — this
+        # stays correct across a schema with/without the legacy upstream_key.
         if _table_exists(remote, "upstream_accounts"):
             r_accounts = {r["id"]: r for r in remote.execute("SELECT * FROM upstream_accounts")}
             l_accounts = {r["id"]: r for r in local.execute("SELECT * FROM upstream_accounts")}
-            acc_cols = cols(remote, "upstream_accounts")
-            nonkey = [c for c in acc_cols if c not in ("id", "upstream_key")]
+            acc_cols = [c for c in cols(remote, "upstream_accounts")
+                        if c in cols(local, "upstream_accounts")]
+            nonkey = [c for c in acc_cols if c != "id"]
             for aid, r in r_accounts.items():
                 if aid in l_accounts:
                     sql = ("UPDATE upstream_accounts SET " +
                            ", ".join(f"{c}=?" for c in nonkey) +
-                           ", upstream_key=? WHERE id=?")
-                    local.execute(sql, [r[c] for c in nonkey] +
-                                  [l_accounts[aid]["upstream_key"] or ""] + [aid])
+                           " WHERE id=?")
+                    local.execute(sql, [r[c] for c in nonkey] + [aid])
                 else:
-                    vals = [r[c] if c != "upstream_key" else "" for c in acc_cols]
-                    safe_insert("upstream_accounts", acc_cols, vals)
+                    safe_insert("upstream_accounts", acc_cols,
+                                [r[c] for c in acc_cols])
             for aid in l_accounts:
                 if aid not in r_accounts:
                     local.execute("DELETE FROM upstream_accounts WHERE id=?", (aid,))
@@ -648,13 +647,14 @@ def _strip_url_credentials(url: str) -> str:
 
 
 def _sanitize_upload_columns(dst: sqlite3.Connection) -> None:
-    """Blank/mask config columns that can carry literal secrets.
+    """Mask config columns that can carry literal secrets.
 
-    upstream_key is blanked; auth_header keeps only its scheme token
-    ('bearer'/'x-api-key'/'auto', never a literal "Bearer sk-…" override);
-    base_url/endpoint_path keep routing info but lose embedded credentials.
+    The legacy upstream_key column no longer exists (migration 0017 drops it;
+    keys live in the local-only upstream_keys table).  auth_header keeps only
+    its scheme token ('bearer'/'x-api-key'/'auto', never a literal
+    "Bearer sk-…" override); base_url/endpoint_path keep routing info but lose
+    embedded credentials.
     """
-    dst.execute("UPDATE upstream_accounts SET upstream_key = ''")
     rows = dst.execute(
         "SELECT id, COALESCE(auth_header,''), COALESCE(base_url,''), "
         "COALESCE(endpoint_path,'') FROM upstream_accounts").fetchall()

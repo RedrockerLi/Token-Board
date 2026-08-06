@@ -254,7 +254,7 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, name, upstream_key, base_url, api_format, "
+                "SELECT id, name, base_url, api_format, "
                 "COALESCE(endpoint_path,'') AS endpoint_path, "
                 "COALESCE(auth_header,'bearer') AS auth_header, "
                 "COALESCE(is_aggregate,0) AS is_aggregate, "
@@ -308,17 +308,13 @@ class ProxyDatabase:
     def _normalize_keys(data: dict) -> list[str]:
         """Collect the intended upstream key list, dropping empty entries.
 
-        Precedence: explicit `upstream_keys` list (new UI) → legacy single
-        `upstream_key` scalar.  Empty strings are dropped (留空=保持 convention).
+        `upstream_keys` is the only key source since the legacy single-column
+        `upstream_key` was removed.  Empty strings are dropped (留空=保持).
         """
-        if data.get("upstream_keys") is not None:
-            raw = data["upstream_keys"]
-            if isinstance(raw, str):
-                raw = [raw]
-            return [k for k in raw if isinstance(k, str) and k.strip()]
-        if data.get("upstream_key"):
-            return [data["upstream_key"]]
-        return []
+        raw = data.get("upstream_keys") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return [k for k in raw if isinstance(k, str) and k.strip()]
 
     @staticmethod
     def _billing_config_conn(conn: sqlite3.Connection) -> sqlite3.Row:
@@ -466,19 +462,17 @@ class ProxyDatabase:
         if currency not in ("CNY", "USD"):
             raise ValueError("币种必须是 CNY / USD")
         keys = self._normalize_keys(data)
-        first = keys[0] if keys else ""
         type_spec = spec(account_type)
         valid_from = _parse_iso_date(data.get("valid_from"))
         conn = self._connect()
         try:
             cursor = conn.execute(
                 "INSERT INTO upstream_accounts "
-                "(name, upstream_key, base_url, api_format, endpoint_path, auth_header, "
+                "(name, base_url, api_format, endpoint_path, auth_header, "
                 " account_type, monthly_price, currency, max_concurrency, valid_from) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     data["name"],
-                    first,
                     data.get("base_url", ""),
                     data.get("api_format", "openai"),
                     data.get("endpoint_path", ""),
@@ -554,26 +548,22 @@ class ProxyDatabase:
                 values.append(val)
 
             # Keys are only touched when the client explicitly edited them
-            # (keys_edited=true) or sent a legacy non-empty `upstream_key`;
-            # otherwise the existing key set is preserved (e.g. a rename-only
-            # edit must never wipe the keys).  Types that don't hold upstream
-            # keys (e.g. agent) never get key replacement.
-            replace_keys = (bool(data.get("keys_edited")) or bool(data.get("upstream_key"))) \
+            # (keys_edited=true); otherwise the existing key set is preserved
+            # (e.g. a rename-only edit must never wipe the keys).  Types that
+            # don't hold upstream keys (e.g. agent) never get key replacement.
+            replace_keys = bool(data.get("keys_edited")) \
                 and type_holds_keys(original["account_type"])
             if replace_keys:
                 # Replace semantics: the final key set = kept existing keys (by
                 # id — the UI only ever sees masked values, never the real
                 # secrets) + newly-typed keys, in that order.
                 keep_ids = [int(i) for i in (data.get("keep_key_ids") or []) if str(i).lstrip('-').isdigit()]
-                final_keys = self._set_upstream_keys(
+                self._set_upstream_keys(
                     conn, account_id, keep_ids, self._normalize_keys(data),
                     keep_valid_froms=data.get("keep_valid_froms"),
                     new_valid_froms=data.get("new_valid_froms"),
                     account_type=original["account_type"],
                 )
-                first = final_keys[0] if final_keys else ""
-                fields.append("upstream_key = ?")
-                values.append(first)
 
             if not fields:
                 conn.commit()
@@ -785,6 +775,22 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    def get_plain_keys(self, account_id: int) -> list[str]:
+        """Plaintext upstream keys of an account (server-side only — never
+        sent to the client; used by the concurrency-test route to hit the
+        upstream directly)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT key_value FROM upstream_keys WHERE account_id=? "
+                "AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
+                "ORDER BY position, id",
+                (account_id,),
+            ).fetchall()
+            return [r[0] for r in rows if r[0]]
+        finally:
+            conn.close()
+
     # ── Aggregate Accounts ─────────────────────────────────────────────
 
     def get_aggregates(self) -> list[dict]:
@@ -816,8 +822,8 @@ class ProxyDatabase:
         try:
             cursor = conn.execute(
                 "INSERT INTO upstream_accounts "
-                "(name, upstream_key, base_url, api_format, is_aggregate) "
-                "VALUES (?, '', '', 'openai', 1)",
+                "(name, base_url, api_format, is_aggregate) "
+                "VALUES (?, '', 'openai', 1)",
                 (data["name"],),
             )
             agg_id = cursor.lastrowid
@@ -1503,7 +1509,7 @@ class ProxyDatabase:
         by_identity: dict[tuple[int, str], dict] = {}
         sub_types = subscription_types()
         accounts = conn.execute(
-            "SELECT id, upstream_key, created_at, valid_from, deleted_at, "
+            "SELECT id, created_at, valid_from, deleted_at, "
             "COALESCE(account_type,'api') AS account_type, "
             "COALESCE(currency,'CNY') AS currency "
             "FROM upstream_accounts "
@@ -1547,21 +1553,6 @@ class ProxyDatabase:
             end = min((v for v in (cloud_end, account_end) if v is not None), default=None)
             if end is not None:
                 meta["end"] = min((v for v in (meta["end"], end) if v is not None), default=end)
-        # Old databases may contain a plan account with a legacy key but no
-        # key row.  An empty cloud-synced account is not a billable key.
-        for account in accounts:
-            if account["upstream_key"] and not any(
-                meta["account_id"] == account["id"] for meta in by_identity.values()
-            ):
-                # 遗留单密钥没有独立 upstream_keys 行：订阅单位是账户，锚点 =
-                # 账户 valid_from → 账户 created_at（与 per_account agent 同一套规则）。
-                anchor = (_parse_iso_date(account["valid_from"])
-                          or _parse_utc_timestamp(account["created_at"]).date())
-                by_identity[(account["id"], mask_key(account["upstream_key"]))] = {
-                    "account_id": account["id"], "key_id": None,
-                    "key_masked": mask_key(account["upstream_key"]), "anchor": anchor,
-                    "end": _parse_utc_timestamp(account["deleted_at"]),
-                }
         # Per-account subscription types (agent): no upstream keys exist, so
         # synthesize exactly one lifecycle per account, keyed "subscription".
         for account in accounts:
@@ -1577,10 +1568,15 @@ class ProxyDatabase:
                 "account_type": account["account_type"],
             }
         for meta in by_identity.values():
-            # Attach the account's native currency for FX conversion.
+            # Attach the account's native currency for FX conversion.  The
+            # account_type default mirrors spec()/routing (api), not a legacy
+            # billing assumption — an empty type must not be treated as plan.
             account_row = account_rows.get(meta["account_id"])
             meta["currency"] = (account_row["currency"] or "CNY") if account_row else "CNY"
-            meta["account_type"] = (account_row["account_type"] or "plan") if account_row else "plan"
+            meta["account_type"] = (
+                (account_row["account_type"] or spec("").account_type)
+                if account_row else spec("").account_type
+            )
             meta["now"] = now
         return list(by_identity.values())
 
@@ -2041,19 +2037,13 @@ class ProxyDatabase:
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
 
-            # Detailed rows only exist for legacy proxy versions. New versions
-            # deliberately keep request identities out of the shared database.
-            in_flight = conn.execute(
-                "SELECT id, model, is_streaming, "
-                "ROUND((julianday('now') - julianday(started_at)) * 86400) AS elapsed_s "
-                "FROM in_flight_requests ORDER BY started_at"
-            ).fetchall()
-
+            # The in_flight_requests table was dropped in migration 0017; live
+            # concurrency comes from /health above.
             return {
                 "rpm": rpm,
                 "recent_requests": recent_count,
                 "latest_concurrent": latest_concurrent,
-                "in_flight": [dict(r) for r in in_flight],
+                "in_flight": [],
             }
         finally:
             conn.close()

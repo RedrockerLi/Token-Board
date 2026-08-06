@@ -23,7 +23,6 @@ public:
     struct RouteResult {
         bool success = false;
         std::string error;       // human-readable when !success
-        std::string upstream_key;
         std::string base_url;
         std::string api_format;      // "openai" | "openai_responses" | "anthropic"
         std::string endpoint_path;   // "" = derive from api_format

@@ -140,9 +140,8 @@ private:
 /// One real upstream target a request may be forwarded to.  Plain accounts
 /// yield one candidate per configured key; aggregate accounts yield one
 /// candidate per (matching entry × its account's keys), in priority order.
-/// `key` overrides `account.upstream_key` for the forward (per-key value);
-/// `key_slot_id` is the concurrency identity (-1 for an account's legacy
-/// single key).
+/// `key` is the per-key value forwarded upstream; `key_slot_id` is its
+/// concurrency identity (an upstream_keys row id).
 struct UpstreamCandidate {
     Database::AccountInfo account;  // real account (complete type from db.h)
     std::string key;                // the key to forward with

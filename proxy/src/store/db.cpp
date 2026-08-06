@@ -136,9 +136,6 @@ bool Database::open(const std::string &path, const std::string &schema_dir) {
         return false;
     }
 
-    // Clear any stale in-flight records from a previous run (e.g. crash)
-    sqlite3_exec(write_db_, "DELETE FROM in_flight_requests", nullptr, nullptr, nullptr);
-
     rc = sqlite3_open_v2(path.c_str(), &read_db_,
                          SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
     if (rc != SQLITE_OK) {
@@ -346,7 +343,7 @@ bool Database::prepare_statements() {
             "FROM local_keys WHERE key_value = ?1",
             stmt_lookup_key_);
 
-    PREPARE_ON(read_db_, "SELECT id, name, upstream_key, base_url, api_format, "
+    PREPARE_ON(read_db_, "SELECT id, name, base_url, api_format, "
             "COALESCE(endpoint_path,''), COALESCE(auth_header,'bearer'), "
             "COALESCE(is_aggregate,0), COALESCE(account_type,'api'), "
             "COALESCE(monthly_price,0), COALESCE(max_concurrency,0), "
@@ -359,7 +356,7 @@ bool Database::prepare_statements() {
         // account_types::routable_filter_sql — built once at startup).
         std::string route_sql =
             "SELECT k.id, k.key_value, k.account_id, COALESCE(k.label,''), "
-            "a.id, a.name, a.upstream_key, a.base_url, a.api_format, "
+            "a.id, a.name, a.base_url, a.api_format, "
             "COALESCE(a.endpoint_path,''), COALESCE(a.auth_header,'bearer'), "
             "COALESCE(a.is_aggregate,0), COALESCE(a.account_type,'api'), "
             "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), "
@@ -396,7 +393,7 @@ bool Database::prepare_statements() {
             "  FROM root r JOIN aggregate_entries e ON e.account_id=r.id "
             "  WHERE r.is_aggregate=1 AND e.pattern=?2"
             ") "
-            "SELECT a.id, a.name, a.upstream_key, a.base_url, a.api_format, "
+            "SELECT a.id, a.name, a.base_url, a.api_format, "
             "COALESCE(a.endpoint_path,''), COALESCE(a.auth_header,'bearer'), "
             "COALESCE(a.is_aggregate,0), COALESCE(a.account_type,'api'), "
             "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), "
@@ -477,18 +474,6 @@ bool Database::prepare_statements() {
             "last_used_at < datetime(?2,'unixepoch'))",
             stmt_update_last_used_);
 
-    PREPARE_ON(write_db_, "INSERT INTO in_flight_requests "
-            "(local_key_id, account_id, model, is_streaming) "
-            "VALUES (?1,?2,?3,?4)",
-            stmt_insert_in_flight_);
-
-    PREPARE_ON(write_db_, "DELETE FROM in_flight_requests WHERE id = ?1",
-            stmt_delete_in_flight_);
-
-    PREPARE_ON(write_db_, "DELETE FROM in_flight_requests "
-            "WHERE started_at < datetime('now', '-' || ?1 || ' minutes')",
-            stmt_cleanup_in_flight_);
-
     #undef PREPARE_ON
     return ok;
 }
@@ -508,9 +493,6 @@ void Database::finalize_statements() {
     FINALIZE(stmt_snapshot_price_);
     FINALIZE(stmt_get_timeout_config_);
     FINALIZE(stmt_update_last_used_);
-    FINALIZE(stmt_insert_in_flight_);
-    FINALIZE(stmt_delete_in_flight_);
-    FINALIZE(stmt_cleanup_in_flight_);
     #undef FINALIZE
 }
 
@@ -555,26 +537,24 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
         info.id = sqlite3_column_int(stmt_get_account_, 0);
         info.name = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_get_account_, 1));
-        info.upstream_key = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 2));
         info.base_url = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 3));
+            sqlite3_column_text(stmt_get_account_, 2));
         info.api_format = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 4));
+            sqlite3_column_text(stmt_get_account_, 3));
         if (info.api_format.empty()) info.api_format = "openai";
         info.endpoint_path = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 5));
+            sqlite3_column_text(stmt_get_account_, 4));
         info.auth_header = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 6));
+            sqlite3_column_text(stmt_get_account_, 5));
         if (info.auth_header.empty()) info.auth_header = "bearer";
-        info.is_aggregate = sqlite3_column_int(stmt_get_account_, 7) != 0;
+        info.is_aggregate = sqlite3_column_int(stmt_get_account_, 6) != 0;
         const char *atype = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 8));
+            sqlite3_column_text(stmt_get_account_, 7));
         info.account_type = atype ? atype : "api";
         if (info.account_type.empty()) info.account_type = "api";
-        info.monthly_price = sqlite3_column_double(stmt_get_account_, 9);
-        info.max_concurrency = sqlite3_column_int(stmt_get_account_, 10);
-        info.deleted = sqlite3_column_int(stmt_get_account_, 11) != 0;
+        info.monthly_price = sqlite3_column_double(stmt_get_account_, 8);
+        info.max_concurrency = sqlite3_column_int(stmt_get_account_, 9);
+        info.deleted = sqlite3_column_int(stmt_get_account_, 10) != 0;
         result = std::move(info);
     }
     sqlite3_reset(stmt_get_account_);
@@ -600,17 +580,16 @@ std::optional<Database::RouteInfo> Database::lookup_route(
         auto &a = route.account;
         a.id = sqlite3_column_int(stmt_lookup_route_, 4);
         a.name = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 5));
-        a.upstream_key = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 6));
-        a.base_url = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 7));
-        a.api_format = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 8));
-        a.endpoint_path = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 9));
-        a.auth_header = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 10));
-        a.is_aggregate = sqlite3_column_int(stmt_lookup_route_, 11) != 0;
-        const char *atype = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 12));
+        a.base_url = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 6));
+        a.api_format = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 7));
+        a.endpoint_path = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 8));
+        a.auth_header = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 9));
+        a.is_aggregate = sqlite3_column_int(stmt_lookup_route_, 10) != 0;
+        const char *atype = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 11));
         a.account_type = atype ? atype : "api";
-        a.monthly_price = sqlite3_column_double(stmt_lookup_route_, 13);
-        a.max_concurrency = sqlite3_column_int(stmt_lookup_route_, 14);
-        a.deleted = sqlite3_column_int(stmt_lookup_route_, 15) != 0;
+        a.monthly_price = sqlite3_column_double(stmt_lookup_route_, 12);
+        a.max_concurrency = sqlite3_column_int(stmt_lookup_route_, 13);
+        a.deleted = sqlite3_column_int(stmt_lookup_route_, 14) != 0;
         result = std::move(route);
     }
     sqlite3_reset(stmt_lookup_route_);
@@ -662,9 +641,9 @@ std::vector<Database::RoutingTarget> Database::resolve_routing_snapshot(
     while ((rc = sqlite3_step(stmt_resolve_routing_snapshot_)) == SQLITE_ROW) {
         const int target_id = sqlite3_column_int(
             stmt_resolve_routing_snapshot_, 0);
-        const std::string upstream_model = text_column(12);
+        const std::string upstream_model = text_column(11);
         const int priority_group = sqlite3_column_int(
-            stmt_resolve_routing_snapshot_, 13);
+            stmt_resolve_routing_snapshot_, 12);
 
         if (result.empty() || result.back().account.id != target_id ||
             result.back().priority_group != priority_group ||
@@ -673,37 +652,36 @@ std::vector<Database::RoutingTarget> Database::resolve_routing_snapshot(
             auto &account = target.account;
             account.id = target_id;
             account.name = text_column(1);
-            account.upstream_key = text_column(2);
-            account.base_url = text_column(3);
-            account.api_format = text_column(4);
+            account.base_url = text_column(2);
+            account.api_format = text_column(3);
             if (account.api_format.empty()) account.api_format = "openai";
-            account.endpoint_path = text_column(5);
-            account.auth_header = text_column(6);
+            account.endpoint_path = text_column(4);
+            account.auth_header = text_column(5);
             if (account.auth_header.empty()) account.auth_header = "bearer";
             account.is_aggregate = sqlite3_column_int(
-                stmt_resolve_routing_snapshot_, 7) != 0;
-            account.account_type = text_column(8);
+                stmt_resolve_routing_snapshot_, 6) != 0;
+            account.account_type = text_column(7);
             if (account.account_type.empty()) account.account_type = "api";
             account.monthly_price = sqlite3_column_double(
-                stmt_resolve_routing_snapshot_, 9);
+                stmt_resolve_routing_snapshot_, 8);
             account.max_concurrency = sqlite3_column_int(
-                stmt_resolve_routing_snapshot_, 10);
+                stmt_resolve_routing_snapshot_, 9);
             account.deleted = sqlite3_column_int(
-                stmt_resolve_routing_snapshot_, 11) != 0;
+                stmt_resolve_routing_snapshot_, 10) != 0;
             target.upstream_model = upstream_model;
             target.priority_group = priority_group;
             result.push_back(std::move(target));
         }
 
-        // LEFT JOIN preserves an account with no multi-key rows, allowing the
-        // caller to use its legacy upstream_key without a second DB lookup.
-        if (sqlite3_column_type(stmt_resolve_routing_snapshot_, 14) !=
+        // LEFT JOIN preserves an account with no multi-key rows (keys is empty;
+        // the single upstream_keys table is the only key source).
+        if (sqlite3_column_type(stmt_resolve_routing_snapshot_, 13) !=
             SQLITE_NULL) {
             KeySlot key;
-            key.id = sqlite3_column_int(stmt_resolve_routing_snapshot_, 14);
-            key.key_value = text_column(15);
+            key.id = sqlite3_column_int(stmt_resolve_routing_snapshot_, 13);
+            key.key_value = text_column(14);
             key.position = sqlite3_column_int(
-                stmt_resolve_routing_snapshot_, 16);
+                stmt_resolve_routing_snapshot_, 15);
             result.back().keys.push_back(std::move(key));
         }
     }
@@ -1612,50 +1590,4 @@ Database::TimeoutConfig Database::get_timeout_config(const std::string &app_type
 
     sqlite3_reset(stmt_get_timeout_config_);
     return tc;
-}
-
-// ── in_flight_requests tracking ─────────────────────────────────────────
-
-int Database::request_start(int local_key_id, int account_id,
-                             const std::string &model, bool is_streaming) {
-    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-    std::lock_guard<std::mutex> lock(write_mutex_);
-
-    sqlite3_reset(stmt_insert_in_flight_);
-    sqlite3_bind_int(stmt_insert_in_flight_, 1, local_key_id);
-    sqlite3_bind_int(stmt_insert_in_flight_, 2, account_id);
-    sqlite3_bind_text(stmt_insert_in_flight_, 3,
-                      model.c_str(), model.size(), SQLITE_STATIC);
-    sqlite3_bind_int(stmt_insert_in_flight_, 4, is_streaming ? 1 : 0);
-
-    int rc = sqlite3_step(stmt_insert_in_flight_);
-    if (rc != SQLITE_DONE)
-        fprintf(stderr, "[DB] request_start insert error: %s\n",
-                sqlite3_errmsg(write_db_));
-    sqlite3_reset(stmt_insert_in_flight_);
-    return rc == SQLITE_DONE ? static_cast<int>(sqlite3_last_insert_rowid(write_db_)) : -1;
-}
-
-void Database::request_end(int row_id) {
-    if (row_id < 0) return;
-    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-    std::lock_guard<std::mutex> lock(write_mutex_);
-
-    sqlite3_reset(stmt_delete_in_flight_);
-    sqlite3_bind_int(stmt_delete_in_flight_, 1, row_id);
-    int rc = sqlite3_step(stmt_delete_in_flight_);
-    if (rc != SQLITE_DONE)
-        fprintf(stderr, "[DB] request_end delete error: %s\n",
-                sqlite3_errmsg(write_db_));
-    sqlite3_reset(stmt_delete_in_flight_);
-}
-
-void Database::cleanup_stale_in_flight(int max_age_minutes) {
-    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-    std::lock_guard<std::mutex> lock(write_mutex_);
-
-    sqlite3_reset(stmt_cleanup_in_flight_);
-    sqlite3_bind_int(stmt_cleanup_in_flight_, 1, max_age_minutes);
-    sqlite3_step(stmt_cleanup_in_flight_);
-    sqlite3_reset(stmt_cleanup_in_flight_);
 }

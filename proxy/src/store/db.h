@@ -54,7 +54,6 @@ public:
     struct AccountInfo {
         int id;
         std::string name;
-        std::string upstream_key;
         std::string base_url;
         std::string api_format;      // "openai" | "openai_responses" | "anthropic"
         std::string endpoint_path;   // "" = derive from api_format
@@ -87,16 +86,14 @@ public:
         std::string key_value;
         int position = 0;   // fill / session-affinity preference order
     };
-    /// All keys of an account, ordered by (position, id).  Empty when the
-    /// account has no keys configured (caller falls back to the account's
-    /// legacy single upstream_key).
+    /// All keys of an account, ordered by (position, id).
     std::vector<KeySlot> get_upstream_keys(int account_id);
 
     /// One fully resolved real-upstream target from a routing snapshot.
     /// `keys` and `account` are read by the same SQLite statement, so callers
     /// cannot combine credentials from one config revision with an endpoint
-    /// from another.  Empty `keys` means the caller may use the account's
-    /// legacy `upstream_key`.
+    /// from another.  `keys` holds the per-key slots (the only key source since
+    /// the legacy single-column upstream_key was removed).
     struct RoutingTarget {
         AccountInfo account;
         std::vector<KeySlot> keys;
@@ -177,19 +174,6 @@ public:
     };
 
     std::vector<PricingEntry> get_all_pricing();
-
-    // ── In-flight request tracking ──────────────────────────────────────
-
-    /// Record a request that has just started. Returns the row ID to use
-    /// in the matching request_end() call.
-    int request_start(int local_key_id, int account_id,
-                      const std::string &model, bool is_streaming);
-
-    /// Mark a request as completed (delete its in-flight record).
-    void request_end(int row_id);
-
-    /// Remove in-flight records older than `max_age_minutes` (stuck/crashed).
-    void cleanup_stale_in_flight(int max_age_minutes = 10);
 
 private:
     struct LogRecord {
@@ -307,7 +291,4 @@ private:
     sqlite3_stmt *stmt_find_log_event_ = nullptr;
     sqlite3_stmt *stmt_insert_attempt_ = nullptr;
     sqlite3_stmt *stmt_update_last_used_ = nullptr;
-    sqlite3_stmt *stmt_insert_in_flight_ = nullptr;
-    sqlite3_stmt *stmt_delete_in_flight_ = nullptr;
-    sqlite3_stmt *stmt_cleanup_in_flight_ = nullptr;
 };

@@ -105,24 +105,25 @@ def update_account_models(account_id):
     import requests
     from requests.auth import HTTPBasicAuth
 
-    acc = _proxy_db().get_accounts()
-    acc = [a for a in acc if a["id"] == account_id]
+    db = _proxy_db()
+    acc = next((a for a in db.get_accounts() if a["id"] == account_id), None)
     if not acc:
         return jsonify({"error": "Account not found"}), 404
-    acc = acc[0]
+    keys = db.get_plain_keys(account_id)
+    key = keys[0] if keys else ""
 
     try:
         url = acc["base_url"].rstrip("/") + "/models"
         resp = requests.get(
             url,
-            headers={"Authorization": "Bearer " + acc["upstream_key"]},
+            headers={"Authorization": "Bearer " + key},
             timeout=15,
         )
         if not resp.ok:
             return jsonify({"error": f"Upstream HTTP {resp.status_code}: {resp.text[:200]}"}), 400
         data = resp.json()
         models = [m["id"] for m in data.get("data", [])]
-        count = _proxy_db().update_account_models(account_id, models)
+        count = db.update_account_models(account_id, models)
         return jsonify({"status": "ok", "count": count, "models": models})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -137,7 +138,7 @@ def get_account_models(account_id):
 def test_account_concurrency(account_id):
     """按账户并发限额，直连上游并行发 N 个极小聊天请求，检验该并发是否安全。
 
-    不经本机 C++ 代理：直接用该账户的 upstream_key 并发打上游，观察在该
+    不经本机 C++ 代理：直接用该账户的第一把上游 Key 并发打上游，观察在该
     并发下上游是否会报错（429 / 5xx / 超时）。自动挑选模型定价列表中最便宜
     的、且该账户可用的模型，尽量压低测试成本。
     """
@@ -155,7 +156,10 @@ def test_account_concurrency(account_id):
     from app.domain.account_types import spec as _type_spec
     if not _type_spec(acc.get("account_type") or "api").holds_keys:
         return jsonify({"error": "该账户类型不持有上游密钥，不支持并发测试"}), 400
-    key = acc.get("upstream_key") or ""
+    key = ""
+    if _type_spec(acc.get("account_type") or "api").holds_keys:
+        keys = db.get_plain_keys(account_id)
+        key = keys[0] if keys else ""
     if not key:
         return jsonify({"error": "该账户未配置上游 Key，请先在账户编辑中填写 Key"}), 400
 
