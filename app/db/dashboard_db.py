@@ -445,28 +445,30 @@ def _rebuild_tables_by_id(dash: sqlite3.Connection) -> None:
 
 
 def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
-    """Mirror upstream_accounts (id → name / account_type / deleted_at) into the
-    dashboard `accounts` table and migrate any legacy name-keyed archive rows to
-    account_id keys. Idempotent.
+    """Mirror upstream_accounts (id → name) into the dashboard `accounts` table
+    and migrate any legacy name-keyed archive rows to account_id keys.
+    Idempotent.
 
     Runs on the local dashboard at startup and on the sync shadow right after
     the schema migrate (before export), so the local archive and the cloud copy
     both converge on account_id bucketing with a consistent name mirror. Once
     the legacy name columns are dropped the rebuild step is skipped.
+
+    Only `name` is mirrored (dashboard 0006 dropped the never-read
+    account_type / deleted_at mirror columns); the proxy DB is the
+    authoritative account store.
     """
     proxy = sqlite3.connect(proxy_path)
     proxy.row_factory = sqlite3.Row
     dash = sqlite3.connect(dash_path, timeout=10)
     try:
         accts = proxy.execute(
-            "SELECT id, name, COALESCE(account_type, 'api') AS account_type, deleted_at "
-            "FROM upstream_accounts"
+            "SELECT id, name FROM upstream_accounts"
         ).fetchall()
         for a in accts:
             dash.execute(
-                "INSERT OR REPLACE INTO accounts (account_id, name, account_type, deleted_at) "
-                "VALUES (?,?,?,?)",
-                (a["id"], a["name"], a["account_type"], a["deleted_at"]),
+                "INSERT OR REPLACE INTO accounts (account_id, name) VALUES (?,?)",
+                (a["id"], a["name"]),
             )
 
         # Legacy name-keyed rows: backfill account_id from the name→id map,
