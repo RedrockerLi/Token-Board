@@ -29,8 +29,10 @@
 
 计费载体是 `request_log` 的**单列 `api_cost`**(0007 起 `cost` + `virtual_cost` 合并——api 账户记真实账单,plan/agent 记虚拟口径,统一落这一列)。两种写时计价路径:
 
-- **第三方/老写入**(`cost_frozen=0`):由触发器 `tr_request_log_insert` 在插入时按当时的 `model_pricing` 单价、档位配置与汇率算好写进当行(0014 版本,USD 定价按请求当天汇率折 CNY)。
+- **第三方/老写入**(`cost_frozen=0`):由触发器 `tr_request_log_insert` 在插入时按当时的 `model_pricing` 单价、档位配置与汇率算好写进当行(0018 版本,USD 定价按请求当天汇率折 CNY)。
 - **代理自身**(`cost_frozen=1`):C++ 在请求**入队时刻**用 `snapshot_request_cost` 快照定价写入,排队延迟不改账;`event_id` 保证本地 spool 重放幂等。
+
+两条路径共用同一个**取价视图 `v_pricing_rate`**(0018,`model_pricing` 基本价 + 缓存价/币种 COALESCE 的唯一事实源):触发器的子查询与 C++ 的 `stmt_snapshot_price_` 都从视图取价,只有峰谷档位/汇率子查询(依赖每行时刻)留在两端。等价性由两个 ctest 门保证:`pricing_equivalence`(v17 触发器 vs v18 视图触发器逐位相等)+ `pricing_snapshot_equiv`(C++ 快照 vs v18 触发器一致)。
 
 迁移 `0002` 删掉了 `tr_pricing_insert/update/delete` 三个改价回溯触发器,所以:
 
@@ -46,7 +48,7 @@
 - 每把上游密钥独立拥有 `valid_from` 起的行政月周期。锚点日为起始日的日号，短月取月末；密钥不需要产生用量也会产生每周期一次的订阅费。
 - 所有边界使用 UTC+0。删除 plan/agent 密钥或账户时按「删除默认操作」(`plan_billing_config.cancellation_mode`，默认 `immediate`)执行：**本期立即删除**(`immediate`，本期计费)把 `deleted_at` 设为删除时刻，即刻停用但本期照收月费；**到期立即删除**(`end_of_period`，本期计费、下期不计费)把 `deleted_at` 设为本期期末，订阅可继续使用至本期最后一天，到期后路由自动停止，本期照收、下期不再计费。api 账户无订阅生命周期，始终立即删除。
 - 月费修改会写入价格历史。设置页可选择默认从本期或下一期生效；不同锚点日的密钥会在各自对应的周期边界切换价格。
-- plan 单把上游密钥收到 HTTP 429 后冷却 5 小时，同账户其他密钥仍可回退接管(见 [proxy-internals.md](proxy-internals.md))。
+- plan 单把上游密钥收到 HTTP 429 后冷却 5 小时，同账户其他密钥仍可回退接管(见 [proxy-internals.md](proxy-internals.md))。冷却期内代理每 1 小时探测一次上游 `GET /models`,2xx 即提前解除冷却,不必等满 5 小时;探测不写 request_log、不占并发(见 [proxy-internals.md](proxy-internals.md) 冷却探测小节)。
 
 plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实际花的钱是月费,虚拟消费是省下来的按量金额。
 

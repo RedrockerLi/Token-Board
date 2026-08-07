@@ -54,6 +54,14 @@
 
 实时并发不写库:请求热路径只更新进程内计数器,`GET /health` 的 `concurrency` 字段暴露它;`in_flight_requests` 表是旧版本的遗留,当前代理不再写入(启动与周期清理仍会清它的残留)。
 
+## 冷却探测
+
+plan 密钥进入 5h 冷却后,后台线程**每隔 `cooldown_probe_interval_secs_`(默认 3600s,`TB_COOLDOWN_PROBE_SECS` 环境变量可覆盖,单位秒)探测一次**该密钥对应的上游:向 `{base_url}/models` 发免费 `GET /models`(OpenAI 与 Anthropic 格式都有此端点),2xx 即 `clear_cooldown` 提前解除,该密钥重新进入候选池;GoUsageLimitError 429 或其它错误保持冷却、下一轮再探。
+
+- 探测线程在 `setup_routes` 启动(`start_cooldown_probe`,幂等),`shutdown()` 内 join(仿 `accounting_thread_` 生命周期);循环按 200ms 切片睡眠,退出迅速。
+- 探测目标按 `upstream_keys.id` 查 `lookup_probe_target`(read_db_ 连接,JOIN 账户取 base_url/key/auth),已删密钥/账户直接跳过。
+- **纪律**:探测不写 `request_log`、不 `acquire`/`release`(不占 `max_concurrency`)、不动 `mark_failure` 计数——只观察冷却态并清除它。冷却状态依旧纯内存,重启即清。
+
 ## 超时与客户端断连
 
 上游超时按客户端线格式配置,存在 `proxy_timeout_config` 表(每行一组,默认值对齐 cc-switch:anthropic 90/180/600、openai_responses 与 openai 60/120/600),由仪表板「设置」页编辑、代理每次转发时按 harness 线格式读取,改动即时生效、无需重启:

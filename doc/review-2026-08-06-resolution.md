@@ -52,16 +52,18 @@
 5. **`in_flight_requests` 死写**:`request_start/request_end` PREPARE 未调用,表恒空;0017 删表并清掉 C++ 侧全部相关语句。
 6. **mock_upstream 的 chunked 终止帧错误**:`0\r\n\r\n` 曾通过 `_write_chunk` 被框架化为 `5\r\n0\r\n\r\n\r\n`,导致读取方永久阻塞;已修正为直接写出。
 
-## 遗留项(建议后续专项,本次未做)
+## 后续专项(已处理,2026-08-07)
 
-- **计价触发器抽函数**:0002/0007/0012/0014 四版重复的巨型计价表达式 + C++ `stmt_snapshot_price_` 双轨。抽成单一 SQL 视图/函数需等价性回归(涉及钱),风险/收益不匹配,本次未动。
-- **双价源**:`upstream_accounts.monthly_price` 与 `plan_price_history` 去一存一。
-- **dashboard.db 双镜像表**:`account_types`(0001)与 `accounts`(0004)合并。
-- **冷却时长数据化**:`PLAN_COOLDOWN=5h` 仍为 C++ 常量;如需按账户类型/上游配置,建议连同上述 schema 专项一起做。
+- **计价触发器抽函数**:`v_pricing_rate` 视图(0018)成为单一定价事实源——写时计价触发器(cost_frozen=0)与 C++ 快照计价(cost_frozen=1)双端都改读视图,消除新增副本与 C++ 双轨漂移。峰谷档位/汇率子查询依赖每行 minute/date,视图不可参数化,保留在两端。**金额安全门**:`pricing_equivalence`(纯 SQL, v17 触发器 vs v18 视图触发器 20 用例逐位相等)+ `pricing_snapshot_equiv`(C++ 快照 vs v18 触发器 15 用例一致),均并入 ctest。历史迁移 0002/0004/0006/0007/0012/0014 冻结不改。提交 `cb5b804`。
+- **双价源**:删 `upstream_accounts.monthly_price`(0019),`plan_price_history` 单源(计费/云端权威都在它)。当前价由最新 `current_period` 事件派生(get_accounts/get_agent_accounts 子查询,输出键仍叫 `monthly_price` → 前端零改动);create/update_account 只写历史事件。C++ 死读全删,并修正 `stmt_resolve_routing_snapshot_` 删列后的列号移位(upstream_model 11→10 / priority_group 12→11 / key 列 13-15→12-14,原误读会把 priority_group 当 upstream_model,ctest 抓到)。sync.py 全 schema 驱动,无需改。提交 `7a4afb7`。
+- **dashboard.db 双镜像表**:核实为 **no-op**——`account_types`(0001)从未有写入、0003 即删、线上库不存在,无运行期消费。顺带清理现存 `accounts`(0004)只写不读的 `account_type`/`deleted_at` 列(0006),镜像只留 `(account_id, name)`;`reconcile_accounts` 同步只写。提交 `b7ea671`。
+- **冷却时长数据化**:**按用户决策取消,重定向为主动探测**。`PLAN_COOLDOWN=5h` 保持 C++ 常量,冷却状态依旧不落库(account_gate.h 本就全内存、重启即清)。新增:冷却期内的 plan 密钥由后台线程每 1h 探测上游 `GET /models`,2xx 提前解除,GoUsageLimitError 429 保持冷却。间隔默认 3600s,env `TB_COOLDOWN_PROBE_SECS` 覆盖(测试用);探测不写 request_log、不占 max_concurrency、不动 gate 计数。`cooldown_probe_test`(ctest)断言正/反例。提交 `982fbe6`。
 
 ## 部署注意事项
 
 - 迁移 `schema/proxy/0017_drop_dead_tables.sql` 由代理启动时自动应用(v16→v17)。**代理二进制与仪表板代码需同版本升级**(0017 删 `upstream_key` 列,旧 Python 账户 CRUD 会引用该列)。
+- **`schema/proxy/0019_drop_monthly_price.sql`(v18→v19)同样要求代理二进制 + 仪表板代码同版本升级**:旧二进制 `prepare_statements` 与旧 Python CRUD 会引用已删列(同 0017 约束)。0018(计价视图)对旧二进制向后安全(旧快照直读 model_pricing,表仍在),仅 0019 带耦合。
+- **`schema/dashboard/0006` 与 `reconcile_accounts` 只写改动需同发**(删 dashboard.accounts 两列后,旧 reconcile 写入会报 no such column)。sync_dashboard 影子库先 migrate 再 reconcile,远端旧列自动删。
 - 生产库副本已验证:v16→v17,`upstream_key` 列删除、账户/请求日志数据完整、Python 账户增删改查正常。
 - 仪表板鉴权:默认 loopback 免鉴权;若用 `--host 0.0.0.0` 暴露且未设 `TB_DASHBOARD_TOKEN`,首次启动会生成 `data/dashboard_token.txt` 并在日志提示 `/login`。
 - 压测/实验脚本均以临时库 + mock_upstream 运行,不影响生产 `data/proxy.db`。

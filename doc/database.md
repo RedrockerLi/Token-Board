@@ -6,7 +6,7 @@
 
 ## proxy.db
 
-代理的运行库,表定义在 `schema/proxy/0001_*.sql`(0001–0014),`user_version` 当前为 14。
+代理的运行库,表定义在 `schema/proxy/0001_*.sql`(0001–0019),`user_version` 当前为 19。
 
 ### upstream_accounts — 上游账户
 
@@ -24,7 +24,6 @@
 | `endpoint_path` | 自定义上游路径;为空则按 `api_format` 推导(`/chat/completions`、`/responses`、`/v1/messages`) |
 | `auth_header` | `bearer` / `x-api-key` / `auto`(auto 按格式推导:anthropic 用 x-api-key,其余用 Bearer) |
 | `account_type` | `api`(按量计费)、`plan`(订阅套餐,调用免费)或 `agent`(Agent 订阅,如 Codex)。agent 与 plan 计费一致,但不绑定上游密钥、不可被路由,用量由后台导入 |
-| `monthly_price` | plan/agent 账户的订阅月费(原生币种,见 `currency`) |
 | `currency` | 订阅价原生币种 `CNY` / `USD`,默认 CNY |
 | `agent_kind` | agent 账户的子类型,目前仅 `codex` |
 | `max_concurrency` | 并发限额,NULL=不限;达到限额的请求返回 429(聚合链内自动切下一个) |
@@ -47,6 +46,8 @@
 ### plan_billing_config 与 plan_price_history — plan 计费设置
 
 `plan_billing_config` 单行全局设置:`price_change_effective`(改价默认从本期还是下期生效)、`cancellation_mode`(删除 plan/agent 的默认操作:`immediate` 本期立即删除(本期计费) / `end_of_period` 到期立即删除(本期计费、下期不计费),默认 `immediate`)。`upstream_accounts.deferred_cleanup_mode` 记录 end_of_period 账户删除的延迟清理意图(detach/cascade)，由删除 finalizer 在 `deleted_at` 到期后执行。`plan_price_history` 记录每次月费变更:`account_id`、`monthly_price`、`changed_at`、`effective_mode`;订阅费由生命周期 + 价格历史重建,历史月份冻结、当月按当前设置刷新。
+
+**`plan_price_history` 是月费唯一事实源**:`upstream_accounts.monthly_price` 列已在 0019 删除,当前价由最新 `current_period` 事件派生(`get_accounts`/`get_agent_accounts` 的子查询,输出键仍叫 `monthly_price`,前端无感知)。改价写入新历史事件,不更新任何列。
 
 ### request_log — 请求日志与计费载体
 
@@ -76,7 +77,7 @@
 
 索引:`idx_rl_account`、`idx_rl_time`、`idx_rl_key`(upstream_key_id)、`idx_rl_ttft_time`(requested_at, ttft_ms)、`idx_request_log_event_id`(event_id,唯一)。
 
-计费触发器 `tr_request_log_insert`(0014 版本)只在 `cost_frozen=0` 时触发,按"当前定价 × 命中时段倍率 × 币种汇率"计算 `api_cost` 固化;代理自身快照计价走 `cost_frozen=1`(入队时定价,排队延迟不改账)。公式:
+计费触发器 `tr_request_log_insert`(0018 版本,基于 `v_pricing_rate` 视图)只在 `cost_frozen=0` 时触发,按"当前定价 × 命中时段倍率 × 币种汇率"计算 `api_cost` 固化;代理自身快照计价走 `cost_frozen=1`(入队时定价,排队延迟不改账,`stmt_snapshot_price_` 同样读 `v_pricing_rate` 视图)。公式:
 
 ```
 api_cost = (miss/1e6) × input_price
@@ -87,6 +88,8 @@ api_cost = (miss/1e6) × input_price
 ```
 
 模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY mp.id LIMIT 1`,即第一条匹配生效,`reorder_pricing` 交换 `model_pricing.id` 来改变匹配优先级。所有账户统一记 `api_cost`(api = 真实账单,plan/agent = 虚拟口径)。`prompt_tokens + completion_tokens = 0` 的行只记日志、不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
+
+**`v_pricing_rate` 视图(0018)**:取价部分(`model_pricing` 基本价 + 缓存价/币种 COALESCE)的唯一事实源,触发器与 C++ 快照都从视图取价。峰谷档位(`pricing_slots`)与汇率(`fx_rate`)子查询依赖每行 `minute(requested_at)` / `date(requested_at)`,视图无法参数化,保留在两端。等价回归:`pricing_equivalence`(v17 触发器 vs v18 视图触发器,20 用例逐位相等)+ `pricing_snapshot_equiv`(C++ 快照 vs v18 触发器),均并入 ctest。
 
 清理规则:同步进度由 `sync_state.last_exported_log_id` 单值提交检查点记录(无逐行 exported 标记)。
 `cleanup_exported_logs` 只删 `id ≤ 检查点 且 请求时间超过 30 天` 的行;未计入存档的行永久保留。
@@ -122,9 +125,9 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。�
 
 ## dashboard.db
 
-可视化**存档**库,表定义在 `schema/dashboard/0001_*.sql`(0001–0005),`user_version` 当前为 5。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
+可视化**存档**库,表定义在 `schema/dashboard/0001_*.sql`(0001–0006),`user_version` 当前为 6。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
-存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `accounts` 元数据镜像表(0004 + 应用层 `reconcile_accounts` 把旧的名字列桶迁移成 id 桶、删掉名字列)。`accounts` 每行 `account_id → name / account_type / deleted_at`,随配置同步、含已软删账户,供历史显示 JOIN 出名字。看板”按用户筛选”即按账户筛选,费用按该账户名下 token 占比分摊。
+存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `accounts` 元数据镜像表(0004 + 应用层 `reconcile_accounts` 把旧的名字列桶迁移成 id 桶、删掉名字列)。`accounts` 每行 `account_id → name`(0006 删除了从未被读的 `account_type`/`deleted_at` 镜像列),随配置同步、含已软删账户,供历史显示 JOIN 出名字。看板”按用户筛选”即按账户筛选,费用按该账户名下 token 占比分摊。
 
 ### token_usage / request_usage
 
