@@ -230,9 +230,6 @@ function initSettingsPage() {
         <div class="section">
             <div class="chart-card">
                 <div class="chart-card__title" style="margin-bottom:12px;">Plan 订阅计费</div>
-                <p style="margin:0 0 12px; font-size:13px; color:var(--color-text-secondary);">
-                    所有订阅起止、价格变更与删除边界均使用 UTC+0。密钥有各自的订阅周期，因此“本月/下月”分别表示该密钥的本期/下期。
-                </p>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
                     <label>修改月费的默认生效时间
                         <select id="billingPriceEffective">
@@ -240,16 +237,12 @@ function initSettingsPage() {
                             <option value="next_period">下一计费周期生效</option>
                         </select>
                     </label>
-                    <label>删除订阅类账户（Plan / Agent）的默认操作
+                    <label>删除订阅类账户的默认操作
                         <select id="billingCancellationMode">
                             <option value="immediate">本期立即删除（本期计费）</option>
                             <option value="end_of_period">到期立即删除（本期计费，下期不计费）</option>
                         </select>
                     </label>
-                </div>
-                <div style="margin-top:10px; font-size:13px; color:var(--color-text-secondary);">
-                    删除订阅类账户/密钥时按此操作执行（按量计费的 api 类型始终立即删除）。「本期立即删除」即刻停用但本期照收月费；
-                    「到期立即删除」可继续使用至本期最后一天，本期照收、下期不再计费。所有边界均按 UTC+0，密钥各自的订阅周期独立计算。
                 </div>
                 <div style="display:flex; justify-content:flex-end; margin-top:12px;">
                     <button class="btn btn--primary" id="btnBillingConfigSave" onclick="saveBillingConfig()">保存 Plan 计费设置</button>
@@ -262,7 +255,7 @@ function initSettingsPage() {
             <div class="chart-card">
                 <div class="chart-card__title" style="margin-bottom:12px;">WebDAV 同步</div>
                 <p style="margin:0 0 12px; font-size:13px; color:var(--color-text-secondary);">
-                    多台电脑共用代理时，用 WebDAV 同步配置与聚合用量；请求明细、性能数据与账号密码绝不上传。
+                    多台电脑共用代理时，用 WebDAV 同步配置与聚合用量。
                 </p>
                 <form id="syncConfigForm" onsubmit="saveSyncSettings(event)">
                     <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
