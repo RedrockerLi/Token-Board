@@ -76,12 +76,45 @@ add_test(
     COMMAND upstream_client_perf reuse
 )
 
+# Money-equivalence gate (2/2): the C++ enqueue-time snapshot twin must agree
+# with the v18 trigger for the same inputs (cost_frozen=1 vs cost_frozen=0).
+add_executable(pricing_snapshot_equiv_test
+    pricing_snapshot_equiv_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/db.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/sqlite3.c
+)
+target_include_directories(pricing_snapshot_equiv_test PRIVATE
+    ${TEST_INCLUDE_DIRS}
+)
+target_compile_features(pricing_snapshot_equiv_test PRIVATE cxx_std_17)
+set_source_files_properties(${CMAKE_SOURCE_DIR}/third_party/sqlite3.c PROPERTIES
+    LANGUAGE C
+    COMPILE_FLAGS "-O2 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1"
+)
+target_link_libraries(pricing_snapshot_equiv_test PRIVATE
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+)
+add_test(NAME pricing_snapshot_equiv COMMAND pricing_snapshot_equiv_test
+    ${CMAKE_SOURCE_DIR}/../schema/proxy
+)
+
 
 # ── Test registration ────────────────────────────────────────────────────
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME format_conversion COMMAND format_conv_test)
 add_test(NAME session_affinity COMMAND session_affinity_test)
 add_test(NAME upstream_client COMMAND upstream_client_test)
+# Money-equivalence gate (1/2): v17 trigger == v18 view-based trigger across a
+# pricing edge-case matrix (pure SQL, exact api_cost equality).  Proves the
+# 0018 view extraction changes no money before the column drop lands.
+add_test(
+    NAME pricing_equivalence
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/pricing_equivalence_test.py
+            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/..
+)
 add_test(
     NAME proxy_forwarding
     COMMAND ${Python3_EXECUTABLE}

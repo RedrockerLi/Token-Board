@@ -41,6 +41,16 @@ public:
     /// Close the database and finalize all prepared statements.
     void close();
 
+    /// Compute the enqueue-time frozen cost for a request (cost_frozen=1
+    /// path).  Looks up the pricing rate via stmt_snapshot_price_ (which reads
+    /// the v_pricing_rate view) and applies the per-(model,date,minute)
+    /// FrozenRate cache.  Public so the pricing-equivalence gate can assert it
+    /// agrees with the cost_frozen=0 trigger path.
+    bool snapshot_request_cost(const std::string &model, int prompt_tokens,
+                               int completion_tokens, int cache_read_tokens,
+                               std::int64_t requested_at_unix,
+                               double &cost);
+
     // ── Lookups ──────────────────────────────────────────────────────────
 
     struct KeyInfo {
@@ -228,10 +238,6 @@ private:
     void log_writer_loop();
     bool persist_log_records(const LogRecord *records, std::size_t count);
     bool write_log_record_in_transaction(const LogRecord &record);
-    bool snapshot_request_cost(const std::string &model, int prompt_tokens,
-                               int completion_tokens, int cache_read_tokens,
-                               std::int64_t requested_at_unix,
-                               double &cost);
     bool append_log_spool_locked(const std::string &payload);
     bool read_log_spool_batch_locked(std::vector<SpoolRecord> &batch);
     bool compact_log_spool_locked(bool force);

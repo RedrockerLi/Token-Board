@@ -445,23 +445,23 @@ bool Database::prepare_statements() {
             stmt_get_pricing_);
 
     PREPARE_ON(pricing_db_,
-            "SELECT mp.input_price, mp.output_price, "
-            "       COALESCE(mp.cache_read_price, mp.input_price), "
+            "SELECT v.input_price, v.output_price, "
+            "       v.cache_read_price, "
             "       COALESCE((SELECT ps.multiplier FROM pricing_slots ps "
-            "                 WHERE ps.pricing_id=mp.id AND "
+            "                 WHERE ps.pricing_id=v.id AND "
             "                   ((ps.start_minute<=ps.end_minute AND "
             "                     ?2>=ps.start_minute AND ?2<ps.end_minute) OR "
             "                    (ps.start_minute>ps.end_minute AND "
             "                     (?2>=ps.start_minute OR ?2<ps.end_minute))) "
             "                 ORDER BY ps.id LIMIT 1), 1.0), "
-            "       COALESCE(mp.currency,'CNY'), "
+            "       v.currency, "
             "       COALESCE((SELECT fr.rate FROM fx_rate fr "
             "                 WHERE fr.base='USD' AND fr.quote='CNY' "
             "                   AND fr.date <= date(?3,'unixepoch') "
             "                 ORDER BY fr.date DESC LIMIT 1), 1.0) "
-            "FROM model_pricing mp "
-            "WHERE LOWER(?1) GLOB LOWER(mp.model_pattern) "
-            "ORDER BY mp.id LIMIT 1",
+            "FROM v_pricing_rate v "
+            "WHERE LOWER(?1) GLOB LOWER(v.model_pattern) "
+            "ORDER BY v.id LIMIT 1",
             stmt_snapshot_price_);
 
     PREPARE_ON(read_db_, "SELECT streaming_first_byte_timeout, streaming_idle_timeout, "
