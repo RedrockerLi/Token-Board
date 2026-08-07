@@ -346,7 +346,7 @@ bool Database::prepare_statements() {
     PREPARE_ON(read_db_, "SELECT id, name, base_url, api_format, "
             "COALESCE(endpoint_path,''), COALESCE(auth_header,'bearer'), "
             "COALESCE(is_aggregate,0), COALESCE(account_type,'api'), "
-            "COALESCE(monthly_price,0), COALESCE(max_concurrency,0), "
+            "COALESCE(max_concurrency,0), "
             "(deleted_at IS NOT NULL AND deleted_at <= datetime('now')) AS deleted_at "
             "FROM upstream_accounts WHERE id = ?1",
             stmt_get_account_);
@@ -359,7 +359,7 @@ bool Database::prepare_statements() {
             "a.id, a.name, a.base_url, a.api_format, "
             "COALESCE(a.endpoint_path,''), COALESCE(a.auth_header,'bearer'), "
             "COALESCE(a.is_aggregate,0), COALESCE(a.account_type,'api'), "
-            "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), "
+            "COALESCE(a.max_concurrency,0), "
             "(a.deleted_at IS NOT NULL AND a.deleted_at <= datetime('now')) AS a_deleted "
             "FROM local_keys k JOIN upstream_accounts a ON a.id=k.account_id "
             "WHERE k.key_value=?1"
@@ -396,7 +396,7 @@ bool Database::prepare_statements() {
             "SELECT a.id, a.name, a.base_url, a.api_format, "
             "COALESCE(a.endpoint_path,''), COALESCE(a.auth_header,'bearer'), "
             "COALESCE(a.is_aggregate,0), COALESCE(a.account_type,'api'), "
-            "COALESCE(a.monthly_price,0), COALESCE(a.max_concurrency,0), "
+            "COALESCE(a.max_concurrency,0), "
             "(a.deleted_at IS NOT NULL AND a.deleted_at <= datetime('now')) AS a_deleted, "
             "targets.upstream_model, targets.priority_group, "
             "k.id, k.key_value, k.position "
@@ -552,9 +552,8 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
             sqlite3_column_text(stmt_get_account_, 7));
         info.account_type = atype ? atype : "api";
         if (info.account_type.empty()) info.account_type = "api";
-        info.monthly_price = sqlite3_column_double(stmt_get_account_, 8);
-        info.max_concurrency = sqlite3_column_int(stmt_get_account_, 9);
-        info.deleted = sqlite3_column_int(stmt_get_account_, 10) != 0;
+        info.max_concurrency = sqlite3_column_int(stmt_get_account_, 8);
+        info.deleted = sqlite3_column_int(stmt_get_account_, 9) != 0;
         result = std::move(info);
     }
     sqlite3_reset(stmt_get_account_);
@@ -587,9 +586,8 @@ std::optional<Database::RouteInfo> Database::lookup_route(
         a.is_aggregate = sqlite3_column_int(stmt_lookup_route_, 10) != 0;
         const char *atype = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 11));
         a.account_type = atype ? atype : "api";
-        a.monthly_price = sqlite3_column_double(stmt_lookup_route_, 12);
-        a.max_concurrency = sqlite3_column_int(stmt_lookup_route_, 13);
-        a.deleted = sqlite3_column_int(stmt_lookup_route_, 14) != 0;
+        a.max_concurrency = sqlite3_column_int(stmt_lookup_route_, 12);
+        a.deleted = sqlite3_column_int(stmt_lookup_route_, 13) != 0;
         result = std::move(route);
     }
     sqlite3_reset(stmt_lookup_route_);
@@ -641,9 +639,9 @@ std::vector<Database::RoutingTarget> Database::resolve_routing_snapshot(
     while ((rc = sqlite3_step(stmt_resolve_routing_snapshot_)) == SQLITE_ROW) {
         const int target_id = sqlite3_column_int(
             stmt_resolve_routing_snapshot_, 0);
-        const std::string upstream_model = text_column(11);
+        const std::string upstream_model = text_column(10);
         const int priority_group = sqlite3_column_int(
-            stmt_resolve_routing_snapshot_, 12);
+            stmt_resolve_routing_snapshot_, 11);
 
         if (result.empty() || result.back().account.id != target_id ||
             result.back().priority_group != priority_group ||
@@ -662,12 +660,10 @@ std::vector<Database::RoutingTarget> Database::resolve_routing_snapshot(
                 stmt_resolve_routing_snapshot_, 6) != 0;
             account.account_type = text_column(7);
             if (account.account_type.empty()) account.account_type = "api";
-            account.monthly_price = sqlite3_column_double(
-                stmt_resolve_routing_snapshot_, 8);
             account.max_concurrency = sqlite3_column_int(
-                stmt_resolve_routing_snapshot_, 9);
+                stmt_resolve_routing_snapshot_, 8);
             account.deleted = sqlite3_column_int(
-                stmt_resolve_routing_snapshot_, 10) != 0;
+                stmt_resolve_routing_snapshot_, 9) != 0;
             target.upstream_model = upstream_model;
             target.priority_group = priority_group;
             result.push_back(std::move(target));
@@ -675,13 +671,13 @@ std::vector<Database::RoutingTarget> Database::resolve_routing_snapshot(
 
         // LEFT JOIN preserves an account with no multi-key rows (keys is empty;
         // the single upstream_keys table is the only key source).
-        if (sqlite3_column_type(stmt_resolve_routing_snapshot_, 13) !=
+        if (sqlite3_column_type(stmt_resolve_routing_snapshot_, 12) !=
             SQLITE_NULL) {
             KeySlot key;
-            key.id = sqlite3_column_int(stmt_resolve_routing_snapshot_, 13);
-            key.key_value = text_column(14);
+            key.id = sqlite3_column_int(stmt_resolve_routing_snapshot_, 12);
+            key.key_value = text_column(13);
             key.position = sqlite3_column_int(
-                stmt_resolve_routing_snapshot_, 15);
+                stmt_resolve_routing_snapshot_, 14);
             result.back().keys.push_back(std::move(key));
         }
     }

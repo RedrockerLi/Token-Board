@@ -72,7 +72,6 @@ public:
         std::string account_type;    // spec identity: "api" | "plan" | "agent"
                                      // (semantics in app/domain/account_types.py
                                      // + proxy/src/core/account_types.h)
-        double monthly_price = 0;    // plan monthly price
         int max_concurrency = 0;     // 0 = unlimited
         bool deleted = false;        // soft-deleted with a PAST deleted_at
                                      // (a future deleted_at = end_of_period

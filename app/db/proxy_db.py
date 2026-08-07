@@ -259,7 +259,11 @@ class ProxyDatabase:
                 "COALESCE(auth_header,'bearer') AS auth_header, "
                 "COALESCE(is_aggregate,0) AS is_aggregate, "
                 "COALESCE(account_type,'api') AS account_type, "
-                "COALESCE(monthly_price,0) AS monthly_price, "
+                "COALESCE((SELECT pph.monthly_price FROM plan_price_history pph "
+                "          WHERE pph.account_id = upstream_accounts.id "
+                "            AND pph.effective_mode = 'current_period' "
+                "          ORDER BY pph.changed_at DESC, pph.id DESC LIMIT 1), 0) "
+                "  AS monthly_price, "
                 "COALESCE(currency,'CNY') AS currency, "
                 "COALESCE(agent_kind,'') AS agent_kind, "
                 "COALESCE(valid_from,'') AS valid_from, "
@@ -469,8 +473,8 @@ class ProxyDatabase:
             cursor = conn.execute(
                 "INSERT INTO upstream_accounts "
                 "(name, base_url, api_format, endpoint_path, auth_header, "
-                " account_type, monthly_price, currency, max_concurrency, valid_from) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " account_type, currency, max_concurrency, valid_from) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     data["name"],
                     data.get("base_url", ""),
@@ -478,7 +482,6 @@ class ProxyDatabase:
                     data.get("endpoint_path", ""),
                     data.get("auth_header", "bearer"),
                     account_type,
-                    float(data.get("monthly_price", 0) or 0),
                     currency,
                     data.get("max_concurrency"),
                     valid_from.isoformat() if valid_from else None,
@@ -514,8 +517,15 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             original = conn.execute(
-                "SELECT account_type, monthly_price, currency FROM upstream_accounts "
-                "WHERE id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))", (account_id,)
+                "SELECT account_type, currency, "
+                "COALESCE((SELECT pph.monthly_price FROM plan_price_history pph "
+                "          WHERE pph.account_id = upstream_accounts.id "
+                "            AND pph.effective_mode = 'current_period' "
+                "          ORDER BY pph.changed_at DESC, pph.id DESC LIMIT 1), 0) "
+                "  AS current_price "
+                "FROM upstream_accounts "
+                "WHERE id=? AND (deleted_at IS NULL OR deleted_at > datetime('now'))",
+                (account_id,),
             ).fetchone()
             if original is None:
                 return False
@@ -523,13 +533,11 @@ class ProxyDatabase:
             values = []
             for key in ("name", "base_url", "api_format",
                         "endpoint_path", "auth_header", "account_type",
-                        "monthly_price", "currency", "agent_kind",
+                        "currency", "agent_kind",
                         "max_concurrency", "valid_from"):
                 if key not in data:
                     continue
-                if key == "monthly_price":
-                    val = float(data[key] or 0)
-                elif key == "max_concurrency":
+                if key == "max_concurrency":
                     val = data[key] if data[key] not in (None, "") else None
                 elif key == "valid_from":
                     parsed = _parse_iso_date(data[key])
@@ -565,19 +573,25 @@ class ProxyDatabase:
                     account_type=original["account_type"],
                 )
 
-            if not fields:
+            # `monthly_price` is no longer an upstream_accounts column (single
+            # price source is plan_price_history); a price-only edit must still
+            # reach the history write below, so it is not part of `fields`.
+            price_requested = "monthly_price" in data
+            if not fields and not price_requested:
                 conn.commit()
                 return False
-            values.append(account_id)
-            conn.execute(
-                f"UPDATE upstream_accounts SET {', '.join(fields)} WHERE id = ?",
-                values,
-            )
+            if fields:
+                values.append(account_id)
+                conn.execute(
+                    f"UPDATE upstream_accounts SET {', '.join(fields)} WHERE id = ?",
+                    values,
+                )
             final_type = data.get("account_type", original["account_type"])
-            final_price = float(data.get("monthly_price", original["monthly_price"]) or 0)
+            final_price = float(data.get("monthly_price", original["current_price"]) or 0)
+            price_changed = price_requested and \
+                final_price != float(original["current_price"] or 0)
             if is_subscription(final_type) and (
-                original["account_type"] != final_type or
-                final_price != float(original["monthly_price"] or 0)
+                original["account_type"] != final_type or price_changed
             ):
                 mode = data.get("price_effective")
                 if mode is not None and mode not in ("current_period", "next_period"):
@@ -973,7 +987,11 @@ class ProxyDatabase:
             rows = conn.execute(
                 "SELECT id, name, COALESCE(agent_kind,'') AS agent_kind, "
                 "COALESCE(currency,'CNY') AS currency, "
-                "COALESCE(monthly_price,0) AS monthly_price "
+                "COALESCE((SELECT pph.monthly_price FROM plan_price_history pph "
+                "          WHERE pph.account_id = upstream_accounts.id "
+                "            AND pph.effective_mode = 'current_period' "
+                "          ORDER BY pph.changed_at DESC, pph.id DESC LIMIT 1), 0) "
+                "  AS monthly_price "
                 "FROM upstream_accounts "
                 f"WHERE COALESCE(account_type,'api') IN ({sql_in(import_types())}) "
                 "  AND COALESCE(is_aggregate,0)=0 "
