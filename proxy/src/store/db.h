@@ -98,6 +98,19 @@ public:
     /// All keys of an account, ordered by (position, id).
     std::vector<KeySlot> get_upstream_keys(int account_id);
 
+    /// Credentials needed to send a cooldown probe for one key slot (the
+    /// upstream base_url + that key's secret + the auth scheme).  Reads
+    /// upstream_keys JOIN upstream_accounts, so a probe never runs against a
+    /// deleted account/key.
+    struct ProbeTarget {
+        std::string base_url;
+        std::string key_value;
+        std::string api_format;   // "openai" | "openai_responses" | "anthropic"
+        std::string auth_header;  // "bearer" | "x-api-key" | "auto"
+        bool valid = false;
+    };
+    std::optional<ProbeTarget> lookup_probe_target(int key_slot_id);
+
     /// One fully resolved real-upstream target from a routing snapshot.
     /// `keys` and `account` are read by the same SQLite statement, so callers
     /// cannot combine credentials from one config revision with an endpoint
@@ -290,6 +303,7 @@ private:
     sqlite3_stmt *stmt_get_pricing_ = nullptr;
     sqlite3_stmt *stmt_snapshot_price_ = nullptr;
     sqlite3_stmt *stmt_get_timeout_config_ = nullptr;
+    sqlite3_stmt *stmt_lookup_probe_target_ = nullptr;
 
     // Mutating statements (write_db_, protected by write_mutex_)
     sqlite3_stmt *stmt_insert_log_ = nullptr;

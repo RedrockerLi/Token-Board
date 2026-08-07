@@ -600,6 +600,75 @@ void ProxyServer::accounting_loop() {
     }
 }
 
+// ── cooldown probe ──────────────────────────────────────────────────────
+// While a plan key is inside its 5h cooldown (in-memory, per key slot), the
+// background probe thread asks the upstream every `cooldown_probe_interval_secs_`
+// whether quota has recovered.  A 2xx GET /models clears the cooldown early so
+// the key rejoins the candidate pool before the 5h window ends.  Discipline:
+// the probe writes NO request_log, does NOT acquire a gate slot (never counted
+// in max_concurrency) and touches no gate failure counters — it only observes
+// cooldown state and clears it.
+
+void ProxyServer::start_cooldown_probe() {
+    std::call_once(cooldown_probe_once_, [this] {
+        cooldown_probe_thread_ =
+            std::thread(&ProxyServer::cooldown_probe_loop, this);
+    });
+}
+
+void ProxyServer::cooldown_probe_loop() {
+    // Sleep in 200ms slices so shutdown is prompt; one cycle runs per interval
+    // (interval * 5 slices).  No work is done while nothing is cooling.
+    while (!cooldown_probe_stop_.load()) {
+        for (int waited = 0; waited < cooldown_probe_interval_secs_ * 5;
+             ++waited) {
+            if (cooldown_probe_stop_.load()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        run_cooldown_probe_cycle();
+    }
+}
+
+void ProxyServer::run_cooldown_probe_cycle() {
+    const auto now = std::chrono::steady_clock::now();
+    const auto cooling = gate_.cooling_keys(now);
+    if (cooling.empty()) return;
+    for (const int key_slot_id : cooling) {
+        const auto target = db_.lookup_probe_target(key_slot_id);
+        if (!target) continue;  // key/account deleted meanwhile — cooldown is
+                                // in-memory and will expire on its own.
+        ForwardOptions opts;
+        opts.non_streaming_timeout = 10;
+        opts.non_streaming_total_timeout = 10;
+        opts.auth_scheme = target->auth_header;
+        if (opts.auth_scheme.empty() || opts.auth_scheme == "auto") {
+            opts.auth_scheme =
+                target->api_format == "anthropic" ? "x-api-key" : "bearer";
+        }
+        UpstreamClient::ForwardResult fwd;
+        try {
+            fwd = upstream_.forward("GET", target->base_url, target->key_value,
+                                    "/models", "", "application/json", nullptr,
+                                    opts);
+        } catch (const std::exception &e) {
+            fprintf(stderr, "[Proxy] cooldown probe error (key=%d): %s\n",
+                    key_slot_id, e.what());
+            continue;  // keep cooling; retry next cycle
+        }
+        if (fwd.status_code >= 200 && fwd.status_code < 300) {
+            gate_.clear_cooldown(key_slot_id);
+            fprintf(stderr,
+                    "[Proxy] cooldown probe: key %d healthy, cooldown cleared "
+                    "early (status %d)\n",
+                    key_slot_id, fwd.status_code);
+        } else {
+            fprintf(stderr,
+                    "[Proxy] cooldown probe: key %d still cooling (status %d)\n",
+                    key_slot_id, fwd.status_code);
+        }
+    }
+}
+
 std::vector<UpstreamCandidate> ProxyServer::resolve_candidates_cached(
     const Router::RouteResult &route, std::string &model) {
     model = fmt::strip_one_m_suffix_for_upstream(model);
@@ -2186,6 +2255,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
 // ── setup_routes ─────────────────────────────────────────────────────────
 
 void ProxyServer::setup_routes(httplib::Server &server) {
+    // The cooldown-probe thread is started once, alongside route setup (db_ is
+    // already open when main constructs ProxyServer).
+    start_cooldown_probe();
     // CORS preflight
     auto cors_handler = [this](const httplib::Request &, httplib::Response &res) {
         add_cors_headers(res);

@@ -126,6 +126,24 @@ public:
                                   std::chrono::steady_clock::now());
     }
 
+    /// Slots currently inside the 5h cooldown window (probe candidates).
+    /// Transient backoff (5s/30s/2min) is NOT included — it self-resolves in
+    /// seconds and a probe would only race it.
+    std::vector<int> cooling_keys(std::chrono::steady_clock::time_point now) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<int> out;
+        for (const auto &kv : cooldown_until_)
+            if (now < kv.second) out.push_back(kv.first);
+        return out;
+    }
+
+    /// Clear the 5h cooldown for a slot (the cooldown probe found the upstream
+    /// healthy again).  No-op when the slot is not cooling.
+    void clear_cooldown(int key_slot_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cooldown_until_.erase(key_slot_id);
+    }
+
 private:
     bool in_cooldown_locked(
         int key_slot_id, std::chrono::steady_clock::time_point now) {

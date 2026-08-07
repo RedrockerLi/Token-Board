@@ -8,9 +8,11 @@
 #include "usage_tracker.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <list>
 #include <mutex>
 #include <string>
@@ -207,10 +209,18 @@ public:
     ProxyServer(Database &db, Router &router, UpstreamClient &upstream,
                 UsageTracker &tracker, CodecRegistry &codecs)
         : db_(db), router_(router), upstream_(upstream), tracker_(tracker),
-          codecs_(codecs), affinity_(&cost_ledger_) {}
+          codecs_(codecs), affinity_(&cost_ledger_) {
+        // Cooldown probe cadence: 1h default; TB_COOLDOWN_PROBE_SECS override
+        // (tests shrink it to seconds).  Clamped to [1, 86400] seconds.
+        const char *env = std::getenv("TB_COOLDOWN_PROBE_SECS");
+        const int secs = env ? std::atoi(env) : 3600;
+        cooldown_probe_interval_secs_ =
+            std::min(86400, std::max(1, secs));
+    }
 
-    /// Stops and joins the accounting thread.  Idempotent; also invoked from
-    /// the destructor.  Must be called BEFORE db_.close() in the owning main.
+    /// Stops and joins the accounting + cooldown-probe threads.  Idempotent;
+    /// also invoked from the destructor.  Must be called BEFORE db_.close() in
+    /// the owning main.
     void shutdown() {
         {
             std::lock_guard<std::mutex> lock(accounting_mutex_);
@@ -218,9 +228,21 @@ public:
         }
         accounting_cv_.notify_all();
         if (accounting_thread_.joinable()) accounting_thread_.join();
+        cooldown_probe_stop_.store(true);
+        if (cooldown_probe_thread_.joinable()) cooldown_probe_thread_.join();
     }
 
     ~ProxyServer() { shutdown(); }
+
+    /// Start the cooldown-probe background thread.  Idempotent (call from
+    /// setup_routes).  Every `cooldown_probe_interval_secs_` it probes plan
+    /// keys inside the 5h cooldown and clears the cooldown early when the
+    /// upstream reports healthy (2xx GET /models).  The probe never writes
+    /// request_log, never counts toward max_concurrency, and touches no gate
+    /// counters — it only observes + clears cooldown.
+    void start_cooldown_probe();
+    void cooldown_probe_loop();
+    void run_cooldown_probe_cycle();
 
     void setup_routes(httplib::Server &server);
     int in_flight_count() const noexcept {
@@ -336,4 +358,11 @@ private:
     bool accounting_stop_ = false;
     std::once_flag accounting_thread_once_;
     std::atomic<std::uint64_t> accounting_dropped_{0};
+
+    // Cooldown-probe thread: while a plan key is inside its 5h cooldown, probe
+    // the upstream every cooldown_probe_interval_secs_ and clear early on 2xx.
+    std::thread cooldown_probe_thread_;
+    std::atomic<bool> cooldown_probe_stop_{false};
+    std::once_flag cooldown_probe_once_;
+    int cooldown_probe_interval_secs_ = 3600;
 };

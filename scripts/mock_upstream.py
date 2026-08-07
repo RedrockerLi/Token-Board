@@ -54,10 +54,20 @@ import argparse
 import json
 import socket
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG_FILE = "/tmp/mock_upstream.log"
+
+# Test-only control surface for the proxy's cooldown-probe feature: a bare
+# GET /models carries no body, so the per-key status must be toggled out-of-band
+# via POST /__ctrl (tests) and observed via GET /__ctrl/status.  `status_by_key`
+# overrides the response status for GETs (429 → GoUsageLimitError envelope);
+# `default_get_status` is the fallback (200 = existing behavior).
+CONTROL_LOCK = threading.Lock()
+CONTROL = {"status_by_key": {}, "default_get_status": 200}
+PROBES = {}  # auth key → GET /models count (the proxy's probe hits this path)
 
 # Exact error body returned by the real opencode.ai "Console Go" backend for
 # request-validation failures (observed 2026-08).
@@ -117,13 +127,65 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def do_GET(self):
-        self.send_response(200)
+        # Control introspection: polled by the probe test to wait until the
+        # proxy's background probe actually reached the upstream.
+        if self.path == "/__ctrl/status":
+            with CONTROL_LOCK:
+                payload = json.dumps(
+                    {"probes": PROBES, "map": CONTROL["status_by_key"]}
+                ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        auth_key = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
+        if not auth_key:
+            auth_key = self.headers.get("x-api-key") or ""
+        if self.path.endswith("/models"):
+            with CONTROL_LOCK:
+                PROBES[auth_key] = PROBES.get(auth_key, 0) + 1
+        with CONTROL_LOCK:
+            status = CONTROL["status_by_key"].get(
+                auth_key, CONTROL["default_get_status"])
+        if status != 200:
+            body = json.dumps(self._error_body(
+                {"mock_error_type": "GoUsageLimitError"}, status, auth_key)).encode()
+        else:
+            body = b"{}"
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len("{}")))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"{}")
+        self.wfile.write(body)
 
     def do_POST(self):
+        # Test-only control endpoint: toggle the persistent per-key GET status
+        # map.  Requires no Authorization, so the proxy never sees it.
+        if self.path == "/__ctrl":
+            raw = self._read_body()
+            try:
+                ctrl = json.loads(raw) if raw else {}
+            except Exception:
+                ctrl = {}
+            with CONTROL_LOCK:
+                if isinstance(ctrl.get("set"), dict):
+                    CONTROL["status_by_key"].update(
+                        {str(k): int(v) for k, v in ctrl["set"].items()})
+                for k in (ctrl.get("clear") or []):
+                    CONTROL["status_by_key"].pop(str(k), None)
+                if "default_get_status" in ctrl:
+                    CONTROL["default_get_status"] = int(ctrl["default_get_status"])
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         raw = self._read_body()
         try:
             req = json.loads(raw) if raw else {}

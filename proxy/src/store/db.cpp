@@ -468,6 +468,18 @@ bool Database::prepare_statements() {
             "non_streaming_timeout FROM proxy_timeout_config WHERE app_type = ?1",
             stmt_get_timeout_config_);
 
+    // Cooldown probe: one key slot → the upstream endpoint + that key's secret
+    // + the auth scheme.  read_db_ carries a WAL busy timeout so a concurrent
+    // checkpoint cannot spuriously fail a background probe.
+    PREPARE_ON(read_db_,
+            "SELECT a.base_url, k.key_value, "
+            "COALESCE(a.api_format,'openai'), COALESCE(a.auth_header,'bearer') "
+            "FROM upstream_keys k JOIN upstream_accounts a ON a.id=k.account_id "
+            "WHERE k.id=?1 "
+            "  AND (k.deleted_at IS NULL OR k.deleted_at > datetime('now')) "
+            "  AND (a.deleted_at IS NULL OR a.deleted_at > datetime('now'))",
+            stmt_lookup_probe_target_);
+
     PREPARE_ON(write_db_, "UPDATE local_keys "
             "SET last_used_at = datetime(?2,'unixepoch') "
             "WHERE id = ?1 AND (last_used_at IS NULL OR "
@@ -492,6 +504,7 @@ void Database::finalize_statements() {
     FINALIZE(stmt_get_pricing_);
     FINALIZE(stmt_snapshot_price_);
     FINALIZE(stmt_get_timeout_config_);
+    FINALIZE(stmt_lookup_probe_target_);
     FINALIZE(stmt_update_last_used_);
     #undef FINALIZE
 }
@@ -614,6 +627,31 @@ std::vector<Database::KeySlot> Database::get_upstream_keys(int account_id) {
     }
     sqlite3_reset(stmt_get_upstream_keys_);
     return result;
+}
+
+// ── lookup_probe_target ──────────────────────────────────────────────────
+
+std::optional<Database::ProbeTarget> Database::lookup_probe_target(
+    int key_slot_id) {
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    sqlite3_reset(stmt_lookup_probe_target_);
+    sqlite3_bind_int(stmt_lookup_probe_target_, 1, key_slot_id);
+    ProbeTarget t;
+    if (sqlite3_step(stmt_lookup_probe_target_) == SQLITE_ROW) {
+        t.base_url = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_lookup_probe_target_, 0));
+        t.key_value = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_lookup_probe_target_, 1));
+        t.api_format = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_lookup_probe_target_, 2));
+        t.auth_header = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt_lookup_probe_target_, 3));
+        t.valid = !t.base_url.empty() && !t.key_value.empty();
+    }
+    sqlite3_reset(stmt_lookup_probe_target_);
+    if (!t.valid) return std::nullopt;
+    return t;
 }
 
 // ── resolve_routing_snapshot ────────────────────────────────────────────

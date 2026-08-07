@@ -156,3 +156,15 @@ add_test(
             ${CMAKE_SOURCE_DIR}/../schema/proxy
             ${CMAKE_SOURCE_DIR}/..
 )
+# Cooldown-probe: a cooled plan key is re-probed every interval (env override,
+# TB_COOLDOWN_PROBE_SECS=2) and cleared early when the upstream returns 2xx;
+# a GoUsageLimitError keeps the cooldown.  Which key served is asserted via
+# request_attempts.upstream_key_id.
+add_test(
+    NAME cooldown_probe
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/cooldown_probe_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/..
+)
