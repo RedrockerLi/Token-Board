@@ -835,6 +835,18 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
         max_id = proxy_db.get_max_log_id()
         export_result = proxy_db.export_to_dashboard(shadow_path, mark, max_id)
 
+        # 3b. Purge zero-usage (failed/test) buckets from the shadow before it
+        #     becomes the authoritative archive, so neither the cloud copy nor
+        #     the local dashboard.db carries all-zero model cards. export only
+        #     adds rows; without this, failed-request rows already in the cloud
+        #     archive would survive forever.
+        from app.db.dashboard_db import DashboardDatabase
+        purge_db = DashboardDatabase(
+            shadow_path, schema_dir=schema_dir_for(dash_db_path, "dashboard"))
+        purged = purge_db.purge_zero_usage_rows()
+        if purged > 0:
+            print(f"[Sync] Purged {purged} zero-usage archive rows", flush=True)
+
         # 4. Upload the shadow → cloud (cloud is always the latest).
         _webdav_upload(config, shadow_path,
                        remote_filename=_make_timestamped_name("dashboard_sync.db"))

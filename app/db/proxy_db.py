@@ -1669,6 +1669,11 @@ class ProxyDatabase:
                 WHERE r.id > ? AND r.id <= ?
                   AND LOWER(r.model) != 'unknown' AND r.model != ''
                   AND r.account_id IS NOT NULL
+                  -- Only successful requests carry real usage; failed/aborted
+                  -- requests (timeouts, auth/limit rejections, client
+                  -- disconnect) record zero tokens and must not pollute the
+                  -- usage archive (they stay in request_log for diagnostics).
+                  AND r.status_code BETWEEN 200 AND 299
                   -- Aggregate accounts are routing groupings, not real upstreams:
                   -- a request they fail to serve is logged against the aggregate
                   -- (zero tokens), which must never pollute the usage archive.
@@ -1717,6 +1722,7 @@ class ProxyDatabase:
                 "SELECT r.account_id,r.upstream_key_id,r.requested_at,r.api_cost "
                 "FROM request_log r JOIN upstream_accounts a ON a.id=r.account_id "
                 f"WHERE r.id>? AND r.id<=? "
+                f"  AND r.status_code BETWEEN 200 AND 299 "
                 f"  AND COALESCE(a.account_type,'api') IN ({sql_in(sub_types)})",
                 (mark, max_id, *sub_types),
             ).fetchall()

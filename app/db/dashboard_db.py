@@ -118,6 +118,38 @@ class DashboardDatabase:
             conn.close()
         return total
 
+    def purge_zero_usage_rows(self) -> int:
+        """Delete archive rows that carry no real usage.
+
+        A (date, model, account_id) bucket with request/cost rows but NO
+        token_usage rows represents failed/aborted or test requests — they are
+        recorded with zero tokens (and zero cost) and must not show up as
+        empty per-model cards. token_usage rows only exist for positive
+        amounts, so "has token rows" == "has real usage"; buckets with any
+        token usage (even 0-cost) are always preserved. Returns rows deleted.
+        """
+        conn = self._connect()
+        try:
+            deleted = conn.execute(
+                """DELETE FROM request_usage
+                   WHERE NOT EXISTS (SELECT 1 FROM token_usage t
+                                     WHERE t.date = request_usage.date
+                                       AND t.model = request_usage.model
+                                       AND t.account_id = request_usage.account_id)"""
+            ).rowcount
+            deleted += conn.execute(
+                """DELETE FROM cost_entry
+                   WHERE cost = 0
+                     AND NOT EXISTS (SELECT 1 FROM token_usage t
+                                     WHERE t.date = cost_entry.date
+                                       AND t.model = cost_entry.model
+                                       AND t.account_id = cost_entry.account_id)"""
+            ).rowcount
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
+
     def accumulate_plan_summary(self, month: str, account_id: int, key_masked: str,
                                 subscription_cost: float, virtual_cost: float,
                                 refresh_subscription: bool = False):
