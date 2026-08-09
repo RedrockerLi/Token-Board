@@ -1450,7 +1450,12 @@ class ProxyDatabase:
             conn.close()
 
     def get_daily_billing_by_model(self, days: int = 30) -> list[dict]:
-        """Daily billing breakdown with input/output token split (for stacked bar chart)."""
+        """Daily usage with all non-aggregate accounts and API-only cost.
+
+        Token/request metrics include api, plan, and agent (e.g. Codex)
+        accounts.  ``cost`` is deliberately limited to usage-billed account
+        types, so subscription accounts contribute no real cost here.
+        """
         conn = self._connect()
         try:
             usage_billed = sql_in(usage_billed_types())
@@ -1462,11 +1467,12 @@ class ProxyDatabase:
                     COALESCE(SUM(r.cache_read_tokens), 0) AS cache_hit_tokens,
                     MAX(COALESCE(SUM(r.prompt_tokens), 0) - COALESCE(SUM(r.cache_read_tokens), 0), 0) AS cache_miss_tokens,
                     COUNT(*) AS requests,
-                    COALESCE(SUM(r.api_cost), 0) AS cost
+                    COALESCE(SUM(CASE
+                        WHEN COALESCE(a.account_type, 'api') IN ({usage_billed})
+                        THEN r.api_cost ELSE 0 END), 0) AS cost
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
                 WHERE COALESCE(a.is_aggregate, 0) = 0
-                  AND COALESCE(a.account_type, 'api') IN ({usage_billed})
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at)
                 ORDER BY date

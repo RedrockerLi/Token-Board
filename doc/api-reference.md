@@ -95,7 +95,7 @@
 |------|------|------|
 | `/api/proxy/billing` | GET | 按 账户×模型×日 聚合的账单(默认近 30 天,参数 `account_id`、`from`、`to`、`days`) |
 | `/api/proxy/billing/daily` | GET | 近 `days` 天(默认 30)每日账单,滚动窗口 |
-| `/api/proxy/billing/daily-by-model` | GET | 近 `days` 天每日 输入/输出/缓存命中 token 分解(堆叠柱状图用) |
+| `/api/proxy/billing/daily-by-model` | GET | 近 `days` 天每日所有非聚合上游的输入/输出/缓存命中 Token 分解(堆叠柱状图用);`cost` 仅统计 `api` 类型实际费用 |
 | `/api/proxy/billing/recent-days` | GET | 近 `days` 天有数据的日期列表 |
 | `/api/proxy/billing/today-upstreams` | GET | 今日各真实上游的 真实/理论费用、token、请求数 |
 | `/api/proxy/logs` | GET | 分页请求日志(参数 `page`、`per_page`、`account_id`、`model`、`from`、`to`) |
