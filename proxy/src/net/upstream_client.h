@@ -34,7 +34,7 @@ struct ForwardOptions {
     // Maximum retained tail of a streaming response.  Chunks are still
     // forwarded in full; bounding this buffer prevents an arbitrarily long
     // stream from growing proxy memory without limit.  0 disables the bound.
-    size_t streaming_body_buffer_limit = 8 * 1024 * 1024;
+    size_t streaming_body_buffer_limit = 256 * 1024;
 
     // Non-streaming responses are rejected once they exceed this hard limit;
     // unlike a streaming tail, silently truncating a JSON response is unsafe.
@@ -70,6 +70,13 @@ struct ForwardOptions {
 /// and streaming (chunk-by-chunk callback) forwarding.
 class UpstreamClient {
 public:
+    struct TransportMetrics {
+        std::uint64_t pool_hits = 0;
+        std::uint64_t pool_misses = 0;
+        std::uint64_t clients_created = 0;
+        std::uint64_t dns_lookups = 0;
+        std::uint64_t dns_total_ms = 0;
+    };
     struct ForwardResult {
         int status_code = 0;
         std::string body;    // full response body (for non-streaming)
@@ -81,6 +88,9 @@ public:
         bool body_truncated = false;  // streaming body contains only its bounded tail
         bool body_too_large = false;  // non-streaming hard response limit fired
         int duration_ms = 0;  // total upstream call time (streaming: until stream ends)
+        int dns_ms = 0;
+        int lease_wait_ms = 0;
+        bool connection_reused = false;
         // Streaming: first received body chunk (transport-level precursor to
         // semantic TTFT). Non-streaming: full response duration; it is never
         // displayed or persisted as user-visible TTFT.
@@ -108,4 +118,6 @@ public:
                           const std::string &content_type,
                           std::function<bool(const char *, size_t)> on_chunk,
                           const ForwardOptions &opts = ForwardOptions{});
+
+    static TransportMetrics transport_metrics();
 };

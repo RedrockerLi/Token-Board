@@ -15,17 +15,24 @@ MODEL_ORDER = {
 }
 
 
+def _is_v1(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='daily_usage'"
+    ).fetchone() is not None
+
+
 class DashboardDatabase:
     """SQLite-backed storage for dashboard visualization data."""
 
     def __init__(self, db_path: str, schema_dir: str | None = None):
         self.db_path = db_path
-        # Schema is owned by versioned migrations (schema/dashboard/*.sql);
+        # Schema is owned by versioned migrations (schema/dashboard/vN/*.sql);
         # apply once at construction. Fails fast (caller aborts) on error.
         # schema_dir may be passed explicitly when db_path is a shadow/temp
         # copy outside the standard data/ layout (schema_dir_for would mis-derive).
         from app.db.migrations import migrate, schema_dir_for
-        migrate(self.db_path, schema_dir or schema_dir_for(self.db_path, "dashboard"))
+        migrate(self.db_path, schema_dir or schema_dir_for(self.db_path, "dashboard"),
+                "dashboard")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=5)
@@ -41,7 +48,8 @@ class DashboardDatabase:
                           account_id: int, prompt_tokens: int,
                           completion_tokens: int, cache_read_tokens: int,
                           request_count: int,
-                          cost: float = 0.0) -> int:
+                          cost: float = 0.0,
+                          billed_usage_cost: float | None = None) -> int:
         """Insert proxy usage data, including a frozen cost_entry row.
 
         cost is the per-request cost already computed by the proxy (frozen at
@@ -58,6 +66,25 @@ class DashboardDatabase:
         conn = self._connect()
         total = 0
         try:
+            if _is_v1(conn):
+                billed = cost if billed_usage_cost is None else billed_usage_cost
+                conn.execute(
+                    """INSERT INTO daily_usage
+                       (date,account_id,model,input_tokens,cache_tokens,output_tokens,
+                        request_count,equivalent_cost,billed_usage_cost)
+                       VALUES(?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(date,account_id,model) DO UPDATE SET
+                         input_tokens=daily_usage.input_tokens+excluded.input_tokens,
+                         cache_tokens=daily_usage.cache_tokens+excluded.cache_tokens,
+                         output_tokens=daily_usage.output_tokens+excluded.output_tokens,
+                         request_count=daily_usage.request_count+excluded.request_count,
+                         equivalent_cost=daily_usage.equivalent_cost+excluded.equivalent_cost,
+                         billed_usage_cost=daily_usage.billed_usage_cost+excluded.billed_usage_cost""",
+                    (date, account_id, model, prompt_tokens, cache_read_tokens,
+                     completion_tokens, request_count, cost, billed),
+                )
+                conn.commit()
+                return 1
             if completion_tokens > 0:
                 conn.execute(
                     """INSERT INTO token_usage
@@ -118,6 +145,39 @@ class DashboardDatabase:
             conn.close()
         return total
 
+    def upsert_proxy_batch(self, rows: list[dict]) -> int:
+        """Bulk export using one connection and one transaction."""
+        if not rows:
+            return 0
+        conn = self._connect()
+        try:
+            if not _is_v1(conn):
+                # V0 remains an archive-only compatibility path.
+                conn.close()
+                return sum(self.upsert_proxy_data(**row) for row in rows)
+            conn.executemany(
+                """INSERT INTO daily_usage
+                   (date,account_id,model,input_tokens,cache_tokens,output_tokens,
+                    request_count,equivalent_cost,billed_usage_cost)
+                   VALUES(:date,:account_id,:model,:prompt_tokens,:cache_read_tokens,
+                          :completion_tokens,:request_count,:cost,:billed_usage_cost)
+                   ON CONFLICT(date,account_id,model) DO UPDATE SET
+                     input_tokens=daily_usage.input_tokens+excluded.input_tokens,
+                     cache_tokens=daily_usage.cache_tokens+excluded.cache_tokens,
+                     output_tokens=daily_usage.output_tokens+excluded.output_tokens,
+                     request_count=daily_usage.request_count+excluded.request_count,
+                     equivalent_cost=daily_usage.equivalent_cost+excluded.equivalent_cost,
+                     billed_usage_cost=daily_usage.billed_usage_cost+excluded.billed_usage_cost""",
+                rows,
+            )
+            conn.commit()
+            return len(rows)
+        finally:
+            try:
+                conn.close()
+            except sqlite3.ProgrammingError:
+                pass
+
     def purge_zero_usage_rows(self) -> int:
         """Delete archive rows that carry no real usage.
 
@@ -130,6 +190,13 @@ class DashboardDatabase:
         """
         conn = self._connect()
         try:
+            if _is_v1(conn):
+                deleted = conn.execute(
+                    "DELETE FROM daily_usage WHERE input_tokens=0 AND "
+                    "cache_tokens=0 AND output_tokens=0 AND equivalent_cost=0"
+                ).rowcount
+                conn.commit()
+                return deleted
             deleted = conn.execute(
                 """DELETE FROM request_usage
                    WHERE NOT EXISTS (SELECT 1 FROM token_usage t
@@ -164,6 +231,21 @@ class DashboardDatabase:
         """
         conn = self._connect()
         try:
+            if _is_v1(conn):
+                conn.execute(
+                    """INSERT INTO monthly_recurring_costs
+                       (month,account_id,billing_unit_id,recurring_charge,equivalent_cost)
+                       VALUES(?,?,?,?,?)
+                       ON CONFLICT(month,account_id,billing_unit_id) DO UPDATE SET
+                         equivalent_cost=monthly_recurring_costs.equivalent_cost+
+                                         excluded.equivalent_cost,
+                         recurring_charge=CASE WHEN ? THEN excluded.recurring_charge
+                           ELSE monthly_recurring_costs.recurring_charge END""",
+                    (month, account_id, key_masked, subscription_cost, virtual_cost,
+                     bool(refresh_subscription)),
+                )
+                conn.commit()
+                return
             conn.execute(
                 """INSERT INTO proxy_plan_summary
                    (month, account_id, key_masked, subscription_cost, virtual_cost)
@@ -190,6 +272,29 @@ class DashboardDatabase:
         """
         conn = self._connect()
         try:
+            if _is_v1(conn):
+                existing = conn.execute(
+                    "SELECT month FROM monthly_recurring_costs "
+                    "WHERE account_id=? AND billing_unit_id=?",
+                    (account_id, key_masked),
+                ).fetchall()
+                for row in existing:
+                    if row["month"] not in subscriptions:
+                        conn.execute(
+                            "UPDATE monthly_recurring_costs SET recurring_charge=0 "
+                            "WHERE account_id=? AND billing_unit_id=? AND month=?",
+                            (account_id, key_masked, row["month"]),
+                        )
+                for month, cost in subscriptions.items():
+                    conn.execute(
+                        "INSERT INTO monthly_recurring_costs"
+                        "(month,account_id,billing_unit_id,recurring_charge,equivalent_cost) "
+                        "VALUES(?,?,?,?,0) ON CONFLICT(month,account_id,billing_unit_id) "
+                        "DO UPDATE SET recurring_charge=excluded.recurring_charge",
+                        (month, account_id, key_masked, cost),
+                    )
+                conn.commit()
+                return
             existing = conn.execute(
                 "SELECT month FROM proxy_plan_summary WHERE account_id=? AND key_masked=?",
                 (account_id, key_masked),
@@ -219,6 +324,8 @@ class DashboardDatabase:
     def load_rows(self):
         conn = self._connect()
         try:
+            if _is_v1(conn):
+                return self._load_v1_rows(conn)
             token_usages: list[dict] = []
             request_usages: list[dict] = []
             cost_entries: list[dict] = []
@@ -356,6 +463,12 @@ class DashboardDatabase:
     def get_record_count(self) -> dict:
         conn = self._connect()
         try:
+            if _is_v1(conn):
+                rows = conn.execute("SELECT COUNT(*) FROM daily_usage").fetchone()[0]
+                recurring = conn.execute(
+                    "SELECT COUNT(*) FROM monthly_recurring_costs").fetchone()[0]
+                return {"daily_usage": rows,
+                        "monthly_recurring_costs": recurring}
             return {
                 "token_usage": conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0],
                 "request_usage": conn.execute("SELECT COUNT(*) FROM request_usage").fetchone()[0],
@@ -363,6 +476,44 @@ class DashboardDatabase:
             }
         finally:
             conn.close()
+
+    def _load_v1_rows(self, conn: sqlite3.Connection):
+        token_usages, request_usages, cost_entries, plan_summary = [], [], [], []
+        months_set, names, models = set(), set(), set()
+        last_month, month_volume = {}, {}
+        for row in conn.execute(
+            "SELECT d.*,COALESCE(a.name,'unknown') AS display_name FROM daily_usage d "
+            "LEFT JOIN accounts a ON a.account_id=d.account_id"):
+            y, m = _parse_date(row["date"])
+            if not y:
+                continue
+            name = row["display_name"]
+            base = {"platform": "", "date": row["date"], "model": row["model"],
+                    "api_key_name": name, "cost_group_key": name,
+                    "_year": y, "_month": m}
+            miss = max(row["input_tokens"] - row["cache_tokens"], 0)
+            for token_type, amount in (
+                ("input_cache_miss", miss), ("input_cache_hit", row["cache_tokens"]),
+                ("output", row["output_tokens"])):
+                if amount:
+                    token_usages.append({**base, "token_type": token_type, "amount": amount})
+            request_usages.append({**base, "count": row["request_count"]})
+            cost_entries.append({**base, "cost": row["equivalent_cost"]})
+            months_set.add((y, m)); names.add(name); models.add(row["model"])
+            _track_recency(last_month, month_volume, name, y, m, row["request_count"])
+        for row in conn.execute(
+            "SELECT p.month,p.account_id,COALESCE(a.name,'unknown') account_name,"
+            "SUM(p.recurring_charge) subscription_cost,"
+            "SUM(p.equivalent_cost) virtual_cost FROM monthly_recurring_costs p "
+            "LEFT JOIN accounts a ON a.account_id=p.account_id "
+            "GROUP BY p.month,p.account_id,a.name ORDER BY p.month,p.account_id"):
+            plan_summary.append(dict(row))
+        available = [{"year": y, "month": m, "label": f"{y}-{m:02d}"}
+                     for y, m in sorted(months_set)]
+        ordered_names = sorted(names, key=lambda name: (
+            -last_month.get(name, -1), -month_volume.get(name, 0), name.lower()))
+        return (token_usages, request_usages, cost_entries, available,
+                ordered_names, [], _sort_models(models), plan_summary)
 
 
 def _sort_models(models: set[str]) -> list[str]:
@@ -494,8 +645,12 @@ def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
     proxy.row_factory = sqlite3.Row
     dash = sqlite3.connect(dash_path, timeout=10)
     try:
+        proxy_v1 = proxy.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='upstreams'"
+        ).fetchone() is not None
         accts = proxy.execute(
-            "SELECT id, name FROM upstream_accounts"
+            "SELECT id,name FROM accounts" if proxy_v1
+            else "SELECT id,name FROM upstream_accounts"
         ).fetchall()
         for a in accts:
             dash.execute(
@@ -505,6 +660,9 @@ def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
 
         # Legacy name-keyed rows: backfill account_id from the name→id map,
         # then rebuild the tables without the name columns.
+        if _is_v1(dash):
+            dash.commit()
+            return
         name_cols = {
             "token_usage": "api_key_name",
             "request_usage": "api_key_name",

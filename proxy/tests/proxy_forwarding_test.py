@@ -126,13 +126,14 @@ def main() -> None:
         legacy_schema = Path(tmp) / "schema-v10"
         legacy_schema.mkdir()
         for migration in schema_dir.glob("*.sql"):
-            if int(migration.stem.split("_", 1)[0]) <= 10:
+            if int(migration.stem.split("_", 1)[0].split("-", 1)[1]) <= 10:
                 shutil.copy2(migration, legacy_schema / migration.name)
         # The proxy applies every migration above v10, so user_version must end
         # up at the highest migration number in the schema dir — derived, not
         # hard-coded, so adding a future migration never breaks this test.
         expected_version = max(
-            int(m.stem.split("_", 1)[0]) for m in schema_dir.glob("*.sql")
+            int(m.stem.split("_", 1)[0].split("-", 1)[1])
+            for m in schema_dir.glob("*.sql")
         )
         migrate(str(db_path), str(legacy_schema))
         conn = sqlite3.connect(db_path)

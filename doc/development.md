@@ -10,7 +10,7 @@
 cd proxy
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-./build/token_proxy --db ../data/proxy.db --schema-dir ../schema/proxy --port 8800
+./build/token_proxy --db ../data/proxy.db --schema-dir ../schema --port 8800
 ```
 
 Release 构建额外加 `-O3 -march=native -flto`。构建产物有两个:`token_proxy`(完整代理)和 `format_conv_test`(codec 自测,见下)。
@@ -77,9 +77,9 @@ SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 
 
 ## 约定与注意事项
 
-- **schema 只通过迁移改。** 任何表/索引/触发器变更都要追加 `schema/<库>/NNNN_*.sql`,规则见 [database-migrations.md](database-migrations.md)。`.sql` 文件内禁止写 `BEGIN`/`COMMIT`/`PRAGMA user_version`。
+- **schema 只通过迁移改。** 兼容变更追加 `schema/<库>/v<major>/<major>-<minor>_*.sql`；跨 Major 使用 transition。规则见 [database-migrations.md](database-migrations.md)。
 - **时间存 UTC,显示 UTC+8。** 库内 `datetime('now')` 存 UTC;看板所有时间显示统一经 `fmtUtc8` 转 UTC+8;峰谷档位边界按 UTC+0 分钟存。
 - **计费写时固化。** 改价、换序不回溯 `request_log.api_cost`,见 [billing-pricing.md](billing-pricing.md)。
 - **request_log 明细不上传。** 同步进度用 `sync_state.last_exported_log_id` 单值检查点,拉取-导出-上传是完整事务(失败回滚),见 [sync.md](sync.md)。
 - **Python 无依赖清单。** 只有 flask、requests 两个第三方包,启动脚本在缺 flask 时自动 pip 安装。
-- **数据库路径与 schema 目录的推导约定**:`data/proxy.db` → `<仓库>/schema/proxy`,`data/dashboard.db` → `<仓库>/schema/dashboard`(`app/migrations.py::schema_dir_for`,C++ 侧同理)。
+- **数据库路径与 schema 目录的推导约定**:`data/proxy.db` / `data/dashboard.db` → `<仓库>/schema/`，runner 再选择 `proxy|dashboard/v<major>`。

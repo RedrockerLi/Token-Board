@@ -49,9 +49,14 @@ constexpr int64_t DNS_ADDRESS_BACKOFF_MS = 15 * 1000;
 constexpr size_t DNS_CACHE_MAX_HOSTS = 256;
 constexpr size_t DNS_QUEUE_MAX = 64;
 constexpr size_t DNS_WORKER_COUNT = 4;
-constexpr size_t CLIENT_POOL_MAX_IDLE = 64;
-constexpr size_t CLIENT_POOL_MAX_IDLE_PER_ORIGIN = 8;
+// A single hot origin commonly serves all worker threads. Keeping only eight
+// idle leases forced the other concurrent requests to redial every wave,
+// amplifying SYN backlog and TLS costs under 64-way bursts.
+constexpr size_t CLIENT_POOL_MAX_IDLE = 256;
+constexpr size_t CLIENT_POOL_MAX_IDLE_PER_ORIGIN = 64;
 constexpr int64_t CLIENT_POOL_IDLE_TTL_MS = 60 * 1000;
+std::atomic<std::uint64_t> transport_dns_lookups{0};
+std::atomic<std::uint64_t> transport_dns_total_ms{0};
 
 long long now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -666,8 +671,10 @@ public:
             if (it->value.origin != origin) continue;
             PooledClient value = std::move(it->value);
             idle_.erase(it);
+            hits_.fetch_add(1, std::memory_order_relaxed);
             return value;
         }
+        misses_.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
 
@@ -696,6 +703,15 @@ public:
         }
     }
 
+    void note_created() { created_.fetch_add(1, std::memory_order_relaxed); }
+    UpstreamClient::TransportMetrics metrics() const {
+        UpstreamClient::TransportMetrics out;
+        out.pool_hits = hits_.load(std::memory_order_relaxed);
+        out.pool_misses = misses_.load(std::memory_order_relaxed);
+        out.clients_created = created_.load(std::memory_order_relaxed);
+        return out;
+    }
+
 private:
     struct Idle {
         PooledClient value;
@@ -713,6 +729,9 @@ private:
 
     std::mutex mutex_;
     std::list<Idle> idle_;
+    std::atomic<std::uint64_t> hits_{0};
+    std::atomic<std::uint64_t> misses_{0};
+    std::atomic<std::uint64_t> created_{0};
 };
 
 /// RAII lease for a pooled client.  The client leaves the pool while leased,
@@ -1195,6 +1214,7 @@ UpstreamClient::forward(const std::string &method,
     // backoff, so the first usable address is the healthy one.  Numeric hosts
     // short-circuit.  The DNS wait shares the connection-establishment budget.
     std::vector<std::string> dns_addresses;
+    const auto dns_started = std::chrono::steady_clock::now();
     if (numeric_host(origin_parts.hostname)) {
         dns_addresses.push_back(origin_parts.hostname);
     } else {
@@ -1228,6 +1248,12 @@ UpstreamClient::forward(const std::string &method,
         result.error = "Upstream DNS returned no usable addresses";
         return result;
     }
+    const int dns_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - dns_started).count());
+    transport_dns_lookups.fetch_add(1, std::memory_order_relaxed);
+    transport_dns_total_ms.fetch_add(static_cast<std::uint64_t>(
+        std::max(0, dns_ms)), std::memory_order_relaxed);
 
     // Build headers.  Anthropic-native upstreams use x-api-key instead of
     // Authorization: Bearer.
@@ -1335,9 +1361,13 @@ UpstreamClient::forward(const std::string &method,
                 t_first = received_at;
                 first_chunk = false;
             }
-            accumulated.append(data, len);
-            if (client_connected &&
-                upstream_status >= 200 && upstream_status < 300) {
+            const bool successful_status =
+                upstream_status >= 200 && upstream_status < 300;
+            // Successful streams are already parsed incrementally by the
+            // caller and are never retained here. An uncommitted upstream
+            // error keeps only a bounded tail for fallback classification.
+            if (!successful_status) accumulated.append(data, len);
+            if (client_connected && successful_status) {
                 client_connected = on_chunk(data, len);
             }
             // on_chunk publishes parser-level semantic_seen/progress.  Read
@@ -1518,14 +1548,21 @@ UpstreamClient::forward(const std::string &method,
     // fresh one for the next untried DNS address.
     std::set<std::string> tried_addresses;
     size_t addr_index = 0;
+    bool connection_reused = false;
     auto acquire = [&]() -> PooledLease {
-        if (auto pooled = ClientPool::instance().take(origin_parts.origin))
+        if (auto pooled = ClientPool::instance().take(origin_parts.origin)) {
+            connection_reused = true;
             return PooledLease(std::move(*pooled));
+        }
+        connection_reused = false;
         for (size_t i = addr_index; i < dns_addresses.size(); ++i) {
             if (tried_addresses.count(dns_addresses[i])) continue;
             std::string error;
             auto made = make_client(origin_parts, dns_addresses[i], error);
-            if (made) return PooledLease(std::move(*made));
+            if (made) {
+                ClientPool::instance().note_created();
+                return PooledLease(std::move(*made));
+            }
         }
         return PooledLease(std::nullopt);
     };
@@ -1542,6 +1579,8 @@ UpstreamClient::forward(const std::string &method,
             configure_client(lease.client());
         }
         const bool retry = attempt(*lease.client());
+        result.dns_ms = dns_ms;
+        result.connection_reused = connection_reused;
         if (retry && addr_index < dns_addresses.size()) {
             const std::string &dead = lease.address();
             tried_addresses.insert(dead);
@@ -1567,4 +1606,11 @@ UpstreamClient::forward(const std::string &method,
                                              lease.address());
 
     return result;
+}
+
+UpstreamClient::TransportMetrics UpstreamClient::transport_metrics() {
+    auto metrics = ClientPool::instance().metrics();
+    metrics.dns_lookups = transport_dns_lookups.load(std::memory_order_relaxed);
+    metrics.dns_total_ms = transport_dns_total_ms.load(std::memory_order_relaxed);
+    return metrics;
 }

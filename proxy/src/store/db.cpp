@@ -16,11 +16,16 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <iomanip>
+#include <regex>
+#include <sstream>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <tuple>
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#include <openssl/sha.h>
 #include <sqlite3.h>
 
 // ── Internal helpers ────────────────────────────────────────────────────
@@ -98,6 +103,17 @@ private:
     sqlite3_stmt *stmt_;
 };
 
+class ReadTransactionGuard {
+public:
+    explicit ReadTransactionGuard(sqlite3 *db) : db_(db) {}
+    ~ReadTransactionGuard() {
+        if (db_) sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+    void release() noexcept { db_ = nullptr; }
+private:
+    sqlite3 *db_;
+};
+
 } // anonymous namespace
 
 // ── Constructor / Destructor ─────────────────────────────────────────────
@@ -134,6 +150,14 @@ bool Database::open(const std::string &path, const std::string &schema_dir) {
         sqlite3_close(write_db_);
         write_db_ = nullptr;
         return false;
+    }
+    {
+        sqlite3_stmt *version_stmt = nullptr;
+        if (sqlite3_prepare_v2(write_db_, "PRAGMA user_version", -1,
+                               &version_stmt, nullptr) == SQLITE_OK &&
+            sqlite3_step(version_stmt) == SQLITE_ROW)
+            schema_major_ = sqlite3_column_int(version_stmt, 0) / 10000;
+        sqlite3_finalize(version_stmt);
     }
 
     rc = sqlite3_open_v2(path.c_str(), &read_db_,
@@ -222,52 +246,12 @@ void Database::close() {
 
 // ── Schema migrations ────────────────────────────────────────────────────
 //
-// Applies pending versioned migrations from `schema_dir` (schema/<db>/NNNN_*.sql),
-// the single source of truth for the database schema (shared with the Python
-// runner in app/migrations.py).  Each step runs inside
-// "BEGIN IMMEDIATE; <body>; PRAGMA user_version = N; COMMIT;" under an advisory
-// flock on <db>.migrate.lock, so concurrent runners (proxy + dashboard) and
-// concurrent processes are serialized and every step is all-or-nothing.
+// The protocol is shared with app/db/migrations.py.  Files are numerically
+// ordered major-minor pairs below schema/proxy/vN.  Same-major minor upgrades
+// are automatic; a major transition is always an explicit maintenance action.
 
 bool Database::run_migrations(const std::string &schema_dir) {
     namespace fs = std::filesystem;
-    if (!fs::is_directory(schema_dir)) {
-        fprintf(stderr, "[DB] schema dir not found: %s\n", schema_dir.c_str());
-        return false;
-    }
-
-    // Enumerate schema_dir/NNNN_*.sql and reject names/versions that the Python
-    // runner would reject. Divergent migration discovery can split the schema.
-    std::vector<std::pair<int, fs::path>> steps;
-    for (const auto &e : fs::directory_iterator(schema_dir)) {
-        std::string fn = e.path().filename().string();
-        if (e.path().extension() != ".sql") continue;
-        const bool valid = fn.size() >= 9 && fn[4] == '_' &&
-            std::all_of(fn.begin(), fn.begin() + 4, [](unsigned char c) {
-                return std::isdigit(c) != 0;
-            });
-        if (!valid) {
-            fprintf(stderr,
-                    "[DB] bad migration filename: %s (need NNNN_desc.sql)\n",
-                    fn.c_str());
-            return false;
-        }
-        steps.emplace_back(std::stoi(fn.substr(0, 4)), e.path());
-    }
-    std::sort(steps.begin(), steps.end(),
-              [](const auto &a, const auto &b) { return a.first < b.first; });
-    if (steps.empty()) {
-        fprintf(stderr, "[DB] no migration files in %s\n", schema_dir.c_str());
-        return false;
-    }
-    for (std::size_t i = 1; i < steps.size(); ++i) {
-        if (steps[i - 1].first == steps[i].first) {
-            fprintf(stderr, "[DB] duplicate migration number: %04d\n",
-                    steps[i].first);
-            return false;
-        }
-    }
-
     // Advisory lock — pairs with the Python runner's fcntl.flock().
     int lock_fd = ::open((db_path_ + ".migrate.lock").c_str(), O_CREAT | O_RDWR, 0644);
     if (lock_fd < 0) {
@@ -281,35 +265,240 @@ bool Database::run_migrations(const std::string &schema_dir) {
         return false;
     }
 
-    // Current schema version.
-    int version = 0;
+    int encoded_version = 0;
     {
         sqlite3_stmt *s = nullptr;
         if (sqlite3_prepare_v2(write_db_, "PRAGMA user_version", -1, &s, nullptr) == SQLITE_OK
             && sqlite3_step(s) == SQLITE_ROW)
-            version = sqlite3_column_int(s, 0);
+            encoded_version = sqlite3_column_int(s, 0);
+        sqlite3_finalize(s);
+    }
+    {
+        sqlite3_stmt *s = nullptr;
+        const char *sql =
+            "SELECT major,minor,database_name FROM schema_version WHERE id=1";
+        if (sqlite3_prepare_v2(write_db_, sql, -1, &s, nullptr) == SQLITE_OK &&
+            sqlite3_step(s) == SQLITE_ROW) {
+            const int major = sqlite3_column_int(s, 0);
+            const int minor = sqlite3_column_int(s, 1);
+            const unsigned char *name = sqlite3_column_text(s, 2);
+            if (encoded_version != major * 10000 + minor || !name ||
+                std::string(reinterpret_cast<const char *>(name)) != "proxy") {
+                fprintf(stderr, "[DB] schema_version disagrees with "
+                        "PRAGMA user_version or database identity\n");
+                sqlite3_finalize(s);
+                flock(lock_fd, LOCK_UN);
+                ::close(lock_fd);
+                return false;
+            }
+        }
         sqlite3_finalize(s);
     }
 
-    bool ok = true;
-    for (const auto &[n, p] : steps) {
-        if (n <= version) continue;
+    bool empty_database = encoded_version == 0;
+    if (empty_database) {
+        sqlite3_stmt *s = nullptr;
+        const char *sql =
+            "SELECT count(*) FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' AND name NOT IN "
+            "('schema_version','schema_migrations')";
+        if (sqlite3_prepare_v2(write_db_, sql, -1, &s, nullptr) == SQLITE_OK &&
+            sqlite3_step(s) == SQLITE_ROW)
+            empty_database = sqlite3_column_int(s, 0) == 0;
+        sqlite3_finalize(s);
+        if (!empty_database) {
+            fprintf(stderr, "[DB] non-empty database has no schema version\n");
+            flock(lock_fd, LOCK_UN);
+            ::close(lock_fd);
+            return false;
+        }
+    }
+    const int current_major = encoded_version / 10000;
+    const int current_minor = encoded_version % 10000;
 
-        std::ifstream f(p);
+    fs::path supplied(schema_dir);
+    if (!fs::is_directory(supplied)) {
+        fprintf(stderr, "[DB] schema dir not found: %s\n", schema_dir.c_str());
+        flock(lock_fd, LOCK_UN);
+        ::close(lock_fd);
+        return false;
+    }
+    const std::regex filename_re(R"(^(\d+)-(\d+)_([a-z0-9][a-z0-9_]*)\.sql$)");
+    auto contains_steps = [&](const fs::path &path) {
+        for (const auto &e : fs::directory_iterator(path))
+            if (e.path().extension() == ".sql") return true;
+        return false;
+    };
+
+    fs::path selected = supplied;
+    if (!contains_steps(selected)) {
+        fs::path database_root = selected.filename() == "proxy"
+            ? selected : selected / "proxy";
+        std::vector<std::pair<int, fs::path>> majors;
+        if (fs::is_directory(database_root)) {
+            for (const auto &e : fs::directory_iterator(database_root)) {
+                const auto name = e.path().filename().string();
+                if (!e.is_directory() || name.size() < 2 || name[0] != 'v' ||
+                    !std::all_of(name.begin() + 1, name.end(), [](unsigned char c) {
+                        return std::isdigit(c) != 0;
+                    })) continue;
+                majors.emplace_back(std::stoi(name.substr(1)), e.path());
+            }
+        }
+        std::sort(majors.begin(), majors.end());
+        if (majors.empty()) {
+            fprintf(stderr, "[DB] no schema/proxy/vN directory below %s\n",
+                    schema_dir.c_str());
+            flock(lock_fd, LOCK_UN);
+            ::close(lock_fd);
+            return false;
+        }
+        selected = majors.back().second;
+        if (!empty_database && current_major != majors.back().first) {
+                fprintf(stderr,
+                        "[DB] proxy schema is V%d.%d but program uses V%d; "
+                        "run schema/transitions/%d-to-%d\n",
+                        current_major, current_minor, majors.back().first,
+                        current_major, majors.back().first);
+                flock(lock_fd, LOCK_UN);
+                ::close(lock_fd);
+                return false;
+        }
+    }
+
+    struct Step { int major; int minor; fs::path path; std::string checksum; };
+    std::vector<Step> steps;
+    for (const auto &e : fs::directory_iterator(selected)) {
+        if (e.path().extension() != ".sql") continue;
+        const std::string fn = e.path().filename().string();
+        std::smatch match;
+        if (!std::regex_match(fn, match, filename_re)) {
+            fprintf(stderr, "[DB] bad migration filename: %s "
+                    "(need major-minor_description.sql)\n", fn.c_str());
+            flock(lock_fd, LOCK_UN);
+            ::close(lock_fd);
+            return false;
+        }
+        std::ifstream input(e.path(), std::ios::binary);
+        std::string body((std::istreambuf_iterator<char>(input)),
+                         std::istreambuf_iterator<char>());
+        unsigned char digest[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char *>(body.data()), body.size(), digest);
+        std::ostringstream hex;
+        for (unsigned char byte : digest)
+            hex << std::hex << std::setw(2) << std::setfill('0')
+                << static_cast<int>(byte);
+        steps.push_back({std::stoi(match[1]), std::stoi(match[2]), e.path(), hex.str()});
+    }
+    std::sort(steps.begin(), steps.end(), [](const Step &a, const Step &b) {
+        return std::tie(a.major, a.minor) < std::tie(b.major, b.minor);
+    });
+    if (steps.empty()) {
+        fprintf(stderr, "[DB] no migration files in %s\n", selected.c_str());
+        flock(lock_fd, LOCK_UN);
+        ::close(lock_fd);
+        return false;
+    }
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        if (steps[i].major != steps.front().major ||
+            (i && steps[i - 1].major == steps[i].major &&
+             steps[i - 1].minor == steps[i].minor)) {
+            fprintf(stderr, "[DB] mixed/duplicate migration version in %s\n",
+                    selected.c_str());
+            flock(lock_fd, LOCK_UN);
+            ::close(lock_fd);
+            return false;
+        }
+    }
+    {
+        sqlite3_stmt *check = nullptr;
+        const char *sql = "SELECT filename,checksum FROM schema_migrations "
+                          "WHERE major=?1 AND minor=?2";
+        if (sqlite3_prepare_v2(write_db_, sql, -1, &check, nullptr) == SQLITE_OK) {
+            for (const auto &step : steps) {
+                sqlite3_reset(check);
+                sqlite3_bind_int(check, 1, step.major);
+                sqlite3_bind_int(check, 2, step.minor);
+                if (sqlite3_step(check) != SQLITE_ROW) continue;
+                const auto *filename = sqlite3_column_text(check, 0);
+                const auto *checksum = sqlite3_column_text(check, 1);
+                if (!filename || !checksum ||
+                    step.path.filename().string() !=
+                        reinterpret_cast<const char *>(filename) ||
+                    step.checksum != reinterpret_cast<const char *>(checksum)) {
+                    fprintf(stderr, "[DB] checksum mismatch for V%d.%d\n",
+                            step.major, step.minor);
+                    sqlite3_finalize(check);
+                    flock(lock_fd, LOCK_UN);
+                    ::close(lock_fd);
+                    return false;
+                }
+            }
+        }
+        sqlite3_finalize(check);
+    }
+    if (!empty_database && current_major != steps.front().major) {
+        fprintf(stderr, "[DB] major schema mismatch: V%d.%d vs V%d\n",
+                current_major, current_minor, steps.front().major);
+        flock(lock_fd, LOCK_UN);
+        ::close(lock_fd);
+        return false;
+    }
+    if (empty_database && steps.front().major >= 1)
+        sqlite3_exec(write_db_, "PRAGMA auto_vacuum=INCREMENTAL", nullptr,
+                     nullptr, nullptr);
+    if (!empty_database && current_minor > steps.back().minor) {
+        fprintf(stderr, "[DB] warning: proxy V%d.%d is newer than known V%d.%d; "
+                "continuing under same-major compatibility\n",
+                current_major, current_minor, steps.back().major, steps.back().minor);
+        flock(lock_fd, LOCK_UN);
+        ::close(lock_fd);
+        return true;
+    }
+
+    auto sql_quote = [](const std::string &value) {
+        std::string result = "'";
+        for (char c : value) result += c == '\'' ? "''" : std::string(1, c);
+        return result + "'";
+    };
+
+    bool ok = true;
+    for (const auto &step : steps) {
+        if (!empty_database && step.minor <= current_minor) continue;
+        std::ifstream f(step.path);
         std::string body((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
         if (body.empty()) {
-            fprintf(stderr, "[DB] Migration %s is empty/unreadable\n", p.c_str());
+            fprintf(stderr, "[DB] Migration %s is empty/unreadable\n",
+                    step.path.c_str());
             ok = false;
             break;
         }
-        std::string sql = "BEGIN IMMEDIATE;\n" + body +
-                          "\nPRAGMA user_version = " + std::to_string(n) + ";\nCOMMIT;";
+        const int user_version = step.major * 10000 + step.minor;
+        std::string sql =
+            "BEGIN IMMEDIATE;\n"
+            "CREATE TABLE IF NOT EXISTS schema_version("
+            "id INTEGER PRIMARY KEY CHECK(id=1),major INTEGER NOT NULL,"
+            "minor INTEGER NOT NULL,database_name TEXT NOT NULL,updated_at TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS schema_migrations("
+            "major INTEGER NOT NULL,minor INTEGER NOT NULL,filename TEXT NOT NULL,"
+            "checksum TEXT NOT NULL,applied_at TEXT NOT NULL,PRIMARY KEY(major,minor),"
+            "UNIQUE(filename));\n" + body +
+            "\nINSERT INTO schema_migrations(major,minor,filename,checksum,applied_at) VALUES(" +
+            std::to_string(step.major) + "," + std::to_string(step.minor) + "," +
+            sql_quote(step.path.filename().string()) + "," + sql_quote(step.checksum) +
+            ",strftime('%Y-%m-%dT%H:%M:%fZ','now'));"
+            "INSERT INTO schema_version(id,major,minor,database_name,updated_at) VALUES(1," +
+            std::to_string(step.major) + "," + std::to_string(step.minor) +
+            ",'proxy',strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(id) DO UPDATE SET "
+            "major=excluded.major,minor=excluded.minor,database_name=excluded.database_name,"
+            "updated_at=excluded.updated_at;"
+            "PRAGMA user_version=" + std::to_string(user_version) + ";\nCOMMIT;";
 
         char *err = nullptr;
         if (sqlite3_exec(write_db_, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
             fprintf(stderr, "[DB] Migration %s failed: %s\n",
-                    p.c_str(), err ? err : sqlite3_errmsg(write_db_));
+                    step.path.c_str(), err ? err : sqlite3_errmsg(write_db_));
             if (err) sqlite3_free(err);
             sqlite3_exec(write_db_, "ROLLBACK", nullptr, nullptr, nullptr);  // atomic step rollback
             ok = false;
@@ -337,6 +526,133 @@ bool Database::prepare_statements() {
                 ok = false; \
             } \
         } while (0)
+
+    if (schema_major_ == 1) {
+        PREPARE_ON(read_db_,
+            "SELECT ck.id,ck.key_value,ck.route_set_id,COALESCE(ck.label,'') "
+            "FROM client_keys ck WHERE ck.key_value=?1 AND ck.enabled=1 "
+            "AND (ck.deleted_at IS NULL OR ck.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            stmt_lookup_key_);
+        PREPARE_ON(read_db_,
+            "SELECT rs.id,rs.name,COALESCE(u.base_url,''),COALESCE(u.api_format,'openai'),"
+            "COALESCE(u.endpoint_path,''),COALESCE(u.auth_scheme,'auto'),"
+            "CASE WHEN rs.account_id IS NULL THEN 1 ELSE 0 END,0,"
+            "COALESCE(u.max_concurrency,0),CASE WHEN rs.enabled=1 THEN 0 ELSE 1 END "
+            "FROM route_sets rs LEFT JOIN upstreams u ON u.account_id=rs.account_id "
+            "AND u.enabled=1 WHERE rs.id=?1 ORDER BY u.id LIMIT 1",
+            stmt_get_account_);
+        PREPARE_ON(read_db_,
+            "SELECT ck.id,ck.key_value,ck.route_set_id,COALESCE(ck.label,''),"
+            "rs.id,rs.name,COALESCE(u.base_url,''),COALESCE(u.api_format,'openai'),"
+            "COALESCE(u.endpoint_path,''),COALESCE(u.auth_scheme,'auto'),"
+            "CASE WHEN rs.account_id IS NULL THEN 1 ELSE 0 END,0,"
+            "COALESCE(u.max_concurrency,0),0 "
+            "FROM client_keys ck JOIN route_sets rs ON rs.id=ck.route_set_id "
+            "LEFT JOIN upstreams u ON u.account_id=rs.account_id AND u.enabled=1 "
+            "WHERE ck.key_value=?1 AND ck.enabled=1 AND rs.enabled=1 "
+            "AND (ck.deleted_at IS NULL OR ck.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "ORDER BY u.id LIMIT 1",
+            stmt_lookup_route_);
+        PREPARE_ON(read_db_,
+            "SELECT c.runtime_id,s.secret_value,c.position FROM upstream_credentials c "
+            "JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+            "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=?1 "
+            "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "ORDER BY c.position,c.runtime_id",
+            stmt_get_upstream_keys_);
+        PREPARE_ON(read_db_,
+            "SELECT a.id,a.name,u.base_url,u.api_format,COALESCE(u.endpoint_path,''),"
+            "COALESCE(u.auth_scheme,'auto'),0,"
+            "CASE WHEN json_extract(COALESCE(bc.cooldown_policy_json,'{}'),'$.kind')="
+            "'subscription_5h' THEN 1 ELSE 0 END,"
+            "u.max_concurrency,0,COALESCE(rr.target_model,?2),rr.priority,"
+            "c.runtime_id,s.secret_value,c.position "
+            "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
+            "LEFT JOIN accounts a ON a.id=u.account_id "
+            "LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
+            "AND bc.valid_until IS NULL "
+            "LEFT JOIN upstream_credentials c ON c.upstream_id=u.id "
+            "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "LEFT JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+            "WHERE rr.route_set_id=?1 AND rr.enabled=1 "
+            "AND (rr.model_pattern='*' OR ?2 GLOB rr.model_pattern) "
+            "AND u.enabled=1 ORDER BY rr.priority,rr.id,c.position,c.runtime_id",
+            stmt_resolve_routing_snapshot_);
+        PREPARE_ON(write_db_,
+            "INSERT INTO request_log(event_id,source_kind,account_id,route_set_id,"
+            "client_key_id,upstream_key_id,credential_uuid,model,prompt_tokens,completion_tokens,"
+            "cache_read_tokens,total_tokens,equivalent_cost,billed_usage_cost,"
+            "is_streaming,status_code,duration_ms,ttft_ms,generation_ms,output_tps,"
+            "upstream_ttft_ms,upstream_duration_ms,attempt_count,fallback_count,requested_at) "
+            "VALUES(?21,'proxy',(SELECT id FROM accounts WHERE id=?1),"
+            "(SELECT route_set_id FROM client_keys WHERE id=?2),"
+            "(SELECT id FROM client_keys WHERE id=?2),?12,"
+            "(SELECT uuid FROM upstream_credentials WHERE runtime_id=?12),"
+            "?3,?4,?5,?6,?7,?8,CASE WHEN EXISTS(SELECT 1 FROM billing_contracts "
+            "WHERE account_id=?1 AND charge_type='recurring' AND valid_until IS NULL) "
+            "THEN 0 ELSE ?8 END,?9,?10,?11,COALESCE(?13,0),COALESCE(?14,0),"
+            "COALESCE(?15,0),COALESCE(?16,0),COALESCE(?17,0),?18,?19,"
+            "strftime('%Y-%m-%dT%H:%M:%fZ',?20,'unixepoch'))",
+            stmt_insert_log_);
+        PREPARE_ON(write_db_, "SELECT id FROM request_log WHERE event_id=?1",
+                   stmt_find_log_event_);
+        PREPARE_ON(write_db_,
+            "INSERT INTO request_attempts(request_log_id,attempt_index,upstream_id,"
+            "credential_uuid,account_id,upstream_key_id,status_code,duration_ms,ttft_ms,is_timeout,error,requested_at,"
+            "dns_ms,connect_ms,tls_ms,lease_wait_ms) "
+            "VALUES(?1,?2,(SELECT id FROM upstreams WHERE account_id=?3 ORDER BY id LIMIT 1),"
+            "(SELECT uuid FROM upstream_credentials WHERE runtime_id=?4),?3,?4,?5,?6,"
+            "COALESCE(?7,0),?8,?9,strftime('%Y-%m-%dT%H:%M:%fZ',?10,'unixepoch'),"
+            "?11,?12,?13,?14)",
+            stmt_insert_attempt_);
+        PREPARE_ON(read_db_,
+            "SELECT model_pattern,u.account_id,COALESCE(target_model,model_pattern) "
+            "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
+            "WHERE route_set_id=?1 AND rr.enabled=1 ORDER BY priority,rr.id",
+            stmt_get_aggregate_entries_);
+        PREPARE_ON(read_db_,
+            "SELECT pr.id,pr.model_pattern,r.input_price,r.output_price "
+            "FROM pricing_rules pr JOIN pricing_rates r ON r.pricing_rule_id=pr.id "
+            "WHERE pr.enabled=1 AND r.valid_until IS NULL ORDER BY pr.priority,pr.id",
+            stmt_get_pricing_);
+        PREPARE_ON(pricing_db_,
+            "SELECT r.input_price,r.output_price,r.cache_read_price,"
+            "COALESCE((SELECT ps.multiplier FROM pricing_slots ps WHERE ps.pricing_rate_id=r.id "
+            "AND ((ps.start_minute<=ps.end_minute AND ?2>=ps.start_minute AND ?2<ps.end_minute) "
+            "OR (ps.start_minute>ps.end_minute AND (?2>=ps.start_minute OR ?2<ps.end_minute))) "
+            "ORDER BY ps.id LIMIT 1),1.0),r.currency,"
+            "COALESCE((SELECT fx.rate FROM fx_rates fx WHERE fx.base_currency='USD' "
+            "AND fx.quote_currency='CNY' AND fx.date<=date(?3,'unixepoch') "
+            "ORDER BY fx.date DESC LIMIT 1),1.0) "
+            "FROM pricing_rules pr JOIN pricing_rates r ON r.pricing_rule_id=pr.id "
+            "WHERE pr.enabled=1 AND LOWER(?1) GLOB LOWER(pr.model_pattern) "
+            "AND r.valid_from<=strftime('%Y-%m-%dT%H:%M:%fZ',?3,'unixepoch') "
+            "AND (r.valid_until IS NULL OR r.valid_until>strftime('%Y-%m-%dT%H:%M:%fZ',?3,'unixepoch')) "
+            "ORDER BY pr.priority,pr.id,r.valid_from DESC LIMIT 1",
+            stmt_snapshot_price_);
+        PREPARE_ON(read_db_,
+            "SELECT streaming_first_byte_timeout,streaming_idle_timeout,"
+            "non_streaming_timeout FROM proxy_timeout_config WHERE endpoint_kind="
+            "CASE ?1 WHEN 'anthropic' THEN 'messages' WHEN 'openai_responses' "
+            "THEN 'responses' ELSE 'chat' END",
+            stmt_get_timeout_config_);
+        PREPARE_ON(read_db_,
+            "SELECT u.base_url,s.secret_value,u.api_format,u.auth_scheme "
+            "FROM upstream_credentials c JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+            "JOIN upstreams u ON u.id=c.upstream_id WHERE c.runtime_id=?1 "
+            "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "AND u.enabled=1",
+            stmt_lookup_probe_target_);
+        PREPARE_ON(write_db_,
+            "UPDATE client_keys SET last_used_at=strftime('%Y-%m-%dT%H:%M:%fZ',?2,'unixepoch') "
+            "WHERE id=?1 AND (last_used_at IS NULL OR "
+            "last_used_at<strftime('%Y-%m-%dT%H:%M:%fZ',?2,'unixepoch'))",
+            stmt_update_last_used_);
+        return ok;
+    }
 
     PREPARE_ON(read_db_, "SELECT id, key_value, account_id, "
             "COALESCE(label,'') "
@@ -561,10 +877,17 @@ std::optional<Database::AccountInfo> Database::get_account(int account_id) {
             sqlite3_column_text(stmt_get_account_, 5));
         if (info.auth_header.empty()) info.auth_header = "bearer";
         info.is_aggregate = sqlite3_column_int(stmt_get_account_, 6) != 0;
-        const char *atype = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 7));
-        info.account_type = atype ? atype : "api";
-        if (info.account_type.empty()) info.account_type = "api";
+        if (schema_major_ == 1) {
+            info.extended_usage_limit_cooldown =
+                sqlite3_column_int(stmt_get_account_, 7) != 0;
+        } else {
+            const char *atype = reinterpret_cast<const char *>(
+                sqlite3_column_text(stmt_get_account_, 7));
+            info.account_type = atype ? atype : "api";
+            info.extended_usage_limit_cooldown =
+                account_types::cooldown_class(info.account_type) ==
+                account_types::CooldownClass::kSubscription5h;
+        }
         info.max_concurrency = sqlite3_column_int(stmt_get_account_, 8);
         info.deleted = sqlite3_column_int(stmt_get_account_, 9) != 0;
         result = std::move(info);
@@ -597,14 +920,227 @@ std::optional<Database::RouteInfo> Database::lookup_route(
         a.endpoint_path = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 8));
         a.auth_header = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 9));
         a.is_aggregate = sqlite3_column_int(stmt_lookup_route_, 10) != 0;
-        const char *atype = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 11));
-        a.account_type = atype ? atype : "api";
+        if (schema_major_ == 1) {
+            a.extended_usage_limit_cooldown =
+                sqlite3_column_int(stmt_lookup_route_, 11) != 0;
+        } else {
+            const char *atype = reinterpret_cast<const char *>(
+                sqlite3_column_text(stmt_lookup_route_, 11));
+            a.account_type = atype ? atype : "api";
+            a.extended_usage_limit_cooldown =
+                account_types::cooldown_class(a.account_type) ==
+                account_types::CooldownClass::kSubscription5h;
+        }
         a.max_concurrency = sqlite3_column_int(stmt_lookup_route_, 12);
         a.deleted = sqlite3_column_int(stmt_lookup_route_, 13) != 0;
         result = std::move(route);
     }
     sqlite3_reset(stmt_lookup_route_);
     return result;
+}
+
+std::uint64_t Database::routing_config_generation() {
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    sqlite3_stmt *stmt = nullptr;
+    std::uint64_t generation = 0;
+    const char *sql = schema_major_ == 1
+        ? "SELECT generation FROM config_state WHERE id=1"
+        : "PRAGMA data_version";
+    if (sqlite3_prepare_v2(read_db_, sql, -1, &stmt,
+                           nullptr) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW)
+        generation = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 0));
+    sqlite3_finalize(stmt);
+    return generation;
+}
+
+bool Database::load_routing_config(RoutingConfig &config) {
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    RoutingConfig next;
+    char *error = nullptr;
+    if (sqlite3_exec(read_db_, "BEGIN", nullptr, nullptr, &error) != SQLITE_OK) {
+        fprintf(stderr, "[DB] routing snapshot begin failed: %s\n",
+                error ? error : sqlite3_errmsg(read_db_));
+        if (error) sqlite3_free(error);
+        return false;
+    }
+    ReadTransactionGuard rollback(read_db_);
+
+    sqlite3_stmt *stmt = nullptr;
+    const char *generation_sql = schema_major_ == 1
+        ? "SELECT generation FROM config_state WHERE id=1"
+        : "PRAGMA data_version";
+    if (sqlite3_prepare_v2(read_db_, generation_sql, -1, &stmt,
+                           nullptr) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW)
+        next.generation = static_cast<std::uint64_t>(
+            sqlite3_column_int64(stmt, 0));
+    sqlite3_finalize(stmt);
+
+    const std::string routes_sql_v0 =
+        "SELECT k.id,k.key_value,k.account_id,COALESCE(k.label,''),"
+        "a.id,a.name,a.base_url,COALESCE(a.api_format,'openai'),"
+        "COALESCE(a.endpoint_path,''),COALESCE(a.auth_header,'auto'),"
+        "COALESCE(a.is_aggregate,0),COALESCE(a.account_type,'api'),"
+        "COALESCE(a.max_concurrency,0),0 "
+        "FROM local_keys k JOIN upstream_accounts a ON a.id=k.account_id "
+        "WHERE (a.deleted_at IS NULL OR a.deleted_at>datetime('now'))" +
+        account_types::routable_filter_sql("a.account_type") +
+        " ORDER BY k.id";
+    const std::string routes_sql_v1 =
+        "SELECT ck.id,ck.key_value,ck.route_set_id,COALESCE(ck.label,''),"
+        "rs.id,rs.name,'','openai','','auto',"
+        "CASE WHEN rs.account_id IS NULL THEN 1 ELSE 0 END,0,0,0 "
+        "FROM client_keys ck JOIN route_sets rs ON rs.id=ck.route_set_id "
+        "WHERE ck.enabled=1 AND rs.enabled=1 "
+        "AND (ck.deleted_at IS NULL OR ck.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "ORDER BY ck.id";
+    const std::string &routes_sql = schema_major_ == 1
+        ? routes_sql_v1 : routes_sql_v0;
+    if (sqlite3_prepare_v2(read_db_, routes_sql.c_str(), -1, &stmt,
+                           nullptr) != SQLITE_OK) {
+        fprintf(stderr, "[DB] routing snapshot routes failed: %s\n",
+                sqlite3_errmsg(read_db_));
+        return false;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        RouteInfo route;
+        route.key.id = sqlite3_column_int(stmt, 0);
+        route.key.key_value = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
+        route.key.account_id = sqlite3_column_int(stmt, 2);
+        route.key.label = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3));
+        auto &a = route.account;
+        a.id = sqlite3_column_int(stmt, 4);
+        a.name = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 5));
+        a.base_url = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 6));
+        a.api_format = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 7));
+        a.endpoint_path = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 8));
+        a.auth_header = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 9));
+        a.is_aggregate = sqlite3_column_int(stmt, 10) != 0;
+        if (schema_major_ == 1) {
+            a.extended_usage_limit_cooldown = sqlite3_column_int(stmt, 11) != 0;
+        } else {
+            a.account_type = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 11));
+            a.extended_usage_limit_cooldown =
+                account_types::cooldown_class(a.account_type) ==
+                account_types::CooldownClass::kSubscription5h;
+        }
+        a.max_concurrency = sqlite3_column_int(stmt, 12);
+        a.deleted = false;
+        next.routes.push_back(std::move(route));
+    }
+    sqlite3_finalize(stmt);
+    stmt = nullptr;
+
+    const std::string rules_sql_v0 =
+        "WITH rules(route_set_id,model_pattern,target_id,target_model,"
+        "priority_sort,priority_group) AS ("
+        " SELECT id,'*',id,NULL,0,0 FROM upstream_accounts "
+        " WHERE COALESCE(is_aggregate,0)=0" +
+        account_types::routable_filter_sql("account_type") +
+        " UNION ALL "
+        " SELECT e.account_id,e.pattern,e.upstream_account_id,e.upstream_model,"
+        "        e.sort_order,e.id FROM aggregate_entries e"
+        ") "
+        "SELECT r.route_set_id,r.model_pattern,r.target_model,r.priority_group,"
+        "a.id,a.name,a.base_url,COALESCE(a.api_format,'openai'),"
+        "COALESCE(a.endpoint_path,''),COALESCE(a.auth_header,'auto'),"
+        "COALESCE(a.account_type,'api'),COALESCE(a.max_concurrency,0),"
+        "k.id,k.key_value,k.position "
+        "FROM rules r JOIN upstream_accounts a ON a.id=r.target_id "
+        "LEFT JOIN upstream_keys k ON k.account_id=a.id "
+        " AND (k.deleted_at IS NULL OR k.deleted_at>datetime('now')) "
+        "WHERE (a.deleted_at IS NULL OR a.deleted_at>datetime('now'))" +
+        account_types::routable_filter_sql("a.account_type") +
+        " ORDER BY r.route_set_id,r.priority_sort,r.priority_group,k.position,k.id";
+    const std::string rules_sql_v1 =
+        "SELECT rr.route_set_id,rr.model_pattern,rr.target_model,rr.priority,"
+        "a.id,a.name,u.base_url,u.api_format,COALESCE(u.endpoint_path,''),"
+        "COALESCE(u.auth_scheme,'auto'),"
+        "CASE WHEN json_extract(COALESCE(bc.cooldown_policy_json,'{}'),'$.kind')="
+        "'subscription_5h' THEN 1 ELSE 0 END,"
+        "u.max_concurrency,c.runtime_id,s.secret_value,c.position "
+        "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
+        "JOIN accounts a ON a.id=u.account_id "
+        "LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
+        "AND bc.valid_until IS NULL "
+        "LEFT JOIN upstream_credentials c ON c.upstream_id=u.id "
+        "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "LEFT JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+        "WHERE rr.enabled=1 AND u.enabled=1 AND a.lifecycle_state='active' "
+        "ORDER BY rr.route_set_id,rr.priority,rr.id,c.position,c.runtime_id";
+    const std::string &rules_sql = schema_major_ == 1
+        ? rules_sql_v1 : rules_sql_v0;
+    if (sqlite3_prepare_v2(read_db_, rules_sql.c_str(), -1, &stmt,
+                           nullptr) != SQLITE_OK) {
+        fprintf(stderr, "[DB] routing snapshot rules failed: %s\n",
+                sqlite3_errmsg(read_db_));
+        return false;
+    }
+    int last_route = -1;
+    int last_group = -1;
+    int last_target = -1;
+    std::string last_pattern;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const int route_id = sqlite3_column_int(stmt, 0);
+        const char *pattern_text = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
+        const std::string pattern = pattern_text ? pattern_text : "*";
+        const int group = sqlite3_column_int(stmt, 3);
+        const int target_id = sqlite3_column_int(stmt, 4);
+        if (next.rules.empty() || route_id != last_route || group != last_group ||
+            target_id != last_target || pattern != last_pattern) {
+            RoutingRule rule;
+            rule.route_set_id = route_id;
+            rule.model_pattern = pattern;
+            const unsigned char *target_model = sqlite3_column_text(stmt, 2);
+            rule.target.upstream_model = target_model
+                ? reinterpret_cast<const char *>(target_model) : "";
+            rule.target.priority_group = group;
+            auto &a = rule.target.account;
+            a.id = target_id;
+            a.name = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 5));
+            a.base_url = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 6));
+            a.api_format = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 7));
+            a.endpoint_path = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 8));
+            a.auth_header = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 9));
+            if (schema_major_ == 1) {
+                a.extended_usage_limit_cooldown = sqlite3_column_int(stmt, 10) != 0;
+            } else {
+                a.account_type = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 10));
+                a.extended_usage_limit_cooldown =
+                    account_types::cooldown_class(a.account_type) ==
+                    account_types::CooldownClass::kSubscription5h;
+            }
+            a.max_concurrency = sqlite3_column_int(stmt, 11);
+            a.is_aggregate = false;
+            a.deleted = false;
+            next.rules.push_back(std::move(rule));
+            last_route = route_id;
+            last_group = group;
+            last_target = target_id;
+            last_pattern = pattern;
+        }
+        if (sqlite3_column_type(stmt, 12) != SQLITE_NULL) {
+            KeySlot key;
+            key.id = sqlite3_column_int(stmt, 12);
+            key.key_value = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 13));
+            key.position = sqlite3_column_int(stmt, 14);
+            next.rules.back().target.keys.push_back(std::move(key));
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (sqlite3_exec(read_db_, "COMMIT", nullptr, nullptr, &error) != SQLITE_OK) {
+        fprintf(stderr, "[DB] routing snapshot commit failed: %s\n",
+                error ? error : sqlite3_errmsg(read_db_));
+        if (error) sqlite3_free(error);
+        return false;
+    }
+    rollback.release();
+    config = std::move(next);
+    return true;
 }
 
 // ── get_upstream_keys ────────────────────────────────────────────────────
@@ -696,8 +1232,16 @@ std::vector<Database::RoutingTarget> Database::resolve_routing_snapshot(
             if (account.auth_header.empty()) account.auth_header = "bearer";
             account.is_aggregate = sqlite3_column_int(
                 stmt_resolve_routing_snapshot_, 6) != 0;
-            account.account_type = text_column(7);
-            if (account.account_type.empty()) account.account_type = "api";
+            if (schema_major_ == 1) {
+                account.extended_usage_limit_cooldown =
+                    sqlite3_column_int(stmt_resolve_routing_snapshot_, 7) != 0;
+            } else {
+                account.account_type = text_column(7);
+                if (account.account_type.empty()) account.account_type = "api";
+                account.extended_usage_limit_cooldown =
+                    account_types::cooldown_class(account.account_type) ==
+                    account_types::CooldownClass::kSubscription5h;
+            }
             account.max_concurrency = sqlite3_column_int(
                 stmt_resolve_routing_snapshot_, 8);
             account.deleted = sqlite3_column_int(
@@ -739,6 +1283,10 @@ std::string Database::serialize_log_record(const LogRecord &record) {
             {"upstream_key_id", attempt.upstream_key_id},
             {"status_code", attempt.status_code},
             {"duration_ms", attempt.duration_ms},
+            {"dns_ms", attempt.dns_ms},
+            {"connect_ms", attempt.connect_ms},
+            {"tls_ms", attempt.tls_ms},
+            {"lease_wait_ms", attempt.lease_wait_ms},
             {"ttft_ms", attempt.ttft_ms},
             {"is_timeout", attempt.is_timeout},
             {"error", attempt.error},
@@ -815,6 +1363,10 @@ bool Database::deserialize_log_record(const std::string &payload,
                 attempt.upstream_key_id = encoded.value("upstream_key_id", 0);
                 attempt.status_code = encoded.value("status_code", 0);
                 attempt.duration_ms = encoded.value("duration_ms", 0);
+                attempt.dns_ms = encoded.value("dns_ms", 0);
+                attempt.connect_ms = encoded.value("connect_ms", 0);
+                attempt.tls_ms = encoded.value("tls_ms", 0);
+                attempt.lease_wait_ms = encoded.value("lease_wait_ms", 0);
                 attempt.ttft_ms = encoded.value("ttft_ms", -1);
                 attempt.is_timeout = encoded.value("is_timeout", false);
                 attempt.error = bounded_string(
@@ -1383,6 +1935,10 @@ bool Database::write_log_record_in_transaction(const LogRecord &record) {
                           SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt_insert_attempt_, 10,
                            record.requested_at_unix);
+        sqlite3_bind_int(stmt_insert_attempt_, 11, attempt.dns_ms);
+        sqlite3_bind_int(stmt_insert_attempt_, 12, attempt.connect_ms);
+        sqlite3_bind_int(stmt_insert_attempt_, 13, attempt.tls_ms);
+        sqlite3_bind_int(stmt_insert_attempt_, 14, attempt.lease_wait_ms);
         rc = sqlite3_step(stmt_insert_attempt_);
         sqlite3_reset(stmt_insert_attempt_);
         if (rc != SQLITE_DONE) {

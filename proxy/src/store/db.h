@@ -34,7 +34,7 @@ public:
     Database &operator=(Database &&) = delete;
 
     /// Open (or create) the database at `path`.  Applies pending schema
-    /// migrations from `schema_dir` (schema/<db>/NNNN_*.sql).  Returns true
+    /// migrations from `schema_dir` (schema/proxy/vN/M-m_*.sql). Returns true
     /// on success.
     bool open(const std::string &path, const std::string &schema_dir);
 
@@ -72,6 +72,7 @@ public:
         std::string account_type;    // spec identity: "api" | "plan" | "agent"
                                      // (semantics in app/domain/account_types.py
                                      // + proxy/src/core/account_types.h)
+        bool extended_usage_limit_cooldown = false; // resolved from contract
         int max_concurrency = 0;     // 0 = unlimited
         bool deleted = false;        // soft-deleted with a PAST deleted_at
                                      // (a future deleted_at = end_of_period
@@ -122,6 +123,21 @@ public:
         std::string upstream_model;
         int priority_group = 0;
     };
+    struct RoutingRule {
+        int route_set_id = 0;
+        std::string model_pattern;
+        RoutingTarget target;
+    };
+    struct RoutingConfig {
+        std::uint64_t generation = 0;
+        std::vector<RouteInfo> routes;
+        std::vector<RoutingRule> rules;
+    };
+    /// Build the complete immutable routing configuration on a background
+    /// thread. No request handler calls SQLite after this succeeds.
+    bool load_routing_config(RoutingConfig &config);
+    /// Cheap background change detector (SQLite data_version/config state).
+    std::uint64_t routing_config_generation();
     /// Resolve a plain or aggregate account for `model` in one consistent
     /// read snapshot.  Aggregate targets are ordered by (sort_order, id), and
     /// missing or soft-deleted accounts are omitted.
@@ -165,6 +181,10 @@ public:
         int upstream_key_id = 0;
         int status_code = 0;
         int duration_ms = 0;
+        int dns_ms = 0;
+        int connect_ms = 0;
+        int tls_ms = 0;
+        int lease_wait_ms = 0;
         int ttft_ms = -1;          // semantic TTFT; -1 when not observed
         bool is_timeout = false;
         std::string error;
@@ -196,6 +216,13 @@ public:
     };
 
     std::vector<PricingEntry> get_all_pricing();
+    std::uint64_t log_spool_bytes() {
+        std::lock_guard<std::mutex> lock(log_queue_mutex_);
+        return log_spool_write_offset_ - log_spool_read_offset_;
+    }
+    std::uint64_t log_persist_failures() const noexcept {
+        return log_persist_failures_.load(std::memory_order_acquire);
+    }
 
 private:
     struct LogRecord {
@@ -239,8 +266,7 @@ private:
         double fx_rate = 1.0;  // USD→CNY; 1.0 for CNY rows or when no rate stored
     };
 
-    /// Apply pending versioned migrations (PRAGMA user_version-gated) from
-    /// `schema_dir`.  Returns false on failure (transaction rolled back).
+    /// Apply same-major migrations from `schema_dir`; reject major changes.
     bool run_migrations(const std::string &schema_dir);
     bool prepare_statements();
     void finalize_statements();
@@ -275,6 +301,7 @@ private:
     sqlite3 *read_db_ = nullptr;
     sqlite3 *pricing_db_ = nullptr;
     std::string db_path_;  // used to derive the "<db>.migrate.lock" filename
+    int schema_major_ = 0;
     mutable std::shared_mutex lifecycle_mutex_;
     std::mutex write_mutex_;
     std::mutex read_mutex_;

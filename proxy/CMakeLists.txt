@@ -58,6 +58,10 @@ target_link_libraries(token_proxy PRIVATE
     ${CMAKE_DL_LIBS}
 )
 
+# cpp-httplib defaults to a listen backlog of 5. A 64-way client burst then
+# waits for TCP retransmission before it even reaches the measured task queue.
+target_compile_definitions(token_proxy PRIVATE CPPHTTPLIB_LISTEN_BACKLOG=512)
+
 # ── Tests ────────────────────────────────────────────────────────────────
 # Test targets are defined only in tests/CMakeLists.txt and built solely
 # under BUILD_TESTING. They never link into token_proxy.

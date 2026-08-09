@@ -163,6 +163,7 @@ def _import_pass(pdb) -> int:
     conn = pdb._connect()
     inserted = 0
     try:
+        v1 = pdb._is_v1(conn)
         # Purge any previously imported rows for excluded models (idempotent —
         # only touches codex-imported rows, never real proxy traffic).
         if EXCLUDED_MODELS:
@@ -172,11 +173,23 @@ def _import_pass(pdb) -> int:
                 "AND event_id LIKE 'codex:%'",
                 tuple(EXCLUDED_MODELS),
             )
-        states = {
-            row["path"]: row for row in conn.execute(
-                "SELECT path, size, mtime FROM codex_import_state"
-            ).fetchall()
-        }
+        if v1:
+            cursor = conn.execute(
+                "SELECT cursor_json FROM account_importers "
+                "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
+                (account_id,),
+            ).fetchone()
+            try:
+                raw_states = json.loads(cursor[0]) if cursor and cursor[0] else {}
+            except (TypeError, ValueError):
+                raw_states = {}
+            states = raw_states if isinstance(raw_states, dict) else {}
+        else:
+            states = {
+                row["path"]: dict(row) for row in conn.execute(
+                    "SELECT path, size, mtime FROM codex_import_state"
+                ).fetchall()
+            }
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for path in files:
             spath = str(path)
@@ -198,15 +211,26 @@ def _import_pass(pdb) -> int:
 
             # Record scan progress.  Crash mid-file only costs a re-read of
             # that file next pass (INSERT OR IGNORE dedups regardless).
+            state = {"size": st.st_size, "mtime": int(st.st_mtime),
+                     "last_line": line_count, "session_id": _session_id_from_path(path),
+                     "parsed_at": now_str}
+            if v1:
+                states[spath] = state
+            else:
+                conn.execute(
+                    "INSERT INTO codex_import_state (path, size, mtime, last_line, session_id, parsed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(path) DO UPDATE SET "
+                    "size=excluded.size,mtime=excluded.mtime,last_line=excluded.last_line,"
+                    "session_id=excluded.session_id,parsed_at=excluded.parsed_at",
+                    (spath, st.st_size, int(st.st_mtime), line_count,
+                     state["session_id"], now_str),
+                )
+        if v1:
             conn.execute(
-                "INSERT INTO codex_import_state (path, size, mtime, last_line, session_id, parsed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(path) DO UPDATE SET "
-                "  size=excluded.size, mtime=excluded.mtime, "
-                "  last_line=excluded.last_line, "
-                "  session_id=excluded.session_id, parsed_at=excluded.parsed_at",
-                (spath, st.st_size, int(st.st_mtime), line_count,
-                 _session_id_from_path(path), now_str),
+                "UPDATE account_importers SET cursor_json=? "
+                "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
+                (json.dumps(states, ensure_ascii=False, separators=(",", ":")), account_id),
             )
         conn.commit()
     finally:

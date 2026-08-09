@@ -174,7 +174,7 @@ def main() -> None:
         legacy = Path(tmp) / "schema"
         legacy.mkdir()
         for mig in schema_dir.glob("*.sql"):
-            if int(mig.stem.split("_", 1)[0]) <= 10:
+            if int(mig.stem.split("_", 1)[0].split("-", 1)[1]) <= 10:
                 shutil.copy2(mig, legacy / mig.name)
         migrate(str(db_path), str(legacy))
         conn = sqlite3.connect(db_path)
@@ -191,10 +191,15 @@ def main() -> None:
 
         proxy_port = free_port()
         env = {**os.environ, "TB_COOLDOWN_PROBE_SECS": "2"}
+        command = [str(proxy_binary), "--db", str(db_path), "--schema-dir",
+                   str(schema_dir), "--host", "127.0.0.1", "--port", str(proxy_port)]
+        if os.environ.get("TB_TEST_DEBUG"):
+            command.extend(["--log-level", "debug"])
         proxy = subprocess.Popen(
-            [str(proxy_binary), "--db", str(db_path), "--schema-dir",
-             str(schema_dir), "--host", "127.0.0.1", "--port", str(proxy_port)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=None if os.environ.get("TB_TEST_DEBUG") else subprocess.PIPE,
+            text=True,
             env=env)
         try:
             wait_for_health(proxy_port)
@@ -215,7 +220,7 @@ def main() -> None:
 
             # ── next request: key1 skipped, key2 serves ──
             send(proxy_port, "tb-p", {**common, "model": "p-model"})
-            _, _, st2, keys2 = latest_attempts(db_path, "p-model", rid)
+            rid2, _, st2, keys2 = latest_attempts(db_path, "p-model", rid)
             assert st2 == [200] and keys2[0] == p2_id, \
                 f"req2 must be served by p2 (key1 skipped): st={st2} keys={keys2}"
             print(f"OK: key1 cooled -> skipped (req2 served by key2 {p2_id})")
@@ -225,7 +230,7 @@ def main() -> None:
             ctrl(upstream_port, "POST", "/__ctrl", {"set": {"sk-p1": 200}})
             wait_probe(upstream_port, "sk-p1", before)   # probe ran after flip
             send(proxy_port, "tb-p", {**common, "model": "p-model"})
-            _, _, st3, keys3 = latest_attempts(db_path, "p-model", rid)
+            rid3, _, st3, keys3 = latest_attempts(db_path, "p-model", rid2)
             assert st3 == [200] and keys3[0] == p1_id, \
                 f"req3 must be served by p1 (probe cleared it): st={st3} keys={keys3}"
             print(f"OK: probe cleared key1 early (req3 served by key1 {p1_id})")
@@ -234,7 +239,7 @@ def main() -> None:
             send(proxy_port, "tb-p", {**common, "model": "p-model",
                 "mock_status_by_key": {"sk-p1": 429, "sk-p2": 200},
                 "mock_error_type_by_key": {"sk-p1": "GoUsageLimitError"}})
-            rid4, _, st4, _ = latest_attempts(db_path, "p-model", rid)
+            rid4, _, st4, _ = latest_attempts(db_path, "p-model", rid3)
             assert st4 == [429, 200], f"req4 recool chain {st4}"
             ctrl(upstream_port, "POST", "/__ctrl", {"set": {"sk-p1": 429}})
             before = ctrl(upstream_port, "GET", "/__ctrl/status")["probes"].get("sk-p1", 0)
@@ -253,7 +258,7 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 proxy.kill()
                 proxy.wait()
-            if proxy.returncode not in (0, -15):
+            if proxy.returncode not in (0, -15) and proxy.stderr is not None:
                 print(proxy.stderr.read(), file=sys.stderr)
 
     upstream.shutdown()

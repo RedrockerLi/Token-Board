@@ -81,7 +81,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PROXY_BIN --db $PROXY_DB --schema-dir $SCRIPT_DIR/schema/proxy --host 127.0.0.1 --port $PROXY_PORT
+ExecStart=$PROXY_BIN --db $PROXY_DB --schema-dir $SCRIPT_DIR/schema --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -98,7 +98,7 @@ EOF
         systemctl --user restart "$SERVICE_NAME"
         echo -e "${GREEN}✓ 代理已重启 (systemd)${NC}"
     else
-        "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema/proxy" --host 127.0.0.1 --port "$PROXY_PORT" &
+        "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema" --host 127.0.0.1 --port "$PROXY_PORT" &
         PROXY_PID=$!
         echo -e "${GREEN}✓ 代理已启动 (PID: $PROXY_PID)${NC}"
     fi

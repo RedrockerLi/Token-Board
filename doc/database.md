@@ -1,10 +1,20 @@
 # 数据库
 
-两个 SQLite 库都开在 WAL 模式,统一 `PRAGMA busy_timeout=5000`、`foreign_keys=ON`。schema 由 `schema/<库名>/NNNN_*.sql` 版本化迁移定义,迁移机制与升级流程见 [database-migrations.md](database-migrations.md),本文只讲表结构、索引、触发器与计费口径。
+两个 SQLite 库都开在 WAL 模式，统一 `busy_timeout=5000`、`foreign_keys=ON`；V1 新库启用 `auto_vacuum=INCREMENTAL`。schema 位于 `schema/<库>/v<major>/<major>-<minor>_*.sql`。
 
 时间字段统一存 UTC(`datetime('now')`),看板界面一律转 UTC+8 显示,峰谷档位边界也按 UTC+0 分钟存储(见 [billing-pricing.md](billing-pricing.md))。
 
-## proxy.db
+## V1 当前结构
+
+Proxy V1 将身份、转发与计费拆开：`accounts` 是稳定计费主体；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，明文只存在本机 `upstream_secrets`；`account_importers` 表示 Codex 等导入源。
+
+计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/rates/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
+
+Dashboard V1 只保留 `accounts`、`daily_usage`、`monthly_recurring_costs`。`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、equivalent cost 和 billed usage cost。
+
+以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
+
+## V0 proxy.db（历史参考）
 
 代理的运行库,表定义在 `schema/proxy/0001_*.sql`(0001–0019),`user_version` 当前为 19。
 

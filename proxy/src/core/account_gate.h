@@ -1,11 +1,10 @@
 #pragma once
 
-#include "account_types.h"
-
 #include <chrono>
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 /// Per-key-slot concurrency gate + per-key-slot plan cooldown tracking.
 ///
@@ -88,9 +87,9 @@ public:
     /// that key down (per-key); every other failure — including a plain
     /// transient 429 — backs off 5s → 30s → 2min instead of locking the key
     /// for the whole cooldown window.
-    void record_failure(int key_slot_id, account_types::CooldownClass cls,
+    void record_failure(int key_slot_id, bool extended_usage_limit_cooldown,
                         bool usage_limit, int status_code) {
-        if (usage_limit && cls == account_types::CooldownClass::kSubscription5h) {
+        if (usage_limit && extended_usage_limit_cooldown) {
             mark_cooldown(key_slot_id);
             return;
         }

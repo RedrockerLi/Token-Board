@@ -1,85 +1,62 @@
 # Token Board 数据库迁移指南
 
-Token Board 的两个 SQLite 数据库（`data/proxy.db` 与 `data/dashboard.db`）的 **schema 全部由版本化迁移文件定义**，C++ 代理与 Python 看板共用同一份 `.sql` 文件。本文说明机制、升级步骤与硬性规则。
+Proxy 与 Dashboard 共用 Major–Minor 版本协议，C++ 和 Python runner 读取同一组 SQL。
 
-## 一、机制
-
-```
+```text
 schema/
-  proxy/0001_initial.sql      # proxy.db 的全部表/索引/触发器
-  dashboard/0001_initial.sql  # dashboard.db 的全部表/索引/触发器
-  proxy/0002_xxx.sql          # 将来的升级步骤（按编号追加）
-  ...
+├── proxy/
+│   ├── v0/0-1_initial.sql … 0-19_drop_monthly_price.sql
+│   └── v1/1-0_baseline.sql
+├── dashboard/
+│   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
+│   └── v1/1-0_baseline.sql
+└── transitions/0-to-1/
+    ├── migrate.py
+    ├── proxy_transform.sql
+    ├── dashboard_transform.sql
+    └── verify.py
 ```
 
-- **版本号**：每个库用 `PRAGMA user_version` 记录已应用的迁移编号。`0` = 未迁移。
-- **迁移文件**：`schema/<库名>/NNNN_描述.sql`，`NNNN` 为 4 位数字（如 `0001`、`0002`），按数字升序应用。允许跳号。
-- **谁执行**：C++ 代理启动时（`proxy/src/store/db.cpp::run_migrations`）与 Python 看板启动时（`app/migrations.py`）各跑一次。两处实现相同协议：读取 `user_version`，仅应用编号大于它的步骤，每步设置 `user_version` 在**同一次事务**里。
-- **并发安全**：执行前先对 `<数据库>.migrate.lock` 加 `flock` 互斥锁（C++ 与 Python 使用同一把锁），每步再包 `BEGIN IMMEDIATE … COMMIT`。因此 proxy 与 dashboard 谁先启动、是否同时重启都安全：后执行者看到版本已到位则空转。
-- **原子性**：一个迁移文件 = 一个事务。执行失败自动回滚，`user_version` 不变，并 **fail-fast**（代理启动失败退出、看板拒绝启动）——不会带着半成品 schema 运行。
-- **幂等**：版本已到位时每次启动是空操作，开销可忽略。
+## 版本语义
 
-## 二、硬性规则
+- 文件名必须匹配 `major-minor_description.sql`，runner 按解析后的整数二元组排序。
+- Minor 增加表示同 Major 向后兼容，启动时自动升级；数据库 Minor 高于程序已知值时允许运行并告警。
+- Major 增加表示不兼容。服务拒绝自动启动，必须运行对应 `schema/transitions/<old>-to-<new>` 工具。
+- 空数据库只执行最新 Major 的 baseline，不重放 V0 历史。
+- `schema_version` 是权威版本，`schema_migrations` 保存文件名、SHA-256 checksum 与应用时间。
+- `PRAGMA user_version` 是兼容镜像：`major * 10000 + minor`，所以 V0.19 是 `19`，V1.0 是 `10000`。
 
-1. **已应用的迁移文件不可修改、不可删除。** 一旦发布过，它就是历史。任何 schema 变更只能**追加**新的 `NNNN` 文件（取当前最大编号 +1）。
-2. **`.sql` 文件内禁止写 `BEGIN` / `COMMIT` / `PRAGMA user_version`** —— 事务控制归 runner，写了会破坏事务原子性。
-3. **先建表后建触发器**。触发器引用表，顺序错了会失败。
-4. **破坏性变更要显式声明并先备份。** 新文件首行写 `-- DESTRUCTIVE: <原因> — 先备份 data/<库>.db`。能做成加性的（新表/新列保留旧对象）就优先加性方案。
+每个 Minor 文件在同一事务中完成 SQL、migration 记录、权威版本和 `user_version` 更新。数据库锁为 `<db>.migrate.lock`；任何一步失败都会整体回滚。
 
-## 三、SQLite 注意点
+## 目录参数
 
-- `PRAGMA foreign_keys` **不能在事务内切换**（事务内是 no-op）。且两个 runner 的外键状态不一致：
-  - **C++ 代理**在连接打开时设 `PRAGMA foreign_keys=ON`，之后才跑迁移 → **C++ 应用迁移时外键开启**；
-  - **Python runner**（`app/migrations.py`）的连接未显式设 `foreign_keys`，默认关闭。
-  - 两者共用同一把 `flock`，谁先启动谁应用 → **每个迁移文件都必须在外键开启下也能正确执行**。
-- 外键开启时，`DROP TABLE` 一个「父表」会先隐式删除其所有行，从而触发引用它的表上的 ON DELETE 动作
-  （`SET NULL` 会清空子表引用列，`RESTRICT` / `NO ACTION` 会拦截删除）。因此凡涉及表重建的迁移
-  （例如把 `NOT NULL` 列改成可空——这类改动无法用加性手段完成），必须满足**外键安全**顺序：
-  - 被 `DROP` 的表在那一刻**没有任何表引用它**：先删「子表」，后删「父表」；
-  - 重建的新表所引用的「新父表」必须先就位。可用**改名让位**交接同名父表：先把旧父表
-    `ALTER TABLE … RENAME` 到临时名（SQLite 会把现存子表的外键引用一并重定向），再把新父表
-    `RENAME` 回正式名，之后即可安全 `DROP` 临时名旧表；
-  - 建表/建索引时若新对象与现存表同名，先 `DROP` 旧表再建（索引名是库级全局的）。
-- WAL 模式下迁移持写锁：并发读者不受影响（看到旧快照），并发写者最多等待 `busy_timeout=5000`。
-- 迁移文件若被 runner 读到为空或不可读，会视为失败并 fail-fast，不会静默跳过。
+`--schema-dir` 推荐指向 `schema/` 根目录。旧式叶子目录（例如 `schema/proxy/v0`）只用于 V0 测试和 transition；程序会明确选择数据库名与 Major。项目默认路径仍由 `data/proxy.db` / `data/dashboard.db` 推导到仓库 `schema/`。
 
-## 四、如何新增一次数据库升级（step-by-step）
+## 新增兼容迁移
 
-以「给 `request_log` 加一列 `foo`」为例：
+例如当前 Proxy 是 V1.0，则新增 `schema/proxy/v1/1-1_add_request_queue.sql`。只追加文件，不修改任何已被 `schema_migrations` 记录的文件；checksum 不一致会 fail-fast。
 
-1. **确定编号**：看 `schema/proxy/` 下现有最大编号。当前是 `0001`，新文件就是 `0002`。
-2. **写迁移文件**：新建 `schema/proxy/0002_add_request_log_foo.sql`：
+SQL 文件不得包含 `BEGIN`、`COMMIT` 或 `PRAGMA user_version`。迁移必须在 `foreign_keys=ON` 下安全，并在副本上验证：重复执行无变化、`PRAGMA foreign_key_check` 为空、Python/C++ runner 得到相同版本。
 
-   ```sql
-   -- 给 request_log 增加 foo 列（加性变更）
-   ALTER TABLE request_log ADD COLUMN foo TEXT NOT NULL DEFAULT '';
-   ```
+## V0 → V1
 
-   > 注意：不要写 `BEGIN`/`COMMIT`/`PRAGMA user_version`。runner 会把它包进事务并自动推进版本号。
-3. **本机验证**（用副本，别动线上库）：
+这是维护窗口迁移，不支持 V0/V1 节点混跑：
 
-   ```bash
-   sqlite3 data/proxy.db ".backup /tmp/upgrade_test.db"   # 或 cp 三个文件
-   python3 - <<'PY'
-   from app.migrations import migrate
-   migrate("/tmp/upgrade_test.db", "schema/proxy")
-   import sqlite3
-   c = sqlite3.connect("/tmp/upgrade_test.db")
-   print(c.execute("PRAGMA user_version").fetchone()[0])   # 期望 = 0002 的数字
-   c.close()
-   PY
-   ```
+```bash
+python3 schema/transitions/0-to-1/migrate.py \
+  --proxy-db data/proxy.db --dashboard-db data/dashboard.db
+```
 
-   再跑一次应无异常（幂等）。也可用并发脚本模拟 proxy 与看板同时启动。
-4. **部署**：重启 proxy 与看板，顺序无所谓（flock 保证安全）：
+默认只构建和校验影子库。确认 manifest 与统计后追加 `--apply` 才原子替换。脚本会检查服务已停止、WAL 可 checkpoint、spool 已排空，备份数据库和附属文件，转换时间/身份/路由/计费，执行总量与外键对账，再记录每个替换阶段。
 
-   ```bash
-   systemctl --user restart token-proxy     # C++ 代理
-   # 看板：重启 server.py 进程（或 bash start.sh）
-   ```
+中断后使用 `--resume-manifest <manifest>` 继续，或用 `--rollback-manifest <manifest>` 恢复整组备份。掩码碰撞、未知版本、非空 spool、总量不一致或外键错误都会在替换前中止。
 
-## 五、常见问题
+## 发布检查
 
-- **升级失败，服务反复重启**：`systemctl --user status token-proxy` 看状态，`journalctl --user -u token-proxy` 看日志。因为每步是原子的，失败后数据库停留在上一个版本，**修好迁移文件后重启即可**，不会二次损坏。
-- **看板启动报 `schema dir not found`**：schema 目录由数据库路径按仓库约定推导（`data/proxy.db` → `<仓库>/schema/proxy`）。数据库请放在仓库 `data/` 布局下；C++ 代理可用 `--schema-dir` 显式指定。
-- **想给 dashboard.db 升级**：同样流程，目录换 `schema/dashboard/`。
+```bash
+cmake -S proxy -B proxy/build
+cmake --build proxy/build -j2
+ctest --test-dir proxy/build --output-on-failure
+```
+
+发布前还应在生产库副本上至少完成两次 dry-run 与一次 apply/rollback 演练，并保留 transition manifest 和备份 checksum。

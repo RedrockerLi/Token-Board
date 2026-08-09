@@ -133,7 +133,7 @@ export OPENAI_API_KEY=<本地密钥>
 cd proxy
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-./build/token_proxy --db ../data/proxy.db --schema-dir ../schema/proxy --port 8800
+./build/token_proxy --db ../data/proxy.db --schema-dir ../schema --port 8800
 ```
 
 命令行参数:
@@ -141,7 +141,7 @@ cmake --build build -j$(nproc)
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--db` | `data/proxy.db` | SQLite 数据库路径 |
-| `--schema-dir` | 由 `--db` 推导 | 迁移文件目录(`schema/<库名>/NNNN_*.sql`) |
+| `--schema-dir` | 由 `--db` 推导 | Major–Minor 迁移根目录(`schema/`) |
 | `--port` | `8800` | 监听端口 |
 | `--host` | `127.0.0.1` | 绑定地址(默认仅本机可访问) |
 | `--log-level` | `info` | 日志级别 |

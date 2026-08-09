@@ -164,7 +164,7 @@ def main() -> None:
         legacy = Path(tmp) / "schema"
         legacy.mkdir()
         for mig in schema_dir.glob("*.sql"):
-            if int(mig.stem.split("_", 1)[0]) <= 10:
+            if int(mig.stem.split("_", 1)[0].split("-", 1)[1]) <= 10:
                 shutil.copy2(mig, legacy / mig.name)
         migrate(str(db_path), str(legacy))
         conn = sqlite3.connect(db_path)

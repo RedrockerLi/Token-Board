@@ -92,11 +92,12 @@ set_source_files_properties(${CMAKE_SOURCE_DIR}/third_party/sqlite3.c PROPERTIES
     COMPILE_FLAGS "-O2 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1"
 )
 target_link_libraries(pricing_snapshot_equiv_test PRIVATE
+    OpenSSL::Crypto
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
 add_test(NAME pricing_snapshot_equiv COMMAND pricing_snapshot_equiv_test
-    ${CMAKE_SOURCE_DIR}/../schema/proxy
+    ${CMAKE_SOURCE_DIR}/../schema/proxy/v0
 )
 
 
@@ -104,6 +105,13 @@ add_test(NAME pricing_snapshot_equiv COMMAND pricing_snapshot_equiv_test
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME format_conversion COMMAND format_conv_test)
 add_test(NAME session_affinity COMMAND session_affinity_test)
+add_test(
+    NAME schema_version
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/schema_version_test.py
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
 add_test(NAME upstream_client COMMAND upstream_client_test)
 # Money-equivalence gate (1/2): v17 trigger == v18 view-based trigger across a
 # pricing edge-case matrix (pure SQL, exact api_cost equality).  Proves the
@@ -112,7 +120,7 @@ add_test(
     NAME pricing_equivalence
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/pricing_equivalence_test.py
-            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/../schema/proxy/v0
             ${CMAKE_SOURCE_DIR}/..
 )
 add_test(
@@ -120,7 +128,29 @@ add_test(
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/proxy_forwarding_test.py
             $<TARGET_FILE:token_proxy>
-            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/../schema/proxy/v0
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME v1_routing
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/v1_routing_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME v1_admin
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/v1_admin_test.py
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME v1_sync
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/v1_sync_test.py
+            ${CMAKE_SOURCE_DIR}/../schema
             ${CMAKE_SOURCE_DIR}/..
 )
 # End-to-end load smoke: drives the real proxy against mock_upstream and
@@ -131,7 +161,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/perf_stress_test.py
             $<TARGET_FILE:token_proxy>
-            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/../schema/proxy/v0
             ${CMAKE_SOURCE_DIR}/..
             --requests 40 --concurrency 8
 )
@@ -142,7 +172,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/cooldown_test.py
             $<TARGET_FILE:token_proxy>
-            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/../schema/proxy/v0
             ${CMAKE_SOURCE_DIR}/..
 )
 # Fallback-matrix experiments A3/A4/B1/B2/B3 (no-fallback 429, fallback
@@ -153,7 +183,7 @@ add_test(
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/fallback_matrix_test.py
             $<TARGET_FILE:token_proxy>
-            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/../schema/proxy/v0
             ${CMAKE_SOURCE_DIR}/..
 )
 # Cooldown-probe: a cooled plan key is re-probed every interval (env override,
@@ -165,6 +195,6 @@ add_test(
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/cooldown_probe_test.py
             $<TARGET_FILE:token_proxy>
-            ${CMAKE_SOURCE_DIR}/../schema/proxy
+            ${CMAKE_SOURCE_DIR}/../schema/proxy/v0
             ${CMAKE_SOURCE_DIR}/..
 )

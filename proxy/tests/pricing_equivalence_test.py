@@ -81,7 +81,7 @@ def build_db(schema_dir: Path, max_migration: int) -> str:
     """Migrate a fresh temp DB to the given migration number and seed it."""
     legacy = Path(tempfile.mkdtemp(prefix="pricing-schema-"))
     for mig in schema_dir.glob("*.sql"):
-        if int(mig.stem.split("_", 1)[0]) <= max_migration:
+        if int(mig.stem.split("_", 1)[0].split("-", 1)[1]) <= max_migration:
             shutil.copy2(mig, legacy / mig.name)
     db_path = str(Path(tempfile.mkdtemp(prefix="pricing-db-")) / "pricing.db")
 

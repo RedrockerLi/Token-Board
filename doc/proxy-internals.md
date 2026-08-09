@@ -4,20 +4,22 @@
 
 ## 生命周期
 
-启动流程:解析 CLI 参数(`core/config.cpp`)→ 打开 SQLite 并跑迁移(`store/db.cpp::open`,schema 目录未指定时由 `--db` 推导为 `<db目录>/../schema/proxy`)→ 组装 Router / UpstreamClient / UsageTracker / CodecRegistry → 建 httplib server 与信号量线程池 → 监听。收到 SIGINT/SIGTERM 后优雅停机退出。
+启动流程:解析 CLI 参数→ 从 `schema/` 选择当前 Major 并跑迁移→ 构建首个 `RoutingSnapshot`→ 组装转发/codec/记账组件→ 建线程池并监听。收到 SIGINT/SIGTERM 后停止刷新、探测和记账线程，排空后退出。
 
-主循环里每 5 分钟做两件事:
+后台维护包括:
 
-- 线程池扩容判断:当 **`pool->queued() > 0` 且 `pool->active() >= 当前线程数`** 且未到上限时,线程数翻倍。只看 `in_flight` 会把长连接误判成积压导致无谓扩容,所以要求确有请求在队列里等线程。
+- enqueue 发现 backlog 且没有空闲 worker 时立即扩容；不等待周期轮询。
+- 每 250ms 检查 `config_state.generation`，后台构建并原子替换路由快照。
+- info 日志每 10 秒输出 RPS、错误、队列和连接池聚合，成功请求逐条日志仅在 debug。
 - 周期清理:`cleanup_stale_in_flight(10)` 清掉 `in_flight_requests` 遗留表里超过 10 分钟的僵死记录(旧版本代理的观测表;新版本已不写)。
 
 ## 线程池:SemaphorePool
 
-`semaphore_pool.h`(net/) 用 POSIX 计数信号量实现 httplib 的 `TaskQueue`,替代 httplib 自带线程池。初始 8 线程,`main` 里上限 **256**;`resize()` 只增不减。信号量的好处是 `sem_post` 每次恰好唤醒一个等待线程,没有惊群。请求进队时在锁外 post,唤醒的线程可立即进入临界区。
+`SemaphorePool` 初始 worker 数为 `clamp(2×CPU, 8, 64)`，上限 256，队列硬上限 4096。任务记录 enqueue/start 时间并聚合 queue p95；满载拒绝数进入健康指标，避免无限排队。监听 backlog 为 512。
 
 ## 路由与认证
 
-`Router::route`(core/router.cpp)把本地密钥映射到上游账户:查 `local_keys` 关联的 `upstream_accounts`,结果缓存在内存。成功结果只缓存 **2 秒**(配置/密钥改动几乎立即生效),失败(无效密钥)一律不缓存。聚合账户只做一级路由,真正的账户由请求里的模型名在 `resolve_candidates` 里二次解析。
+`Router` 只读 `shared_ptr<const RoutingSnapshot>`：`client_key → route_set`、`route_set+model → ordered targets`、endpoint/auth/credential 都在一次配置快照内。请求热路径不查询 SQLite，也不复制整份 URL/secret 候选。普通账户在 V1 中同样是一条 `* → upstream` route rule；聚合只是多条 rule，核心不再检查 `is_aggregate`。
 
 认证同时接受两种头:`Authorization: Bearer <密钥>` 与 `x-api-key: <密钥>`,与客户端用什么格式无关,密钥只用来选账户。
 
@@ -78,7 +80,7 @@ plan 密钥进入 5h 冷却后,后台线程**每隔 `cooldown_probe_interval_sec
 
 ## 请求记账与性能事件
 
-每次请求的结局都写进 `request_log`:`UsageTracker`(store/)解析上游返回的 usage(三种格式各有非流式与 SSE 解析器,见 [format-conversion.md](format-conversion.md)),连同状态码、耗时、TTFT/生成耗时/输出速度一起记入;解析不出 usage 时也记一行零 token,保证日志完整真实。`api_cost` 由代理入队快照(`cost_frozen=1`)或 `tr_request_log_insert` 触发器(`cost_frozen=0`)写时固化,见 [billing-pricing.md](billing-pricing.md)。每次上游尝试再写一行 `request_attempts`(状态码、耗时、TTFT、是否超时、错误),回退诊断与"各上游成功率"据此统计。
+HTTP 线程只移动一个 `UsageEvent` 到有界队列。writer 最多 64 条或等待 5ms 成批落 spool/SQLite；活跃事件不再从 spool 二次反序列化，spool 只用于启动恢复。队列满或持久化失败会令健康检查失败并报警。`request_attempts` 还记录 DNS、connect、TLS 与 connection lease wait。
 
 **性能数据源是 `request_log` 的列 + `request_attempts`,不再写 `perf_events`**(旧表仅作兼容):`ttft_ms` / `generation_ms` / `output_tps`(输出速度)、`upstream_ttft_ms` / `upstream_duration_ms`(上游侧耗时)、`attempt_count` / `fallback_count` 支撑延迟 P50/P95/P99、输出速度分布(P50/P95/P99)与各模型 TTFT/速度采样;实时并发来自进程内计数器(`/health` 的 `concurrency`)。request_log 的清理按高水位检查点 + 30 天:`cleanup_exported_logs` 只删 `id ≤ 检查点 且 请求时间超过 30 天` 的行,见 [sync.md](sync.md)。
 

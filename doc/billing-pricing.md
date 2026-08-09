@@ -1,16 +1,16 @@
 # 计费与定价
 
-计费链路从代理写 `request_log` 开始,成本在写入那一刻按当时的定价固化下来,之后改价不回溯。这是迁移 `0002`(峰谷定价 + 写时计价固化)定下的规则。本文讲定价如何配置、时段档位怎么命中、plan 账户如何处理,以及看板上的三种消费口径。
+V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库按 `requested_at` 选择历史 rate 并固化 `equivalent_cost`；metered 合同同时写 `billed_usage_cost=equivalent_cost`，recurring 合同写 0，真实周期费用来自 `billing_period_charges`。兼容 API 仍展示 api/plan/agent 模板，但核心计费不按类型字符串分支。
 
 ## 定价模型
 
-`model_pricing` 一行定义一个模型的单价,`model_pattern` 支持 `*` / `?` GLOB 通配,单位元/百万 tokens:
+`pricing_rules` 保存 pattern 与显式 priority；每条规则有带 `valid_from/valid_until` 的 `pricing_rates` 历史。`model_pattern` 支持 `*` / `?` GLOB 通配，单位为每百万 tokens：
 
 - `input_price`:未命中缓存的输入单价
 - `output_price`:输出单价
 - `cache_read_price`:缓存命中的输入单价,缺省回落 `input_price`
 
-模型匹配取 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY mp.id LIMIT 1`,第一条匹配生效。同一条请求在多个 pattern 都命中时,`id` 小的优先;看板定价页的上下移按钮交换 `id`,从而调整优先级。换序只影响新请求,已固化的历史成本不受影响。
+匹配按 `priority,id`，再在请求时间点选择有效 rate。上下移只交换 priority；改价关闭旧 rate 并新建 rate，不修改主键或历史行。
 
 ## 峰谷档位
 

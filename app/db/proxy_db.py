@@ -13,6 +13,7 @@ import secrets
 import sqlite3
 import string
 import urllib.request
+import uuid
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 
@@ -133,10 +134,10 @@ class ProxyDatabase:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        # Schema is owned by versioned migrations (schema/proxy/*.sql); apply
+        # Schema is owned by versioned migrations (schema/proxy/vN/*.sql); apply
         # once at construction. Fails fast (create_app aborts) on error.
         from app.db.migrations import migrate, schema_dir_for
-        migrate(self.db_path, schema_dir_for(self.db_path, "proxy"))
+        migrate(self.db_path, schema_dir_for(self.db_path, "proxy"), "proxy")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -145,6 +146,40 @@ class ProxyDatabase:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
+
+    @staticmethod
+    def _schema_major(conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT major FROM schema_version WHERE id=1"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    @classmethod
+    def _is_v1(cls, conn: sqlite3.Connection) -> bool:
+        return cls._schema_major(conn) >= 1
+
+    @staticmethod
+    def _next_shared_id(conn: sqlite3.Connection) -> int:
+        """Allocate an integer in the compatibility ID namespace.
+
+        V0 exposed accounts and aggregate route sets through one integer ID.
+        V1 keeps those concepts separate, but allocating above both maxima
+        preserves the existing HTTP contract without conflating them in the
+        normalized foreign keys.
+        """
+        return int(conn.execute(
+            "SELECT max(COALESCE((SELECT max(id) FROM accounts),0),"
+            "COALESCE((SELECT max(id) FROM route_sets),0))+1"
+        ).fetchone()[0])
+
+    @staticmethod
+    def _v1_route_account(conn: sqlite3.Connection, route_set_id: int):
+        return conn.execute(
+            "SELECT rs.id AS route_set_id,rs.account_id,u.id AS upstream_id "
+            "FROM route_sets rs LEFT JOIN upstreams u ON u.account_id=rs.account_id "
+            "AND u.enabled=1 WHERE rs.id=? ORDER BY u.id LIMIT 1",
+            (route_set_id,),
+        ).fetchone()
 
     # ── Stats ──────────────────────────────────────────────────────────
 
@@ -163,6 +198,45 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+            if self._is_v1(conn):
+                usage = conn.execute(
+                    "SELECT COUNT(*) total_requests,"
+                    "COALESCE(SUM(total_tokens),0) total_tokens,"
+                    "COALESCE(SUM(billed_usage_cost),0) billed_usage_cost "
+                    "FROM request_log "
+                    "WHERE requested_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days')"
+                ).fetchone()
+                daily = conn.execute(
+                    "SELECT COUNT(*) today_requests,"
+                    "COALESCE(SUM(equivalent_cost),0) today_cost "
+                    "FROM request_log WHERE date(requested_at)=?",
+                    (today,),
+                ).fetchone()
+                recurring = conn.execute(
+                    "SELECT COALESCE(SUM(recurring_charge),0) "
+                    "FROM billing_period_charges "
+                    "WHERE period_start<=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "AND period_end>strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+                ).fetchone()[0]
+                active_upstreams = conn.execute(
+                    "SELECT COUNT(DISTINCT r.account_id) FROM request_log r "
+                    "JOIN accounts a ON a.id=r.account_id "
+                    "WHERE a.lifecycle_state='active' AND date(r.requested_at)=?",
+                    (today,),
+                ).fetchone()[0]
+                active_accounts = conn.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE lifecycle_state='active'"
+                ).fetchone()[0]
+                return {
+                    "total_requests": usage["total_requests"],
+                    "today_requests": daily["today_requests"],
+                    "total_cost": round(usage["billed_usage_cost"] + recurring, 4),
+                    "today_cost": round(daily["today_cost"], 4),
+                    "total_tokens": usage["total_tokens"],
+                    "active_upstreams": active_upstreams,
+                    "active_accounts": active_accounts,
+                }
 
             total_requests = conn.execute(
                 "SELECT COUNT(*) FROM request_log "
@@ -253,6 +327,60 @@ class ProxyDatabase:
     def get_accounts(self) -> list[dict]:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                rows = conn.execute(
+                    "SELECT rs.id,a.name,u.base_url,u.api_format,"
+                    "COALESCE(u.endpoint_path,'') endpoint_path,"
+                    "COALESCE(u.auth_scheme,'bearer') auth_header,0 is_aggregate,"
+                    "CASE WHEN bc.charge_type='recurring' THEN "
+                    "CASE WHEN i.id IS NULL THEN 'plan' ELSE 'agent' END ELSE 'api' END account_type,"
+                    "COALESCE((SELECT recurring_price FROM billing_rate_events "
+                    "WHERE contract_id=bc.id ORDER BY effective_at DESC,id DESC LIMIT 1),0) monthly_price,"
+                    "COALESCE(bc.currency,'CNY') currency,COALESCE(i.importer_kind,'') agent_kind,"
+                    "COALESCE(a.valid_from,'') valid_from,u.max_concurrency,a.created_at,a.deleted_at,"
+                    "(SELECT count(*) FROM upstream_credentials c WHERE c.upstream_id=u.id "
+                    "AND c.deleted_at IS NULL) key_count "
+                    "FROM route_sets rs JOIN accounts a ON a.id=rs.account_id "
+                    "JOIN upstreams u ON u.account_id=a.id AND u.enabled=1 "
+                    "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.valid_until IS NULL "
+                    "LEFT JOIN account_importers i ON i.account_id=a.id AND i.enabled=1 "
+                    "WHERE rs.enabled=1 AND a.lifecycle_state='active' "
+                    "UNION ALL "
+                    "SELECT a.id,a.name,'','openai','','auto',0,'agent',"
+                    "COALESCE((SELECT recurring_price FROM billing_rate_events "
+                    "WHERE contract_id=bc.id ORDER BY effective_at DESC,id DESC LIMIT 1),0),"
+                    "COALESCE(bc.currency,'CNY'),i.importer_kind,COALESCE(a.valid_from,''),"
+                    "0,a.created_at,a.deleted_at,0 "
+                    "FROM account_importers i JOIN accounts a ON a.id=i.account_id "
+                    "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.valid_until IS NULL "
+                    "WHERE i.enabled=1 AND a.lifecycle_state='active'"
+                ).fetchall()
+                accounts = []
+                for row in rows:
+                    acc = dict(row)
+                    route = self._v1_route_account(conn, acc["id"])
+                    if route and route["upstream_id"] is not None:
+                        keys = conn.execute(
+                            "SELECT c.runtime_id,s.secret_value,c.key_masked,c.valid_from,c.deleted_at "
+                            "FROM upstream_credentials c LEFT JOIN upstream_secrets s "
+                            "ON s.credential_uuid=c.uuid WHERE c.upstream_id=? "
+                            "AND c.deleted_at IS NULL ORDER BY c.position,c.runtime_id",
+                            (route["upstream_id"],),
+                        ).fetchall()
+                        acc["keys"] = [
+                            {"id": key["runtime_id"], "masked": key["key_masked"],
+                             "valid_from": key["valid_from"], "deleted_at": key["deleted_at"]}
+                            for key in keys if key["secret_value"] is not None
+                        ]
+                        acc["cloud_keys"] = [
+                            {"masked": key["key_masked"], "valid_from": key["valid_from"]}
+                            for key in keys if key["secret_value"] is None
+                        ]
+                    else:
+                        acc["keys"], acc["cloud_keys"] = [], []
+                    accounts.append(acc)
+                accounts.sort(key=lambda account: account["id"])
+                return accounts
             rows = conn.execute(
                 "SELECT id, name, base_url, api_format, "
                 "COALESCE(endpoint_path,'') AS endpoint_path, "
@@ -322,6 +450,12 @@ class ProxyDatabase:
 
     @staticmethod
     def _billing_config_conn(conn: sqlite3.Connection) -> sqlite3.Row:
+        if ProxyDatabase._is_v1(conn):
+            return conn.execute(
+                "SELECT COALESCE((SELECT value FROM sync_settings WHERE key='billing.price_change_effective'),'current_period') "
+                "AS price_change_effective,COALESCE((SELECT value FROM sync_settings WHERE key='billing.cancellation_mode'),'period_end') "
+                "AS cancellation_mode"
+            ).fetchone()
         return conn.execute(
             "SELECT price_change_effective, cancellation_mode "
             "FROM plan_billing_config WHERE id=1"
@@ -330,6 +464,10 @@ class ProxyDatabase:
     @staticmethod
     def _refresh_upstream_keys_cloud(conn: sqlite3.Connection, account_id: int) -> None:
         """Mirror local key lifecycle metadata without ever copying a secret."""
+        if ProxyDatabase._is_v1(conn):
+            # Credential identity/lifecycle is already cloud-safe in V1;
+            # plaintext lives exclusively in upstream_secrets.
+            return
         conn.execute("DELETE FROM upstream_keys_cloud WHERE account_id=?", (account_id,))
         for row in conn.execute(
             "SELECT key_value, position, valid_from, deleted_at "
@@ -363,6 +501,70 @@ class ProxyDatabase:
         """
         keep_valid_froms = keep_valid_froms or {}
         new_valid_froms = new_valid_froms or []
+        if ProxyDatabase._is_v1(conn):
+            route = ProxyDatabase._v1_route_account(conn, account_id)
+            if route is None or route["upstream_id"] is None:
+                raise ValueError("账户没有可写入密钥的上游")
+            upstream_id = int(route["upstream_id"])
+            active = {
+                row["runtime_id"]: row for row in conn.execute(
+                    "SELECT c.runtime_id,c.uuid,c.valid_from,c.created_at,s.secret_value "
+                    "FROM upstream_credentials c LEFT JOIN upstream_secrets s "
+                    "ON s.credential_uuid=c.uuid WHERE c.upstream_id=? "
+                    "AND c.deleted_at IS NULL",
+                    (upstream_id,),
+                )
+            }
+            retained = [key_id for key_id in keep_ids if key_id in active]
+            config = ProxyDatabase._billing_config_conn(conn)
+            now = _utc_now()
+            for key_id, row in active.items():
+                if key_id not in retained:
+                    anchor = (_parse_iso_date(row["valid_from"])
+                              or _parse_utc_timestamp(row["created_at"]).date())
+                    end = _cancellation_end(config, now, anchor.day, account_type)
+                    conn.execute(
+                        "UPDATE upstream_credentials SET deleted_at=? WHERE runtime_id=?",
+                        (end.strftime("%Y-%m-%dT%H:%M:%SZ"), key_id),
+                    )
+            active_values = []
+            position = 0
+            for key_id in retained:
+                valid = _parse_iso_date(keep_valid_froms.get(str(key_id)))
+                conn.execute(
+                    "UPDATE upstream_credentials SET position=?,valid_from=? WHERE runtime_id=?",
+                    (position, valid.isoformat() if valid else None, key_id),
+                )
+                if active[key_id]["secret_value"]:
+                    active_values.append(active[key_id]["secret_value"])
+                position += 1
+            seen = set(active_values)
+            next_runtime = int(conn.execute(
+                "SELECT COALESCE(max(runtime_id),0)+1 FROM upstream_credentials"
+            ).fetchone()[0])
+            for index, raw_key in enumerate(new_keys):
+                key = raw_key.strip()
+                if not key or key in seen:
+                    continue
+                valid = _parse_iso_date(
+                    new_valid_froms[index] if index < len(new_valid_froms) else None)
+                credential_uuid = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO upstream_credentials"
+                    "(uuid,runtime_id,upstream_id,position,key_masked,valid_from) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (credential_uuid, next_runtime, upstream_id, position,
+                     mask_key(key), valid.isoformat() if valid else None),
+                )
+                conn.execute(
+                    "INSERT INTO upstream_secrets(credential_uuid,secret_value) VALUES(?,?)",
+                    (credential_uuid, key),
+                )
+                active_values.append(key)
+                seen.add(key)
+                next_runtime += 1
+                position += 1
+            return active_values
         active = {
             row["id"]: row for row in conn.execute(
                 "SELECT id,key_value,valid_from,created_at FROM upstream_keys "
@@ -426,6 +628,28 @@ class ProxyDatabase:
             raise ValueError("请输入密钥明文")
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                route = self._v1_route_account(conn, account_id)
+                if route is None or route["upstream_id"] is None:
+                    return False
+                cloud = conn.execute(
+                    "SELECT c.uuid,c.valid_from,s.secret_value FROM upstream_credentials c "
+                    "LEFT JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+                    "WHERE c.upstream_id=? AND c.key_masked=? AND c.deleted_at IS NULL",
+                    (route["upstream_id"], masked),
+                ).fetchone()
+                if cloud is None:
+                    return False
+                if mask_key(key_value) != masked:
+                    raise ValueError("密钥明文与云端掩码不匹配")
+                conn.execute(
+                    "INSERT INTO upstream_secrets(credential_uuid,secret_value) VALUES(?,?) "
+                    "ON CONFLICT(credential_uuid) DO UPDATE SET secret_value=excluded.secret_value,"
+                    "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                    (cloud["uuid"], key_value),
+                )
+                conn.commit()
+                return True
             cloud = conn.execute(
                 "SELECT valid_from FROM upstream_keys_cloud "
                 "WHERE account_id=? AND key_masked=?",
@@ -470,6 +694,64 @@ class ProxyDatabase:
         valid_from = _parse_iso_date(data.get("valid_from"))
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                shared_id = self._next_shared_id(conn)
+                now = _utc_now()
+                start_date = (valid_from or now.date()).isoformat()
+                effective_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+                conn.execute(
+                    "INSERT INTO accounts(id,uuid,name,valid_from) VALUES(?,?,?,?)",
+                    (shared_id, str(uuid.uuid4()), data["name"], start_date),
+                )
+                config = self._billing_config_conn(conn)
+                contract_id = conn.execute(
+                    "INSERT INTO billing_contracts"
+                    "(uuid,account_id,charge_type,billing_scope,currency,billing_anchor_day,"
+                    "cancellation_policy,cooldown_policy_json,valid_from) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), shared_id,
+                     "recurring" if is_subscription(account_type) else "metered",
+                     "credential" if type_spec.subscription_unit == "per_key" else "account",
+                     currency, valid_from.day if valid_from else 1,
+                     "immediate" if config["cancellation_mode"] == "immediate" else "period_end",
+                     json.dumps({"kind": type_spec.cooldown or "none"}), effective_at),
+                ).lastrowid
+                if is_subscription(account_type):
+                    conn.execute(
+                        "INSERT INTO billing_rate_events"
+                        "(contract_id,recurring_price,effective_at,effective_rule) VALUES(?,?,?,'immediate')",
+                        (contract_id, float(data.get("monthly_price", 0) or 0), effective_at),
+                    )
+                if type_spec.usage_source == "import":
+                    conn.execute(
+                        "INSERT INTO account_importers(uuid,account_id,importer_kind) VALUES(?,?,?)",
+                        (str(uuid.uuid4()), shared_id,
+                         str(data.get("agent_kind") or "codex")),
+                    )
+                else:
+                    upstream_id = conn.execute(
+                        "INSERT INTO upstreams"
+                        "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,max_concurrency) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (shared_id, data["name"], data.get("base_url", ""),
+                         data.get("api_format", "openai"), data.get("auth_header", "bearer"),
+                         data.get("endpoint_path", ""), int(data.get("max_concurrency") or 0)),
+                    ).lastrowid
+                    conn.execute(
+                        "INSERT INTO route_sets(id,uuid,account_id,name) VALUES(?,?,?,?)",
+                        (shared_id, str(uuid.uuid4()), shared_id, data["name"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO route_rules(route_set_id,model_pattern,priority,upstream_id) "
+                        "VALUES(?,'*',0,?)", (shared_id, upstream_id),
+                    )
+                    if keys and type_spec.holds_keys:
+                        self._set_upstream_keys(
+                            conn, shared_id, [], keys,
+                            new_valid_froms=data.get("new_valid_froms"),
+                            account_type=account_type)
+                conn.commit()
+                return shared_id
             cursor = conn.execute(
                 "INSERT INTO upstream_accounts "
                 "(name, base_url, api_format, endpoint_path, auth_header, "
@@ -516,6 +798,8 @@ class ProxyDatabase:
     def update_account(self, account_id: int, data: dict) -> bool:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                return self._update_account_v1(conn, account_id, data)
             original = conn.execute(
                 "SELECT account_type, currency, "
                 "COALESCE((SELECT pph.monthly_price FROM plan_price_history pph "
@@ -609,6 +893,115 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    def _update_account_v1(self, conn: sqlite3.Connection, external_id: int,
+                           data: dict) -> bool:
+        route = self._v1_route_account(conn, external_id)
+        real_id = route["account_id"] if route and route["account_id"] is not None else external_id
+        original = conn.execute(
+            "SELECT a.*,bc.id contract_id,bc.charge_type,bc.billing_scope,bc.currency,"
+            "bc.cancellation_policy,bc.cooldown_policy_json,"
+            "(SELECT recurring_price FROM billing_rate_events WHERE contract_id=bc.id "
+            "ORDER BY effective_at DESC,id DESC LIMIT 1) current_price,"
+            "i.id importer_id,i.importer_kind FROM accounts a "
+            "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.valid_until IS NULL "
+            "LEFT JOIN account_importers i ON i.account_id=a.id AND i.enabled=1 "
+            "WHERE a.id=? AND a.lifecycle_state='active'", (real_id,),
+        ).fetchone()
+        if original is None:
+            return False
+        original_type = ("agent" if original["importer_id"] is not None else
+                         "plan" if original["charge_type"] == "recurring" else "api")
+        final_type = data.get("account_type", original_type)
+        if final_type not in ACCOUNT_TYPES:
+            raise ValueError("账户类型必须是 " + " / ".join(ACCOUNT_TYPES))
+        final_spec = spec(final_type)
+        currency = data.get("currency", original["currency"] or "CNY")
+        if currency not in ("CNY", "USD"):
+            raise ValueError("币种必须是 CNY / USD")
+        name = data.get("name", original["name"])
+        if "valid_from" in data:
+            parsed_start = _parse_iso_date(data["valid_from"])
+            start = parsed_start.isoformat() if parsed_start else None
+        else:
+            start = original["valid_from"]
+        conn.execute(
+            "UPDATE accounts SET name=?,valid_from=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE id=?", (name, start, real_id),
+        )
+        charge = "recurring" if is_subscription(final_type) else "metered"
+        scope = "credential" if final_spec.subscription_unit == "per_key" else "account"
+        conn.execute(
+            "UPDATE billing_contracts SET charge_type=?,billing_scope=?,currency=?,"
+            "cooldown_policy_json=? WHERE id=?",
+            (charge, scope, currency,
+             json.dumps({"kind": final_spec.cooldown or "none"}), original["contract_id"]),
+        )
+        upstream = conn.execute(
+            "SELECT id FROM upstreams WHERE account_id=? ORDER BY id LIMIT 1", (real_id,)
+        ).fetchone()
+        if final_spec.routable:
+            if upstream is None:
+                upstream_id = conn.execute(
+                    "INSERT INTO upstreams"
+                    "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,max_concurrency) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (real_id, name, data.get("base_url", ""), data.get("api_format", "openai"),
+                     data.get("auth_header", "bearer"), data.get("endpoint_path", ""),
+                     int(data.get("max_concurrency") or 0)),
+                ).lastrowid
+            else:
+                upstream_id = upstream["id"]
+                conn.execute(
+                    "UPDATE upstreams SET name=?,base_url=COALESCE(?,base_url),"
+                    "api_format=COALESCE(?,api_format),auth_scheme=COALESCE(?,auth_scheme),"
+                    "endpoint_path=COALESCE(?,endpoint_path),max_concurrency=COALESCE(?,max_concurrency),"
+                    "enabled=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                    (name, data.get("base_url"), data.get("api_format"),
+                     data.get("auth_header"), data.get("endpoint_path"),
+                     data.get("max_concurrency"), upstream_id),
+                )
+            conn.execute("UPDATE account_importers SET enabled=0 WHERE account_id=?", (real_id,))
+            route_row = conn.execute("SELECT id FROM route_sets WHERE id=?", (external_id,)).fetchone()
+            if route_row is None:
+                conn.execute(
+                    "INSERT INTO route_sets(id,uuid,account_id,name) VALUES(?,?,?,?)",
+                    (external_id, str(uuid.uuid4()), real_id, name),
+                )
+                conn.execute(
+                    "INSERT INTO route_rules(route_set_id,model_pattern,priority,upstream_id) "
+                    "VALUES(?,'*',0,?)", (external_id, upstream_id),
+                )
+            else:
+                conn.execute("UPDATE route_sets SET name=?,enabled=1 WHERE id=?", (name, external_id))
+            if data.get("keys_edited") and final_spec.holds_keys:
+                keep_ids = [int(value) for value in (data.get("keep_key_ids") or [])
+                            if str(value).isdigit()]
+                self._set_upstream_keys(
+                    conn, external_id, keep_ids, self._normalize_keys(data),
+                    keep_valid_froms=data.get("keep_valid_froms"),
+                    new_valid_froms=data.get("new_valid_froms"), account_type=final_type)
+        else:
+            conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
+            conn.execute("UPDATE route_sets SET enabled=0 WHERE account_id=?", (real_id,))
+            importer_kind = str(data.get("agent_kind") or original["importer_kind"] or "codex")
+            conn.execute(
+                "INSERT INTO account_importers(uuid,account_id,importer_kind,enabled) VALUES(?,?,?,1) "
+                "ON CONFLICT(account_id,importer_kind) DO UPDATE SET enabled=1",
+                (str(uuid.uuid4()), real_id, importer_kind),
+            )
+        if is_subscription(final_type) and ("monthly_price" in data or
+                                             original_type != final_type):
+            mode = data.get("price_effective") or self._billing_config_conn(conn)["price_change_effective"]
+            effective_rule = "next_period" if mode == "next_period" else "immediate"
+            conn.execute(
+                "INSERT INTO billing_rate_events"
+                "(contract_id,recurring_price,effective_at,effective_rule) VALUES(?,?,?,?)",
+                (original["contract_id"], float(data.get("monthly_price") or 0),
+                 _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"), effective_rule),
+            )
+        conn.commit()
+        return conn.total_changes > 0
+
     def delete_account(self, account_id: int, mode: str = "detach") -> dict:
         """Soft-delete an account. Returns {ok: bool, error: str}.
 
@@ -639,6 +1032,54 @@ class ProxyDatabase:
         """
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                route = self._v1_route_account(conn, account_id)
+                real_id = (route["account_id"] if route and route["account_id"] is not None
+                           else account_id)
+                account = conn.execute(
+                    "SELECT a.created_at,a.valid_from,bc.charge_type,bc.cancellation_policy "
+                    "FROM accounts a LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
+                    "AND bc.valid_until IS NULL WHERE a.id=? AND a.lifecycle_state='active'",
+                    (real_id,),
+                ).fetchone()
+                if account is None:
+                    return {"ok": False, "error": "Account not found"}
+                now = _utc_now()
+                anchor = (_parse_iso_date(account["valid_from"])
+                          or _parse_utc_timestamp(account["created_at"]).date())
+                deferred = (account["charge_type"] == "recurring" and
+                            account["cancellation_policy"] == "period_end")
+                effective = (_period_start(
+                    _next_month(_billing_period_month(now, anchor.day)), anchor.day)
+                             - timedelta(seconds=1)) if deferred else now
+                timestamp = effective.strftime("%Y-%m-%dT%H:%M:%SZ")
+                conn.execute("UPDATE accounts SET deleted_at=? WHERE id=?", (timestamp, real_id))
+                upstream_ids = [row[0] for row in conn.execute(
+                    "SELECT id FROM upstreams WHERE account_id=?", (real_id,))]
+                if upstream_ids:
+                    placeholders = ",".join("?" for _ in upstream_ids)
+                    conn.execute(
+                        f"UPDATE upstream_credentials SET deleted_at=? WHERE upstream_id IN ({placeholders}) "
+                        "AND deleted_at IS NULL", (timestamp, *upstream_ids))
+                if not deferred:
+                    conn.execute("UPDATE accounts SET lifecycle_state='deleted' WHERE id=?", (real_id,))
+                    conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
+                    conn.execute("UPDATE route_sets SET enabled=0 WHERE account_id=?", (real_id,))
+                    conn.execute(
+                        "UPDATE client_keys SET enabled=0,deleted_at=? WHERE route_set_id IN "
+                        "(SELECT id FROM route_sets WHERE account_id=?)",
+                        (timestamp, real_id),
+                    )
+                    if upstream_ids:
+                        placeholders = ",".join("?" for _ in upstream_ids)
+                        conn.execute(
+                            f"UPDATE route_rules SET enabled=0 WHERE upstream_id IN ({placeholders})",
+                            upstream_ids)
+                conn.commit()
+                return {"ok": conn.total_changes > 0, "error": "",
+                        "cancellation_mode": account["cancellation_policy"],
+                        "cancelled_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "effective_deleted_at": timestamp, "deferred": deferred}
             config = self._billing_config_conn(conn)
             account = conn.execute(
                 "SELECT account_type, created_at, valid_from FROM upstream_accounts "
@@ -729,6 +1170,28 @@ class ProxyDatabase:
         """
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+                pending = conn.execute(
+                    "SELECT id FROM accounts WHERE lifecycle_state='active' "
+                    "AND deleted_at IS NOT NULL AND deleted_at<=?", (now,)
+                ).fetchall()
+                for row in pending:
+                    real_id = row["id"]
+                    conn.execute("UPDATE accounts SET lifecycle_state='deleted' WHERE id=?",
+                                 (real_id,))
+                    conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
+                    conn.execute("UPDATE route_sets SET enabled=0 WHERE account_id=?", (real_id,))
+                    conn.execute(
+                        "UPDATE client_keys SET enabled=0,deleted_at=COALESCE(deleted_at,?) "
+                        "WHERE route_set_id IN (SELECT id FROM route_sets WHERE account_id=?)",
+                        (now, real_id),
+                    )
+                    conn.execute(
+                        "UPDATE route_rules SET enabled=0 WHERE upstream_id IN "
+                        "(SELECT id FROM upstreams WHERE account_id=?)", (real_id,))
+                conn.commit()
+                return len(pending)
             now = _utc_now().strftime("%Y-%m-%d %H:%M:%S")
             pending = conn.execute(
                 "SELECT id, deferred_cleanup_mode FROM upstream_accounts "
@@ -767,6 +1230,18 @@ class ProxyDatabase:
         """Replace all models for an account. Returns count of models stored."""
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                route = self._v1_route_account(conn, account_id)
+                if route is None or route["upstream_id"] is None:
+                    return 0
+                conn.execute("DELETE FROM upstream_model_catalog WHERE upstream_id=?",
+                             (route["upstream_id"],))
+                conn.executemany(
+                    "INSERT OR IGNORE INTO upstream_model_catalog(upstream_id,model_id) VALUES(?,?)",
+                    [(route["upstream_id"], model) for model in models],
+                )
+                conn.commit()
+                return len(models)
             conn.execute("DELETE FROM account_models WHERE account_id = ?", (account_id,))
             for m in models:
                 conn.execute(
@@ -781,6 +1256,15 @@ class ProxyDatabase:
     def get_account_models(self, account_id: int) -> list[str]:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                route = self._v1_route_account(conn, account_id)
+                if route is None or route["upstream_id"] is None:
+                    return []
+                rows = conn.execute(
+                    "SELECT model_id FROM upstream_model_catalog WHERE upstream_id=? ORDER BY model_id",
+                    (route["upstream_id"],),
+                ).fetchall()
+                return [row[0] for row in rows]
             rows = conn.execute(
                 "SELECT model_id FROM account_models WHERE account_id = ? ORDER BY id",
                 (account_id,),
@@ -795,6 +1279,17 @@ class ProxyDatabase:
         upstream directly)."""
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                route = self._v1_route_account(conn, account_id)
+                if route is None or route["upstream_id"] is None:
+                    return []
+                rows = conn.execute(
+                    "SELECT s.secret_value FROM upstream_credentials c JOIN upstream_secrets s "
+                    "ON s.credential_uuid=c.uuid WHERE c.upstream_id=? "
+                    "AND c.disabled_at IS NULL AND c.deleted_at IS NULL "
+                    "ORDER BY c.position,c.runtime_id", (route["upstream_id"],)
+                ).fetchall()
+                return [row[0] for row in rows if row[0]]
             rows = conn.execute(
                 "SELECT key_value FROM upstream_keys WHERE account_id=? "
                 "AND (deleted_at IS NULL OR deleted_at > datetime('now')) "
@@ -811,6 +1306,22 @@ class ProxyDatabase:
         """Aggregate accounts (is_aggregate=1) with their model entries."""
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                rows = conn.execute(
+                    "SELECT id,name,created_at FROM route_sets WHERE account_id IS NULL "
+                    "AND enabled=1 ORDER BY id"
+                ).fetchall()
+                result = []
+                for row in rows:
+                    entries = conn.execute(
+                        "SELECT rr.id,rr.model_pattern pattern,u.account_id upstream_account_id,"
+                        "a.name upstream_account_name,COALESCE(rr.target_model,rr.model_pattern) upstream_model "
+                        "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
+                        "LEFT JOIN accounts a ON a.id=u.account_id WHERE rr.route_set_id=? "
+                        "AND rr.enabled=1 ORDER BY rr.priority,rr.id", (row["id"],)
+                    ).fetchall()
+                    result.append({**dict(row), "entries": [dict(entry) for entry in entries]})
+                return result
             rows = conn.execute(
                 "SELECT id, name, created_at FROM upstream_accounts "
                 "WHERE is_aggregate = 1 AND deleted_at IS NULL ORDER BY id"
@@ -834,6 +1345,15 @@ class ProxyDatabase:
         """Create an aggregate account (is_aggregate=1) + its model entries."""
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                aggregate_id = self._next_shared_id(conn)
+                conn.execute(
+                    "INSERT INTO route_sets(id,uuid,name,account_id) VALUES(?,?,?,NULL)",
+                    (aggregate_id, str(uuid.uuid4()), data["name"]),
+                )
+                self._replace_v1_aggregate_rules(conn, aggregate_id, data.get("entries", []))
+                conn.commit()
+                return aggregate_id
             cursor = conn.execute(
                 "INSERT INTO upstream_accounts "
                 "(name, base_url, api_format, is_aggregate) "
@@ -856,6 +1376,15 @@ class ProxyDatabase:
     def update_aggregate(self, agg_id: int, data: dict) -> bool:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                if "name" in data:
+                    conn.execute(
+                        "UPDATE route_sets SET name=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                        "WHERE id=? AND account_id IS NULL", (data["name"], agg_id))
+                if "entries" in data:
+                    self._replace_v1_aggregate_rules(conn, agg_id, data["entries"])
+                conn.commit()
+                return conn.total_changes > 0
             if "name" in data:
                 conn.execute(
                     "UPDATE upstream_accounts SET name=? WHERE id=? AND is_aggregate=1",
@@ -880,6 +1409,13 @@ class ProxyDatabase:
         """Soft-delete an aggregate account (id stays, row flagged deleted_at)."""
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                conn.execute(
+                    "UPDATE route_sets SET enabled=0,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE id=? AND account_id IS NULL AND enabled=1", (agg_id,))
+                conn.execute("UPDATE route_rules SET enabled=0 WHERE route_set_id=?", (agg_id,))
+                conn.commit()
+                return conn.total_changes > 0
             conn.execute(
                 "UPDATE upstream_accounts SET deleted_at = datetime('now', 'localtime') "
                 "WHERE id=? AND is_aggregate=1 AND deleted_at IS NULL",
@@ -891,11 +1427,36 @@ class ProxyDatabase:
         finally:
             conn.close()
 
+    @staticmethod
+    def _replace_v1_aggregate_rules(conn: sqlite3.Connection, route_set_id: int,
+                                    entries: list[dict]) -> None:
+        conn.execute("DELETE FROM route_rules WHERE route_set_id=?", (route_set_id,))
+        for priority, entry in enumerate(entries):
+            target = ProxyDatabase._v1_route_account(conn, int(entry["account_id"]))
+            if target is None or target["upstream_id"] is None:
+                raise ValueError(f"上游账户 {entry['account_id']} 不可路由")
+            conn.execute(
+                "INSERT INTO route_rules"
+                "(route_set_id,model_pattern,priority,upstream_id,target_model) VALUES(?,?,?,?,?)",
+                (route_set_id, entry["pattern"], priority, target["upstream_id"],
+                 entry.get("upstream_model") or None),
+            )
+
     # ── Local API Keys ─────────────────────────────────────────────────
 
     def get_keys(self) -> list[dict]:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                rows = conn.execute(
+                    "SELECT ck.id,ck.key_value,ck.label,ck.route_set_id account_id,"
+                    "rs.name account_name,COALESCE(u.api_format,'openai') account_format,"
+                    "ck.created_at,ck.last_used_at FROM client_keys ck "
+                    "JOIN route_sets rs ON rs.id=ck.route_set_id "
+                    "LEFT JOIN upstreams u ON u.account_id=rs.account_id AND u.enabled=1 "
+                    "WHERE ck.enabled=1 AND ck.deleted_at IS NULL ORDER BY ck.id"
+                ).fetchall()
+                return [dict(row) for row in rows]
             rows = conn.execute(
                 "SELECT k.id, k.key_value, k.label, k.account_id, "
                 "a.name AS account_name, a.api_format AS account_format, "
@@ -918,6 +1479,13 @@ class ProxyDatabase:
         """
         if account_id is None:
             return
+        if ProxyDatabase._is_v1(conn):
+            row = conn.execute(
+                "SELECT 1 FROM route_sets WHERE id=? AND enabled=1", (account_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("账户不可路由")
+            return
         row = conn.execute(
             "SELECT COALESCE(account_type,'api') AS account_type FROM upstream_accounts "
             "WHERE id=?", (account_id,)
@@ -931,6 +1499,13 @@ class ProxyDatabase:
         conn = self._connect()
         try:
             self._assert_routable_account(conn, data.get("account_id"))
+            if self._is_v1(conn):
+                conn.execute(
+                    "INSERT INTO client_keys(uuid,key_value,label,route_set_id) VALUES(?,?,?,?)",
+                    (str(uuid.uuid4()), key_value, data.get("label", ""), data["account_id"]),
+                )
+                conn.commit()
+                return key_value
             conn.execute(
                 "INSERT INTO local_keys (key_value, label, account_id) "
                 "VALUES (?, ?, ?)",
@@ -946,6 +1521,20 @@ class ProxyDatabase:
         try:
             if "account_id" in data:
                 self._assert_routable_account(conn, data["account_id"])
+            if self._is_v1(conn):
+                fields, values = [], []
+                if "label" in data:
+                    fields.append("label=?")
+                    values.append(data["label"])
+                if "account_id" in data:
+                    fields.append("route_set_id=?")
+                    values.append(data["account_id"])
+                if not fields:
+                    return False
+                conn.execute(f"UPDATE client_keys SET {','.join(fields)} WHERE id=?",
+                             (*values, key_id))
+                conn.commit()
+                return conn.total_changes > 0
             fields = []
             values = []
             for key in ("label", "account_id"):
@@ -970,6 +1559,12 @@ class ProxyDatabase:
         so usage/billing data is preserved."""
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                conn.execute(
+                    "UPDATE client_keys SET enabled=0,deleted_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE id=? AND enabled=1", (key_id,))
+                conn.commit()
+                return conn.total_changes > 0
             conn.execute("DELETE FROM local_keys WHERE id = ?", (key_id,))
             conn.commit()
             return conn.total_changes > 0
@@ -1015,6 +1610,18 @@ class ProxyDatabase:
         idempotent across crashes/restarts.  `requested_at` must be a SQLite UTC
         timestamp "YYYY-MM-DD HH:MM:SS".  Returns True when a row was inserted.
         """
+        if ProxyDatabase._is_v1(conn):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO request_log"
+                "(event_id,source_kind,account_id,model,prompt_tokens,completion_tokens,"
+                "cache_read_tokens,total_tokens,equivalent_cost,billed_usage_cost,"
+                "is_streaming,status_code,duration_ms,requested_at) "
+                "VALUES(?,'import',?,?,?,?,?,?,0,0,0,200,0,?)",
+                (event_id, account_id, model, int(prompt_tokens),
+                 int(completion_tokens), int(cache_read_tokens), int(total_tokens),
+                 requested_at),
+            )
+            return cur.rowcount > 0
         cur = conn.execute(
             "INSERT OR IGNORE INTO request_log "
             "(account_id, local_key_id, model, prompt_tokens, completion_tokens, "
@@ -1051,6 +1658,23 @@ class ProxyDatabase:
     def get_pricing(self) -> list[dict]:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                rows = conn.execute(
+                    "SELECT pr.id,pr.model_pattern,r.input_price,r.output_price,"
+                    "r.cache_read_price,r.currency,r.id rate_id FROM pricing_rules pr "
+                    "JOIN pricing_rates r ON r.pricing_rule_id=pr.id "
+                    "WHERE pr.enabled=1 AND r.valid_until IS NULL "
+                    "ORDER BY pr.priority,pr.id"
+                ).fetchall()
+                result = []
+                for row in rows:
+                    item = dict(row)
+                    item["slots"] = [dict(slot) for slot in conn.execute(
+                        "SELECT id,start_minute,end_minute,multiplier FROM pricing_slots "
+                        "WHERE pricing_rate_id=? ORDER BY id", (row["rate_id"],))]
+                    item.pop("rate_id", None)
+                    result.append(item)
+                return result
             rows = conn.execute(
                 "SELECT id, model_pattern, input_price, output_price, "
                 "cache_read_price, currency "
@@ -1082,14 +1706,32 @@ class ProxyDatabase:
         """
         if not slots:
             return
+        v1 = ProxyDatabase._is_v1(conn)
+        rate_id = pricing_id
+        if v1:
+            row = conn.execute(
+                "SELECT id FROM pricing_rates WHERE pricing_rule_id=? AND valid_until IS NULL "
+                "ORDER BY valid_from DESC,id DESC LIMIT 1", (pricing_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("计价规则没有当前 rate")
+            rate_id = row[0]
         for s in slots:
-            conn.execute(
-                "INSERT INTO pricing_slots "
-                "(pricing_id, start_minute, end_minute, multiplier) "
-                "VALUES (?,?,?,?)",
-                (pricing_id, int(s["start_minute"]), int(s["end_minute"]),
-                 float(s.get("multiplier", 1.0))),
-            )
+            if v1:
+                conn.execute(
+                    "INSERT INTO pricing_slots"
+                    "(pricing_rate_id,start_minute,end_minute,multiplier) VALUES(?,?,?,?)",
+                    (rate_id, int(s["start_minute"]), int(s["end_minute"]),
+                     float(s.get("multiplier", 1.0))),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO pricing_slots "
+                    "(pricing_id, start_minute, end_minute, multiplier) "
+                    "VALUES (?,?,?,?)",
+                    (pricing_id, int(s["start_minute"]), int(s["end_minute"]),
+                     float(s.get("multiplier", 1.0))),
+                )
 
     def create_pricing(self, data: dict) -> int:
         conn = self._connect()
@@ -1097,6 +1739,25 @@ class ProxyDatabase:
             currency = data.get("currency", "CNY")
             if currency not in ("CNY", "USD"):
                 raise ValueError("币种必须是 CNY / USD")
+            if self._is_v1(conn):
+                priority = conn.execute(
+                    "SELECT COALESCE(max(priority),-1)+1 FROM pricing_rules"
+                ).fetchone()[0]
+                pid = conn.execute(
+                    "INSERT INTO pricing_rules(model_pattern,priority) VALUES(?,?)",
+                    (data["model_pattern"], priority),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO pricing_rates"
+                    "(pricing_rule_id,input_price,cache_read_price,output_price,currency,valid_from) "
+                    "VALUES(?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    (pid, data["input_price"],
+                     data.get("cache_read_price", data["input_price"]),
+                     data["output_price"], currency),
+                )
+                self._insert_pricing_slots(conn, pid, data.get("slots"))
+                conn.commit()
+                return pid
             cursor = conn.execute(
                 "INSERT INTO model_pricing (model_pattern, input_price, output_price, cache_read_price, currency) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -1115,6 +1776,42 @@ class ProxyDatabase:
     def update_pricing(self, pricing_id: int, data: dict) -> bool:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                current = conn.execute(
+                    "SELECT pr.model_pattern,r.* FROM pricing_rules pr JOIN pricing_rates r "
+                    "ON r.pricing_rule_id=pr.id WHERE pr.id=? AND pr.enabled=1 "
+                    "AND r.valid_until IS NULL", (pricing_id,)
+                ).fetchone()
+                if current is None:
+                    return False
+                currency = data.get("currency", current["currency"])
+                if currency not in ("CNY", "USD"):
+                    raise ValueError("币种必须是 CNY / USD")
+                if "model_pattern" in data:
+                    conn.execute("UPDATE pricing_rules SET model_pattern=? WHERE id=?",
+                                 (data["model_pattern"], pricing_id))
+                rate_changed = any(key in data for key in
+                                   ("input_price", "output_price", "cache_read_price",
+                                    "currency", "slots"))
+                if rate_changed:
+                    now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+                    old_slots = [dict(row) for row in conn.execute(
+                        "SELECT start_minute,end_minute,multiplier FROM pricing_slots "
+                        "WHERE pricing_rate_id=? ORDER BY id", (current["id"],))]
+                    conn.execute("UPDATE pricing_rates SET valid_until=? WHERE id=?",
+                                 (now, current["id"]))
+                    conn.execute(
+                        "INSERT INTO pricing_rates"
+                        "(pricing_rule_id,input_price,cache_read_price,output_price,currency,valid_from) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (pricing_id, data.get("input_price", current["input_price"]),
+                         data.get("cache_read_price", current["cache_read_price"]),
+                         data.get("output_price", current["output_price"]), currency, now),
+                    )
+                    self._insert_pricing_slots(
+                        conn, pricing_id, data.get("slots", old_slots))
+                conn.commit()
+                return conn.total_changes > 0
             fields = []
             values = []
             for key in ("model_pattern", "input_price", "output_price",
@@ -1145,6 +1842,11 @@ class ProxyDatabase:
     def delete_pricing(self, pricing_id: int) -> bool:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                conn.execute("UPDATE pricing_rules SET enabled=0 WHERE id=? AND enabled=1",
+                             (pricing_id,))
+                conn.commit()
+                return conn.total_changes > 0
             conn.execute("DELETE FROM model_pricing WHERE id = ?", (pricing_id,))
             conn.commit()
             # pricing_slots rows are removed by ON DELETE CASCADE.
@@ -1155,6 +1857,23 @@ class ProxyDatabase:
     def reorder_pricing(self, pid: int, direction: str) -> bool:
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                rows = conn.execute(
+                    "SELECT id,priority FROM pricing_rules WHERE enabled=1 ORDER BY priority,id"
+                ).fetchall()
+                idx = next((i for i, row in enumerate(rows) if row["id"] == pid), None)
+                if idx is None:
+                    return False
+                other = idx - 1 if direction == "up" else idx + 1
+                if other < 0 or other >= len(rows):
+                    return True
+                conn.execute("UPDATE pricing_rules SET priority=-1 WHERE id=?", (pid,))
+                conn.execute("UPDATE pricing_rules SET priority=? WHERE id=?",
+                             (rows[idx]["priority"], rows[other]["id"]))
+                conn.execute("UPDATE pricing_rules SET priority=? WHERE id=?",
+                             (rows[other]["priority"], pid))
+                conn.commit()
+                return True
             rows = conn.execute(
                 "SELECT id FROM model_pricing ORDER BY id").fetchall()
             idx = next((i for i, r in enumerate(rows) if r["id"] == pid), None)
@@ -1187,6 +1906,15 @@ class ProxyDatabase:
         """All proxy_timeout_config rows (one per client wire format)."""
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                rows = conn.execute(
+                    "SELECT CASE endpoint_kind WHEN 'messages' THEN 'anthropic' "
+                    "WHEN 'responses' THEN 'openai_responses' ELSE 'openai' END app_type,"
+                    "streaming_first_byte_timeout,streaming_idle_timeout,non_streaming_timeout "
+                    "FROM proxy_timeout_config WHERE endpoint_kind IN ('messages','responses','chat') "
+                    "ORDER BY endpoint_kind"
+                ).fetchall()
+                return [dict(row) for row in rows]
             rows = conn.execute(
                 "SELECT app_type, streaming_first_byte_timeout, "
                 "streaming_idle_timeout, non_streaming_timeout "
@@ -1224,6 +1952,21 @@ class ProxyDatabase:
             values[key] = v
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                endpoint = {"anthropic": "messages", "openai_responses": "responses",
+                            "openai": "chat"}[app_type]
+                conn.execute(
+                    "INSERT INTO proxy_timeout_config"
+                    "(endpoint_kind,streaming_first_byte_timeout,streaming_idle_timeout,non_streaming_timeout) "
+                    "VALUES(?,?,?,?) ON CONFLICT(endpoint_kind) DO UPDATE SET "
+                    "streaming_first_byte_timeout=excluded.streaming_first_byte_timeout,"
+                    "streaming_idle_timeout=excluded.streaming_idle_timeout,"
+                    "non_streaming_timeout=excluded.non_streaming_timeout",
+                    (endpoint, values["streaming_first_byte_timeout"],
+                     values["streaming_idle_timeout"], values["non_streaming_timeout"]),
+                )
+                conn.commit()
+                return conn.total_changes > 0
             conn.execute(
                 "INSERT INTO proxy_timeout_config "
                 "(app_type, streaming_first_byte_timeout, streaming_idle_timeout, "
@@ -1264,6 +2007,20 @@ class ProxyDatabase:
             raise ValueError("删除默认操作必须是 immediate 或 end_of_period")
         conn = self._connect()
         try:
+            if self._is_v1(conn):
+                conn.executemany(
+                    "INSERT INTO sync_settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    [("billing.price_change_effective", mode),
+                     ("billing.cancellation_mode", cancellation)],
+                )
+                conn.execute(
+                    "UPDATE billing_contracts SET cancellation_policy=? "
+                    "WHERE charge_type='recurring' AND valid_until IS NULL",
+                    ("immediate" if cancellation == "immediate" else "period_end",),
+                )
+                conn.commit()
+                return conn.total_changes > 0
             conn.execute(
                 "UPDATE plan_billing_config SET price_change_effective=?, "
                 "cancellation_mode=? WHERE id=1",
@@ -1339,6 +2096,8 @@ class ProxyDatabase:
         date_from: str | None = None,
         date_to: str | None = None,
         include_attempts: bool = True,
+        before_requested_at: str | None = None,
+        before_id: int | None = None,
     ) -> dict:
         """Paginated request log with filters."""
         page = max(1, int(page))
@@ -1363,6 +2122,10 @@ class ProxyDatabase:
             if date_to:
                 where.append("date(r.requested_at) <= ?")
                 params.append(date_to)
+            if before_requested_at is not None and before_id is not None:
+                where.append("(r.requested_at < ? OR "
+                             "(r.requested_at = ? AND r.id < ?))")
+                params.extend([before_requested_at, before_requested_at, before_id])
 
             where_clause = " AND ".join(where)
 
@@ -1373,7 +2136,7 @@ class ProxyDatabase:
             ).fetchone()[0]
 
             # Paginated data
-            offset = (page - 1) * per_page
+            offset = 0 if before_requested_at is not None else (page - 1) * per_page
             rows = conn.execute(
                 f"""SELECT
                     r.id, r.account_id, COALESCE(a.name, 'unknown') AS account_name,
@@ -1419,6 +2182,9 @@ class ProxyDatabase:
                 "per_page": per_page,
                 "total_pages": max(1, (total + per_page - 1) // per_page),
                 "items": items,
+                "next_cursor": ({"requested_at": items[-1]["requested_at"],
+                                 "id": items[-1]["id"]}
+                                if len(items) == per_page else None),
             }
             conn.commit()
             return result
@@ -1435,6 +2201,7 @@ class ProxyDatabase:
                     date(r.requested_at) AS date,
                     COALESCE(a.name, 'unknown') AS account_name,
                     COALESCE(SUM(r.api_cost), 0) AS cost,
+                    COALESCE(a.account_type, 'api') AS account_type,
                     COUNT(*) AS requests,
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
@@ -1530,6 +2297,52 @@ class ProxyDatabase:
     def _plan_key_billing_meta(conn: sqlite3.Connection) -> list[dict]:
         """Build billable key lifecycles, including cloud-only masked keys."""
         now = _utc_now()
+        if ProxyDatabase._is_v1(conn):
+            result = []
+            contracts = conn.execute(
+                "SELECT bc.*,a.created_at,a.valid_from account_valid_from,a.deleted_at account_deleted_at "
+                "FROM billing_contracts bc JOIN accounts a ON a.id=bc.account_id "
+                "WHERE bc.charge_type='recurring' AND bc.valid_until IS NULL"
+            ).fetchall()
+            for contract in contracts:
+                if contract["billing_scope"] == "credential":
+                    credentials = conn.execute(
+                        "SELECT c.runtime_id,c.uuid,c.key_masked,c.created_at,c.valid_from,c.deleted_at "
+                        "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
+                        "JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+                        "WHERE u.account_id=?", (contract["account_id"],)
+                    ).fetchall()
+                    for credential in credentials:
+                        anchor = (_parse_iso_date(credential["valid_from"])
+                                  or _parse_utc_timestamp(credential["created_at"]).date())
+                        end = min((value for value in (
+                            _parse_utc_timestamp(credential["deleted_at"]),
+                            _parse_utc_timestamp(contract["account_deleted_at"]))
+                                   if value is not None), default=None)
+                        result.append({
+                            "account_id": contract["account_id"],
+                            "contract_id": contract["id"],
+                            "credential_uuid": credential["uuid"],
+                            "key_id": credential["runtime_id"],
+                            "key_masked": credential["key_masked"],
+                            "billing_unit_id": credential["uuid"],
+                            "anchor": anchor, "end": end, "now": now,
+                            "currency": contract["currency"],
+                        })
+                else:
+                    anchor = (_parse_iso_date(contract["account_valid_from"])
+                              or _parse_utc_timestamp(contract["created_at"]).date())
+                    result.append({
+                        "account_id": contract["account_id"],
+                        "contract_id": contract["id"],
+                        "credential_uuid": None, "key_id": None,
+                        "key_masked": "subscription",
+                        "billing_unit_id": f"contract:{contract['uuid']}",
+                        "anchor": anchor,
+                        "end": _parse_utc_timestamp(contract["account_deleted_at"]),
+                        "now": now, "currency": contract["currency"],
+                    })
+            return result
         by_identity: dict[tuple[int, str], dict] = {}
         sub_types = subscription_types()
         accounts = conn.execute(
@@ -1606,8 +2419,21 @@ class ProxyDatabase:
 
     @staticmethod
     def _price_for_period(conn: sqlite3.Connection, account_id: int,
-                          period: str, anchor_day: int) -> float:
+                          period: str, anchor_day: int,
+                          contract_id: int | None = None) -> float:
         price = 0.0
+        if ProxyDatabase._is_v1(conn):
+            for row in conn.execute(
+                "SELECT recurring_price,effective_at,effective_rule FROM billing_rate_events "
+                "WHERE contract_id=? ORDER BY effective_at,id", (contract_id,)
+            ):
+                changed = _parse_utc_timestamp(row["effective_at"])
+                effective = _billing_period_month(changed, anchor_day)
+                if row["effective_rule"] == "next_period":
+                    effective = _next_month(effective)
+                if effective <= period:
+                    price = float(row["recurring_price"] or 0)
+            return price
         for row in conn.execute(
             "SELECT monthly_price,changed_at,effective_mode FROM plan_price_history "
             "WHERE account_id=? ORDER BY changed_at,id", (account_id,)
@@ -1630,7 +2456,8 @@ class ProxyDatabase:
         # Every admin month the lifecycle touches is billed in full — there is
         # no grace free-window anymore (uniform new rule, see 0015).
         return {month: cls._price_for_period(conn, meta["account_id"], month,
-                                             meta["anchor"].day)
+                                             meta["anchor"].day,
+                                             meta.get("contract_id"))
                 for month in _iter_months(first, last)}
 
     def export_to_dashboard(self, target_path: str, mark: int, max_id: int) -> dict:
@@ -1660,7 +2487,18 @@ class ProxyDatabase:
 
             # A) usage + frozen cost: keyed by account_id (the identity). The
             #    display name comes from the dashboard `accounts` mirror.
-            rows = conn.execute("""
+            if self._is_v1(conn):
+                cost_columns = (
+                    "COALESCE(SUM(r.equivalent_cost),0) AS cost, "
+                    "COALESCE(SUM(r.billed_usage_cost),0) AS billed_usage_cost,"
+                )
+            else:
+                cost_columns = (
+                    "COALESCE(SUM(r.api_cost),0) AS cost, "
+                    "COALESCE(SUM(CASE WHEN COALESCE(a.account_type,'api')='api' "
+                    "THEN r.api_cost ELSE 0 END),0) AS billed_usage_cost,"
+                )
+            rows = conn.execute(f"""
                 SELECT
                     date(r.requested_at) AS date,
                     r.account_id,
@@ -1668,7 +2506,7 @@ class ProxyDatabase:
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
                     COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
-                    COALESCE(SUM(r.api_cost), 0) AS cost,
+                    {cost_columns}
                     COUNT(*) AS request_count
                 FROM request_log r
                 LEFT JOIN upstream_accounts a ON a.id = r.account_id
@@ -1688,18 +2526,18 @@ class ProxyDatabase:
                 ORDER BY date(r.requested_at), r.account_id, r.model
             """, (mark, max_id)).fetchall()
 
-            dash_count = 0
-            for r in rows:
-                dash_count += dash_db.upsert_proxy_data(
-                    date=r["date"],
-                    model=r["model"],
-                    account_id=r["account_id"],
-                    prompt_tokens=r["prompt_tokens"],
-                    completion_tokens=r["completion_tokens"],
-                    cache_read_tokens=r["cache_read_tokens"],
-                    request_count=r["request_count"],
-                    cost=r["cost"],
-                )
+            dash_count = dash_db.upsert_proxy_batch([
+                {
+                    "date": r["date"], "model": r["model"],
+                    "account_id": r["account_id"],
+                    "prompt_tokens": r["prompt_tokens"],
+                    "completion_tokens": r["completion_tokens"],
+                    "cache_read_tokens": r["cache_read_tokens"],
+                    "request_count": r["request_count"], "cost": r["cost"],
+                    "billed_usage_cost": r["billed_usage_cost"],
+                }
+                for r in rows
+            ])
 
             # B) Plan/agent subscriptions are derived from key lifecycles, not
             # from usage.  Reconcile every known lifecycle on every export so an
@@ -1717,28 +2555,68 @@ class ProxyDatabase:
                         month: native * _fx_rate_for_month(conn, month)
                         for month, native in native_periods.items()
                     }
+                if self._is_v1(conn):
+                    frozen_periods = {}
+                    for month, charge in native_periods.items():
+                        existing = conn.execute(
+                            "SELECT recurring_charge FROM billing_period_charges "
+                            "WHERE contract_id=? AND credential_uuid IS ? AND period_start=?",
+                            (meta["contract_id"], meta["credential_uuid"],
+                             _period_start(month, meta["anchor"].day).strftime(
+                                 "%Y-%m-%dT%H:%M:%SZ")),
+                        ).fetchone()
+                        if existing is None:
+                            period_start = _period_start(month, meta["anchor"].day)
+                            period_end = _period_start(_next_month(month),
+                                                       meta["anchor"].day)
+                            conn.execute(
+                                "INSERT INTO billing_period_charges"
+                                "(contract_id,credential_uuid,period_start,period_end,"
+                                "recurring_charge,currency) VALUES(?,?,?,?,?,'CNY')",
+                                (meta["contract_id"], meta["credential_uuid"],
+                                 period_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                 period_end.strftime("%Y-%m-%dT%H:%M:%SZ"), charge),
+                            )
+                            frozen_periods[month] = charge
+                        else:
+                            frozen_periods[month] = float(existing["recurring_charge"])
+                    native_periods = frozen_periods
                 dash_db.reconcile_plan_subscription(
-                    meta["account_id"], meta["key_masked"],
+                    meta["account_id"], meta.get("billing_unit_id", meta["key_masked"]),
                     native_periods,
                 )
 
+            if self._is_v1(conn):
+                conn.commit()
+
             virtual_buckets: dict[tuple[str, int, str], float] = {}
-            sub_types = subscription_types()
-            plan_logs = conn.execute(
-                "SELECT r.account_id,r.upstream_key_id,r.requested_at,r.api_cost "
-                "FROM request_log r JOIN upstream_accounts a ON a.id=r.account_id "
-                f"WHERE r.id>? AND r.id<=? "
-                f"  AND r.status_code BETWEEN 200 AND 299 "
-                f"  AND COALESCE(a.account_type,'api') IN ({sql_in(sub_types)})",
-                (mark, max_id, *sub_types),
-            ).fetchall()
+            if self._is_v1(conn):
+                plan_logs = conn.execute(
+                    "SELECT r.account_id,r.upstream_key_id,r.requested_at,r.equivalent_cost api_cost "
+                    "FROM request_log r JOIN billing_contracts bc ON bc.account_id=r.account_id "
+                    "WHERE r.id>? AND r.id<=? AND r.status_code BETWEEN 200 AND 299 "
+                    "AND bc.charge_type='recurring' AND bc.valid_from<=r.requested_at "
+                    "AND (bc.valid_until IS NULL OR bc.valid_until>r.requested_at)",
+                    (mark, max_id),
+                ).fetchall()
+            else:
+                sub_types = subscription_types()
+                plan_logs = conn.execute(
+                    "SELECT r.account_id,r.upstream_key_id,r.requested_at,r.api_cost "
+                    "FROM request_log r JOIN upstream_accounts a ON a.id=r.account_id "
+                    f"WHERE r.id>? AND r.id<=? "
+                    f"AND r.status_code BETWEEN 200 AND 299 "
+                    f"AND COALESCE(a.account_type,'api') IN ({sql_in(sub_types)})",
+                    (mark, max_id, *sub_types),
+                ).fetchall()
             for log in plan_logs:
                 meta = by_key_id.get(log["upstream_key_id"]) or by_account.get(log["account_id"])
                 if meta is None:
                     continue
                 requested = _parse_utc_timestamp(log["requested_at"])
                 month = _billing_period_month(requested, meta["anchor"].day)
-                bucket = (month, meta["account_id"], meta["key_masked"])
+                bucket = (month, meta["account_id"],
+                          meta.get("billing_unit_id", meta["key_masked"]))
                 virtual_buckets[bucket] = virtual_buckets.get(bucket, 0.0) + float(log["api_cost"] or 0)
             for (month, account_id, key_masked), virtual_cost in virtual_buckets.items():
                 dash_db.accumulate_plan_summary(
@@ -1773,6 +2651,9 @@ class ProxyDatabase:
                 (mark, str(max_age_days)),
             )
             conn.commit()
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version // 10000 >= 1:
+                conn.execute("PRAGMA incremental_vacuum(256)")
             return cursor.rowcount
         finally:
             conn.close()

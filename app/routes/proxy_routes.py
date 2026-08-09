@@ -643,6 +643,8 @@ def request_logs():
             date_to=request.args.get("to"),
             include_attempts=request.args.get("include_attempts", "1").lower()
             in {"1", "true", "yes"},
+            before_requested_at=request.args.get("before_requested_at"),
+            before_id=request.args.get("before_id", type=int),
         )
     )
 

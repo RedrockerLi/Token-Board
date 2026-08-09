@@ -33,6 +33,12 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 
+class LoadHTTPServer(ThreadingHTTPServer):
+    # The benchmark measures proxy queueing, not the stdlib test server's
+    # default five-entry SYN backlog. Keep it above the tested concurrency.
+    request_queue_size = 512
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -82,7 +88,7 @@ def main() -> None:
     from scripts.mock_upstream import Handler as MockHandler
 
     upstream_port = free_port()
-    upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), MockHandler)
+    upstream = LoadHTTPServer(("127.0.0.1", upstream_port), MockHandler)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
 
@@ -91,7 +97,7 @@ def main() -> None:
         legacy_schema = Path(tmp) / "schema-v10"
         legacy_schema.mkdir()
         for migration in schema_dir.glob("*.sql"):
-            if int(migration.stem.split("_", 1)[0]) <= 10:
+            if int(migration.stem.split("_", 1)[0].split("-", 1)[1]) <= 10:
                 shutil.copy2(migration, legacy_schema / migration.name)
         migrate(str(db_path), str(legacy_schema))
         conn = sqlite3.connect(db_path)

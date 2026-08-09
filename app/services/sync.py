@@ -19,7 +19,7 @@ import shutil
 import sqlite3
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -260,6 +260,8 @@ def _count_dashboard_rows(db_path: str) -> int:
     """Count total rows across all dashboard tables."""
     conn = sqlite3.connect(db_path)
     try:
+        if _schema_major(conn) >= 1:
+            return conn.execute("SELECT COUNT(*) FROM daily_usage").fetchone()[0]
         total = conn.execute("SELECT COUNT(*) FROM token_usage").fetchone()[0]
         total += conn.execute("SELECT COUNT(*) FROM request_usage").fetchone()[0]
         total += conn.execute("SELECT COUNT(*) FROM cost_entry").fetchone()[0]
@@ -282,6 +284,13 @@ CONFIG_TABLES = [
     "plan_price_history",
 ]
 
+V1_CONFIG_TABLES = [
+    "accounts", "upstreams", "route_sets", "route_rules", "client_keys",
+    "upstream_credentials", "account_importers", "billing_contracts",
+    "billing_rate_events", "pricing_rules", "pricing_rates", "pricing_slots",
+    "upstream_model_catalog", "proxy_timeout_config",
+]
+
 # Runtime/secret tables stripped from the upload copy before it ever reaches
 # the cloud. sync_state holds the machine-local sync watermark + config hash.
 # upstream_keys (the per-account multi-key set) and session_key_log (session→
@@ -298,6 +307,10 @@ _RUNTIME_TABLES = [
     # state is meaningless elsewhere).
     "fx_rate",
     "codex_import_state",
+    # V1 local-only payloads. Credential metadata/UUID is synchronized, while
+    # the corresponding plaintext and importer cursor never leave the node.
+    "upstream_secrets",
+    "billing_period_charges",
 ]
 
 
@@ -305,6 +318,17 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
+
+
+def _schema_major(conn: sqlite3.Connection) -> int:
+    if not _table_exists(conn, "schema_version"):
+        return 0
+    row = conn.execute("SELECT major FROM schema_version WHERE id=1").fetchone()
+    return int(row[0]) if row else 0
+
+
+def _config_tables(conn: sqlite3.Connection) -> list[str]:
+    return V1_CONFIG_TABLES if _schema_major(conn) >= 1 else CONFIG_TABLES
 
 
 def _merge_upstream_keys_cloud(remote_path: str, local_path: str) -> None:
@@ -364,10 +388,14 @@ def _config_hash_of_db(db_path: str) -> str:
     conn = sqlite3.connect(db_path)
     h = hashlib.sha256()
     try:
-        for table in CONFIG_TABLES:
+        for table in _config_tables(conn):
             if not _table_exists(conn, table):
                 continue
             cols = [d[0] for d in conn.execute(f"SELECT * FROM {table} LIMIT 0").description]
+            if table == "upstream_credentials":
+                cols = [column for column in cols if column != "runtime_id"]
+            elif table == "account_importers":
+                cols = [column for column in cols if column != "cursor_json"]
             if not cols:
                 continue
             h.update(table.encode())
@@ -408,6 +436,23 @@ def snapshot_config(db_path: str) -> None:
     """Copy CONFIG_TABLES (+ the local-only upstream_keys, WITH their values —
     keys are secrets that must survive a "discard" rollback) into the snapshot."""
     snap = _snapshot_path(db_path)
+    probe = sqlite3.connect(db_path)
+    try:
+        major = _schema_major(probe)
+    finally:
+        probe.close()
+    if major >= 1:
+        _safe_copy_db(db_path, snap)
+        snapshot = sqlite3.connect(snap)
+        try:
+            for table in ("request_attempts", "request_log",
+                          "billing_period_charges", "fx_rates"):
+                if _table_exists(snapshot, table):
+                    snapshot.execute(f"DELETE FROM {table}")
+            snapshot.commit()
+        finally:
+            snapshot.close()
+        return
     src = sqlite3.connect(db_path)
     src.row_factory = sqlite3.Row
     dst = sqlite3.connect(snap)
@@ -447,6 +492,33 @@ def restore_config_snapshot(db_path: str) -> bool:
     snap_path = _snapshot_path(db_path)
     if not os.path.exists(snap_path):
         return False
+    probe = sqlite3.connect(snap_path)
+    try:
+        snapshot_major = _schema_major(probe)
+    finally:
+        probe.close()
+    if snapshot_major >= 1:
+        _merge_v1_config(snap_path, db_path)
+        snapshot = sqlite3.connect(snap_path)
+        snapshot.row_factory = sqlite3.Row
+        local = sqlite3.connect(db_path)
+        try:
+            local.execute("BEGIN IMMEDIATE")
+            for row in snapshot.execute("SELECT * FROM upstream_secrets"):
+                local.execute(
+                    "INSERT INTO upstream_secrets(credential_uuid,secret_value,updated_at) "
+                    "VALUES(?,?,?) ON CONFLICT(credential_uuid) DO UPDATE SET "
+                    "secret_value=excluded.secret_value,updated_at=excluded.updated_at",
+                    tuple(row),
+                )
+            local.commit()
+        except Exception:
+            local.rollback()
+            raise
+        finally:
+            snapshot.close()
+            local.close()
+        return True
     snap = sqlite3.connect(snap_path)
     snap.row_factory = sqlite3.Row
     local = sqlite3.connect(db_path, timeout=10)
@@ -524,6 +596,21 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
     - account_models / aggregate_entries / pricing_slots /
       proxy_timeout_config: replaced wholesale from the cloud.
     """
+    probe_remote = sqlite3.connect(remote_path)
+    probe_local = sqlite3.connect(local_path)
+    try:
+        remote_major = _schema_major(probe_remote)
+        local_major = _schema_major(probe_local)
+    finally:
+        probe_remote.close()
+        probe_local.close()
+    if remote_major != local_major:
+        raise RuntimeError(
+            f"配置同步拒绝跨 Major 合并: remote=V{remote_major}, local=V{local_major}")
+    if local_major >= 1:
+        _merge_v1_config(remote_path, local_path)
+        return
+
     _merge_upstream_keys_cloud(remote_path, local_path)
     remote = sqlite3.connect(remote_path)
     remote.row_factory = sqlite3.Row
@@ -628,6 +715,127 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
         local.close()
 
 
+def _merge_v1_config(remote_path: str, local_path: str) -> None:
+    """Merge normalized V1 configuration without ever copying secrets.
+
+    Stable UUIDs are authoritative. Missing rows become disabled tombstones
+    rather than being deleted, preserving request/attempt foreign keys and
+    historical pricing. ``runtime_id`` and importer cursors remain local.
+    """
+    remote = sqlite3.connect(remote_path)
+    remote.row_factory = sqlite3.Row
+    local = sqlite3.connect(local_path, timeout=10)
+    local.row_factory = sqlite3.Row
+    try:
+        local.execute("PRAGMA busy_timeout=5000")
+        local.execute("PRAGMA foreign_keys=ON")
+        local.execute("BEGIN IMMEDIATE")
+
+        def table_info(conn, table):
+            return conn.execute(f"PRAGMA table_info({table})").fetchall()
+
+        def merge_table(table: str, excluded: set[str] | None = None) -> None:
+            excluded = excluded or set()
+            if not _table_exists(remote, table) or not _table_exists(local, table):
+                return
+            r_info = table_info(remote, table)
+            local_columns = {row[1] for row in table_info(local, table)}
+            columns = [row[1] for row in r_info
+                       if row[1] in local_columns and row[1] not in excluded]
+            primary = [row[1] for row in sorted(r_info, key=lambda row: row[5]) if row[5]]
+            if not columns or not primary:
+                return
+            updates = [column for column in columns if column not in primary]
+            placeholders = ",".join("?" for _ in columns)
+            conflict = ",".join(primary)
+            suffix = (" DO UPDATE SET " + ",".join(
+                f"{column}=excluded.{column}" for column in updates)) if updates else " DO NOTHING"
+            statement = (f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders}) "
+                         f"ON CONFLICT({conflict}){suffix}")
+            for row in remote.execute(f"SELECT {','.join(columns)} FROM {table}"):
+                local.execute(statement, tuple(row))
+
+        # Parent-first upsert. Historical rows not present remotely remain as
+        # inactive/local history instead of violating live request FKs.
+        for table in ("accounts", "upstreams", "route_sets", "route_rules",
+                      "client_keys"):
+            merge_table(table)
+
+        remote_credential_ids: set[str] = set()
+        if _table_exists(remote, "upstream_credentials"):
+            next_runtime = int(local.execute(
+                "SELECT COALESCE(max(runtime_id),0)+1 FROM upstream_credentials"
+            ).fetchone()[0])
+            for row in remote.execute("SELECT * FROM upstream_credentials ORDER BY position,uuid"):
+                remote_credential_ids.add(row["uuid"])
+                existing = local.execute(
+                    "SELECT runtime_id FROM upstream_credentials WHERE uuid=?", (row["uuid"],)
+                ).fetchone()
+                runtime_id = existing[0] if existing else next_runtime
+                if existing is None:
+                    next_runtime += 1
+                local.execute(
+                    "INSERT INTO upstream_credentials"
+                    "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,created_at,disabled_at,deleted_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET "
+                    "upstream_id=excluded.upstream_id,position=excluded.position,"
+                    "key_masked=excluded.key_masked,valid_from=excluded.valid_from,"
+                    "disabled_at=excluded.disabled_at,deleted_at=excluded.deleted_at",
+                    (row["uuid"], runtime_id, row["upstream_id"], row["position"],
+                     row["key_masked"], row["valid_from"], row["created_at"],
+                     row["disabled_at"], row["deleted_at"]),
+                )
+
+        merge_table("account_importers", {"cursor_json"})
+        for table in ("billing_contracts", "billing_rate_events", "pricing_rules",
+                      "pricing_rates", "pricing_slots", "upstream_model_catalog",
+                      "proxy_timeout_config"):
+            merge_table(table)
+
+        remote_ids = {
+            table: {tuple(row) for row in remote.execute(
+                "SELECT " + ",".join(
+                    info[1] for info in sorted(table_info(remote, table), key=lambda value: value[5])
+                    if info[5]) + f" FROM {table}")}
+            for table in ("accounts", "upstreams", "route_sets", "route_rules",
+                          "client_keys", "account_importers", "pricing_rules")
+            if _table_exists(remote, table)
+        }
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tombstones = {
+            "accounts": ("lifecycle_state='disabled',disabled_at=?", (now,)),
+            "upstreams": ("enabled=0", ()), "route_sets": ("enabled=0", ()),
+            "route_rules": ("enabled=0", ()), "client_keys": ("enabled=0", ()),
+            "account_importers": ("enabled=0", ()), "pricing_rules": ("enabled=0", ()),
+        }
+        for table, identities in remote_ids.items():
+            info = table_info(local, table)
+            primary = [row[1] for row in sorted(info, key=lambda value: value[5]) if row[5]]
+            for row in local.execute(f"SELECT {','.join(primary)} FROM {table}").fetchall():
+                identity = tuple(row)
+                if identity not in identities:
+                    clause, params = tombstones[table]
+                    where = " AND ".join(f"{column}=?" for column in primary)
+                    local.execute(f"UPDATE {table} SET {clause} WHERE {where}",
+                                  (*params, *identity))
+        for row in local.execute("SELECT uuid FROM upstream_credentials").fetchall():
+            if row["uuid"] not in remote_credential_ids:
+                local.execute(
+                    "UPDATE upstream_credentials SET disabled_at=COALESCE(disabled_at,?) "
+                    "WHERE uuid=?", (now, row["uuid"]))
+        local.execute("UPDATE config_state SET generation=generation+1 WHERE id=1")
+        violation = local.execute("PRAGMA foreign_key_check").fetchone()
+        if violation:
+            raise sqlite3.IntegrityError(f"V1 config merge FK violation: {tuple(violation)}")
+        local.commit()
+    except Exception:
+        local.rollback()
+        raise
+    finally:
+        remote.close()
+        local.close()
+
+
 def _strip_url_credentials(url: str) -> str:
     """Remove embedded credentials from a URL (userinfo, query, fragment).
 
@@ -655,6 +863,20 @@ def _sanitize_upload_columns(dst: sqlite3.Connection) -> None:
     "Bearer sk-…" override); base_url/endpoint_path keep routing info but lose
     embedded credentials.
     """
+    if _schema_major(dst) >= 1:
+        rows = dst.execute(
+            "SELECT id,COALESCE(auth_scheme,''),COALESCE(base_url,''),"
+            "COALESCE(endpoint_path,'') FROM upstreams"
+        ).fetchall()
+        for row_id, auth, base, endpoint in rows:
+            auth = (auth or "").strip().split()[0] if (auth or "").strip() else ""
+            dst.execute(
+                "UPDATE upstreams SET auth_scheme=?,base_url=?,endpoint_path=? WHERE id=?",
+                (auth, _strip_url_credentials(base),
+                 (endpoint or "").split("?")[0].split("#")[0], row_id),
+            )
+        dst.execute("UPDATE account_importers SET cursor_json='{}'")
+        return
     rows = dst.execute(
         "SELECT id, COALESCE(auth_header,''), COALESCE(base_url,''), "
         "COALESCE(endpoint_path,'') FROM upstream_accounts").fetchall()
@@ -698,7 +920,7 @@ def sync_config_upload(db_path: str) -> dict:
             # comparison (and the _merge_upstream_keys_cloud below) is
             # column-consistent.
             from app.db.migrations import migrate, schema_dir_for
-            migrate(remote_path, schema_dir_for(db_path, "proxy"))
+            migrate(remote_path, schema_dir_for(db_path, "proxy"), "proxy")
             last_hash = _get_sync_state(db_path, "config_hash")
             cloud_hash = _config_hash_of_db(remote_path)
             if last_hash is None or cloud_hash != last_hash:
@@ -770,7 +992,7 @@ def sync_config_download(db_path: str) -> bool:
         # file from an older release (e.g. one still carrying a now-dropped
         # column like cancellation_grace_hours) cannot fight the local schema.
         from app.db.migrations import migrate, schema_dir_for
-        migrate(remote_path, schema_dir_for(db_path, "proxy"))
+        migrate(remote_path, schema_dir_for(db_path, "proxy"), "proxy")
         _merge_config_tables(remote_path, db_path)
         _set_sync_state(db_path, "config_hash", _config_hash_of_db(remote_path))
         snapshot_config(db_path)
@@ -819,7 +1041,7 @@ def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
 
         # 2. Bring the shadow up to the current schema (cloud may be older).
         from app.db.migrations import migrate, schema_dir_for
-        migrate(shadow_path, schema_dir_for(dash_db_path, "dashboard"))
+        migrate(shadow_path, schema_dir_for(dash_db_path, "dashboard"), "dashboard")
 
         # 2b. Reconcile: mirror upstream_accounts (id → name/type/deleted_at)
         #     into the shadow's `accounts` table and backfill any legacy

@@ -132,7 +132,7 @@
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--db` | `data/proxy.db` | SQLite 数据库路径 |
-| `--schema-dir` | 由 `--db` 推导(`<db目录>/../schema/proxy`) | 迁移文件目录 |
+| `--schema-dir` | 由 `--db` 推导到仓库 `schema/` | Major–Minor schema 根目录；旧叶子路径仅兼容 |
 | `--port` | `8800` | 监听端口 |
 | `--host` | `127.0.0.1` | 绑定地址(默认仅本机可访问) |
 | `--log-level` | `info` | 日志级别(debug/info/warn/error) |

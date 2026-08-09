@@ -12,7 +12,7 @@ static void print_help(const char *argv0) {
         "  --db PATH       SQLite database path (default: data/proxy.db)\n"
         "  --schema-dir PATH\n"
         "                  Migration file directory (default: derived from --db\n"
-        "                  as <db_dir>/../schema/proxy)\n"
+        "                  as <db_dir>/../schema)\n"
         "  --port PORT     Listen port (default: 8800)\n"
         "  --host HOST     Bind address (default: 127.0.0.1 — loopback only)\n"
         "  --log-level LVL Log level: debug|info|warn|error (default: info)\n"

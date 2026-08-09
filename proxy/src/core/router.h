@@ -3,9 +3,15 @@
 #include "db.h"
 
 #include <chrono>
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
+
+struct RoutingSnapshot;
 
 /// Maps local (proxy) API keys to upstream CSTCloud accounts.
 ///
@@ -18,7 +24,10 @@
 /// takes effect on the next uncached request.
 class Router {
 public:
-    explicit Router(Database &db) : db_(db) {}
+    explicit Router(Database &db);
+    ~Router();
+    Router(const Router &) = delete;
+    Router &operator=(const Router &) = delete;
 
     struct RouteResult {
         bool success = false;
@@ -29,22 +38,21 @@ public:
         std::string auth_header;     // "bearer" | "x-api-key"
         int account_id = 0;
         int local_key_id = 0;
-        bool is_aggregate = false;   // aggregate account — resolve per model
         Database::AccountInfo account;
+        std::shared_ptr<const RoutingSnapshot> snapshot;
     };
 
     RouteResult route(const std::string &local_key);
+    std::vector<Database::RoutingTarget> resolve_targets(
+        const RouteResult &route, const std::string &model) const;
+    std::vector<std::string> model_patterns(const RouteResult &route) const;
+    void shutdown();
 
 private:
+    bool reload();
+    void refresh_loop();
     Database &db_;
-
-    // Short-TTL success cache (C2-2).  Bounded in practice: only valid keys
-    // are cached, so the map is at most the number of distinct active keys.
-    static constexpr int kCacheTtlSec = 2;
-    struct CacheEntry {
-        RouteResult result;
-        std::chrono::steady_clock::time_point expires_at;
-    };
-    std::mutex cache_mutex_;
-    std::unordered_map<std::string, CacheEntry> cache_;
+    std::shared_ptr<const RoutingSnapshot> snapshot_;
+    std::thread refresh_thread_;
+    std::atomic<bool> stop_{false};
 };

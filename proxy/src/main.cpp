@@ -15,6 +15,7 @@
 #include "format_anthropic.h"
 #include "format_openai.h"
 #include "format_responses.h"
+#include "logging.h"
 #include "proxy_server.h"
 #include "router.h"
 #include "semaphore_pool.h"
@@ -26,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <thread>
 
 // Signal-safe flag for graceful shutdown
 static volatile sig_atomic_t g_shutdown = 0;
@@ -40,6 +42,10 @@ int main(int argc, char *argv[]) {
 
     // ── Parse config ──────────────────────────────────────────────────
     Config cfg = parse_args(argc, argv);
+    if (!set_log_level(cfg.log_level)) {
+        fprintf(stderr, "Invalid --log-level: %s\n", cfg.log_level.c_str());
+        return 2;
+    }
 
     printf("Token Board Proxy\n");
     printf("  DB:   %s\n", cfg.db_path.c_str());
@@ -49,9 +55,9 @@ int main(int argc, char *argv[]) {
     // ── Open database ─────────────────────────────────────────────────
     if (cfg.schema_dir.empty()) {
         // Derive the default migration dir from the DB path:
-        // data/proxy.db → data/../schema/proxy → schema/proxy
+        // data/proxy.db → data/../schema → schema root
         auto dbp = std::filesystem::path(cfg.db_path);
-        cfg.schema_dir = (dbp.parent_path() / ".." / "schema" / "proxy")
+        cfg.schema_dir = (dbp.parent_path() / ".." / "schema")
                              .lexically_normal()
                              .string();
     }
@@ -75,13 +81,21 @@ int main(int argc, char *argv[]) {
     // ── Configure httplib server ──────────────────────────────────────
     httplib::Server server;
 
-    // Start with 8 threads and grow only for a real backlog. A bounded ceiling
+    // Start at 2× logical CPUs (bounded to 8..64) and grow on enqueue. A bounded ceiling
     // prevents a stalled provider from turning queued requests into thousands
     // of native thread stacks.
-    auto *pool = new SemaphorePool(8, 256);
+    const auto cpu_count = std::max(1u, std::thread::hardware_concurrency());
+    const size_t initial_workers = std::clamp<size_t>(cpu_count * 2, 8, 64);
+    auto *pool = new SemaphorePool(initial_workers, 256, 4096);
     server.new_task_queue = [pool] { return pool; };
 
     proxy_server.setup_routes(server);
+    server.set_logger([&proxy_server](const httplib::Request &req,
+                                      const httplib::Response &res) {
+        proxy_server.record_http_result(res.status);
+        TB_LOG_DEBUG("[HTTP] %s %s status=%d\n", req.method.c_str(),
+                     req.path.c_str(), res.status);
+    });
 
     // ── Graceful shutdown ─────────────────────────────────────────────
     signal(SIGINT, signal_handler);
@@ -97,25 +111,30 @@ int main(int argc, char *argv[]) {
 
     // Wait for signal, with periodic cleanup + auto-scale
     auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+    auto info_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::uint64_t last_requests = 0;
+    std::uint64_t last_errors = 0;
     while (!g_shutdown) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         auto now = std::chrono::steady_clock::now();
 
-        // ── Auto-scale: double pool when saturated ───────────────────
-        int in_flight = proxy_server.in_flight_count();
-        size_t cur_size = pool->size();
-        // Long-lived streams legitimately occupy every current worker. Grow
-        // only when accepted requests are actually queued behind those workers;
-        // using in_flight alone doubled the pool every 200 ms during an outage
-        // even when there was no backlog.
-        if (pool->queued() > 0 && pool->active() >= cur_size &&
-            cur_size < pool->max_size()) {
-            size_t new_size = std::min(cur_size * 2, pool->max_size());
-            fprintf(stderr,
-                    "[Scale] %zu → %zu threads (in_flight=%d, queued=%zu)\n",
-                    cur_size, new_size, in_flight, pool->queued());
-            pool->resize(new_size);
+        if (now >= info_deadline) {
+            info_deadline = now + std::chrono::seconds(10);
+            const auto requests = proxy_server.completed_requests();
+            const auto errors = proxy_server.error_requests();
+            const auto interval_requests = requests - last_requests;
+            const auto interval_errors = errors - last_errors;
+            last_requests = requests;
+            last_errors = errors;
+            TB_LOG_INFO("[Perf] rps=%.1f errors=%llu workers=%zu active=%zu "
+                        "queue=%zu queue_avg=%.2fms queue_p95=%.2fms "
+                        "rejected=%zu in_flight=%d\n",
+                        interval_requests / 10.0,
+                        static_cast<unsigned long long>(interval_errors),
+                        pool->size(), pool->active(), pool->queued(),
+                        pool->queue_average_ms(), pool->queue_p95_ms(),
+                        pool->rejected(), proxy_server.in_flight_count());
         }
 
         // ── Periodic cleanup: every 5 min ────────────────────────────
@@ -130,6 +149,7 @@ int main(int argc, char *argv[]) {
 
     // Drain and join the accounting thread before closing the DB it writes to.
     proxy_server.shutdown();
+    router.shutdown();
     db.close();
     printf("Goodbye.\n");
     return 0;

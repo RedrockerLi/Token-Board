@@ -22,7 +22,7 @@ Token Board 由两个独立进程组成,共享同一份版本化数据库 schema
                  └──────────────────────────────────────────┘
 ```
 
-schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [database-migrations.md](database-migrations.md)。`schema/proxy/` 定义 `proxy.db` 的表、索引、触发器,`schema/dashboard/` 定义 `dashboard.db` 的。C++ 侧 `proxy/src/store/db.cpp::run_migrations` 与 Python 侧 `app/migrations.py` 实现同一套 flock + `user_version` 协议,任一进程先启动都安全。
+schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [database-migrations.md](database-migrations.md)。当前 baseline 位于 `schema/proxy/v1/1-0_baseline.sql` 与 `schema/dashboard/v1/1-0_baseline.sql`；V0 文件按原内容归档在各自 `v0/`。C++ 与 Python runner 共用 flock、`schema_version`、checksum 与 `user_version` 镜像协议。
 
 两个库各管一件事:
 
@@ -55,7 +55,7 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 │   │   ├── main.cpp        入口、线程池扩容、周期清理、优雅停机
 │   │   ├── core/           路由、并发闸门、会话亲和、成本台账、服务端
 │   │   │   ├── config.cpp      CLI 参数
-│   │   │   ├── router.cpp      本地密钥 → 上游账户路由(2s 短缓存)
+│   │   │   ├── router.cpp      不可变 RoutingSnapshot(250ms generation 刷新)
 │   │   │   ├── proxy_server.cpp 三个 chat 端点共用管线、候选回退、流式处理、/health
 │   │   │   ├── account_gate.h   按密钥槽并发闸门 + plan 5h 冷却 + 短熔断退避
 │   │   │   ├── key_cost_ledger.h 累计成本台账(冷启动选最省密钥,内存)
@@ -73,8 +73,9 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 │   │       ├── db.cpp/h    SQLite 访问、迁移、快照计价、预编译语句
 │   │       └── usage_tracker.cpp/h 三种格式的 usage 解析,写 request_log / request_attempts
 │   └── tests/              codec 自测(格式转换矩阵)、上游转发、会话亲和测试
-├── schema/proxy/           迁移:0001_initial … 0014_trigger_fx(proxy.db,user_version 14)
-├── schema/dashboard/       迁移:0001_initial … 0005_per_key_plan_billing(dashboard.db,user_version 5)
+├── schema/proxy/v0,v1/     Proxy 历史迁移与当前 V1 baseline
+├── schema/dashboard/v0,v1/ Dashboard 历史迁移与当前 V1 baseline
+├── schema/transitions/     不兼容 Major 的离线影子库迁移工具
 ├── static/                 css + js(9 个模块)+ display_config.json
 ├── templates/index.html    SPA 页面(ECharts 5.5.0 CDN)
 ├── scripts/                启动/状态/模拟上游脚本(start-proxy.sh、start-dashboard.sh、status.sh、mock_upstream.py)
@@ -87,20 +88,20 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 
 请求进来先走代理这一路。客户端密钥经 `Router::route` 找到上游账户,请求按客户端 URL 路径识别格式,与上游格式不同时经 IR 编解码转换(见 [format-conversion.md](format-conversion.md)),随后由 `UpstreamClient` 转发。每次请求的结果写进 `proxy.db` 的 `request_log`(计费 + TTFT/速度指标)与 `request_attempts`(每次上游尝试),流式响应实时透传。
 
-看板这一路负责把 `proxy.db` 变成可读的图。配置(账户、密钥、定价)直接由看板写 `proxy.db`,代理下个请求自动读到新配置,路由缓存最长 2 秒。用量数据不走实时:看板导出事务把 `request_log` 按 日×账户×模型 增量聚合写进 `dashboard.db` 存档,再以「云端权威」模型同步到 WebDAV(见 [sync.md](sync.md))。`DataStore` 启动时读 `dashboard.db`,数据看板页面全部基于它渲染。
+看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。用量按 日×账户×模型 批量 upsert 到 Dashboard V1 的 `daily_usage`，再以「云端权威」模型同步到 WebDAV。
 
-dashboard.db 是**纯存档**:只存用量与总价,无价格表、无重算能力;`cost_entry` 一旦写入不再受改价影响。
+dashboard.db 是**纯存档**，V1 仅有 `accounts`、`daily_usage`、`monthly_recurring_costs`；没有价格表和重算能力。
 
 ## 关键设计决策
 
 这些设计取舍直接决定系统的行为,列在这里便于后来者理解"为什么这么设计"。
 
-**数据库是唯一事实来源。** 请求插入 `request_log` 那一刻,按当时的定价与峰谷档位(代理入队快照或触发器)算好 `api_cost` 固化下来,之后改价不回溯(见 [billing-pricing.md](billing-pricing.md))。看板的 `cost_entry` 在导出时按 `request_log.api_cost` 聚合固化,不再由 `model_pricing` 触发器重算。
+**数据库是唯一事实来源。** V1 按 `requested_at` 选择 `pricing_rules → pricing_rates → pricing_slots → fx_rates`，把 `equivalent_cost` 与 `billed_usage_cost` 固化；周期费用来自 `billing_period_charges`。看板直接归档这两个口径与 recurring charge，改价不回溯。
 
 **格式转换收敛到 IR。** 三种线格式的编解码统一到 `ir.h` 的中间表示:`parse(harness) → IR → serialize(upstream)`。同格式走透传快速路径,不经过 IR;客户端格式由请求 URL 路径识别,密钥不绑定格式(见 [format-conversion.md](format-conversion.md))。
 
 **request_log 明细绝不上传云端。** 多机同步只同步聚合后的 `dashboard.db` 和配置表;导出进度用一个单值检查点(`sync_state.last_exported_log_id`)跟踪,拉取-导出-上传是一个完整事务,失败即回滚(见 [sync.md](sync.md))。
 
-**schema 单一 DDL 来源。** 两库的全部 DDL 收敛到 `schema/<库>/NNNN_*.sql`,C++ 与 Python 共用同一份文件与同一套迁移协议,任何进程都能初始化或升级库(见 [database-migrations.md](database-migrations.md))。
+**schema 单一 DDL 来源。** 文件布局为 `schema/<库>/v<major>/<major>-<minor>_*.sql`；同 Major 自动升级，跨 Major 必须执行 transition。
 
-**plan 账户单独建模。** 订阅套餐调用不按量收费,真实账单里不计 plan 的流量金额;同时按 api 口径算好 `api_cost`(虚拟口径),用来衡量套餐划不划算(见 [billing-pricing.md](billing-pricing.md))。
+**计费是合同驱动。** 路由核心不判断 `api/plan/agent`。兼容 API 的三种模板在写入时转换为 `billing_contracts`、`account_importers` 和 route rules；metered/recurring 行为由数据决定。

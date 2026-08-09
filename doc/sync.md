@@ -61,7 +61,8 @@
 
 配置走独立的 `proxy_config_*.db` 文件,采用**云端权威镜像**(改名/编辑/删除跨机传播):
 
-- **上传**(一次事务):看板在用户**退出设置界面**时调 `POST /api/proxy/sync/config/upload` → `sync_config_upload`。副本先删掉运行时表(见 `sync._RUNTIME_TABLES`:请求明细 `request_log` / `request_attempts`、`perf_events`、`sync_config`、`in_flight_requests`、`sync_state`、上游密钥 `upstream_keys`、会话分配观测 `session_key_log`,以及仅本机的 `fx_rate` / `codex_import_state`),并把 `upstream_accounts.upstream_key` 置空(**上游 API Key 绝不上传,每台机器各自填写的 Key 只存本机**),`VACUUM` 后上传。上传前先拉取最新云端文件算 config hash,与 `sync_state.config_hash` 比对:不一致(云端被其他机器改过,或本机尚未下载过)返回 `conflict` 拒绝覆盖,防止用落后配置冲掉云端新配置。
+- **上传**(一次事务):V1 同步 accounts/upstreams/route sets/rules、client keys、credential UUID/掩码、contracts 与 pricing 历史；`upstream_secrets`、request/attempt、FX、周期已结费用和 importer cursor 会从上传副本清除。endpoint URL 还会剥离 userinfo/query。稳定 UUID 参与合并，但 runtime ID 与明文始终保留在本机。上传前以去除本机字段后的配置 hash 做冲突检查。
+- **Major 隔离**:远端与本机 Major 不同会明确拒绝合并；必须先在影子副本完成 transition。V1 下载只做同 Major 的 Minor 自动升级。
 - **下载**(启动时):`create_app` 调 `sync_config_download`,取云端最新配置按**云端权威**合入本地:账户按 id upsert(保留本机非空上游 Key)、密钥按 key_value upsert、定价按 id upsert,聚合/账户模型/时段/超时整表替换,本地不在云端的行删除(delete-stale)。
 - **回滚**:每台机在成功下载/上传的提交点维护本地快照 `data/config_snapshot.db`(含本机 Key,本地独有)。上传失败后用户选「丢弃设置」→ `POST /api/proxy/sync/config/discard` 从快照单事务回滚,不需要网络。
 

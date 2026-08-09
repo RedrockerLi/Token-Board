@@ -248,6 +248,24 @@ public:
     int in_flight_count() const noexcept {
         return in_flight_count_.load(std::memory_order_relaxed);
     }
+    std::size_t accounting_queue_depth() {
+        std::lock_guard<std::mutex> lock(accounting_mutex_);
+        return accounting_queue_.size();
+    }
+    std::uint64_t accounting_dropped() const noexcept {
+        return accounting_dropped_.load(std::memory_order_acquire);
+    }
+    void record_http_result(int status_code) noexcept {
+        completed_requests_.fetch_add(1, std::memory_order_relaxed);
+        if (status_code >= 400)
+            error_requests_.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::uint64_t completed_requests() const noexcept {
+        return completed_requests_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t error_requests() const noexcept {
+        return error_requests_.load(std::memory_order_relaxed);
+    }
 
 private:
     /// One request-log record enqueued by the response thread and drained by
@@ -268,6 +286,7 @@ private:
         int upstream_duration_ms = -1;
         int attempt_count = 1;
         std::vector<Database::AttemptInfo> attempts;
+        std::chrono::steady_clock::time_point enqueued_at;
     };
 
     /// Enqueue a request-log record; the response thread pays only an
@@ -292,9 +311,11 @@ private:
     /// key/upstream within the same request, and only after every candidate
     /// fails is an error status (429/504) committed to the client.
     void handle_streaming(const std::vector<UpstreamCandidate> &cands,
+                          const std::vector<std::string> &candidate_bodies,
                           size_t start, const std::string &session_id,
                           int local_key_id, ir::ApiFormat harness,
                           const std::string &resolved_model,
+                          const ir::ChatRequest &parsed_request,
                           const httplib::Request &req,
                           httplib::Response &res,
                           std::chrono::steady_clock::time_point t0);
@@ -318,15 +339,6 @@ private:
     KeyCostLedger cost_ledger_;  // accrued cost per key slot (cold-start bias)
     SessionAffinity affinity_;   // session → preferred key (in-memory)
 
-    struct CandidateCacheEntry {
-        std::vector<UpstreamCandidate> candidates;
-        std::chrono::steady_clock::time_point expires_at;
-    };
-    std::mutex candidate_cache_mutex_;
-    std::condition_variable candidate_cache_cv_;
-    std::unordered_set<std::string> candidate_cache_loading_;
-    std::unordered_map<std::string, CandidateCacheEntry> candidate_cache_;
-
     struct TimeoutCacheEntry {
         Database::TimeoutConfig config;
         std::chrono::steady_clock::time_point expires_at{};
@@ -342,6 +354,8 @@ private:
     };
     std::atomic<std::uint64_t> next_request_id_{1};
     std::atomic<int> in_flight_count_{0};
+    std::atomic<std::uint64_t> completed_requests_{0};
+    std::atomic<std::uint64_t> error_requests_{0};
     // Per-request round-robin offset for in-group key rotation (tier-5
     // routing): each non-affinity group rotates its keys by this counter.
     std::atomic<std::uint64_t> routing_rr_{0};
@@ -358,6 +372,7 @@ private:
     bool accounting_stop_ = false;
     std::once_flag accounting_thread_once_;
     std::atomic<std::uint64_t> accounting_dropped_{0};
+    std::atomic<std::size_t> accounting_last_batch_{0};
 
     // Cooldown-probe thread: while a plan key is inside its 5h cooldown, probe
     // the upstream every cooldown_probe_interval_secs_ and clear early on 2xx.
