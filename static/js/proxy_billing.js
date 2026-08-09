@@ -205,7 +205,7 @@ function initBillingPage() {
             <div class="stat-card stat-card--highlight">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#0070F3;"></span> 近30天 Token</div>
                 <div class="stat-card__value number-lg" id="billTotalTokens">--</div>
-                <div class="stat-card__sub">滚动窗口，含当前计划</div>
+                <div class="stat-card__sub">滚动窗口</div>
             </div>
             <div class="stat-card">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#8B5CF6;"></span> 近30天请求数</div>
