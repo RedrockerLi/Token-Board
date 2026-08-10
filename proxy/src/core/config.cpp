@@ -1,4 +1,5 @@
 #include "config.h"
+#include "logging.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -34,7 +35,7 @@ Config parse_args(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             cfg.port = atoi(argv[++i]);
             if (cfg.port <= 0 || cfg.port > 65535) {
-                fprintf(stderr, "Invalid port: %s\n", argv[i]);
+                TB_LOG_ERROR( "Invalid port: %s\n", argv[i]);
                 exit(1);
             }
         } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -42,7 +43,7 @@ Config parse_args(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
             cfg.log_level = argv[++i];
         } else {
-            fprintf(stderr, "Unknown option: %s\nTry --help\n", argv[i]);
+            TB_LOG_ERROR( "Unknown option: %s\nTry --help\n", argv[i]);
             exit(1);
         }
     }

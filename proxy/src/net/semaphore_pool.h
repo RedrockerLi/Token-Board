@@ -27,6 +27,9 @@
 #include <thread>
 #include <vector>
 
+#include "request_timing.h"
+#include "core/logging.h"
+
 class SemaphorePool final : public httplib::TaskQueue {
   public:
     /// @param n      Initial number of worker threads (≥ 1).
@@ -130,6 +133,13 @@ class SemaphorePool final : public httplib::TaskQueue {
     size_t rejected() const noexcept {
         return rejected_.load(std::memory_order_acquire);
     }
+    std::int64_t queue_oldest_age_ms() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (jobs_.empty()) return 0;
+        return std::max<std::int64_t>(0, std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                       jobs_.front().enqueued_at).count());
+    }
     double queue_average_ms() const noexcept {
         const auto count = queue_samples_.load(std::memory_order_acquire);
         return count ? static_cast<double>(queue_total_us_.load()) / count / 1000.0 : 0.0;
@@ -188,16 +198,22 @@ class SemaphorePool final : public httplib::TaskQueue {
             if (!job.fn && shutdown_.load(std::memory_order_acquire)) return;
 
             if (job.fn) {
-                observe_queue_delay(std::chrono::steady_clock::now() - job.enqueued_at);
+                const auto queue_delay =
+                    std::chrono::steady_clock::now() - job.enqueued_at;
+                observe_queue_delay(queue_delay);
+                set_request_queue_delay_ms(static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        queue_delay).count()));
                 active_.fetch_add(1, std::memory_order_release);
                 try {
                     job.fn();
                 } catch (const std::exception &e) {
-                    fprintf(stderr, "[Pool] uncaught request exception: %s\n",
+                    TB_LOG_ERROR("[Pool] uncaught request exception: %s\n",
                             e.what());
                 } catch (...) {
-                    fprintf(stderr, "[Pool] uncaught request exception\n");
+                    TB_LOG_ERROR("[Pool] uncaught request exception\n");
                 }
+                set_request_queue_delay_ms(0);
                 active_.fetch_sub(1, std::memory_order_release);
             } else {
                 // spurious wakeup from shutdown post during init race

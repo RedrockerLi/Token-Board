@@ -1,10 +1,24 @@
 #include "ir.h"
 
+#include <algorithm>
+#include <cctype>
+
 namespace ir {
 
 ApiFormat parse_api_format(const std::string &s) {
-    if (s == "openai_responses") return ApiFormat::OpenAIResponses;
+    // Routing snapshots store canonical spellings. Avoid allocating a
+    // temporary for the overwhelmingly common hot-path values; retain the
+    // normalized fallback for configuration files written by older clients.
+    if (s == "openai" || s.empty()) return ApiFormat::OpenAI;
     if (s == "anthropic") return ApiFormat::Anthropic;
+    if (s == "openai_responses") return ApiFormat::OpenAIResponses;
+    std::string normalized = s;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char value) {
+                       return static_cast<char>(std::tolower(value));
+                   });
+    if (normalized == "openai_responses") return ApiFormat::OpenAIResponses;
+    if (normalized == "anthropic") return ApiFormat::Anthropic;
     return ApiFormat::OpenAI;  // "openai" and any unknown value → OpenAI
 }
 

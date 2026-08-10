@@ -4,6 +4,11 @@ Loads the dashboard archive (dashboard.db) and stores everything as plain
 dict rows.
 """
 
+import logging
+
+
+log = logging.getLogger(__name__)
+
 
 class DataStore:
     """Holds all parsed rows and derived metadata.
@@ -12,7 +17,7 @@ class DataStore:
 
         store = DataStore("/path/to/data")
         store.load()
-        print(len(store.token_usages))
+        len(store.token_usages)
     """
 
     def __init__(self, data_dir):
@@ -25,6 +30,9 @@ class DataStore:
         self.api_key_names: list[str] = []
         self.platforms: list[str] = []             # discovered platform names
         self.models: list[str] = []                # unique model names
+        # DashboardDatabase accepts only normalized V1; retain this attribute
+        # as a read-only compatibility flag for templates and old clients.
+        self.is_v1 = True
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -32,7 +40,7 @@ class DataStore:
         """Rebuild state from the dashboard archive (dashboard.db)."""
         db_path = self.data_dir / "dashboard.db"
         if not db_path.exists():
-            print(f"[WARN] Dashboard archive not found: {db_path}")
+            log.warning("dashboard archive not found: %s", db_path)
             self._commit([], [], [], [], [], [], [], [])
             return
         self._load_from_db(str(db_path))
@@ -44,6 +52,13 @@ class DataStore:
         from app.db.dashboard_db import DashboardDatabase
 
         db = DashboardDatabase(db_path)
+        conn = db._connect()
+        try:
+            # Opening the façade already verified the V1 schema.  Do not probe
+            # or branch on historical table layouts in the request path.
+            self.is_v1 = True
+        finally:
+            conn.close()
         (
             token_usages,
             request_usages,

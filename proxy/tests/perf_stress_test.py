@@ -18,6 +18,8 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import json
 import shutil
@@ -78,6 +80,12 @@ def main() -> None:
     ap.add_argument("--mock-stall-after", type=int, default=None,
                     help="streaming: pause after this SSE frame (commit-then-stall)")
     ap.add_argument("--mock-stall-secs", type=float, default=5)
+    ap.add_argument("--min-rps", type=float, default=0,
+                    help="fail when measured throughput is below this gate")
+    ap.add_argument("--max-p95", type=float, default=0,
+                    help="fail when client p95 exceeds this gate (ms)")
+    ap.add_argument("--max-queue-p95", type=float, default=0,
+                    help="fail when /health queue p95 exceeds this gate (ms)")
     args = ap.parse_args()
 
     proxy_binary = Path(args.token_proxy).resolve()
@@ -94,30 +102,15 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "proxy.db"
-        legacy_schema = Path(tmp) / "schema-v10"
-        legacy_schema.mkdir()
-        for migration in schema_dir.glob("*.sql"):
-            if int(migration.stem.split("_", 1)[0].split("-", 1)[1]) <= 10:
-                shutil.copy2(migration, legacy_schema / migration.name)
-        migrate(str(db_path), str(legacy_schema))
+        migrate(str(db_path), str(schema_dir), "proxy")
         conn = sqlite3.connect(db_path)
         try:
-            account_id = conn.execute(
-                "INSERT INTO upstream_accounts "
-                "(name,upstream_key,base_url,api_format,auth_header,max_concurrency) "
-                "VALUES (?,?,?,?,?,?)",
-                ("mock", "", f"http://127.0.0.1:{upstream_port}",
-                 "openai", "bearer", 256),
-            ).lastrowid
-            conn.execute(
-                "INSERT INTO local_keys(key_value,label,account_id) VALUES (?,?,?)",
-                ("tb-stress", "stress", account_id),
-            )
-            conn.executemany(
-                "INSERT INTO upstream_keys(account_id,key_value,position) "
-                "VALUES (?,?,?)",
-                [(account_id, "sk-mock-1", 0), (account_id, "sk-mock-2", 1)],
-            )
+            from v1_fixture import add_plain_route, add_upstream
+            account_id, upstream_id, _ = add_upstream(
+                conn, "mock", f"http://127.0.0.1:{upstream_port}",
+                ["sk-mock-1", "sk-mock-2"], max_concurrency=256)
+            add_plain_route(conn, "tb-stress", "stress", upstream_id,
+                            account_id)
             conn.commit()
         finally:
             conn.close()
@@ -129,6 +122,7 @@ def main() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            env=os.environ.copy(),
         )
         try:
             wait_for_health(proxy_port)
@@ -222,6 +216,30 @@ def main() -> None:
                 f"errors={errors[:3]}",
                 flush=True,
             )
+            client_p95 = pct(lat_sorted, 95)
+            queue_p95 = 0.0
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{proxy_port}/health", timeout=1) as health_response:
+                    health = json.loads(health_response.read().decode())
+                queue_p95 = float(health.get("queue", {}).get("p95_ms", 0) or 0)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                if args.max_queue_p95 > 0:
+                    print("ERROR: unable to read queue metrics", flush=True)
+                    sys.exit(3)
+            throughput = args.requests / total_secs
+            if args.min_rps > 0 and throughput < args.min_rps:
+                print(f"ERROR: throughput {throughput:.1f} < {args.min_rps:.1f} RPS",
+                      flush=True)
+                sys.exit(3)
+            if args.max_p95 > 0 and client_p95 > args.max_p95:
+                print(f"ERROR: client p95 {client_p95:.1f} > {args.max_p95:.1f} ms",
+                      flush=True)
+                sys.exit(3)
+            if args.max_queue_p95 > 0 and queue_p95 > args.max_queue_p95:
+                print(f"ERROR: queue p95 {queue_p95:.1f} > {args.max_queue_p95:.1f} ms",
+                      flush=True)
+                sys.exit(3)
             if ok < len(statuses):
                 print("WARNING: non-200 responses:", {
                     s: statuses.count(s) for s in set(statuses) if s != 200

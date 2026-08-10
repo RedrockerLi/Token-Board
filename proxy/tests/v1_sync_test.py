@@ -7,6 +7,7 @@ import importlib.util
 import sqlite3
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 
@@ -41,7 +42,14 @@ def main() -> None:
     schema_root = Path(sys.argv[1]).resolve()
     project = Path(sys.argv[2]).resolve()
     migrations = load("token_board_migrations", project / "app/db/migrations.py")
-    sync = load("token_board_sync", project / "app/services/sync.py")
+    for package, package_path in {
+        "app": project / "app",
+        "app.services": project / "app/services",
+    }.items():
+        module = types.ModuleType(package)
+        module.__path__ = [str(package_path)]
+        sys.modules[package] = module
+    import app.services.sync as sync
     directory = Path(tempfile.mkdtemp())
     local, remote = directory / "local.db", directory / "remote.db"
     migrations.migrate(str(local), str(schema_root), "proxy")

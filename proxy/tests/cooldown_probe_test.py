@@ -56,42 +56,9 @@ def wait_for_health(port: int) -> None:
 
 def build_scenario(conn, local_key, model, plan_keys, deepseek_key):
     """plan account (plan_keys) + deepseek fallback, behind aggregate."""
-    plan_id = conn.execute(
-        "INSERT INTO upstream_accounts "
-        "(name,upstream_key,base_url,api_format,auth_header,max_concurrency,"
-        "account_type) VALUES (?,?,?,?,?,?,?)",
-        (f"{local_key}-plan", "", "", "openai", "bearer", 64, "plan"),
-    ).lastrowid
-    conn.executemany(
-        "INSERT INTO upstream_keys(account_id,key_value,position) VALUES (?,?,?)",
-        [(plan_id, k, i) for i, k in enumerate(plan_keys)],
-    )
-    ds_id = conn.execute(
-        "INSERT INTO upstream_accounts "
-        "(name,upstream_key,base_url,api_format,auth_header,max_concurrency,"
-        "account_type) VALUES (?,?,?,?,?,?,?)",
-        (f"{local_key}-ds", "", "", "openai", "bearer", 64, "api"),
-    ).lastrowid
-    conn.execute(
-        "INSERT INTO upstream_keys(account_id,key_value,position) VALUES (?,?,?)",
-        (ds_id, deepseek_key, 0),
-    )
-    agg_id = conn.execute(
-        "INSERT INTO upstream_accounts "
-        "(name,upstream_key,base_url,api_format,auth_header,max_concurrency,"
-        "account_type,is_aggregate) VALUES (?,?,?,?,?,?,?,?)",
-        (f"{local_key}-agg", "", "", "openai", "bearer", 64, "api", 1),
-    ).lastrowid
-    conn.executemany(
-        "INSERT INTO aggregate_entries "
-        "(account_id,sort_order,pattern,upstream_account_id,upstream_model) "
-        "VALUES (?,?,?,?,?)",
-        [(agg_id, 0, model, plan_id, model), (agg_id, 1, model, ds_id, model)],
-    )
-    conn.execute(
-        "INSERT INTO local_keys(key_value,label,account_id) VALUES (?,?,?)",
-        (local_key, local_key, agg_id),
-    )
+    from v1_fixture import build_aggregate_scenario
+    return build_aggregate_scenario(
+        conn, local_key, model, plan_keys, deepseek_key)
 
 
 def send(proxy_port, local_key, body, timeout=30):
@@ -171,20 +138,17 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "proxy.db"
-        legacy = Path(tmp) / "schema"
-        legacy.mkdir()
-        for mig in schema_dir.glob("*.sql"):
-            if int(mig.stem.split("_", 1)[0].split("-", 1)[1]) <= 10:
-                shutil.copy2(mig, legacy / mig.name)
-        migrate(str(db_path), str(legacy))
+        migrate(str(db_path), str(schema_dir), "proxy")
         conn = sqlite3.connect(db_path)
         base_url = f"http://127.0.0.1:{upstream_port}"
         try:
             build_scenario(conn, "tb-p", "p-model", ["sk-p1", "sk-p2"], "sk-p-d")
-            conn.execute("UPDATE upstream_accounts SET base_url=?", (base_url,))
+            conn.execute("UPDATE upstreams SET base_url=?", (base_url,))
             conn.commit()
             key_ids = {kv: k for k, kv in conn.execute(
-                "SELECT id, key_value FROM upstream_keys WHERE key_value LIKE 'sk-p%'")}
+                "SELECT c.runtime_id,s.secret_value FROM upstream_credentials c "
+                "JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+                "WHERE s.secret_value LIKE 'sk-p%'")}
         finally:
             conn.close()
         p1_id, p2_id = key_ids["sk-p1"], key_ids["sk-p2"]

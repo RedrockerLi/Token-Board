@@ -1,4 +1,5 @@
 #include "usage_tracker.h"
+#include "core/logging.h"
 #include "db.h"
 #include "format_common.h"
 
@@ -94,7 +95,7 @@ UsageTracker::parse_usage(const std::string &body) {
 
         return info;
     } catch (const json::exception &e) {
-        fprintf(stderr, "[Tracker] JSON usage parse error: %s\n", e.what());
+        TB_LOG_ERROR( "[Tracker] JSON usage parse error: %s\n", e.what());
         return std::nullopt;
     }
 }
@@ -234,7 +235,7 @@ UsageTracker::parse_anthropic_usage(const std::string &body) {
 
         return info;
     } catch (const json::exception &e) {
-        fprintf(stderr, "[Tracker] Anthropic usage parse error: %s\n", e.what());
+        TB_LOG_ERROR( "[Tracker] Anthropic usage parse error: %s\n", e.what());
         return std::nullopt;
     }
 }
@@ -341,7 +342,7 @@ UsageTracker::parse_responses_usage(const std::string &body) {
                                           info.completion_tokens);
         return info;
     } catch (const json::exception &e) {
-        fprintf(stderr, "[Tracker] Responses usage parse error: %s\n", e.what());
+        TB_LOG_ERROR( "[Tracker] Responses usage parse error: %s\n", e.what());
         return std::nullopt;
     }
 }
@@ -421,10 +422,12 @@ bool UsageTracker::log_request(int account_id, int local_key_id,
                                int upstream_ttft_ms, int upstream_duration_ms,
                                int attempt_count,
                                const std::vector<Database::AttemptInfo> &attempts,
-                               double *out_cost) {
-    // Cost is computed automatically by the tr_request_log_insert SQLite
-    // trigger, so we pass 0.0 here. The trigger reads model_pricing and
-    // sets the correct api_cost immediately after insert.
+                               int queue_ms,
+                               double *out_cost,
+                               UsageReservation *reservation) {
+    // Cost is computed automatically by the V1 SQLite pricing trigger, so we
+    // pass 0.0 here.  The trigger selects pricing_rates by requested_at and
+    // records equivalent_cost/pricing_status for the UsageEvent.
     double cost = 0.0;
 
     const bool accepted = db_.log_request(
@@ -433,9 +436,10 @@ bool UsageTracker::log_request(int account_id, int local_key_id,
         usage.cache_read_tokens, usage.total_tokens, cost,
         is_streaming, status_code, duration_ms, upstream_key_id,
         ttft_ms, generation_ms, output_tps, upstream_ttft_ms,
-        upstream_duration_ms, attempt_count, attempts, out_cost);
+        upstream_duration_ms, attempt_count, attempts, queue_ms, out_cost,
+        reservation);
     if (!accepted) {
-        fprintf(stderr,
+        TB_LOG_ERROR(
                 "[Tracker] request log rejected/failed: account=%d model=%s "
                 "status=%d\n",
                 account_id, usage.model.c_str(), status_code);

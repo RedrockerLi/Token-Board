@@ -1024,6 +1024,10 @@ public:
   void decommission();
 
   std::function<TaskQueue *(void)> new_task_queue;
+  // Called synchronously by the accept loop when TaskQueue::enqueue rejects
+  // an accepted socket.  Applications can send a small overload response;
+  // the socket is always shut down and closed immediately afterwards.
+  std::function<void(socket_t)> task_queue_rejection_handler;
 
 protected:
   bool process_request(Stream &strm, const std::string &remote_addr,
@@ -1203,6 +1207,12 @@ private:
 
 class ClientImpl {
 public:
+  // Minimal transport timing hook used by the proxy.  Phase 1 is TCP
+  // connection establishment and phase 2 is TLS handshake.  The callback is
+  // invoked only when a new socket is opened; keep-alive reuse intentionally
+  // reports zero for both phases.
+  using TimingCallback = std::function<void(int phase, int elapsed_ms)>;
+
   explicit ClientImpl(const std::string &host);
 
   explicit ClientImpl(const std::string &host, int port);
@@ -1417,6 +1427,7 @@ public:
   void set_tcp_nodelay(bool on);
   void set_ipv6_v6only(bool on);
   void set_socket_options(SocketOptions socket_options);
+  void set_timing_callback(TimingCallback timing_callback);
 
   void set_connection_timeout(time_t sec, time_t usec = 0);
   template <class Rep, class Period>
@@ -1557,6 +1568,7 @@ protected:
   bool tcp_nodelay_ = CPPHTTPLIB_TCP_NODELAY;
   bool ipv6_v6only_ = CPPHTTPLIB_IPV6_V6ONLY;
   SocketOptions socket_options_ = nullptr;
+  TimingCallback timing_callback_;
 
   bool compress_ = false;
   bool decompress_ = true;
@@ -1625,6 +1637,8 @@ private:
 
 class Client {
 public:
+  using TimingCallback = ClientImpl::TimingCallback;
+
   // Universal interface
   explicit Client(const std::string &scheme_host_port);
 
@@ -1847,6 +1861,7 @@ public:
   void set_address_family(int family);
   void set_tcp_nodelay(bool on);
   void set_socket_options(SocketOptions socket_options);
+  void set_timing_callback(TimingCallback timing_callback);
 
   void set_connection_timeout(time_t sec, time_t usec = 0);
   template <class Rep, class Period>
@@ -6837,6 +6852,9 @@ inline bool Server::listen_internal() {
 
       if (!task_queue->enqueue(
               [this, sock]() { process_and_close_socket(sock); })) {
+        if (task_queue_rejection_handler) {
+          task_queue_rejection_handler(sock);
+        }
         detail::shutdown_socket(sock);
         detail::close_socket(sock);
       }
@@ -7357,7 +7375,13 @@ inline socket_t ClientImpl::create_client_socket(Error &error) const {
 
 inline bool ClientImpl::create_and_connect_socket(Socket &socket,
                                                   Error &error) {
+  const auto started = std::chrono::steady_clock::now();
   auto sock = create_client_socket(error);
+  if (timing_callback_) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    timing_callback_(1, static_cast<int>(std::max<long long>(0, elapsed)));
+  }
   if (sock == INVALID_SOCKET) { return false; }
   socket.sock = sock;
   return true;
@@ -8762,6 +8786,10 @@ inline void ClientImpl::set_socket_options(SocketOptions socket_options) {
   socket_options_ = std::move(socket_options);
 }
 
+inline void ClientImpl::set_timing_callback(TimingCallback timing_callback) {
+  timing_callback_ = std::move(timing_callback);
+}
+
 inline void ClientImpl::set_compress(bool on) { compress_ = on; }
 
 inline void ClientImpl::set_decompress(bool on) { decompress_ = on; }
@@ -9406,6 +9434,7 @@ inline bool SSLClient::load_certs() {
 }
 
 inline bool SSLClient::initialize_ssl(Socket &socket, Error &error) {
+  const auto started = std::chrono::steady_clock::now();
   auto ssl = detail::ssl_new(
       socket.sock, ctx_, ctx_mutex_,
       [&](SSL *ssl2) {
@@ -9468,6 +9497,12 @@ inline bool SSLClient::initialize_ssl(Socket &socket, Error &error) {
 #endif
         return true;
       });
+
+  if (timing_callback_) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    timing_callback_(2, static_cast<int>(std::max<long long>(0, elapsed)));
+  }
 
   if (ssl) {
     socket.ssl = ssl;
@@ -10119,6 +10154,10 @@ inline void Client::set_tcp_nodelay(bool on) { cli_->set_tcp_nodelay(on); }
 
 inline void Client::set_socket_options(SocketOptions socket_options) {
   cli_->set_socket_options(std::move(socket_options));
+}
+
+inline void Client::set_timing_callback(TimingCallback timing_callback) {
+  cli_->set_timing_callback(std::move(timing_callback));
 }
 
 inline void Client::set_connection_timeout(time_t sec, time_t usec) {

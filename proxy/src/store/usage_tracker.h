@@ -55,8 +55,9 @@ public:
     static std::optional<UsageInfo> parse_stream_usage(const std::string &api_format,
                                                        const std::string &sse_data);
 
-    /// Compute cost and enqueue a request-log entry.  False means shutdown
-    /// rejected it or the saturated queue's synchronous fallback failed.
+    /// Enqueue a request-log entry using the admission reservation acquired
+    /// before upstream access. False means the reservation is missing,
+    /// shutdown rejected it, or the durable writer is degraded.
     bool log_request(int account_id, int local_key_id, const UsageInfo &usage,
                      bool is_streaming, int status_code, int duration_ms,
                      int upstream_key_id = 0, int ttft_ms = -1,
@@ -64,7 +65,9 @@ public:
                      int upstream_ttft_ms = -1, int upstream_duration_ms = -1,
                      int attempt_count = 1,
                      const std::vector<Database::AttemptInfo> &attempts = {},
-                     double *out_cost = nullptr);
+                     int queue_ms = 0,
+                     double *out_cost = nullptr,
+                     UsageReservation *reservation = nullptr);
 
 private:
     Database &db_;

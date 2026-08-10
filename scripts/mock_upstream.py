@@ -43,6 +43,8 @@ Response selection:
   - Streaming timing: "mock_chunk_delay" sleeps between SSE frames;
     "mock_stall_after" pauses after that frame index (post-commit stall);
     "mock_stall_secs" the pause length; "mock_stall_forever" stalls forever.
+  - "mock_long_stream_frames": N emits N small content frames for long-stream
+    memory tests.
   - "mock_simple_stream": true returns the plain content-only stream (no
     reasoning_content / cost frames).
   - Streaming: request body "stream": true returns an SSE stream.
@@ -443,6 +445,20 @@ class Handler(BaseHTTPRequestHandler):
                 'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n',
                 'data: [DONE]\n\n',
             ]
+
+        long_frames = int(req.get("mock_long_stream_frames", 0) or 0)
+        if long_frames > 0:
+            chunks = [self._openai_chunk(
+                cid, model, {"role": "assistant", "content": None,
+                             "reasoning_content": ""})]
+            chunks.extend(self._openai_chunk(
+                cid, model, {"content": "x", "reasoning_content": None})
+                for _ in range(min(long_frames, 10000)))
+            chunks.append(self._openai_chunk(cid, model, {"content": ""}, "stop"))
+            frames = ["data: " + json.dumps(c) + "\n\n" for c in chunks]
+            frames.append('data: {"choices":[],"usage":{"prompt_tokens":11,'
+                          '"completion_tokens":7,"total_tokens":18}}\n\n')
+            return frames + ["data: [DONE]\n\n"]
 
         # Realistic DeepSeek-family stream (as observed from opencode.ai):
         # role-start → reasoning_content deltas → content deltas →

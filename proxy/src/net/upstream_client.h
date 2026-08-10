@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_set>
 
 /// Auth scheme + path handling for an upstream forward call.
 struct ForwardOptions {
@@ -76,6 +77,13 @@ public:
         std::uint64_t clients_created = 0;
         std::uint64_t dns_lookups = 0;
         std::uint64_t dns_total_ms = 0;
+        std::uint64_t connect_total_ms = 0;
+        std::uint64_t tls_total_ms = 0;
+        std::uint64_t new_connections = 0;
+        std::uint64_t reused_connections = 0;
+        std::uint64_t lease_count = 0;
+        std::uint64_t lease_wait_ms = 0;
+        std::uint64_t active_leases = 0;
     };
     struct ForwardResult {
         int status_code = 0;
@@ -89,7 +97,10 @@ public:
         bool body_too_large = false;  // non-streaming hard response limit fired
         int duration_ms = 0;  // total upstream call time (streaming: until stream ends)
         int dns_ms = 0;
+        int connect_ms = 0;
+        int tls_ms = 0;
         int lease_wait_ms = 0;
+        int first_byte_ms = 0;
         bool connection_reused = false;
         // Streaming: first received body chunk (transport-level precursor to
         // semantic TTFT). Non-streaming: full response duration; it is never
@@ -105,10 +116,9 @@ public:
 
     /// Forward a request to the upstream API.
     ///
-    /// If `on_chunk` is provided each chunk of the response body is passed
-    /// to the callback as it arrives (SSE streaming).  The full body is
-    /// retained (up to streaming_body_buffer_limit) and returned in
-    /// `ForwardResult::body` for later usage parsing.
+    /// If `on_chunk` is provided each chunk is passed to the callback as it
+    /// arrives. Successful streams retain no body; only an error/truncated
+    /// stream keeps a bounded diagnostic tail in `ForwardResult::body`.
     ///
     ForwardResult forward(const std::string &method,
                           const std::string &base_url,
@@ -120,4 +130,10 @@ public:
                           const ForwardOptions &opts = ForwardOptions{});
 
     static TransportMetrics transport_metrics();
+    // Drop idle keep-alive connections after a routing/origin snapshot
+    // replacement. Leased connections finish their current request and are
+    // discarded by their normal lease path.
+    static void invalidate_connections();
+    static void invalidate_connections(
+        const std::unordered_set<std::string> &origins);
 };

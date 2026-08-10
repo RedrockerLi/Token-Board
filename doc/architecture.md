@@ -45,7 +45,7 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 │   ├── data_loader.py      DataStore 单例:读 dashboard.db 存档
 │   ├── sync.py             WebDAV 同步(配置上传/下载、dashboard 云端权威事务)
 │   ├── migrations.py       Python 侧迁移 runner
-│   ├── cost_allocator.py   按 Token 占比分摊成本
+│   ├── cost_allocator.py   V1 已归属成本兼容读取
 │   ├── ir.py               平台无关 IR 数据类(TokenUsage/RequestUsage/CostEntry)
 │   ├── fx.py               USD→CNY 汇率拉取与缓存(本地,不上云)
 │   └── codex_import.py     Codex 会话用量后台导入(增量游标,幂等)

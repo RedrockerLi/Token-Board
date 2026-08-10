@@ -6,19 +6,22 @@ Fetch-on-demand rule (per requirements):
   * If the fetch fails (or returns the same old data) → keep using the most
     recent stored rate.
 
-The table lives in proxy.db (fx_rate) and is excluded from cloud sync
-(app/sync.py _RUNTIME_TABLES).  Every function is best-effort and never raises
+The table lives in proxy.db (fx_rates) and is excluded from cloud sync.
+Every function is best-effort and never raises
 into the request path; missing data degrades to the nearest stored rate (the
 earliest one when the requested date precedes every row; 1.0 only when the
 pair has never been stored).
 """
 
 from datetime import datetime, timezone
+import logging
+from collections.abc import Callable
 
 import requests
 
 FRANKFURTER_URL = "https://api.frankfurter.dev/v2/rate/USD/CNY"
 _FETCH_TIMEOUT = 3  # seconds
+log = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -27,12 +30,6 @@ def _utc_now() -> datetime:
 
 def _utc_date() -> str:
     return _utc_now().strftime("%Y-%m-%d")
-
-
-def _v1(conn) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fx_rates'"
-    ).fetchone() is not None
 
 
 def get_rate(conn, base: str = "USD", quote: str = "CNY",
@@ -46,34 +43,28 @@ def get_rate(conn, base: str = "USD", quote: str = "CNY",
     return 1.0 (no failure — CNY prices are unaffected).
     """
     date = date or _utc_date()
-    table = "fx_rates" if _v1(conn) else "fx_rate"
-    base_col = "base_currency" if table == "fx_rates" else "base"
-    quote_col = "quote_currency" if table == "fx_rates" else "quote"
     row = conn.execute(
-        f"SELECT rate FROM {table} WHERE {base_col}=? AND {quote_col}=? AND date<=? "
+        "SELECT rate FROM fx_rates WHERE base_currency=? AND quote_currency=? AND date<=? "
         "ORDER BY date DESC LIMIT 1", (base, quote, date)).fetchone()
     if row is not None:
         return float(row["rate"])
     # 请求日期早于所有已存汇率（如过去月份早于首次拉取）→ 用最早一条。
     row = conn.execute(
-        f"SELECT rate FROM {table} WHERE {base_col}=? AND {quote_col}=? "
+        "SELECT rate FROM fx_rates WHERE base_currency=? AND quote_currency=? "
         "ORDER BY date ASC LIMIT 1", (base, quote)).fetchone()
     return float(row["rate"]) if row is not None else 1.0
 
 
 def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
-                date: str | None = None) -> float:
+                date: str | None = None,
+                on_error: Callable[[Exception], None] | None = None) -> float:
     """Return the rate for ``date`` (default today), fetching and storing it
     when the exact row is missing.  Falls back to the nearest stored rate on
     any error.  Never raises.
     """
     date = date or _utc_date()
-    is_v1 = _v1(conn)
-    table = "fx_rates" if is_v1 else "fx_rate"
-    base_col = "base_currency" if is_v1 else "base"
-    quote_col = "quote_currency" if is_v1 else "quote"
     row = conn.execute(
-        f"SELECT rate FROM {table} WHERE {base_col}=? AND {quote_col}=? AND date=?",
+        "SELECT rate FROM fx_rates WHERE base_currency=? AND quote_currency=? AND date=?",
         (base, quote, date)).fetchone()
     if row is not None:
         return float(row["rate"])
@@ -84,20 +75,17 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
         data = resp.json()
         rate = float(data.get("rate"))
         fetched_date = data.get("date") or date
-        if is_v1:
-            conn.execute(
-                "INSERT INTO fx_rates(base_currency,quote_currency,date,rate) VALUES(?,?,?,?) "
-                "ON CONFLICT(base_currency,quote_currency,date) DO UPDATE SET rate=excluded.rate",
-                (base, quote, fetched_date, rate))
-        else:
-            conn.execute(
-                "INSERT OR REPLACE INTO fx_rate (base, quote, date, rate, fetched_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (base, quote, fetched_date, rate,
-                 _utc_now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.execute(
+            "INSERT INTO fx_rates(base_currency,quote_currency,date,rate) VALUES(?,?,?,?) "
+            "ON CONFLICT(base_currency,quote_currency,date) DO UPDATE SET rate=excluded.rate",
+            (base, quote, fetched_date, rate))
         conn.commit()
-    except Exception:
-        pass  # offline / bad payload → use nearest stored rate below
+    except Exception as exc:
+        # Offline/bad payload: use the nearest stored rate below, but keep the
+        # failure visible to the billing health and application logs.
+        log.warning("FX fetch failed; using stored rate: %s", exc)
+        if on_error:
+            on_error(exc)
 
     return get_rate(conn, base, quote, date)
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "db.h"
+#include "routing_snapshot.h"
 
 #include <chrono>
 #include <atomic>
@@ -11,17 +12,10 @@
 #include <unordered_map>
 #include <vector>
 
-struct RoutingSnapshot;
-
-/// Maps local (proxy) API keys to upstream CSTCloud accounts.
-///
-/// Authentication is verified against SQLite, but a very short-TTL cache
-/// absorbs the per-request `read_mutex_`-serialized lookup: a 2-second window
-/// of stale auth/routing is the deliberate price for removing a synchronous
-/// SQLite read from every request's hot path.  Only SUCCESSFUL results are
-/// cached (a revoked/invalid key stays uncached and is re-checked every
-/// request), so a random-key attack cannot grow the cache and key revocation
-/// takes effect on the next uncached request.
+/// Resolves client keys and model rules from an immutable in-memory snapshot.
+/// SQLite is read only by the background generation watcher; request threads
+/// retain the snapshot they started with so a concurrent refresh cannot
+/// invalidate candidate references.
 class Router {
 public:
     explicit Router(Database &db);
@@ -32,27 +26,26 @@ public:
     struct RouteResult {
         bool success = false;
         std::string error;       // human-readable when !success
-        std::string base_url;
-        std::string api_format;      // "openai" | "openai_responses" | "anthropic"
-        std::string endpoint_path;   // "" = derive from api_format
-        std::string auth_header;     // "bearer" | "x-api-key"
-        int account_id = 0;
-        int local_key_id = 0;
-        Database::AccountInfo account;
-        std::shared_ptr<const RoutingSnapshot> snapshot;
+        int account_id = 0;      // route-set id (kept for logging)
+        int local_key_id = 0;    // client_keys.id
+        std::uint32_t route_set_index = 0;  // into RoutingSnapshot::route_sets
+        std::shared_ptr<const routing::RoutingSnapshot> snapshot;
     };
 
     RouteResult route(const std::string &local_key);
-    std::vector<Database::RoutingTarget> resolve_targets(
+    std::vector<routing::CandidateRef> resolve_targets(
         const RouteResult &route, const std::string &model) const;
     std::vector<std::string> model_patterns(const RouteResult &route) const;
+    Database::TimeoutConfig timeout_config(const std::string &endpoint) const;
+    bool snapshot_loaded() const noexcept;
+    std::uint64_t snapshot_generation() const noexcept;
     void shutdown();
 
 private:
     bool reload();
     void refresh_loop();
     Database &db_;
-    std::shared_ptr<const RoutingSnapshot> snapshot_;
+    std::shared_ptr<const routing::RoutingSnapshot> snapshot_;
     std::thread refresh_thread_;
     std::atomic<bool> stop_{false};
 };

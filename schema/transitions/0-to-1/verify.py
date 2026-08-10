@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import sqlite3
 from pathlib import Path
 
@@ -13,11 +14,23 @@ class VerificationError(RuntimeError):
     pass
 
 
+def latest_user_version(schema_root: Path, database: str) -> int:
+    versions = []
+    for path in (schema_root / database / "v1").glob("*.sql"):
+        match = re.match(r"^(\d+)-(\d+)_", path.name)
+        if match:
+            versions.append(int(match.group(1)) * 10_000 + int(match.group(2)))
+    if not versions:
+        raise VerificationError(f"no V1 schema files for {database}")
+    return max(versions)
+
+
 def scalar(conn: sqlite3.Connection, sql: str, params=()):
     return conn.execute(sql, params).fetchone()[0]
 
 
-def verify_proxy(v0_path: str, v1_path: str) -> dict[str, int | float]:
+def verify_proxy(v0_path: str, v1_path: str, expected_version: int | None = None,
+                 spool_records: list[dict] | None = None) -> dict[str, int | float]:
     old = sqlite3.connect(v0_path)
     new = sqlite3.connect(v1_path)
     try:
@@ -28,24 +41,33 @@ def verify_proxy(v0_path: str, v1_path: str) -> dict[str, int | float]:
         if actual_accounts != expected_accounts:
             raise VerificationError(
                 f"proxy accounts: expected {expected_accounts}, got {actual_accounts}")
+        spool_records = spool_records or []
+        old_events = {row[0] for row in old.execute(
+            "SELECT event_id FROM request_log")}
+        imported = [row for row in spool_records
+                    if row.get("event_id") not in old_events]
         for table in ("request_log", "request_attempts"):
             before = scalar(old, f"SELECT count(*) FROM {table}")
             after = scalar(new, f"SELECT count(*) FROM {table}")
-            if before != after:
+            expected = before + (len(imported) if table == "request_log" else
+                                 sum(len(row.get("attempts", [])) for row in imported))
+            if expected != after:
                 raise VerificationError(f"{table}: expected {before}, got {after}")
         token_before = scalar(old, "SELECT COALESCE(sum(total_tokens),0) FROM request_log")
         token_after = scalar(new, "SELECT COALESCE(sum(total_tokens),0) FROM request_log")
         cost_before = float(scalar(old, "SELECT COALESCE(sum(api_cost),0) FROM request_log"))
         cost_after = float(scalar(new, "SELECT COALESCE(sum(equivalent_cost),0) FROM request_log"))
-        if token_before != token_after or not math.isclose(
-                cost_before, cost_after, rel_tol=1e-10, abs_tol=1e-8):
+        spool_tokens = sum(int(row.get("total_tokens", 0) or 0) for row in imported)
+        spool_cost = sum(float(row.get("cost", 0.0) or 0.0) for row in imported)
+        if token_before + spool_tokens != token_after or not math.isclose(
+                cost_before + spool_cost, cost_after, rel_tol=1e-10, abs_tol=1e-8):
             raise VerificationError("proxy token/cost totals changed")
         fk = new.execute("PRAGMA foreign_key_check").fetchall()
         if fk:
             raise VerificationError(f"proxy foreign_key_check failed: {fk[:10]}")
         version = scalar(new, "PRAGMA user_version")
-        if version != 10000:
-            raise VerificationError(f"proxy user_version is {version}, expected 10000")
+        if expected_version is not None and version != expected_version:
+            raise VerificationError(f"proxy user_version is {version}, expected {expected_version}")
         return {"accounts": actual_accounts, "requests": scalar(new, "SELECT count(*) FROM request_log"),
                 "attempts": scalar(new, "SELECT count(*) FROM request_attempts"),
                 "tokens": token_after, "equivalent_cost": cost_after}
@@ -54,7 +76,7 @@ def verify_proxy(v0_path: str, v1_path: str) -> dict[str, int | float]:
         new.close()
 
 
-def verify_dashboard(v0_path: str, v1_path: str) -> dict[str, int | float]:
+def verify_dashboard(v0_path: str, v1_path: str, expected_version: int | None = None) -> dict[str, int | float]:
     old = sqlite3.connect(v0_path)
     new = sqlite3.connect(v1_path)
     try:
@@ -88,8 +110,9 @@ def verify_dashboard(v0_path: str, v1_path: str) -> dict[str, int | float]:
         fk = new.execute("PRAGMA foreign_key_check").fetchall()
         if fk:
             raise VerificationError(f"dashboard foreign_key_check failed: {fk[:10]}")
-        if scalar(new, "PRAGMA user_version") != 10000:
-            raise VerificationError("dashboard is not V1.0")
+        version = scalar(new, "PRAGMA user_version")
+        if expected_version is not None and version != expected_version:
+            raise VerificationError(f"dashboard user_version is {version}, expected {expected_version}")
         return {"daily_rows": scalar(new, "SELECT count(*) FROM daily_usage"),
                 "requests": values[3], "equivalent_cost": float(values[4]),
                 "recurring_charge": recurring_after}
@@ -104,12 +127,16 @@ def main() -> None:
     parser.add_argument("--proxy-v1", required=True)
     parser.add_argument("--dashboard-v0", required=True)
     parser.add_argument("--dashboard-v1", required=True)
+    parser.add_argument("--schema-dir", default=str(Path(__file__).resolve().parents[2] / "schema"))
     args = parser.parse_args()
     for path in vars(args).values():
         if not Path(path).is_file():
             parser.error(f"database not found: {path}")
-    print({"proxy": verify_proxy(args.proxy_v0, args.proxy_v1),
-           "dashboard": verify_dashboard(args.dashboard_v0, args.dashboard_v1)})
+    root = Path(args.schema_dir).resolve()
+    print({"proxy": verify_proxy(args.proxy_v0, args.proxy_v1,
+                                  latest_user_version(root, "proxy")),
+           "dashboard": verify_dashboard(args.dashboard_v0, args.dashboard_v1,
+                                           latest_user_version(root, "dashboard"))})
 
 
 if __name__ == "__main__":

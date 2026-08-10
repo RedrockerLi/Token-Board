@@ -19,6 +19,7 @@ import gzip
 import json
 import logging
 import threading
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -129,7 +130,9 @@ def _parse_session(path: Path):
 
 
 def run_import(pdb, stop_event: threading.Event | None = None,
-               once: bool = False) -> int:
+               once: bool = False,
+               on_error: Callable[[Exception], None] | None = None,
+               on_success: Callable[[int], None] | None = None) -> int:
     """Scan codex sessions and import new usage into the proxy database.
 
     Returns the number of rows inserted this pass.  Loops every
@@ -139,9 +142,14 @@ def run_import(pdb, stop_event: threading.Event | None = None,
     total = 0
     while True:
         try:
-            total += _import_pass(pdb)
-        except Exception:
+            inserted = _import_pass(pdb)
+            total += inserted
+            if on_success:
+                on_success(inserted)
+        except Exception as exc:
             log.exception("codex import pass failed (will retry)")
+            if on_error:
+                on_error(exc)
         if once:
             return total
         if stop_event is not None and stop_event.wait(SCAN_INTERVAL_SECONDS):
@@ -163,7 +171,6 @@ def _import_pass(pdb) -> int:
     conn = pdb._connect()
     inserted = 0
     try:
-        v1 = pdb._is_v1(conn)
         # Purge any previously imported rows for excluded models (idempotent —
         # only touches codex-imported rows, never real proxy traffic).
         if EXCLUDED_MODELS:
@@ -173,23 +180,16 @@ def _import_pass(pdb) -> int:
                 "AND event_id LIKE 'codex:%'",
                 tuple(EXCLUDED_MODELS),
             )
-        if v1:
-            cursor = conn.execute(
-                "SELECT cursor_json FROM account_importers "
-                "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
-                (account_id,),
-            ).fetchone()
-            try:
-                raw_states = json.loads(cursor[0]) if cursor and cursor[0] else {}
-            except (TypeError, ValueError):
-                raw_states = {}
-            states = raw_states if isinstance(raw_states, dict) else {}
-        else:
-            states = {
-                row["path"]: dict(row) for row in conn.execute(
-                    "SELECT path, size, mtime FROM codex_import_state"
-                ).fetchall()
-            }
+        cursor = conn.execute(
+            "SELECT cursor_json FROM account_importers "
+            "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
+            (account_id,),
+        ).fetchone()
+        try:
+            raw_states = json.loads(cursor[0]) if cursor and cursor[0] else {}
+        except (TypeError, ValueError):
+            raw_states = {}
+        states = raw_states if isinstance(raw_states, dict) else {}
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for path in files:
             spath = str(path)
@@ -214,24 +214,12 @@ def _import_pass(pdb) -> int:
             state = {"size": st.st_size, "mtime": int(st.st_mtime),
                      "last_line": line_count, "session_id": _session_id_from_path(path),
                      "parsed_at": now_str}
-            if v1:
-                states[spath] = state
-            else:
-                conn.execute(
-                    "INSERT INTO codex_import_state (path, size, mtime, last_line, session_id, parsed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(path) DO UPDATE SET "
-                    "size=excluded.size,mtime=excluded.mtime,last_line=excluded.last_line,"
-                    "session_id=excluded.session_id,parsed_at=excluded.parsed_at",
-                    (spath, st.st_size, int(st.st_mtime), line_count,
-                     state["session_id"], now_str),
-                )
-        if v1:
-            conn.execute(
-                "UPDATE account_importers SET cursor_json=? "
-                "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
-                (json.dumps(states, ensure_ascii=False, separators=(",", ":")), account_id),
-            )
+            states[spath] = state
+        conn.execute(
+            "UPDATE account_importers SET cursor_json=? "
+            "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
+            (json.dumps(states, ensure_ascii=False, separators=(",", ":")), account_id),
+        )
         conn.commit()
     finally:
         conn.close()

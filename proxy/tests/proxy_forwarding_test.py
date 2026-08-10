@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import sqlite3
@@ -121,51 +122,17 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "proxy.db"
-        # Bootstrap only through v10. Starting the C++ proxy below must apply
-        # v11 itself with foreign_keys=ON, matching production startup.
-        legacy_schema = Path(tmp) / "schema-v10"
-        legacy_schema.mkdir()
-        for migration in schema_dir.glob("*.sql"):
-            if int(migration.stem.split("_", 1)[0].split("-", 1)[1]) <= 10:
-                shutil.copy2(migration, legacy_schema / migration.name)
-        # The proxy applies every migration above v10, so user_version must end
-        # up at the highest migration number in the schema dir — derived, not
-        # hard-coded, so adding a future migration never breaks this test.
-        expected_version = max(
-            int(m.stem.split("_", 1)[0].split("-", 1)[1])
-            for m in schema_dir.glob("*.sql")
-        )
-        migrate(str(db_path), str(legacy_schema))
+        migrate(str(db_path), str(schema_dir), "proxy")
         conn = sqlite3.connect(db_path)
         try:
-            account_id = conn.execute(
-                "INSERT INTO upstream_accounts "
-                "(name,upstream_key,base_url,api_format,auth_header,max_concurrency) "
-                "VALUES (?,?,?,?,?,?)",
-                ("test", BAD_AUTH, f"http://127.0.0.1:{upstream_port}",
-                 "anthropic", "bearer", 8),
-            ).lastrowid
+            from v1_fixture import add_plain_route, add_upstream
+            account_id, upstream_id, _ = add_upstream(
+                conn, "test", f"http://127.0.0.1:{upstream_port}",
+                [BAD_AUTH, STREAM_ERROR, GOOD], api_format="anthropic",
+                auth_scheme="bearer", max_concurrency=8)
             local_key = "tb-test"
-            conn.execute(
-                "INSERT INTO local_keys(key_value,label,account_id) VALUES (?,?,?)",
-                (local_key, "test", account_id),
-            )
-            conn.executemany(
-                "INSERT INTO upstream_keys(account_id,key_value,position) VALUES (?,?,?)",
-                [(account_id, BAD_AUTH, 0),
-                 (account_id, STREAM_ERROR, 1),
-                 (account_id, GOOD, 2)],
-            )
-            historical_log_id = conn.execute(
-                "INSERT INTO request_log(model,status_code) VALUES (?,?)",
-                ("legacy-orphan", 502),
-            ).lastrowid
-            conn.execute(
-                "INSERT INTO request_attempts "
-                "(request_log_id,attempt_index,account_id,status_code) "
-                "VALUES (?,?,?,?)",
-                (historical_log_id, 0, 999999, 502),
-            )
+            add_plain_route(conn, local_key, "test-route", upstream_id,
+                            account_id)
             conn.commit()
         finally:
             conn.close()
@@ -177,6 +144,7 @@ def main() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            env=os.environ.copy(),
         )
         try:
             wait_for_health(proxy_port)
@@ -196,11 +164,11 @@ def main() -> None:
 
             conn = sqlite3.connect(db_path)
             try:
+                expected_version = max(
+                    int(path.name.split("_", 1)[0].split("-")[0]) * 10000
+                    + int(path.name.split("_", 1)[0].split("-")[1])
+                    for path in (schema_dir / "proxy/v1").glob("*.sql"))
                 assert conn.execute("PRAGMA user_version").fetchone()[0] == expected_version
-                assert conn.execute(
-                    "SELECT account_id FROM request_attempts WHERE request_log_id=?",
-                    (historical_log_id,),
-                ).fetchone()[0] is None
                 # Logging is now asynchronous (a dedicated accounting thread);
                 # the HTTP response can complete before the row is durable, so
                 # poll briefly for the proxy's row (attempt_count == 3 uniquely
@@ -225,16 +193,22 @@ def main() -> None:
                 )]
                 assert statuses == [401, 503, 200], statuses
 
-                # Runtime history must not block cloud-authoritative account
-                # removal; both request and attempt identities detach safely.
+                # V1 uses lifecycle closure instead of deleting historical
+                # identities. Request and attempt foreign keys remain stable.
                 conn.execute("PRAGMA foreign_keys=ON")
-                conn.execute("DELETE FROM local_keys WHERE account_id=?", (account_id,))
-                conn.execute("DELETE FROM upstream_accounts WHERE id=?", (account_id,))
+                conn.execute(
+                    "UPDATE client_keys SET enabled=0,deleted_at="
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key_value=?",
+                    (local_key,))
+                conn.execute(
+                    "UPDATE accounts SET lifecycle_state='deleted',deleted_at="
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                    (account_id,))
                 conn.commit()
                 assert conn.execute(
                     "SELECT account_id FROM request_log WHERE id=?", (log[0],)
-                ).fetchone()[0] is None
-                assert all(row[0] is None for row in conn.execute(
+                ).fetchone()[0] == account_id
+                assert all(row[0] == account_id for row in conn.execute(
                     "SELECT account_id FROM request_attempts WHERE request_log_id=?",
                     (log[0],),
                 ))

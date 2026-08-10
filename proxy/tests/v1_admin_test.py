@@ -21,18 +21,33 @@ def load(name: str, path: Path):
     return module
 
 
+def latest_version(schema_root: Path, database: str) -> int:
+    versions = []
+    for path in (schema_root / database / "v1").glob("*.sql"):
+        major, minor = path.name.split("_", 1)[0].split("-")
+        versions.append(int(major) * 10000 + int(minor))
+    return max(versions)
+
+
 def main() -> None:
     schema_root = Path(sys.argv[1]).resolve()
     project = Path(sys.argv[2]).resolve()
-    for package in ("app", "app.db", "app.domain", "app.services"):
+    package_paths = {
+        "app": project / "app",
+        "app.db": project / "app/db",
+        "app.domain": project / "app/domain",
+        "app.services": project / "app/services",
+    }
+    for package, package_path in package_paths.items():
         module = types.ModuleType(package)
-        module.__path__ = []
+        module.__path__ = [str(package_path)]
         sys.modules[package] = module
     load("app.domain.account_types", project / "app/domain/account_types.py")
     load("app.services.fx", project / "app/services/fx.py")
     migrations = load("app.db.migrations", project / "app/db/migrations.py")
     dashboard_module = load("app.db.dashboard_db", project / "app/db/dashboard_db.py")
     proxy_module = load("app.db.proxy_db", project / "app/db/proxy_db.py")
+    billing_module = load("app.db.proxy.billing", project / "app/db/proxy/billing.py")
 
     db_path = Path(tempfile.mkdtemp()) / "proxy.db"
     migrations.migrate(str(db_path), str(schema_root), "proxy")
@@ -81,7 +96,8 @@ def main() -> None:
             "INSERT INTO fx_rates(base_currency,quote_currency,date,rate) "
             "VALUES('USD','CNY','2026-08-09',7.2)")
         assert fx.get_rate(conn, date="2026-08-09") == 7.2
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10000
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == latest_version(
+            schema_root, "proxy")
         assert conn.execute("SELECT count(*) FROM upstream_secrets").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM client_keys WHERE key_value=?",
                             (local_key,)).fetchone()[0] == 1
@@ -95,6 +111,28 @@ def main() -> None:
         conn.close()
     assert database.get_accounts()
     assert database.get_pricing()[0]["id"] == pricing_id
+    first_materialize = billing_module.materialize_period_charges(str(db_path))
+    second_materialize = billing_module.materialize_period_charges(str(db_path))
+    assert first_materialize >= 1
+    assert second_materialize >= 0
+    with sqlite3.connect(db_path) as conn:
+        charge = conn.execute(
+            "SELECT contract_id,period_start,count(*) FROM billing_period_charges "
+            "WHERE credential_uuid IS NULL GROUP BY contract_id,period_start"
+        ).fetchone()
+        assert charge and charge[2] == 1
+        try:
+            conn.execute(
+                "INSERT INTO billing_period_charges"
+                "(contract_id,credential_uuid,period_start,period_end,"
+                "recurring_charge,currency) "
+                "SELECT contract_id,NULL,period_start,period_end,recurring_charge,currency "
+                "FROM billing_period_charges WHERE credential_uuid IS NULL LIMIT 1"
+            )
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("account-level recurring charge accepted a duplicate NULL unit")
     dashboard_path = db_path.parent / "dashboard.db"
     migrations.migrate(str(dashboard_path), str(schema_root), "dashboard")
     dashboard_module.reconcile_accounts(str(dashboard_path), str(db_path))

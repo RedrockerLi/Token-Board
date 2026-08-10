@@ -1,10 +1,13 @@
 #pragma once
 
 #include "account_gate.h"
+#include "candidate_selection.h"
 #include "codec.h"
 #include "db.h"
+#include "endpoint_policy.h"
 #include "key_cost_ledger.h"
 #include "router.h"
+#include "session_affinity.h"
 #include "usage_tracker.h"
 
 #include <atomic>
@@ -13,7 +16,9 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -27,170 +32,13 @@ class Router;
 class UpstreamClient;
 class UsageTracker;
 
+using CandidateRequestBody = std::shared_ptr<const std::string>;
+
 namespace httplib {
 class Server;
 struct Request;
 struct Response;
 } // namespace httplib
-
-/// Bounded, process-local session → upstream-key affinity.
-///
-/// The hot path is entirely in memory.  A successful fallback is rebound to
-/// the key that actually served it, and a bounded O(1) LRU keeps memory use
-/// predictable.  On a cold start the least-cost key slot is preferred (in-
-/// memory ledger, fed by the accounting thread), so keys wear roughly evenly
-/// by spend; without a ledger it falls back to rendezvous hashing (stable
-/// regardless of candidate-list changes, unlike hash(session) % candidate_count).
-class SessionAffinity {
-public:
-    SessionAffinity() = default;
-    /// `ledger` (may be null) supplies the cold-start policy: without it the
-    /// unit-test/legacy behavior is rendezvous hashing.
-    explicit SessionAffinity(KeyCostLedger *ledger) : ledger_(ledger) {}
-
-    /// Preferred candidate index. `scope` must isolate local credentials and
-    /// wire formats; `key_slot_ids` are persistent DB identities, never vector
-    /// offsets. Empty sessions deliberately use normal fill-first routing.
-    size_t preferred_index(const std::string &scope,
-                           const std::string &session_id,
-                           const std::vector<int> &key_slot_ids) {
-        if (session_id.empty() || key_slot_ids.empty()) return 0;
-        const std::string key = digest(scope, session_id);
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto now = std::chrono::steady_clock::now();
-        auto it = bindings_.find(key);
-        if (it != bindings_.end()) {
-            if (now - it->second.last_seen > ttl_) {
-                lru_.erase(it->second.lru_it);
-                bindings_.erase(it);
-            } else {
-                it->second.last_seen = now;
-                lru_.splice(lru_.begin(), lru_, it->second.lru_it);
-                for (size_t i = 0; i < key_slot_ids.size(); ++i) {
-                    if (key_slot_ids[i] == it->second.key_slot_id) return i;
-                }
-            }
-        }
-
-        // Cold start: prefer the key slot that has accrued the least cost
-        // (in-memory ledger, fed asynchronously by the accounting thread), so
-        // new sessions wear the account's keys roughly evenly by spend.
-        if (ledger_ != nullptr) return ledger_->lowest_cost_index(key_slot_ids);
-
-        // Rendezvous hashing: choose the candidate with the greatest score.
-        size_t best = 0;
-        uint64_t best_score = 0;
-        for (size_t i = 0; i < key_slot_ids.size(); ++i) {
-            uint64_t score = hash64(key + "#" + std::to_string(key_slot_ids[i]));
-            if (i == 0 || score > best_score) {
-                best = i;
-                best_score = score;
-            }
-        }
-        return best;
-    }
-
-    /// Bind only after a successful upstream response.  Rebinding is local,
-    /// so affinity never adds a synchronous SQLite write to a request.
-    void bind(const std::string &scope, const std::string &session_id,
-              int key_slot_id) {
-        if (session_id.empty()) return;
-        const std::string key = digest(scope, session_id);
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto now = std::chrono::steady_clock::now();
-        auto it = bindings_.find(key);
-        if (it != bindings_.end()) {
-            it->second.key_slot_id = key_slot_id;
-            it->second.last_seen = now;
-            lru_.splice(lru_.begin(), lru_, it->second.lru_it);
-            return;
-        }
-        while (bindings_.size() >= max_ && !lru_.empty()) {
-            bindings_.erase(lru_.back());
-            lru_.pop_back();
-        }
-        lru_.push_front(key);
-        bindings_.emplace(key, Entry{key_slot_id, now, lru_.begin()});
-    }
-
-private:
-    static uint64_t hash64(const std::string &value) {
-        // FNV-1a is deterministic and keeps the raw session id out of the
-        // map. This is an in-memory routing key, not a cryptographic digest.
-        uint64_t h = 1469598103934665603ULL;
-        for (unsigned char c : value) { h ^= c; h *= 1099511628211ULL; }
-        return h;
-    }
-    static std::string digest(const std::string &scope,
-                              const std::string &session_id) {
-        return std::to_string(hash64(scope + "\x1f" + session_id));
-    }
-    struct Entry {
-        int key_slot_id;
-        std::chrono::steady_clock::time_point last_seen;
-        std::list<std::string>::iterator lru_it;
-    };
-
-    static constexpr size_t max_ = 100000;
-    std::chrono::hours ttl_{24};
-    std::mutex mutex_;
-    std::list<std::string> lru_;
-    std::unordered_map<std::string, Entry> bindings_;
-    KeyCostLedger *ledger_ = nullptr;  // cold-start policy; null = rendezvous
-};
-
-/// One real upstream target a request may be forwarded to.  Plain accounts
-/// yield one candidate per configured key; aggregate accounts yield one
-/// candidate per (matching entry × its account's keys), in priority order.
-/// `key` is the per-key value forwarded upstream; `key_slot_id` is its
-/// concurrency identity (an upstream_keys row id).
-struct UpstreamCandidate {
-    Database::AccountInfo account;  // real account (complete type from db.h)
-    std::string key;                // the key to forward with
-    int key_slot_id = -1;           // concurrency slot id (upstream_keys.id)
-    std::string upstream_model;     // model name forwarded upstream
-    // Aggregate entry ordinal.  Keys belonging to one entry may spill over
-    // among themselves, but an entry with a larger group is only considered
-    // after every candidate in an earlier group was unavailable or failed.
-    int priority_group = 0;
-};
-
-/// Build the candidate retry order: groups are tried in priority order
-/// (cheaper/higher-priority first), and WITHIN each group the keys are rotated
-/// so a group's multiple keys wear evenly.  The group containing the
-/// affinity-preferred candidate (`preferred_index`, a global index into
-/// `candidates`) starts at that key; every other group starts at a per-request
-/// round-robin offset.  Cross-group usage is deliberately NOT balanced — a
-/// cheaper upstream should be used more, per aggregate sort_order.
-inline std::vector<size_t> candidate_order(
-    const std::vector<UpstreamCandidate> &candidates,
-    size_t preferred_index, size_t rr_offset) {
-    std::vector<size_t> order;
-    if (candidates.empty()) return order;
-    size_t i = 0;
-    while (i < candidates.size()) {
-        const int group = candidates[i].priority_group;
-        const size_t begin = i;
-        while (i < candidates.size() &&
-               candidates[i].priority_group == group) ++i;
-        const size_t size = i - begin;
-        const size_t start = (preferred_index >= begin && preferred_index < i)
-            ? (preferred_index - begin) % size
-            : rr_offset % size;
-        for (size_t k = 0; k < size; ++k)
-            order.push_back(begin + (start + k) % size);
-    }
-    return order;
-}
-
-/// Failures tied to one configured credential/provider candidate should spill
-/// over before the proxy gives up.  401/403 are candidate-specific for a
-/// multi-key account just as 429 is; retrying another key is both safe and
-/// required when one subscription credential was revoked.
-inline bool candidate_failure_retryable(int status_code) {
-    return status_code == 401 || status_code == 403 ||
-           status_code == 429 || status_code >= 500;
-}
 
 /// Configures the httplib::Server with route handlers.
 ///
@@ -206,10 +54,23 @@ inline bool candidate_failure_retryable(int status_code) {
 /// account's upstream format via the codec registry when they differ.
 class ProxyServer {
 public:
+    struct QueueMetrics {
+        std::size_t depth = 0;
+        std::size_t active = 0;
+        std::size_t workers = 0;
+        std::size_t rejected = 0;
+        double average_ms = 0.0;
+        double p95_ms = 0.0;
+        std::int64_t oldest_age_ms = 0;
+    };
+
     ProxyServer(Database &db, Router &router, UpstreamClient &upstream,
                 UsageTracker &tracker, CodecRegistry &codecs)
         : db_(db), router_(router), upstream_(upstream), tracker_(tracker),
           codecs_(codecs), affinity_(&cost_ledger_) {
+        db_.set_cost_observer([this](int key_slot_id, double cost) {
+            cost_ledger_.add(key_slot_id, cost);
+        });
         // Cooldown probe cadence: 1h default; TB_COOLDOWN_PROBE_SECS override
         // (tests shrink it to seconds).  Clamped to [1, 86400] seconds.
         const char *env = std::getenv("TB_COOLDOWN_PROBE_SECS");
@@ -222,14 +83,9 @@ public:
     /// also invoked from the destructor.  Must be called BEFORE db_.close() in
     /// the owning main.
     void shutdown() {
-        {
-            std::lock_guard<std::mutex> lock(accounting_mutex_);
-            accounting_stop_ = true;
-        }
-        accounting_cv_.notify_all();
-        if (accounting_thread_.joinable()) accounting_thread_.join();
         cooldown_probe_stop_.store(true);
         if (cooldown_probe_thread_.joinable()) cooldown_probe_thread_.join();
+        db_.set_cost_observer({});
     }
 
     ~ProxyServer() { shutdown(); }
@@ -245,15 +101,47 @@ public:
     void run_cooldown_probe_cycle();
 
     void setup_routes(httplib::Server &server);
+    void set_queue_metrics_provider(std::function<QueueMetrics()> provider) {
+        queue_metrics_provider_ = std::move(provider);
+    }
     int in_flight_count() const noexcept {
         return in_flight_count_.load(std::memory_order_relaxed);
     }
     std::size_t accounting_queue_depth() {
-        std::lock_guard<std::mutex> lock(accounting_mutex_);
-        return accounting_queue_.size();
+        return db_.log_queue_depth();
     }
+    bool try_reserve_accounting() {
+        if (auto reservation = db_.reserve_usage_event()) {
+            accounting_reservation_ = std::move(reservation);
+            return true;
+        }
+        accounting_rejected_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    void release_unconsumed_accounting() noexcept {
+        accounting_reservation_.reset();
+    }
+    std::shared_ptr<UsageReservation> detach_accounting_reservation() noexcept {
+        auto reservation = std::move(accounting_reservation_);
+        accounting_reservation_.reset();
+        return reservation;
+    }
+    void adopt_accounting_reservation(
+        const std::shared_ptr<UsageReservation> &reservation) noexcept {
+        accounting_reservation_ = reservation;
+    }
+    /// Record the account/key/model context on the current reservation and mark
+    /// it as having begun upstream work, so an abnormal exit (no completed
+    /// UsageEvent) writes an internal_abort record instead of silently
+    /// releasing the slot.  No-op when no reservation is held.
+    void mark_accounting_upstream_started(int account_id, int local_key_id,
+                                          const std::string &model,
+                                          bool streaming);
     std::uint64_t accounting_dropped() const noexcept {
         return accounting_dropped_.load(std::memory_order_acquire);
+    }
+    std::uint64_t accounting_rejected() const noexcept {
+        return accounting_rejected_.load(std::memory_order_acquire);
     }
     void record_http_result(int status_code) noexcept {
         completed_requests_.fetch_add(1, std::memory_order_relaxed);
@@ -266,29 +154,11 @@ public:
     std::uint64_t error_requests() const noexcept {
         return error_requests_.load(std::memory_order_relaxed);
     }
+    QueueMetrics queue_metrics() const {
+        return queue_metrics_provider_ ? queue_metrics_provider_() : QueueMetrics{};
+    }
 
 private:
-    /// One request-log record enqueued by the response thread and drained by
-    /// the accounting thread.  Copying bounds are enforced by the DB layer
-    /// (kLogAttemptsMax, kLogErrorMaxBytes).
-    struct LogJob {
-        int account_id = 0;
-        int local_key_id = 0;
-        UsageTracker::UsageInfo usage;
-        bool is_streaming = false;
-        int status_code = 0;
-        int duration_ms = 0;
-        int upstream_key_id = 0;
-        int ttft_ms = -1;
-        int generation_ms = -1;
-        double output_tps = -1.0;
-        int upstream_ttft_ms = -1;
-        int upstream_duration_ms = -1;
-        int attempt_count = 1;
-        std::vector<Database::AttemptInfo> attempts;
-        std::chrono::steady_clock::time_point enqueued_at;
-    };
-
     /// Enqueue a request-log record; the response thread pays only an
     /// in-memory move.  Same signature/defaults as UsageTracker::log_request.
     void enqueue_log(int account_id, int local_key_id,
@@ -298,7 +168,16 @@ private:
                      int upstream_ttft_ms, int upstream_duration_ms,
                      int attempt_count,
                      const std::vector<Database::AttemptInfo> &attempts);
-    void accounting_loop();
+
+    /// Record a failed/aborted request with zero token usage (status 499 on a
+    /// client disconnect, otherwise the truthful upstream status).  Shared by
+    /// every non-streaming/streaming tail so failure accounting stays uniform.
+    void enqueue_zero_usage(int account_id, int local_key_id,
+                            const std::string &model, bool is_streaming,
+                            int status_code, int duration_ms,
+                            int upstream_key_id, int attempt_count,
+                            const std::vector<Database::AttemptInfo> &attempts,
+                            int upstream_duration_ms = -1);
 
     void handle_chat_request(const httplib::Request &req,
                              httplib::Response &res);
@@ -311,11 +190,13 @@ private:
     /// key/upstream within the same request, and only after every candidate
     /// fails is an error status (429/504) committed to the client.
     void handle_streaming(const std::vector<UpstreamCandidate> &cands,
-                          const std::vector<std::string> &candidate_bodies,
+                          const std::vector<CandidateRequestBody> &candidate_bodies,
                           size_t start, const std::string &session_id,
                           int local_key_id, ir::ApiFormat harness,
                           const std::string &resolved_model,
-                          const ir::ChatRequest &parsed_request,
+                          std::shared_ptr<const json> parsed_json,
+                          std::shared_ptr<const ir::ChatRequest> parsed_request,
+                          std::shared_ptr<UsageReservation> reservation,
                           const httplib::Request &req,
                           httplib::Response &res,
                           std::chrono::steady_clock::time_point t0);
@@ -325,7 +206,7 @@ private:
                            httplib::Response &res);
     std::vector<UpstreamCandidate> resolve_candidates_cached(
         const Router::RouteResult &route, std::string &model);
-    Database::TimeoutConfig timeout_config_cached(ir::ApiFormat harness);
+    Database::TimeoutConfig timeout_config_cached(EndpointKind kind);
     std::uint64_t request_started(const std::string &model, bool streaming);
     void request_finished(std::uint64_t request_id);
     void add_cors_headers(httplib::Response &res);
@@ -339,14 +220,6 @@ private:
     KeyCostLedger cost_ledger_;  // accrued cost per key slot (cold-start bias)
     SessionAffinity affinity_;   // session → preferred key (in-memory)
 
-    struct TimeoutCacheEntry {
-        Database::TimeoutConfig config;
-        std::chrono::steady_clock::time_point expires_at{};
-        bool valid = false;
-    };
-    std::mutex timeout_cache_mutex_;
-    std::unordered_map<int, TimeoutCacheEntry> timeout_cache_;
-
     struct LiveRequest {
         std::string model;
         bool streaming = false;
@@ -356,23 +229,18 @@ private:
     std::atomic<int> in_flight_count_{0};
     std::atomic<std::uint64_t> completed_requests_{0};
     std::atomic<std::uint64_t> error_requests_{0};
+    std::function<QueueMetrics()> queue_metrics_provider_;
+    static thread_local std::shared_ptr<UsageReservation> accounting_reservation_;
     // Per-request round-robin offset for in-group key rotation (tier-5
     // routing): each non-affinity group rotates its keys by this counter.
     std::atomic<std::uint64_t> routing_rr_{0};
     mutable std::mutex live_requests_mutex_;
     std::unordered_map<std::uint64_t, LiveRequest> live_requests_;
 
-    // Request-log accounting is drained by a dedicated thread so the response
-    // path never pays pricing SELECT + JSON + spool write synchronously.
-    static constexpr std::size_t kAccountingQueueMax = 16384;
-    std::mutex accounting_mutex_;
-    std::condition_variable accounting_cv_;
-    std::list<LogJob> accounting_queue_;
-    std::thread accounting_thread_;
-    bool accounting_stop_ = false;
-    std::once_flag accounting_thread_once_;
+    // Rejections are sticky health failures; accepted events live in the
+    // Database UsageEventWriter's single in-memory queue.
     std::atomic<std::uint64_t> accounting_dropped_{0};
-    std::atomic<std::size_t> accounting_last_batch_{0};
+    std::atomic<std::uint64_t> accounting_rejected_{0};
 
     // Cooldown-probe thread: while a plan key is inside its 5h cooldown, probe
     // the upstream every cooldown_probe_interval_secs_ and clear early on 2xx.

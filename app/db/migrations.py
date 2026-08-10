@@ -274,7 +274,9 @@ def _run_locked(db_path: str, schema_dir: str, database_name: str) -> None:
                 try:
                     conn.execute("ROLLBACK")
                 except sqlite3.Error:
-                    pass
+                    # executescript may already have rolled the transaction
+                    # back; preserve the original migration exception.
+                    _rollback_was_already_complete = True
                 raise
             current = v
     finally:

@@ -42,9 +42,11 @@ def main() -> None:
     fresh = Path(tempfile.mkdtemp()) / "proxy.db"
     migrate(str(fresh), str(schema_root), "proxy")
     conn = sqlite3.connect(fresh)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10000
+    latest_proxy = max(step.version for step in _sql_steps(schema_root / "proxy" / "v1"))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == latest_proxy.user_version
     assert conn.execute(
-        "SELECT major,minor,database_name FROM schema_version").fetchone() == (1, 0, "proxy")
+        "SELECT major,minor,database_name FROM schema_version").fetchone() == (
+            latest_proxy.major, latest_proxy.minor, "proxy")
     conn.close()
 
     ordered = Path(tempfile.mkdtemp())

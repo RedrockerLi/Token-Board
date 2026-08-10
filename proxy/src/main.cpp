@@ -43,7 +43,7 @@ int main(int argc, char *argv[]) {
     // ── Parse config ──────────────────────────────────────────────────
     Config cfg = parse_args(argc, argv);
     if (!set_log_level(cfg.log_level)) {
-        fprintf(stderr, "Invalid --log-level: %s\n", cfg.log_level.c_str());
+        TB_LOG_ERROR( "Invalid --log-level: %s\n", cfg.log_level.c_str());
         return 2;
     }
 
@@ -64,7 +64,14 @@ int main(int argc, char *argv[]) {
 
     Database db;
     if (!db.open(cfg.db_path, cfg.schema_dir)) {
-        fprintf(stderr, "FATAL: Cannot open database\n");
+        TB_LOG_ERROR( "FATAL: Cannot open database\n");
+        return 1;
+    }
+    if (db.schema_major() != 1) {
+        TB_LOG_ERROR(
+                "FATAL: Runtime requires a V1 database; run "
+                "schema/transitions/0-to-1/migrate.py first\n");
+        db.close();
         return 1;
     }
 
@@ -85,9 +92,44 @@ int main(int argc, char *argv[]) {
     // prevents a stalled provider from turning queued requests into thousands
     // of native thread stacks.
     const auto cpu_count = std::max(1u, std::thread::hardware_concurrency());
-    const size_t initial_workers = std::clamp<size_t>(cpu_count * 2, 8, 64);
-    auto *pool = new SemaphorePool(initial_workers, 256, 4096);
+    size_t max_workers = 256;
+    if (const char *configured = std::getenv("TB_MAX_WORKERS")) {
+        const auto parsed = std::strtoull(configured, nullptr, 10);
+        if (parsed > 0) max_workers = std::min<std::size_t>(parsed, 256);
+    }
+    const size_t initial_workers = std::min(
+        max_workers, std::clamp<size_t>(cpu_count * 2, 8, 64));
+    size_t task_queue_max = 4096;
+    if (const char *configured = std::getenv("TB_TASK_QUEUE_MAX")) {
+        const auto parsed = std::strtoull(configured, nullptr, 10);
+        if (parsed > 0) task_queue_max = std::min<std::size_t>(parsed, 1'000'000);
+    }
+    auto *pool = new SemaphorePool(initial_workers, max_workers, task_queue_max);
     server.new_task_queue = [pool] { return pool; };
+    proxy_server.set_queue_metrics_provider([pool] {
+        return ProxyServer::QueueMetrics{
+            pool->queued(), pool->active(), pool->size(), pool->rejected(),
+            pool->queue_average_ms(), pool->queue_p95_ms(),
+            pool->queue_oldest_age_ms()};
+    });
+    server.task_queue_rejection_handler = [](socket_t sock) {
+        static constexpr char response[] =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 54\r\n"
+            "Retry-After: 1\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"error\":{\"message\":\"Proxy queue is full\",\"code\":503}}";
+        const char *cursor = response;
+        std::size_t remaining = sizeof(response) - 1;
+        while (remaining != 0) {
+            const auto written = httplib::detail::send_socket(
+                sock, cursor, remaining, CPPHTTPLIB_SEND_FLAGS);
+            if (written <= 0) break;
+            cursor += written;
+            remaining -= static_cast<std::size_t>(written);
+        }
+    };
 
     proxy_server.setup_routes(server);
     server.set_logger([&proxy_server](const httplib::Request &req,

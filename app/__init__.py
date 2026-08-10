@@ -2,12 +2,12 @@
 
 from pathlib import Path
 
-from flask import Flask
-
 from app.services.data_loader import DataStore
 
 
-def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1"):
+def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
+               *, testing: bool = False,
+               start_background_tasks: bool = True):
     """Flask application factory.
 
     Explicitly sets template_folder and static_folder because Flask
@@ -21,6 +21,11 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1"):
         host: The bind address.  A non-loopback address (or a configured
               TB_DASHBOARD_TOKEN) activates the access-token auth guard.
     """
+    # Keep database/schema tooling importable on maintenance hosts where the
+    # optional web dependency is not installed.  Flask is required only when
+    # constructing the HTTP application itself.
+    from flask import Flask
+
     root = Path(__file__).resolve().parent.parent  # project root
 
     flask_app = Flask(
@@ -28,7 +33,13 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1"):
         template_folder=str(root / "templates"),
         static_folder=str(root / "static"),
     )
-    flask_app.config["DATA_STORE"] = DataStore(root / "data")
+    flask_app.config["TESTING"] = testing
+    # Keep the dashboard archive next to an explicitly supplied proxy DB.
+    # Embedded deployments and the App testbench must read the same
+    # normalized V1 dataset, not the repository's default data/ directory.
+    data_dir = (Path(proxy_db_path).resolve().parent
+                if proxy_db_path else root / "data")
+    flask_app.config["DATA_STORE"] = DataStore(data_dir)
 
     from app.routes.routes import bp  # noqa: E402
     flask_app.register_blueprint(bp)
@@ -38,85 +49,46 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1"):
         from app.db.proxy_db import ProxyDatabase  # noqa: E402
         from app.routes.proxy_routes import bp_proxy  # noqa: E402
 
+        # Direct server.py launches use the same unattended local upgrade
+        # boundary as start.sh.  The C++ proxy still opens only V1; this call
+        # completes the upgrade before ProxyDatabase creates its connection.
+        from app.db.schema_upgrade import ensure_local_databases  # noqa: E402
+        dash_db_path = str(Path(proxy_db_path).resolve().parent / "dashboard.db")
+        ensure_local_databases(
+            proxy_db_path, dash_db_path,
+            str(root / "schema"),
+            source_timezone="Asia/Shanghai",
+        )
+
         pdb = ProxyDatabase(proxy_db_path)
         flask_app.config["PROXY_DB"] = pdb
         flask_app.register_blueprint(bp_proxy)
         print(f" * Proxy management enabled (DB: {proxy_db_path})")
 
-        # Pull latest config from cloud on startup
-        from app.services.sync import sync_config_download  # noqa: E402
-        try:
-            if sync_config_download(proxy_db_path):
-                print(" * Config synced from cloud")
-        except Exception:
-            pass  # network / not configured — ignore
+        # Pull latest config from cloud on startup. Tests use isolated V1
+        # fixtures and deliberately do not touch network state.
+        if not testing:
+            from app.services.sync import sync_config_download  # noqa: E402
+            try:
+                if sync_config_download(proxy_db_path):
+                    print(" * Config synced from cloud")
+            except Exception:
+                flask_app.logger.exception("startup config sync failed")
 
-        # Reconcile the local dashboard archive: mirror upstream_accounts
+        # Reconcile the local dashboard archive: mirror normalized accounts
         # (id → name) into dashboard.accounts and backfill any legacy
         # name-keyed buckets to account_id. Runs before the DataStore loads
         # (server.py calls .load() after create_app), so names display right.
         try:
             from app.db.dashboard_db import reconcile_accounts  # noqa: E402
-            dash_db_path = str(Path(proxy_db_path).parent / "dashboard.db")
-            reconcile_accounts(dash_db_path, proxy_db_path)
+            if Path(dash_db_path).exists():
+                reconcile_accounts(dash_db_path, proxy_db_path)
         except Exception:
-            pass  # no dashboard archive yet / not migrated — ignore
+            flask_app.logger.exception("dashboard account reconcile failed")
 
-        # Background, best-effort threads (daemon, never affect the request
-        # path): pre-warm today's USD→CNY rate, then start the Codex session
-        # importer which scans ~/.codex/sessions every 60 s.
-        try:
-            from app.services import fx  # noqa: E402
-            def _fx_prewarm():
-                try:
-                    conn = pdb._connect()
-                    try:
-                        fx.ensure_rate(conn)
-                    finally:
-                        conn.close()
-                except Exception:
-                    pass
-            import threading
-            threading.Thread(target=_fx_prewarm, daemon=True,
-                             name="fx-prewarm").start()
-        except Exception:
-            pass
-
-        try:
-            from app.services.codex_import import run_import  # noqa: E402
-            import threading
-            stop_event = threading.Event()
-            flask_app.config["CODEX_IMPORT_STOP"] = stop_event
-            threading.Thread(target=run_import, args=(pdb, stop_event),
-                             daemon=True, name="codex-importer").start()
-        except Exception:
-            pass
-
-        # End-of-period account deletions (plan/agent scheduled to end at the
-        # close of their current billing period) keep routing until deleted_at
-        # passes, then the deletion finalizer completes the deferred local-key
-        # and aggregate cleanup.  Routing stop does NOT depend on this thread
-        # (queries treat a past deleted_at as gone); this only finishes cleanup.
-        try:
-            import threading
-
-            def _finalizer_loop(stop_event):
-                # Sweep once at startup (catches anything that came due while
-                # the app was down), then every 60 s.
-                while True:
-                    try:
-                        pdb.finalize_deferred_deletions()
-                    except Exception:
-                        pass  # best-effort, never affect the request path
-                    if stop_event.wait(60):
-                        break
-
-            stop_event = threading.Event()
-            flask_app.config["DEFERRED_DELETE_STOP"] = stop_event
-            threading.Thread(target=_finalizer_loop, args=(stop_event,),
-                             daemon=True, name="deletion-finalizer").start()
-        except Exception:
-            pass
+        if start_background_tasks:
+            from app.services.runtime_tasks import start_runtime_tasks  # noqa: E402
+            start_runtime_tasks(flask_app, pdb, proxy_db_path)
 
     # ── Access-token auth (off-loopback or TB_DASHBOARD_TOKEN) ──
     from app import dashboard_auth  # noqa: E402

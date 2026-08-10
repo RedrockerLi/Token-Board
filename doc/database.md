@@ -137,11 +137,11 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。�
 
 可视化**存档**库,表定义在 `schema/dashboard/0001_*.sql`(0001–0006),`user_version` 当前为 6。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
-存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `accounts` 元数据镜像表(0004 + 应用层 `reconcile_accounts` 把旧的名字列桶迁移成 id 桶、删掉名字列)。`accounts` 每行 `account_id → name`(0006 删除了从未被读的 `account_type`/`deleted_at` 镜像列),随配置同步、含已软删账户,供历史显示 JOIN 出名字。看板”按用户筛选”即按账户筛选,费用按该账户名下 token 占比分摊。
+存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `accounts` 元数据镜像表(0004 + 应用层 `reconcile_accounts` 把旧的名字列桶迁移成 id 桶、删掉名字列)。`accounts` 每行 `account_id → name`(0006 删除了从未被读的 `account_type`/`deleted_at` 镜像列),随配置同步、含已软删账户,供历史显示 JOIN 出名字。看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 V1 ledger 行。
 
 ### token_usage / request_usage
 
-`token_usage` 每行一天某账户某模型某 token 类型的量,`token_type` 取值 `output` / `input_cache_hit` / `input_cache_miss`,唯一键 `(date, model, account_id, token_type)`。`request_usage` 同理记请求数,唯一键 `(date, model, account_id)`。费用分摊仍按用户(账户)维度:`app/cost_allocator.py` 按同组内各用户的 token 占比分摊。
+`token_usage` 每行一天某账户某模型某 token 类型的量,`token_type` 取值 `output` / `input_cache_hit` / `input_cache_miss`,唯一键 `(date, model, account_id, token_type)`。`request_usage` 同理记请求数,唯一键 `(date, model, account_id)`。V1 的 `daily_usage` 同时保存 `equivalent_cost`（理论成本）和 `billed_usage_cost`（实际用量成本），报表不再按 token 占比分摊。
 
 ### cost_entry
 

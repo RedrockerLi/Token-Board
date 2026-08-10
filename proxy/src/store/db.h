@@ -2,8 +2,11 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -13,45 +16,26 @@
 #include <unordered_map>
 #include <vector>
 
+#include "usage_reservation.h"
+
 struct sqlite3;
 struct sqlite3_stmt;
 
-/// RAII wrapper around a SQLite3 database connection.
-///
-/// Opens with WAL mode and foreign keys enabled.  Prepared statements are
-/// cached internally for performance; all public methods are thread-safe.
-/// Read and write statements use separate SQLite connections so a writer
-/// waiting on WAL's busy timeout cannot convoy unrelated route lookups.
 class Database {
 public:
     Database() = default;
     ~Database();
 
-    // Non-copyable, movable
     Database(const Database &) = delete;
     Database &operator=(const Database &) = delete;
     Database(Database &&) = delete;
     Database &operator=(Database &&) = delete;
 
-    /// Open (or create) the database at `path`.  Applies pending schema
-    /// migrations from `schema_dir` (schema/proxy/vN/M-m_*.sql). Returns true
-    /// on success.
     bool open(const std::string &path, const std::string &schema_dir);
+    int schema_major() const noexcept { return schema_major_; }
+    int schema_minor() const noexcept { return schema_minor_; }
 
-    /// Close the database and finalize all prepared statements.
     void close();
-
-    /// Compute the enqueue-time frozen cost for a request (cost_frozen=1
-    /// path).  Looks up the pricing rate via stmt_snapshot_price_ (which reads
-    /// the v_pricing_rate view) and applies the per-(model,date,minute)
-    /// FrozenRate cache.  Public so the pricing-equivalence gate can assert it
-    /// agrees with the cost_frozen=0 trigger path.
-    bool snapshot_request_cost(const std::string &model, int prompt_tokens,
-                               int completion_tokens, int cache_read_tokens,
-                               std::int64_t requested_at_unix,
-                               double &cost);
-
-    // ── Lookups ──────────────────────────────────────────────────────────
 
     struct KeyInfo {
         int id;
@@ -65,18 +49,15 @@ public:
         int id;
         std::string name;
         std::string base_url;
-        std::string api_format;      // "openai" | "openai_responses" | "anthropic"
-        std::string endpoint_path;   // "" = derive from api_format
-        std::string auth_header;     // "bearer" | "x-api-key"
-        bool is_aggregate = false;   // aggregate account (routes by model)
-        std::string account_type;    // spec identity: "api" | "plan" | "agent"
-                                     // (semantics in app/domain/account_types.py
-                                     // + proxy/src/core/account_types.h)
-        bool extended_usage_limit_cooldown = false; // resolved from contract
-        int max_concurrency = 0;     // 0 = unlimited
-        bool deleted = false;        // soft-deleted with a PAST deleted_at
-                                     // (a future deleted_at = end_of_period
-                                     // cancellation, still routable until then)
+        std::string api_format;
+        std::string endpoint_path;
+        std::string auth_header;
+        int upstream_id = 0;
+        bool is_aggregate = false;
+        std::string account_type;
+        bool extended_usage_limit_cooldown = false;
+        int max_concurrency = 0;
+        bool deleted = false;
     };
     std::optional<AccountInfo> get_account(int account_id);
 
@@ -84,100 +65,66 @@ public:
         KeyInfo key;
         AccountInfo account;
     };
-    /// Authenticate a local key and read its account in one snapshot/query.
     std::optional<RouteInfo> lookup_route(const std::string &key_value);
 
-    // ── Upstream keys (multi-key per account, local-only) ───────────────
-
-    /// One API key slot of an account (child of upstream_accounts).  The key
-    /// itself is a local secret — never synced to the cloud.
     struct KeySlot {
         int id;
         std::string key_value;
-        int position = 0;   // fill / session-affinity preference order
+        int position = 0;
     };
-    /// All keys of an account, ordered by (position, id).
     std::vector<KeySlot> get_upstream_keys(int account_id);
 
-    /// Credentials needed to send a cooldown probe for one key slot (the
-    /// upstream base_url + that key's secret + the auth scheme).  Reads
-    /// upstream_keys JOIN upstream_accounts, so a probe never runs against a
-    /// deleted account/key.
     struct ProbeTarget {
         std::string base_url;
         std::string key_value;
-        std::string api_format;   // "openai" | "openai_responses" | "anthropic"
-        std::string auth_header;  // "bearer" | "x-api-key" | "auto"
+        std::string api_format;
+        std::string auth_header;
         bool valid = false;
     };
     std::optional<ProbeTarget> lookup_probe_target(int key_slot_id);
 
-    /// One fully resolved real-upstream target from a routing snapshot.
-    /// `keys` and `account` are read by the same SQLite statement, so callers
-    /// cannot combine credentials from one config revision with an endpoint
-    /// from another.  `keys` holds the per-key slots (the only key source since
-    /// the legacy single-column upstream_key was removed).
     struct RoutingTarget {
-        AccountInfo account;
-        std::vector<KeySlot> keys;
-        std::string upstream_model;
+        // Immutable snapshot owns one copy of each account, credential and
+        // target model.  Route rules only keep references into that storage;
+        // request candidates never copy URLs or secrets.
+        std::shared_ptr<const AccountInfo> account_ref;
+        std::vector<std::shared_ptr<const KeySlot>> key_refs;
+        std::shared_ptr<const std::string> upstream_model_ref;
         int priority_group = 0;
+
+        const AccountInfo &account() const { return *account_ref; }
+        const std::string &upstream_model() const { return *upstream_model_ref; }
     };
     struct RoutingRule {
         int route_set_id = 0;
         std::string model_pattern;
         RoutingTarget target;
     };
+    struct TimeoutConfig {
+        int streaming_first_byte_timeout = 60;
+        int streaming_idle_timeout = 120;
+        int non_streaming_timeout = 600;
+    };
     struct RoutingConfig {
         std::uint64_t generation = 0;
         std::vector<RouteInfo> routes;
         std::vector<RoutingRule> rules;
+        std::unordered_map<std::string, TimeoutConfig> timeouts;
     };
-    /// Build the complete immutable routing configuration on a background
-    /// thread. No request handler calls SQLite after this succeeds.
     bool load_routing_config(RoutingConfig &config);
-    /// Cheap background change detector (SQLite data_version/config state).
     std::uint64_t routing_config_generation();
-    /// Resolve a plain or aggregate account for `model` in one consistent
-    /// read snapshot.  Aggregate targets are ordered by (sort_order, id), and
-    /// missing or soft-deleted accounts are omitted.
-    std::vector<RoutingTarget> resolve_routing_snapshot(
-        int account_id, const std::string &model);
-
-    // ── Timeout config (per client wire format) ────────────────────────
-
-    /// Per-wire-format upstream timeouts (seconds; 0 = disabled).
-    struct TimeoutConfig {
-        int streaming_first_byte_timeout = 60;  // wait for first streaming chunk
-        int streaming_idle_timeout = 120;       // max gap between chunks; 0 = disabled
-        int non_streaming_timeout = 600;        // non-streaming body read timeout
-    };
-    /// Timeout config for a client wire format: "anthropic" | "openai_responses"
-    /// | "openai" (any other value → defaults).  Falls back to the struct
-    /// defaults when the row is missing.
     TimeoutConfig get_timeout_config(const std::string &app_type);
-
-    // ── Aggregate accounts ─────────────────────────────────────────────
-
-    /// One model-mapping entry of an aggregate account.
     struct AggregateEntry {
-        std::string pattern;          // glob, matched against the request model
-        int upstream_account_id = 0;  // real upstream account
-        std::string upstream_model;   // model name forwarded upstream
+        std::string pattern;
+        int upstream_account_id = 0;
+        std::string upstream_model;
     };
-    /// Resolve the real upstream targets for `model` on an aggregate account.
-    /// Returns ALL matching entries in priority order (sort_order, id) — one
-    /// model may map to several upstream accounts; the caller tries them in
-    /// order (skipping full / cooling-down accounts).
     std::vector<AggregateEntry> resolve_aggregate(int account_id,
                                                   const std::string &model);
-    /// All model patterns of an aggregate account (used by /v1/models).
     std::vector<std::string> get_aggregate_model_patterns(int account_id);
-
-    // ── Usage logging ───────────────────────────────────────────────────
-
     struct AttemptInfo {
         int account_id = 0;
+        int upstream_id = 0;
         int upstream_key_id = 0;
         int status_code = 0;
         int duration_ms = 0;
@@ -185,15 +132,13 @@ public:
         int connect_ms = 0;
         int tls_ms = 0;
         int lease_wait_ms = 0;
-        int ttft_ms = -1;          // semantic TTFT; -1 when not observed
+        int first_byte_ms = 0;
+        bool connection_reused = false;
+        int ttft_ms = -1;
         bool is_timeout = false;
         std::string error;
     };
 
-    /// Durably append one request and all of its attempts to the local spool.
-    /// A dedicated writer replays the spool into SQLite atomically. Request
-    /// threads never fall back to SQLite when the writer is busy; false means
-    /// the spool append failed or shutdown has stopped accepting new records.
     bool log_request(int account_id, int local_key_id, const std::string &model,
                      int prompt_tokens, int completion_tokens,
                      int cache_read_tokens, int total_tokens,
@@ -204,10 +149,9 @@ public:
                      int upstream_ttft_ms = -1, int upstream_duration_ms = -1,
                      int attempt_count = 1,
                      const std::vector<AttemptInfo> &attempts = {},
-                     double *out_cost = nullptr);
-
-    // ── Pricing ─────────────────────────────────────────────────────────
-
+                     int queue_ms = 0,
+                     double *out_cost = nullptr,
+                     UsageReservation *reservation = nullptr);
     struct PricingEntry {
         int id;
         std::string model_pattern;
@@ -216,14 +160,28 @@ public:
     };
 
     std::vector<PricingEntry> get_all_pricing();
-    std::uint64_t log_spool_bytes() {
-        std::lock_guard<std::mutex> lock(log_queue_mutex_);
-        return log_spool_write_offset_ - log_spool_read_offset_;
+    std::uint64_t log_spool_bytes();
+    std::size_t log_queue_depth();
+    std::int64_t log_oldest_age_ms();
+    std::shared_ptr<UsageReservation> reserve_usage_event();
+    bool reserve_log_slot();
+    void release_log_slot();
+    bool log_writer_healthy();
+    bool log_recovery_complete();
+    using CostObserver = std::function<void(int key_slot_id, double cost)>;
+    void set_cost_observer(CostObserver observer);
+    std::size_t log_last_batch_size() const noexcept {
+        return log_last_batch_size_.load(std::memory_order_acquire);
     }
     std::uint64_t log_persist_failures() const noexcept {
         return log_persist_failures_.load(std::memory_order_acquire);
     }
-
+    std::uint64_t log_lost_events() const noexcept {
+        return log_lost_events_.load(std::memory_order_acquire);
+    }
+    std::uint64_t log_last_accounting_ms() const noexcept {
+        return log_last_accounting_ms_.load(std::memory_order_acquire);
+    }
 private:
     struct LogRecord {
         int account_id = 0;
@@ -247,7 +205,8 @@ private:
         std::vector<AttemptInfo> attempts;
         std::int64_t requested_at_unix = 0;
         std::string event_id;
-        bool cost_frozen = false;
+        int queue_ms = 0;
+        std::chrono::steady_clock::time_point enqueued_at;
     };
 
     struct SpoolRecord {
@@ -256,17 +215,6 @@ private:
         std::size_t frame_bytes = 0;
     };
 
-    struct FrozenRate {
-        bool matched = false;
-        double input_price = 0.0;
-        double output_price = 0.0;
-        double cache_read_price = 0.0;
-        double multiplier = 1.0;
-        std::string currency = "CNY";
-        double fx_rate = 1.0;  // USD→CNY; 1.0 for CNY rows or when no rate stored
-    };
-
-    /// Apply same-major migrations from `schema_dir`; reject major changes.
     bool run_migrations(const std::string &schema_dir);
     bool prepare_statements();
     void finalize_statements();
@@ -275,7 +223,12 @@ private:
     void stop_log_writer();
     void log_writer_loop();
     bool persist_log_records(const LogRecord *records, std::size_t count);
-    bool write_log_record_in_transaction(const LogRecord &record);
+    bool write_log_record_in_transaction(const LogRecord &record,
+                                         bool *inserted = nullptr);
+    bool update_accounting_metrics(
+        const std::vector<const LogRecord *> &records);
+    void notify_rated_costs(
+        const std::vector<const LogRecord *> &records);
     bool append_log_spool_locked(const std::string &payload);
     bool read_log_spool_batch_locked(std::vector<SpoolRecord> &batch);
     bool compact_log_spool_locked(bool force);
@@ -284,16 +237,13 @@ private:
                                        LogRecord &record);
 
     static constexpr std::size_t kLogBatchSize = 64;
+    static constexpr std::size_t kLogQueueMax = 16384;
     static constexpr std::size_t kLogBatchBytes = 1024 * 1024;
     static constexpr std::size_t kLogRecordMaxBytes = 256 * 1024;
     static constexpr std::size_t kLogModelMaxBytes = 512;
     static constexpr std::size_t kLogErrorMaxBytes = 2048;
     static constexpr std::size_t kLogAttemptsMax = 64;
     static constexpr std::uint64_t kLogCompactThreshold = 8 * 1024 * 1024;
-    // Hard cap on the durable request-log spool file.  Appends past this are
-    // rejected so a wedged/unavailable writer can never grow the spool without
-    // bound on disk.  Not a data-loss-free guard: once hit, new records drop
-    // until the writer drains (log_accepting_ is the first line of defense).
     static constexpr std::uint64_t kLogSpoolHardLimit = 256 * 1024 * 1024;
     static constexpr int kShutdownRetryLimit = 3;
 
@@ -302,39 +252,39 @@ private:
     sqlite3 *pricing_db_ = nullptr;
     std::string db_path_;  // used to derive the "<db>.migrate.lock" filename
     int schema_major_ = 0;
+    int schema_minor_ = 0;
     mutable std::shared_mutex lifecycle_mutex_;
     std::mutex write_mutex_;
     std::mutex read_mutex_;
     std::mutex pricing_mutex_;
-
-    // The append-only spool is the durable queue. Request threads only serialize
-    // and fdatasync a bounded record; SQLite I/O belongs to log_writer_thread_.
-    std::mutex log_queue_mutex_;
+    std::mutex cost_observer_mutex_;
+    CostObserver cost_observer_;
+    mutable std::mutex log_queue_mutex_;
     std::condition_variable log_queue_cv_;
     std::thread log_writer_thread_;
     bool log_accepting_ = false;
+    bool log_recovering_ = false;
     bool log_stop_ = false;
+    std::deque<LogRecord> log_memory_queue_;
+    std::size_t log_reservations_ = 0;
     int log_spool_fd_ = -1;
     std::uint64_t log_spool_read_offset_ = 0;
     std::uint64_t log_spool_write_offset_ = 0;
     std::atomic<std::uint64_t> log_persist_failures_{0};
-    std::unordered_map<std::string, FrozenRate> frozen_rate_cache_;
-
-    // Read statements (read_db_, protected by read_mutex_)
+    std::atomic<std::uint64_t> log_lost_events_{0};
+    std::atomic<std::size_t> log_last_batch_size_{0};
+    std::atomic<std::uint64_t> log_last_accounting_ms_{0};
     sqlite3_stmt *stmt_lookup_key_ = nullptr;
     sqlite3_stmt *stmt_get_account_ = nullptr;
     sqlite3_stmt *stmt_lookup_route_ = nullptr;
     sqlite3_stmt *stmt_get_upstream_keys_ = nullptr;
-    sqlite3_stmt *stmt_resolve_routing_snapshot_ = nullptr;
     sqlite3_stmt *stmt_get_aggregate_entries_ = nullptr;
     sqlite3_stmt *stmt_get_pricing_ = nullptr;
-    sqlite3_stmt *stmt_snapshot_price_ = nullptr;
     sqlite3_stmt *stmt_get_timeout_config_ = nullptr;
     sqlite3_stmt *stmt_lookup_probe_target_ = nullptr;
-
-    // Mutating statements (write_db_, protected by write_mutex_)
     sqlite3_stmt *stmt_insert_log_ = nullptr;
     sqlite3_stmt *stmt_find_log_event_ = nullptr;
     sqlite3_stmt *stmt_insert_attempt_ = nullptr;
     sqlite3_stmt *stmt_update_last_used_ = nullptr;
+    sqlite3_stmt *stmt_update_accounting_ = nullptr;
 };

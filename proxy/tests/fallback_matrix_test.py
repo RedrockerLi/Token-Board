@@ -21,6 +21,8 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import json
 import shutil
@@ -57,47 +59,9 @@ def wait_for_health(port: int) -> None:
 
 def build_scenario(conn, local_key, model, plan_keys, deepseek_key=None):
     """plan account (plan_keys) + optional deepseek account, behind aggregate."""
-    plan_id = conn.execute(
-        "INSERT INTO upstream_accounts "
-        "(name,upstream_key,base_url,api_format,auth_header,max_concurrency,"
-        "account_type) VALUES (?,?,?,?,?,?,?)",
-        (f"{local_key}-plan", "", "", "openai", "bearer", 64, "plan"),
-    ).lastrowid
-    conn.executemany(
-        "INSERT INTO upstream_keys(account_id,key_value,position) VALUES (?,?,?)",
-        [(plan_id, k, i) for i, k in enumerate(plan_keys)],
-    )
-    ds_id = None
-    if deepseek_key:
-        ds_id = conn.execute(
-            "INSERT INTO upstream_accounts "
-            "(name,upstream_key,base_url,api_format,auth_header,max_concurrency,"
-            "account_type) VALUES (?,?,?,?,?,?,?)",
-            (f"{local_key}-ds", "", "", "openai", "bearer", 64, "api"),
-        ).lastrowid
-        conn.execute(
-            "INSERT INTO upstream_keys(account_id,key_value,position) VALUES (?,?,?)",
-            (ds_id, deepseek_key, 0),
-        )
-    agg_id = conn.execute(
-        "INSERT INTO upstream_accounts "
-        "(name,upstream_key,base_url,api_format,auth_header,max_concurrency,"
-        "account_type,is_aggregate) VALUES (?,?,?,?,?,?,?,?)",
-        (f"{local_key}-agg", "", "", "openai", "bearer", 64, "api", 1),
-    ).lastrowid
-    entries = [(agg_id, 0, model, plan_id, model)]
-    if ds_id:
-        entries.append((agg_id, 1, model, ds_id, model))
-    conn.executemany(
-        "INSERT INTO aggregate_entries "
-        "(account_id,sort_order,pattern,upstream_account_id,upstream_model) "
-        "VALUES (?,?,?,?,?)",
-        entries,
-    )
-    conn.execute(
-        "INSERT INTO local_keys(key_value,label,account_id) VALUES (?,?,?)",
-        (local_key, local_key, agg_id),
-    )
+    from v1_fixture import build_aggregate_scenario
+    return build_aggregate_scenario(
+        conn, local_key, model, plan_keys, deepseek_key)
 
 
 def send(proxy_port, local_key, body, timeout=30):
@@ -159,12 +123,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "proxy.db"
-        legacy = Path(tmp) / "schema"
-        legacy.mkdir()
-        for mig in schema_dir.glob("*.sql"):
-            if int(mig.stem.split("_", 1)[0].split("-", 1)[1]) <= 10:
-                shutil.copy2(mig, legacy / mig.name)
-        migrate(str(db_path), str(legacy))
+        migrate(str(db_path), str(schema_dir), "proxy")
         conn = sqlite3.connect(db_path)
         base_url = f"http://127.0.0.1:{upstream_port}"
         try:
@@ -173,13 +132,13 @@ def main() -> None:
             build_scenario(conn, "tb-b1", "b1-model", ["sk-b1-p1", "sk-b1-p2"], "sk-b1-d")
             build_scenario(conn, "tb-b2", "b2-model", ["sk-b2-p1", "sk-b2-p2"], "sk-b2-d")
             build_scenario(conn, "tb-b3", "b3-model", ["sk-b3-p1"], "sk-b3-d")
-            conn.execute("UPDATE upstream_accounts SET base_url=?", (base_url,))
+            conn.execute("UPDATE upstreams SET base_url=?", (base_url,))
             # Fast B3 baseline: shrink the OpenAI-format semantic idle timeout
             # so the commit-then-stall → 504 round-trip completes in seconds.
             conn.execute(
                 "UPDATE proxy_timeout_config SET "
                 "streaming_first_byte_timeout=10, streaming_idle_timeout=4 "
-                "WHERE app_type='openai'")
+                "WHERE endpoint_kind='chat'")
             conn.commit()
         finally:
             conn.close()
@@ -188,7 +147,8 @@ def main() -> None:
         proxy = subprocess.Popen(
             [str(proxy_binary), "--db", str(db_path), "--schema-dir",
              str(schema_dir), "--host", "127.0.0.1", "--port", str(proxy_port)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            env=os.environ.copy())
         try:
             wait_for_health(proxy_port)
             common = {"messages": [{"role": "user", "content": "hi"}]}

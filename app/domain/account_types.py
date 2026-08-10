@@ -1,11 +1,11 @@
 """Upstream account-type semantics — the single source of truth.
 
-`upstream_accounts.account_type` is a free-form identity string (no DB CHECK
-constraint).  Its behavior is defined HERE, as a declarative spec table: what
-an account of a given type may do (routing / keys / billing / cooldown /
-deletion / usage source).  Code must ask the spec (``spec(t).routable`` …)
-instead of comparing the string directly, so adding a new account type is one
-row in :data:`ACCOUNT_TYPES` — not a new branch in every caller.
+`account_type` is a UI/template compatibility value, not a storage-table
+identity. Its behavior is defined HERE, as a declarative spec table: what an
+account of a given type may do (routing / keys / billing / cooldown / deletion
+/ usage source). Code must ask the spec (``spec(t).routable`` …) instead of
+comparing the string directly, so adding a type is one row in
+:data:`ACCOUNT_TYPES` — not a new branch in every caller.
 
 The C++ proxy mirrors the parts it needs in ``proxy/src/core/account_types.h``
 (non-routable filter + 429 cooldown class) — keep the two in sync.
