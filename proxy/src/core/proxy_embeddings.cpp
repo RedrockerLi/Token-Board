@@ -129,6 +129,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     // Parse usage
     auto usage = parse_usage_for_format(used->account().api_format, fwd.body);
     if (usage.has_value()) {
+        // Log the client-requested model, not the upstream-echoed one —
+        // consistent with every other logging path.
+        usage->model = req_model;
         enqueue_log(used->account().id,
                              ar.route.local_key_id,
                              *usage, false, fwd.status_code,

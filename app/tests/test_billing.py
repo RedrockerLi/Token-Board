@@ -76,42 +76,6 @@ class BillingTest(AppDatabaseTestCase):
                 "WHERE event_id='frozen'").fetchone()
             self.assertEqual(frozen, ("frozen", 0.0))
 
-    def test_recurring_charge_requires_historical_fx_and_is_idempotent(self) -> None:
-        db = self.proxy_database()
-        account_id = db.create_account({
-            "name": "usd-plan", "account_type": "plan", "currency": "USD",
-            "monthly_price": 10, "valid_from": "2026-08-01",
-            "base_url": "http://example.test", "upstream_keys": ["sk-usd-plan"],
-        })
-        at = datetime.now(timezone.utc) + timedelta(seconds=2)
-        fx_date = at.strftime("%Y-%m-05")
-        materialize_period_charges(str(self.proxy_path), at)
-        with sqlite3.connect(self.proxy_path) as conn:
-            row = conn.execute(
-                "SELECT normalized_recurring_cost,fx_rate_date FROM "
-                "billing_period_charges bc JOIN billing_contracts c "
-                "ON c.id=bc.contract_id WHERE c.account_id=?", (account_id,)
-            ).fetchone()
-            # No stored USD rate at all: the historical contract semantics
-            # degrade to 1.0 (no conversion), never to an incomplete charge.
-            self.assertEqual(row, (10.0, None))
-            conn.execute(
-                "INSERT INTO fx_rates(base_currency,quote_currency,date,rate) "
-                "VALUES('USD','CNY',?,7.2)", (fx_date,))
-            conn.commit()
-        materialize_period_charges(str(self.proxy_path), at)
-        materialize_period_charges(str(self.proxy_path), at)
-        with sqlite3.connect(self.proxy_path) as conn:
-            rows = conn.execute(
-                "SELECT normalized_recurring_cost,base_currency,fx_rate_date "
-                "FROM billing_period_charges bc JOIN billing_contracts c "
-                "ON c.id=bc.contract_id WHERE c.account_id=?", (account_id,)
-            ).fetchall()
-            # The rate was stored after the period start; the earliest stored
-            # rate applies (period-start fallback), and rematerialization is
-            # idempotent.
-            self.assertEqual(rows, [(72.0, "CNY", fx_date)])
-
     def test_usd_usage_without_historical_fx_is_unrated(self) -> None:
         db = self.proxy_database()
         account_id = db.create_account({

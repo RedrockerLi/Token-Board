@@ -268,6 +268,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             auto usage = parse_usage_for_format(ir::to_string(used_upstream_fmt),
                                                 fwd.body);
             if (usage.has_value()) {
+                // Log the client-requested model, not the upstream-echoed one —
+                // consistent with converted, streaming and zero-usage paths.
+                usage->model = model;
                 enqueue_log(used->account().id, ar.route.local_key_id,
                                      *usage, false, fwd.status_code,
                                      fwd.duration_ms, used->key_slot_id,
