@@ -6,6 +6,8 @@ import threading
 from app import create_app
 from app.db.dashboard_db import DashboardDatabase
 from app.db.proxy_db import ProxyDatabase
+from app.db.proxy.common import _parse_utc_timestamp
+from app.services.codex_import import _iso_z_to_sqlite
 
 from app.tests.support import AppDatabaseTestCase
 
@@ -210,6 +212,59 @@ class AppContractTest(AppDatabaseTestCase):
         stop_runtime_tasks(app, join_timeout=1.0)
         self.assertTrue(finished.wait(0.1))
         self.assertFalse(thread.is_alive())
+
+    def test_time_conventions_are_iso_only(self) -> None:
+        self.assertEqual(_iso_z_to_sqlite("2026-08-04T16:37:44.757Z"),
+                         "2026-08-04T16:37:44Z")
+        parsed = _parse_utc_timestamp("2026-08-04T16:37:44Z")
+        self.assertEqual(parsed.year, 2026)
+        self.assertEqual(parsed.hour, 16)
+        # The legacy SQLite space format is no longer accepted at runtime.
+        with self.assertRaises(ValueError):
+            _parse_utc_timestamp("2026-08-04 16:37:44")
+
+    def test_request_logs_filter_by_iso_range(self) -> None:
+        db = self.proxy_database()
+        account_id = db.create_account({
+            "name": "iso-filter", "account_type": "api",
+            "base_url": "http://iso.test", "upstream_keys": ["sk-iso"],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            for ts in ("2026-08-04T01:00:00Z", "2026-08-04T12:00:00Z",
+                       "2026-08-05T01:00:00Z"):
+                conn.execute(
+                    "INSERT INTO request_log(event_id,source_kind,account_id,"
+                    "model,status_code,requested_at,pricing_status) "
+                    "VALUES(?,?,?,'model',200,?,'frozen')",
+                    ("iso-filter:" + ts, "proxy", account_id, ts))
+            conn.commit()
+        result = db.get_request_logs(
+            date_from="2026-08-04T00:00:00Z",
+            date_to="2026-08-04T23:59:59.999Z")
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(
+            {item["requested_at"] for item in result["items"]},
+            {"2026-08-04T01:00:00Z", "2026-08-04T12:00:00Z"})
+
+    def test_perf_bucket_is_iso(self) -> None:
+        db = self.proxy_database()
+        account_id = db.create_account({
+            "name": "iso-perf", "account_type": "api",
+            "base_url": "http://perf.test", "upstream_keys": ["sk-perf"],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO request_log(event_id,source_kind,account_id,"
+                "model,status_code,requested_at,pricing_status) "
+                "VALUES('iso-perf','proxy',?,'model',200,"
+                "strftime('%Y-%m-%dT%H:%M:%fZ','now'),'frozen')",
+                (account_id,))
+            conn.commit()
+        rows = db.get_perf_throughput(60)
+        self.assertTrue(rows)
+        import re
+        self.assertRegex(rows[0]["bucket"],
+                         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00Z$")
 
     def test_account_key_and_credential_crud(self) -> None:
         database = self.proxy_database()

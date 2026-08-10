@@ -63,14 +63,19 @@ def _parse_iso_date(value: object) -> date | None:
 
 
 def _parse_utc_timestamp(value: object) -> datetime | None:
+    """Parse an ISO-8601 UTC timestamp ("...Z" or explicit offset).
+
+    The V1 databases only store ISO timestamps; the legacy SQLite space
+    format ("YYYY-MM-DD HH:MM:SS") is no longer accepted at runtime.
+    """
     if value in (None, ""):
         return None
     text = str(value).replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        # SQLite's datetime('now') has a space separator and no offset.
-        parsed = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    if " " in text:
+        raise ValueError(
+            "legacy space-separated timestamps are not supported; "
+            "expected ISO format (YYYY-MM-DDTHH:MM:SSZ)")
+    parsed = datetime.fromisoformat(text)
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 

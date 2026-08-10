@@ -5,17 +5,6 @@
  * Lazy-loaded by app.js when navigating to #/proxy/billing or #/proxy/logs.
  */
 
-/**
- * Format a UTC timestamp string from SQLite (YYYY-MM-DD HH:MM:SS)
- * into UTC+8 display (all interfaces show UTC+8, independent of the
- * browser's timezone).
- */
-function fmtTime(ts) {
-    if (!ts) return '';
-    // SQLite datetime('now') returns "YYYY-MM-DD HH:MM:SS" in UTC.
-    return fmtUtc8(ts);
-}
-
 // ── Billing Page ─────────────────────────────────────────────────────────
 
 async function loadBillingStats() {
@@ -278,7 +267,7 @@ async function loadLogsTable() {
 
         tbody.innerHTML = data.items.map((r) => `
             <tr>
-                <td>${esc(fmtTime(r.requested_at))}</td>
+                <td>${esc(fmtLocal(r.requested_at))}</td>
                 <td>${esc(r.account_name || `ID:${r.account_id}`)}</td>
                 <td><code>${esc(r.model)}</code></td>
                 <td>${fmtNum(r.prompt_tokens)} / ${fmtNum(r.cache_read_tokens || 0)} / ${fmtNum(r.completion_tokens)} / ${fmtNum(r.total_tokens)}</td>
@@ -309,6 +298,12 @@ function applyLogFilters() {
     for (const [k, v] of fd.entries()) {
         if (v) logsFilters[k] = v;
     }
+    // Date pickers are local calendar days; the backend filters on ISO UTC
+    // timestamps, so convert each day to its UTC range here.
+    const fromRange = logsFilters.from ? localDateToUtcRange(logsFilters.from) : null;
+    const toRange = logsFilters.to ? localDateToUtcRange(logsFilters.to) : null;
+    if (fromRange) logsFilters.from = fromRange[0];
+    if (toRange) logsFilters.to = toRange[1];
     loadLogsTable();
 }
 

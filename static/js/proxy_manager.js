@@ -185,8 +185,8 @@ function addKeyRow(value, validFrom) {
     date.className = 'key-valid-from';
     date.style.display = keyDateDisplay();
     date.name = 'upstream_valid_froms[]';
-    date.title = '订阅起始日（UTC，留空=创建日期）';
-    date.value = validFrom || '';
+    date.title = '订阅起始日（本地日期，存储 UTC，留空=创建日期）';
+    date.value = validFrom ? utcDateToLocalDate(validFrom) : '';
     date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
     del.type = 'button';
@@ -215,8 +215,8 @@ function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion) {
     date.type = 'date';
     date.className = 'existing-key-valid-from key-valid-from';
     date.style.display = keyDateDisplay();
-    date.title = '订阅起始日（UTC，留空=创建日期）';
-    date.value = validFrom || '';
+    date.title = '订阅起始日（本地日期，存储 UTC，留空=创建日期）';
+    date.value = validFrom ? utcDateToLocalDate(validFrom) : '';
     date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
     del.type = 'button';
@@ -301,14 +301,16 @@ function collectKeyRows(form) {
         if (!input.value.trim()) return;
         upstream_keys.push(input.value.trim());
         new_valid_froms.push(useKeyDates
-            ? (input.parentElement.querySelector('[name="upstream_valid_froms[]"]').value || null)
+            ? (localDateToUtcDate(input.parentElement.querySelector('[name="upstream_valid_froms[]"]').value) || null)
             : null);
     });
     const keepRows = [...form.querySelectorAll('#keyList .existing-key')];
     const keep_key_ids = keepRows.map(r => r.dataset.keepId);
     const keep_valid_froms = Object.fromEntries(keepRows.map(r => [
         r.dataset.keepId,
-        useKeyDates ? (r.querySelector('.existing-key-valid-from').value || null) : null,
+        useKeyDates
+            ? (localDateToUtcDate(r.querySelector('.existing-key-valid-from').value) || null)
+            : null,
     ]));
     return { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms };
 }
@@ -327,7 +329,7 @@ async function loadAccountsTable() {
         }
         tbody.innerHTML = real.map((a) => `
             <tr>
-                <td>${esc(a.name)}${a.deleted_at ? ` <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="到期删除：${esc(a.deleted_at)} UTC">到期 ${esc(a.deleted_at.slice(0, 10))}</span>` : ''}</td>
+                <td>${esc(a.name)}${a.deleted_at ? ` <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="到期删除：${esc(fmtLocal(a.deleted_at))}">到期 ${esc(fmtLocal(a.deleted_at).slice(0, 10))}</span>` : ''}</td>
                 <td><code>${esc(maskKey(a.upstream_key))}</code>${a.key_count > 1 ? ` <span class="badge" title="${a.key_count} 把密钥（同一配置的多个并发槽位）">×${a.key_count}</span>` : ''}${!a.upstream_key && !a.key_count ? ' <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
@@ -378,7 +380,8 @@ async function saveAccount(e) {
         common.agent_kind = form['agent_kind'] ? (form['agent_kind'].value || 'codex') : 'codex';
     }
     if (s.subscription_unit === 'per_account') {
-        common.valid_from = form['valid_from'] ? (form['valid_from'].value || null) : null;
+        common.valid_from = form['valid_from']
+            ? (localDateToUtcDate(form['valid_from'].value) || null) : null;
     }
     try {
         if (id) {
@@ -442,14 +445,15 @@ async function editAccount(id) {
         if (form['currency']) form['currency'].value = acc.currency || 'CNY';
         form['max_concurrency'].value = acc.max_concurrency || '';
         if (form['agent_kind']) form['agent_kind'].value = acc.agent_kind || 'codex';
-        if (form['valid_from']) form['valid_from'].value = acc.valid_from || '';
+        if (form['valid_from']) form['valid_from'].value =
+            acc.valid_from ? utcDateToLocalDate(acc.valid_from) : '';
         toggleTypeFields(form['account_type']);
         // Existing keys → masked keep-rows; user adds new rows as needed.
         resetKeyList();
         // Existing keys → masked keep-rows; user adds new rows as needed.
         // 已安排本期期末删除的 key（deleted_at 在未来）移除键灰置。
         resetKeyList();
-        const nowUtc = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        const nowUtc = new Date().toISOString();
         (acc.keys || []).forEach((k) => {
             addExistingKeyRow(k.id, k.masked, k.valid_from,
                               !!(k.deleted_at && k.deleted_at > nowUtc));
@@ -517,7 +521,8 @@ async function _doDeleteAccount(id, mode, isSubscription) {
     try {
         const resp = await proxyFetch(`/api/proxy/accounts/${id}?mode=${mode}`, { method: 'DELETE' });
         if (resp && resp.deferred) {
-            const until = (resp.effective_deleted_at || '').slice(0, 10);
+            const until = resp.effective_deleted_at
+                ? fmtLocal(resp.effective_deleted_at).slice(0, 10) : '';
             showToast(`已安排到期删除，可继续使用至 ${until}（本期仍计费，下期不计费）`);
         } else if (isSubscription) {
             showToast('账户已删除（本期已计费）');
@@ -675,7 +680,7 @@ function initAccountsPage() {
                             <option value="USD">USD</option>
                         </select>
                     </label>
-                    <label id="agentValidFromField" style="display:none;">订阅起始日（UTC，留空=创建日期）
+                    <label id="agentValidFromField" style="display:none;">订阅起始日（本地日期，存储 UTC，留空=创建日期）
                         <input name="valid_from" type="date">
                     </label>
                     <div style="display:flex; gap:8px;">
@@ -721,8 +726,8 @@ async function loadKeysTable() {
                 <td><code class="key-display" title="${esc(k.key_value)}">${esc(k.key_masked)}</code> <button class="btn btn--sm" onclick="copyKey('${esc(k.key_value)}')">复制</button></td>
                 <td>${esc(k.label || '-')}</td>
                 <td>${k.account_id == null ? '<span style="color:#9CA3AF;">未分配</span>' : esc(k.account_name || `ID:${k.account_id}`)}</td>
-                <td>${esc(k.last_used_at || '从未使用')}</td>
-                <td>${esc(k.created_at || '')}</td>
+                <td>${k.last_used_at ? esc(fmtLocal(k.last_used_at)) : '从未使用'}</td>
+                <td>${k.created_at ? esc(fmtLocal(k.created_at)) : ''}</td>
                 <td>
                     <button class="btn btn--sm" onclick="openEditKeyModal(${k.id})">编辑</button>
                     <button class="btn btn--sm" onclick="deleteKey(${k.id}, '${esc(k.label || k.key_masked)}')" style="color:#EF4444;">删除</button>
@@ -1095,9 +1100,9 @@ function initAggregatesPage() {
 // Cached pricing rows (with slots) so the edit modal can look up by id.
 let _pricingCache = [];
 
-// ── Time-slot helpers (UTC+0 storage ↔ UTC+8 UI) ─────────────────────────
+// ── Time-slot helpers (UTC+0 storage ↔ browser-local UI) ────────────────
 // Slot boundaries are stored as minute-of-day in UTC+0; the UI enters and
-// shows them in UTC+8 (Beijing time).
+// shows them in the computer's local timezone.
 function minutesToHHMM(m) {
     m = ((Math.round(m) % 1440) + 1440) % 1440;
     return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
@@ -1107,8 +1112,10 @@ function hhmmToMinutes(hhmm) {
     if (p.length < 2 || isNaN(p[0]) || isNaN(p[1])) return NaN;
     return p[0] * 60 + p[1];
 }
-function minutes8to0(min8) { return ((min8 - 480) % 1440 + 1440) % 1440; }  // UTC+8 → UTC+0
-function minutes0to8(min0) { return ((min0 + 480) % 1440 + 1440) % 1440; }  // UTC+0 → UTC+8
+/** getTimezoneOffset() = UTC − local (minutes). */
+function localTzOffsetMinutes() { return new Date().getTimezoneOffset(); }
+function minutesLocalToUtc(minLocal) { return ((minLocal - localTzOffsetMinutes()) % 1440 + 1440) % 1440; }
+function minutesUtcToLocal(minUtc) { return ((minUtc + localTzOffsetMinutes()) % 1440 + 1440) % 1440; }
 
 function addSlotRow(slot) {
     var rows = document.getElementById('slotRows');
@@ -1116,8 +1123,8 @@ function addSlotRow(slot) {
     var div = document.createElement('div');
     div.className = 'slot-row';
     div.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:6px;';
-    var startVal = slot ? minutesToHHMM(minutes0to8(slot.start_minute)) : '08:00';
-    var endVal = slot ? minutesToHHMM(minutes0to8(slot.end_minute)) : '23:00';
+    var startVal = slot ? minutesToHHMM(minutesUtcToLocal(slot.start_minute)) : '08:00';
+    var endVal = slot ? minutesToHHMM(minutesUtcToLocal(slot.end_minute)) : '23:00';
     var multVal = slot ? slot.multiplier : 1.0;
     div.innerHTML =
         '<input type="time" class="slot-start" step="60" value="' + startVal + '">' +
@@ -1143,8 +1150,8 @@ function collectSlots() {
         if (isNaN(start) || isNaN(end) || isNaN(mult)) return;  // skip incomplete rows
         if (start === end) return;  // zero-length window is meaningless
         slots.push({
-            start_minute: minutes8to0(start),
-            end_minute: minutes8to0(end),
+            start_minute: minutesLocalToUtc(start),
+            end_minute: minutesLocalToUtc(end),
             multiplier: mult,
         });
     });
@@ -1154,7 +1161,7 @@ function collectSlots() {
 function slotsSummary(slots) {
     if (!slots || !slots.length) return '<span style="color:var(--color-text-tertiary);">无</span>';
     return slots.map(function (s) {
-        return minutesToHHMM(minutes0to8(s.start_minute)) + '-' + minutesToHHMM(minutes0to8(s.end_minute)) + ' ×' + s.multiplier;
+        return minutesToHHMM(minutesUtcToLocal(s.start_minute)) + '-' + minutesToHHMM(minutesUtcToLocal(s.end_minute)) + ' ×' + s.multiplier;
     }).join('、');
 }
 
@@ -1281,7 +1288,7 @@ function initPricingPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">模型定价管理</h1>
-            <p class="page-subtitle">配置模型价格（百万元 token 价格，CNY 默认 / 可选 USD）· 时段倍率按 UTC+8 时间设置</p>
+            <p class="page-subtitle">配置模型价格（百万元 token 价格，CNY 默认 / 可选 USD）· 时段倍率按本机当地时间设置（存储 UTC）</p>
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
         <table class="mgmt-table" id="pricingTable">
@@ -1307,7 +1314,7 @@ function initPricingPage() {
                     </label>
                     <div style="margin:10px 0;">
                         <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:6px;">
-                            时段倍率（每日生效，按 UTC+8 时间；倍率作用于输入/输出/缓存三档价格）
+                            时段倍率（每日生效，按本机当地时间设置，存储 UTC+0；倍率作用于输入/输出/缓存三档价格）
                         </div>
                         <div id="slotRows"></div>
                         <button type="button" class="btn btn--sm" onclick="addSlotRow(null)">+ 添加时段</button>

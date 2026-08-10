@@ -5,31 +5,54 @@
  * are available everywhere.
  */
 
-// ── Time formatting (UTC → UTC+8) ─────────────────────────────────────────
+// ── Time formatting (ISO UTC → browser-local display) ────────────────────
 
-/**
- * Convert a UTC datetime string from the databases ("YYYY-MM-DD HH:MM:SS")
- * into a UTC+8 (Asia/Shanghai) display string.  Falls back to the input on
- * unparseable values.  All frontend time displays use this so every interface
- * shows UTC+8 regardless of the browser's own timezone.
- */
-function fmtUtc8(utcStr) {
-    if (utcStr == null || utcStr === '') return '';
-    var d = new Date(String(utcStr).replace(' ', 'T') + 'Z');
-    if (isNaN(d.getTime())) return String(utcStr);
-    return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+function _pad2(n) { return String(n).padStart(2, '0'); }
+
+/** ISO UTC timestamp ("YYYY-MM-DDTHH:MM:SS[.fff]Z") → local "YYYY-MM-DD HH:MM:SS". */
+function fmtLocal(isoStr) {
+    if (isoStr == null || isoStr === '') return '';
+    var d = new Date(String(isoStr));
+    if (isNaN(d.getTime())) return '';
+    return d.getFullYear() + '-' + _pad2(d.getMonth() + 1) + '-' + _pad2(d.getDate())
+        + ' ' + _pad2(d.getHours()) + ':' + _pad2(d.getMinutes()) + ':' + _pad2(d.getSeconds());
 }
 
-/** "YYYY-MM-DD HH:MM[:SS]" (UTC) → "HH:MM" in UTC+8 (for chart x-axis labels). */
-function fmtUtc8HHMM(utcStr) {
-    if (utcStr == null || utcStr === '') return '';
-    var s = String(utcStr);
-    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) s = s + ':00';
-    var out = fmtUtc8(s);
-    if (!out) return '';
-    // toLocaleString output ends with "YYYY/M/D HH:MM:SS" — take the time part.
-    var m = out.match(/(\d{1,2}:\d{2})/);
-    return m ? m[1] : out;
+/** ISO UTC timestamp → local "HH:MM" (for chart x-axis labels). */
+function fmtLocalHHMM(isoStr) {
+    var s = fmtLocal(isoStr);
+    return s ? s.slice(11, 16) : '';
+}
+
+/** Local calendar date "YYYY-MM-DD" → UTC calendar date "YYYY-MM-DD". */
+function localDateToUtcDate(localDate) {
+    if (!localDate) return '';
+    var p = String(localDate).split('-').map(Number);
+    if (p.length !== 3 || isNaN(p[0]) || isNaN(p[1]) || isNaN(p[2])) return '';
+    var d = new Date(p[0], p[1] - 1, p[2]);
+    if (isNaN(d.getTime())) return '';
+    return d.getUTCFullYear() + '-' + _pad2(d.getUTCMonth() + 1) + '-' + _pad2(d.getUTCDate());
+}
+
+/** UTC calendar date "YYYY-MM-DD" → local calendar date "YYYY-MM-DD". */
+function utcDateToLocalDate(utcDate) {
+    if (!utcDate) return '';
+    var p = String(utcDate).split('-').map(Number);
+    if (p.length !== 3 || isNaN(p[0]) || isNaN(p[1]) || isNaN(p[2])) return '';
+    var d = new Date(Date.UTC(p[0], p[1] - 1, p[2]));
+    if (isNaN(d.getTime())) return '';
+    return d.getFullYear() + '-' + _pad2(d.getMonth() + 1) + '-' + _pad2(d.getDate());
+}
+
+/** Local date "YYYY-MM-DD" → [UTC start ISO, UTC end ISO] covering the local day. */
+function localDateToUtcRange(localDate) {
+    if (!localDate) return null;
+    var p = String(localDate).split('-').map(Number);
+    if (p.length !== 3 || isNaN(p[0]) || isNaN(p[1]) || isNaN(p[2])) return null;
+    var start = new Date(p[0], p[1] - 1, p[2]);
+    if (isNaN(start.getTime())) return null;
+    var end = new Date(p[0], p[1] - 1, p[2] + 1);
+    return [start.toISOString(), new Date(end.getTime() - 1).toISOString()];
 }
 
 // ── Number formatting ───────────────────────────────────────────────────────

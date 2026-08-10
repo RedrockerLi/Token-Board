@@ -111,7 +111,7 @@ function renderLatencyChart(domId, data) {
         });
         return;
     }
-    var labels = data.map(function(d) { return fmtUtc8HHMM(d.bucket); }); // HH:MM in UTC+8
+    var labels = data.map(function(d) { return fmtLocalHHMM(d.bucket); }); // HH:MM 本地时间
 
     chartLatency.setOption({
         tooltip: {
@@ -164,7 +164,7 @@ function renderSpeedChart(domId, data) {
         });
         return;
     }
-    var labels = data.map(function(d) { return fmtUtc8HHMM(d.bucket); }); // HH:MM in UTC+8
+    var labels = data.map(function(d) { return fmtLocalHHMM(d.bucket); }); // HH:MM 本地时间
 
     chartSpeed.setOption({
         tooltip: {
@@ -208,22 +208,22 @@ function renderSpeedChart(domId, data) {
     });
 }
 
-/** Date(UTC) → "YYYY-MM-DD HH:MM"（与后端 strftime bucket 格式一致） */
-function fmtUtcMinuteStr(d) {
+/** Date(UTC) → "YYYY-MM-DDTHH:MM:00Z"（与后端 bucket 格式一致） */
+function fmtUtcMinuteIso(d) {
     return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0')
          + '-' + String(d.getUTCDate()).padStart(2, '0')
-         + ' ' + String(d.getUTCHours()).padStart(2, '0')
-         + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+         + 'T' + String(d.getUTCHours()).padStart(2, '0')
+         + ':' + String(d.getUTCMinutes()).padStart(2, '0') + ':00Z';
 }
 
-/** "YYYY-MM-DD HH:MM"（UTC）→ 毫秒时间戳 */
+/** ISO bucket "YYYY-MM-DDTHH:MM:00Z" → 毫秒时间戳 */
 function parseUtcMinuteMs(s) {
-    return new Date(String(s).replace(' ', 'T') + ':00Z').getTime();
+    return new Date(String(s)).getTime();
 }
 
 /**
  * 把后端稀疏的按分钟数据补全为连续 *minutes* 个 1 分钟桶，
- * 结束于当前 UTC 分钟（被 fmtUtc8HHMM 显示为 UTC+8 的「现在」），
+ * 结束于当前 UTC 分钟（被 fmtLocalHHMM 显示为本地时间的「现在」），
  * 缺的分钟用 0 请求数填充。
  */
 function buildThroughputSeries(data, minutes) {
@@ -238,7 +238,7 @@ function buildThroughputSeries(data, minutes) {
     data.forEach(function(d) { map[d.bucket] = d.requests; });
     var out = [];
     for (var i = minutes - 1; i >= 0; i--) {
-        var key = fmtUtcMinuteStr(new Date(end - i * 60000));
+        var key = fmtUtcMinuteIso(new Date(end - i * 60000));
         out.push({ bucket: key, requests: map[key] || 0 });
     }
     return out;
@@ -249,7 +249,7 @@ function renderRPMChart(domId, data, minutes) {
     if (!chartRPM) return;
     // Fill the full minute window — minutes without requests show 0.
     data = buildThroughputSeries(data || [], minutes || 60);
-    var labels = data.map(function(d) { return fmtUtc8HHMM(d.bucket); });
+    var labels = data.map(function(d) { return fmtLocalHHMM(d.bucket); });
     var vals = data.map(function(d) { return d.requests; });
 
     chartRPM.setOption({

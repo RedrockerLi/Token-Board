@@ -40,7 +40,7 @@ class ProxyPerformanceMixin:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
+                "SELECT strftime('%Y-%m-%dT%H:%M:00Z', requested_at) AS bucket, "
                 "ttft_ms FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "  AND status_code BETWEEN 200 AND 299 "
@@ -78,7 +78,7 @@ class ProxyPerformanceMixin:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
+                "SELECT strftime('%Y-%m-%dT%H:%M:00Z', requested_at) AS bucket, "
                 "output_tps FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
                 "  AND status_code BETWEEN 200 AND 299 "
@@ -116,7 +116,7 @@ class ProxyPerformanceMixin:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT strftime('%Y-%m-%d %H:%M', requested_at) AS bucket, "
+                "SELECT strftime('%Y-%m-%dT%H:%M:00Z', requested_at) AS bucket, "
                 "COUNT(*) AS request_count "
                 "FROM request_log "
                 "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "

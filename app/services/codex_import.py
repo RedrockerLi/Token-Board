@@ -20,7 +20,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -34,14 +34,14 @@ EXCLUDED_MODELS = {"codex-auto-review"}
 
 
 def _iso_z_to_sqlite(ts: str) -> str | None:
-    """'2026-08-04T16:37:44.757Z' → '2026-08-04 16:37:44' (SQLite UTC)."""
+    """'2026-08-04T16:37:44.757Z' → '2026-08-04T16:37:44Z' (ISO UTC)."""
     if not ts:
         return None
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _session_id_from_path(path: Path) -> str:
@@ -190,7 +190,7 @@ def _import_pass(pdb) -> int:
         except (TypeError, ValueError):
             raw_states = {}
         states = raw_states if isinstance(raw_states, dict) else {}
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for path in files:
             spath = str(path)
             try:

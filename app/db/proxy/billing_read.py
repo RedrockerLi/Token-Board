@@ -3,6 +3,21 @@
 from app.db.proxy.common import *  # noqa: F401,F403
 
 
+def _filter_bound(value: str | None, *, end: bool = False) -> str | None:
+    """Normalize a from/to filter to an ISO UTC timestamp.
+
+    The UI sends ISO UTC timestamps; a bare "YYYY-MM-DD" (legacy callers) is
+    expanded to the UTC day boundary so direct ``requested_at`` comparisons
+    stay correct.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return text + ("T23:59:59.999Z" if end else "T00:00:00Z")
+    return text
+
+
 class ProxyBillingReadMixin:
     def get_plan_billing_config(self) -> dict:
         conn = self._connect()
@@ -83,14 +98,14 @@ class ProxyBillingReadMixin:
                 sql += " AND r.account_id = ?"
                 params.append(account_id)
             if date_from:
-                sql += " AND date(r.requested_at) >= ?"
-                params.append(date_from)
+                sql += " AND r.requested_at >= ?"
+                params.append(_filter_bound(date_from))
             else:
                 sql += " AND r.requested_at >= datetime('now', '-' || ? || ' days')"
                 params.append(str(days))
             if date_to:
-                sql += " AND date(r.requested_at) <= ?"
-                params.append(date_to)
+                sql += " AND r.requested_at <= ?"
+                params.append(_filter_bound(date_to, end=True))
 
             sql += """
                 GROUP BY r.account_id, r.model, date(r.requested_at)
@@ -131,11 +146,11 @@ class ProxyBillingReadMixin:
                 where.append("r.model LIKE ?")
                 params.append(f"%{model}%")
             if date_from:
-                where.append("date(r.requested_at) >= ?")
-                params.append(date_from)
+                where.append("r.requested_at >= ?")
+                params.append(_filter_bound(date_from))
             if date_to:
-                where.append("date(r.requested_at) <= ?")
-                params.append(date_to)
+                where.append("r.requested_at <= ?")
+                params.append(_filter_bound(date_to, end=True))
             if before_requested_at is not None and before_id is not None:
                 where.append("(r.requested_at < ? OR "
                              "(r.requested_at = ? AND r.id < ?))")

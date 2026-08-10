@@ -66,7 +66,7 @@ function updateSubtitle() {
     } else {
         parts.push('总览 (所有用户)');
     }
-    parts.push('所有时间均按 UTC+8 显示');
+    parts.push('所有时间均按本机当地时间显示');
     el.textContent = parts.join(' · ');
 }
 
@@ -443,9 +443,9 @@ async function loadSummary() {
 
     var lastUpdatedEl = document.getElementById('lastUpdated');
     if (lastUpdatedEl) {
-        var nowUtc = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        var nowIso = new Date().toISOString();
         lastUpdatedEl.textContent =
-            '数据更新时间: ' + fmtUtc8(nowUtc) + ' · 共 ' + months.length + ' 个月数据';
+            '数据更新时间: ' + fmtLocal(nowIso) + ' · 共 ' + months.length + ' 个月数据';
     }
 }
 
