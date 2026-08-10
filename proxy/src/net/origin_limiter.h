@@ -95,6 +95,6 @@ private:
     std::size_t total_active_ = 0;
     std::uint64_t lease_count_ = 0;
     std::uint64_t lease_wait_ms_ = 0;
-    static constexpr std::size_t origin_limit_ = 64;
-    static constexpr std::size_t total_limit_ = 256;
+    static constexpr std::size_t origin_limit_ = 512;
+    static constexpr std::size_t total_limit_ = 512;
 };

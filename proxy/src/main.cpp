@@ -92,10 +92,10 @@ int main(int argc, char *argv[]) {
     // prevents a stalled provider from turning queued requests into thousands
     // of native thread stacks.
     const auto cpu_count = std::max(1u, std::thread::hardware_concurrency());
-    size_t max_workers = 256;
+    size_t max_workers = 512;
     if (const char *configured = std::getenv("TB_MAX_WORKERS")) {
         const auto parsed = std::strtoull(configured, nullptr, 10);
-        if (parsed > 0) max_workers = std::min<std::size_t>(parsed, 256);
+        if (parsed > 0) max_workers = std::min<std::size_t>(parsed, 512);
     }
     const size_t initial_workers = std::min(
         max_workers, std::clamp<size_t>(cpu_count * 2, 8, 64));
