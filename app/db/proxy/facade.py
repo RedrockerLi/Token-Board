@@ -84,19 +84,30 @@ class ProxyDatabase(
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             usage = conn.execute(
                 "SELECT COUNT(*) total_requests,COALESCE(SUM(total_tokens),0) total_tokens,"
-                "COALESCE(SUM(billed_usage_cost),0) billed_usage_cost FROM request_log "
-                "WHERE requested_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days')"
+                "COALESCE(SUM(r.billed_usage_cost),0) billed_usage_cost "
+                "FROM request_log r "
+                "WHERE r.requested_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') "
+                "AND NOT EXISTS(SELECT 1 FROM billing_contracts bc "
+                "WHERE bc.account_id=r.account_id AND bc.charge_type='recurring' "
+                "AND bc.valid_from<=r.requested_at "
+                "AND (bc.valid_until IS NULL OR bc.valid_until>r.requested_at))"
             ).fetchone()
             daily = conn.execute(
                 "SELECT COUNT(*) today_requests,COALESCE(SUM(equivalent_cost),0) "
-                "today_theoretical_cost,COALESCE(SUM(billed_usage_cost),0) "
-                "today_billed_usage_cost FROM request_log WHERE date(requested_at)=?",
+                "today_theoretical_cost,COALESCE(SUM(r.billed_usage_cost),0) "
+                "today_billed_usage_cost FROM request_log r "
+                "WHERE date(r.requested_at)=? "
+                "AND NOT EXISTS(SELECT 1 FROM billing_contracts bc "
+                "WHERE bc.account_id=r.account_id AND bc.charge_type='recurring' "
+                "AND bc.valid_from<=r.requested_at "
+                "AND (bc.valid_until IS NULL OR bc.valid_until>r.requested_at))",
                 (today,),
             ).fetchone()
             recurring = conn.execute(
                 "SELECT COALESCE(SUM(normalized_recurring_cost),0) "
-                "FROM billing_period_charges WHERE period_end>strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') "
-                "AND period_start<=strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+                "FROM billing_period_charges "
+                "WHERE period_start<=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "AND period_end>strftime('%Y-%m-%dT%H:%M:%fZ','now')"
             ).fetchone()[0]
             today_recurring = conn.execute(
                 "SELECT COALESCE(SUM(normalized_recurring_cost),0) "
@@ -114,7 +125,9 @@ class ProxyDatabase(
             ).fetchone()[0]
             billing_incomplete = conn.execute(
                 "SELECT COUNT(*) FROM billing_period_charges "
-                "WHERE finalized_at IS NULL AND normalized_recurring_cost IS NULL"
+                "WHERE period_start<=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "AND period_end>strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "AND finalized_at IS NULL AND normalized_recurring_cost IS NULL"
             ).fetchone()[0]
             active_accounts = conn.execute(
                 "SELECT COUNT(*) FROM accounts WHERE lifecycle_state='active'"

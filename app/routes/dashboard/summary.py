@@ -45,19 +45,33 @@ def api_summary():
 
     total_tokens = total_output + total_input_hit + total_input_miss
 
-    # V1 rows already carry the two canonical usage-ledger values.  Never
-    # allocate or exclude rows by account template here.
+    # Plan/agent rows carry their api-equivalent (theoretical) amount in
+    # `cost`; their real economics live in plan_summary.  Exclude those rows
+    # from the *real* total (otherwise the plan virtual bill would be
+    # double-counted with its subscription), matching the pre-V1 summary.
+    plan_account_names = {
+        ps.get("account_name") for ps in _store().plan_summary
+        if ps.get("account_name")
+    }
+
+    def _non_plan(ces):
+        return [ce for ce in ces
+                if ce["cost_group_key"] not in plan_account_names]
+
     selected_costs = [
         ce for ce in _store().cost_entries
         if (not api_key_name or ce["api_key_name"] == api_key_name)
         and (not platform_filter or ce["platform"] == platform_filter)
     ]
+    non_plan_costs = _non_plan(selected_costs)
     total_cost = round(sum(float(ce.get("cost", 0) or 0)
-                           for ce in selected_costs), 4)
+                           for ce in non_plan_costs), 4)
     theoretical_cost = round(sum(float(ce.get("theoretical_cost", 0) or 0)
                                  for ce in selected_costs), 4)
+    billed_cost = round(sum(float(ce.get("actual_cost", 0) or 0)
+                            for ce in selected_costs), 4)
     model_cost = defaultdict(float)
-    for ce in selected_costs:
+    for ce in non_plan_costs:
         model_cost[ce["model"]] += float(ce.get("cost", 0) or 0)
 
     # Plan economics (proxy-exported data). When a specific user is selected,
@@ -105,7 +119,7 @@ def api_summary():
         # Canonical V1 ledger views. `total_cost`/`theoretical_cost` remain
         # legacy UI fields; these explicit totals are never computed by
         # account_type or aggregate branches.
-        "actual_cost": round(total_cost + plan_subscription_cost, 4),
+        "actual_cost": round(billed_cost + plan_subscription_cost, 4),
         "theoretical_total_cost": (
             round(theoretical_cost or 0, 4)
             if theoretical_cost is not None else None
@@ -168,11 +182,12 @@ def api_monthly():
         monthly_amount[key]["requests"] += ru["count"]
         monthly_amount[key]["by_model"][ru["model"]]["requests"] += ru["count"]
 
-    # Aggregate cost entries by month + model. V1 is already keyed by stable
-    # account identity and has no proportional allocation step.
-    monthly_theoretical = defaultdict(float)
-    monthly_cost = defaultdict(float)
-    monthly_cost_by_model = defaultdict(lambda: defaultdict(float))
+    # Aggregate cost entries by month + model.  The legacy `cost` field keeps
+    # its api-equivalent meaning (theoretical for plan/agent), while the real
+    # metered bill is carried by `actual_cost`.
+    monthly_equivalent = defaultdict(float)
+    monthly_equivalent_by_model = defaultdict(lambda: defaultdict(float))
+    monthly_actual = defaultdict(float)
     for ce in _store().cost_entries:
         if api_key_name and ce["api_key_name"] != api_key_name:
             continue
@@ -181,10 +196,11 @@ def api_monthly():
         if platform_filter and ce["platform"] != platform_filter:
             continue
         key = (ce["_year"], ce["_month"])
-        actual = float(ce.get("cost", 0) or 0)
-        monthly_cost[key] += actual
-        monthly_cost_by_model[key][ce["model"]] += actual
-        monthly_theoretical[key] += float(ce.get("theoretical_cost", 0) or 0)
+        equiv = float(ce.get("cost", 0) or 0)
+        actual = float(ce.get("actual_cost", 0) or 0)
+        monthly_equivalent[key] += equiv
+        monthly_equivalent_by_model[key][ce["model"]] += equiv
+        monthly_actual[key] += actual
 
     monthly_recurring = defaultdict(float)
     monthly_incomplete = defaultdict(int)
@@ -212,7 +228,8 @@ def api_monthly():
                 "input_cache_miss_tokens": v["input_miss"],
                 "total_tokens": v["output"] + v["input_hit"] + v["input_miss"],
                 "requests": v["requests"],
-                "cost": round(monthly_cost_by_model.get(key, {}).get(mdl, 0), 4),
+                "cost": round(
+                    monthly_equivalent_by_model.get(key, {}).get(mdl, 0), 4),
             }
         result.append({
             "year": m["year"],
@@ -226,12 +243,12 @@ def api_monthly():
                              am.get("input_cache_hit", 0) +
                              am.get("input_cache_miss", 0)),
             "requests": am.get("requests", 0),
-            "cost": round(monthly_cost.get(key, 0), 4),
-            "theoretical_cost": round(monthly_theoretical.get(key, 0), 4),
-            "actual_cost": round(monthly_cost.get(key, 0) +
+            "cost": round(monthly_equivalent.get(key, 0), 4),
+            "theoretical_cost": round(monthly_equivalent.get(key, 0), 4),
+            "actual_cost": round(monthly_actual.get(key, 0) +
                                  monthly_recurring.get(key, 0), 4),
             "billing_incomplete_count": monthly_incomplete.get(key, 0),
-            "theoretical_total_cost": round(monthly_theoretical.get(key, 0), 4),
+            "theoretical_total_cost": round(monthly_equivalent.get(key, 0), 4),
             "by_model": by_model,
         })
 

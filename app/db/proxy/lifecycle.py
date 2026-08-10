@@ -163,7 +163,9 @@ class ProxyLifecycleMixin:
             rows = conn.execute(
                 "SELECT s.secret_value FROM upstream_credentials c JOIN upstream_secrets s "
                 "ON s.credential_uuid=c.uuid WHERE c.upstream_id=? "
-                "AND c.disabled_at IS NULL AND c.deleted_at IS NULL "
+                "AND c.disabled_at IS NULL "
+                "AND (c.deleted_at IS NULL OR c.deleted_at>"
+                "strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
                 "ORDER BY c.position,c.runtime_id", (route["upstream_id"],)
             ).fetchall()
             return [row[0] for row in rows if row[0]]

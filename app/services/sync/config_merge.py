@@ -91,11 +91,19 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
             for row in remote.execute("SELECT * FROM upstream_credentials ORDER BY position,uuid"):
                 remote_credential_ids.add(row["uuid"])
                 existing = local.execute(
-                    "SELECT runtime_id FROM upstream_credentials WHERE uuid=?", (row["uuid"],)
+                    "SELECT runtime_id, EXISTS(SELECT 1 FROM upstream_secrets s "
+                    "WHERE s.credential_uuid=upstream_credentials.uuid) "
+                    "FROM upstream_credentials WHERE uuid=?", (row["uuid"],)
                 ).fetchone()
                 runtime_id = existing[0] if existing else next_runtime
                 if existing is None:
                     next_runtime += 1
+                # Local plaintext credentials are machine secrets: the cloud
+                # copy never carries them and must never be able to disable
+                # them.  Only cloud-only rows (no local secret) take their
+                # disabled_at from the remote artifact.
+                has_local_secret = bool(existing and existing[1])
+                disabled_value = None if has_local_secret else row["disabled_at"]
                 local.execute(
                     "INSERT INTO upstream_credentials"
                     "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,created_at,disabled_at,deleted_at) "
@@ -105,7 +113,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                     "disabled_at=excluded.disabled_at,deleted_at=excluded.deleted_at",
                     (row["uuid"], runtime_id, row["upstream_id"], row["position"],
                      row["key_masked"], row["valid_from"], row["created_at"],
-                     row["disabled_at"], row["deleted_at"]),
+                     disabled_value, row["deleted_at"]),
                 )
 
         merge_table("account_importers", {"cursor_json"})
@@ -144,7 +152,9 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
             if row["uuid"] not in remote_credential_ids:
                 local.execute(
                     "UPDATE upstream_credentials SET disabled_at=COALESCE(disabled_at,?) "
-                    "WHERE uuid=?", (now, row["uuid"]))
+                    "WHERE uuid=? AND NOT EXISTS(SELECT 1 FROM upstream_secrets s "
+                    "WHERE s.credential_uuid=upstream_credentials.uuid)",
+                    (now, row["uuid"]))
         local.execute("UPDATE config_state SET generation=generation+1 WHERE id=1")
         violation = local.execute("PRAGMA foreign_key_check").fetchone()
         if violation:

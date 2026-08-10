@@ -302,7 +302,8 @@ def _transition_pair_impl(proxy: Path, dashboard: Path, schema_root: Path,
     mapping = transition.transform_proxy(proxy_source, proxy_shadow, source_tz,
                                          spool_records)
     transition.transform_dashboard(dashboard_source, dashboard_shadow,
-                                    proxy_source, mapping)
+                                    proxy_source, mapping,
+                                    mapping.get("credential_masks"))
     manifest["stage"] = "transformed"
     _write_manifest(manifest_path, manifest)
     _verify(proxy_shadow, "proxy", _latest_version(schema_root, "proxy", 1))

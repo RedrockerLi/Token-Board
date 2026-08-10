@@ -108,6 +108,13 @@ function routableAccounts(accounts) {
     return (accounts || []).filter(a => !a.is_aggregate && typeSpec(a.account_type).routable);
 }
 
+/** Local-key binding accepts aggregates too: a key bound to an aggregate
+ * resolves its upstream by model at request time.  The aggregate editor's
+ * target picker still uses routableAccounts() (aggregates cannot nest). */
+function keyBindingAccounts(accounts) {
+    return (accounts || []).filter(a => typeSpec(a.account_type).routable);
+}
+
 /// Show/hide account-form fields based on the selected account type.
 /// Mirrors the backend type spec (app/domain/account_types.py):
 ///   billing 'subscription'  → 订阅月费 + 币种
@@ -777,7 +784,7 @@ async function openEditKeyModal(id) {
         const accountSel = document.getElementById('editKeyAccount');
         accountSel.innerHTML =
             `<option value="" ${key.account_id == null ? 'selected' : ''}>未分配</option>` +
-            routableAccounts(accounts).map((a) =>
+            keyBindingAccounts(accounts).map((a) =>
                 `<option value="${a.id}" ${a.id === key.account_id ? 'selected' : ''}>${esc(a.name)}</option>`
             ).join('');
 
@@ -816,7 +823,7 @@ async function loadAccountOptions() {
         const accounts = await proxyFetch('/api/proxy/accounts');
         const sel = document.getElementById('keyAccountSelect');
         if (!sel) return;
-        sel.innerHTML = routableAccounts(accounts)
+        sel.innerHTML = keyBindingAccounts(accounts)
             .map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
     } catch (err) {
         console.error('Failed to load accounts:', err);

@@ -58,11 +58,12 @@ def api_daily():
         daily_tokens[day]["requests"] += ru["count"]
         daily_tokens[day]["by_model"][ru["model"]]["requests"] += ru["count"]
 
-    # Daily cost aggregation from the canonical V1 usage ledger.
-    daily_theoretical = defaultdict(float)
-    daily_theoretical_by_model = defaultdict(lambda: defaultdict(float))
-    daily_cost = defaultdict(float)
-    daily_cost_by_model = defaultdict(lambda: defaultdict(float))
+    # Daily cost aggregation from the canonical V1 usage ledger.  The legacy
+    # `cost` field is the api-equivalent amount (theoretical for plan/agent),
+    # and `actual_cost` is the metered bill.
+    daily_equivalent = defaultdict(float)
+    daily_equivalent_by_model = defaultdict(lambda: defaultdict(float))
+    daily_actual = defaultdict(float)
     for ce in _store().cost_entries:
         if ce["_year"] != year or ce["_month"] != month:
             continue
@@ -73,15 +74,15 @@ def api_daily():
         if platform_filter and ce["platform"] != platform_filter:
             continue
         day = ce["date"]
-        actual = float(ce.get("cost", 0) or 0)
-        theoretical = float(ce.get("theoretical_cost", 0) or 0)
-        daily_cost[day] += actual
-        daily_cost_by_model[day][ce["model"]] += actual
-        daily_theoretical[day] += theoretical
-        daily_theoretical_by_model[day][ce["model"]] += theoretical
+        equiv = float(ce.get("cost", 0) or 0)
+        actual = float(ce.get("actual_cost", 0) or 0)
+        daily_equivalent[day] += equiv
+        daily_equivalent_by_model[day][ce["model"]] += equiv
+        daily_actual[day] += actual
 
     # Build sorted daily result
-    sorted_days = sorted(set(daily_tokens.keys()) | set(daily_cost.keys()))
+    sorted_days = sorted(set(daily_tokens.keys()) |
+                         set(daily_equivalent.keys()))
     result = []
     for day in sorted_days:
         dt = daily_tokens[day]
@@ -94,8 +95,9 @@ def api_daily():
             "total_tokens": (dt["output_tokens"] + dt["input_cache_hit"] +
                              dt["input_cache_miss"]),
             "requests": dt["requests"],
-            "cost": round(daily_cost.get(day, 0), 4),
-            "theoretical_cost": round(daily_theoretical.get(day, 0), 4),
+            "cost": round(daily_equivalent.get(day, 0), 4),
+            "theoretical_cost": round(daily_equivalent.get(day, 0), 4),
+            "actual_cost": round(daily_actual.get(day, 0), 4),
             "by_model": {
                 m: {
                     "output_tokens": v["output"],
@@ -103,9 +105,10 @@ def api_daily():
                     "input_cache_miss_tokens": v["input_miss"],
                     "total_tokens": v["output"] + v["input_hit"] + v["input_miss"],
                     "requests": v["requests"],
-                    "cost": round(daily_cost_by_model.get(day, {}).get(m, 0), 4),
+                    "cost": round(
+                        daily_equivalent_by_model.get(day, {}).get(m, 0), 4),
                     "theoretical_cost": round(
-                        daily_theoretical_by_model.get(day, {}).get(m, 0), 4),
+                        daily_equivalent_by_model.get(day, {}).get(m, 0), 4),
                 }
                 for m, v in sorted(dt["by_model"].items())
             },

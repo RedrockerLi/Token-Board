@@ -55,7 +55,8 @@ def resume_transition(
                 proxy, Path(manifest["shadows"]["proxy"]), source_tz,
                 spool_records)
             transform_dashboard(
-                dashboard, Path(manifest["shadows"]["dashboard"]), proxy, mapping)
+                dashboard, Path(manifest["shadows"]["dashboard"]), proxy, mapping,
+                mapping.get("credential_masks"))
             manifest["stage"] = "transformed"
             write_manifest(path, manifest)
             stage = manifest["stage"]

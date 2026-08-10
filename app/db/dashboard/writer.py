@@ -193,3 +193,34 @@ class DashboardWriterMixin:
             conn.commit()
         finally:
             conn.close()
+
+    def cleanup_stale_subscription_units(self, account_id: int,
+                                         active_unit_ids: set[str]) -> None:
+        """Zero subscription rows for units no longer in the lifecycle set.
+
+        V0→V1 migrations could carry rows under legacy billing-unit ids (for
+        example a per-account row keyed by a synthesized credential uuid while
+        the live export keys it as ``contract:<uuid>``).  Those rows must keep
+        their additive virtual-cost archive, but their subscription portion
+        must not be counted twice after the export starts reconciling the
+        canonical unit ids.
+        """
+        conn = self._connect()
+        try:
+            if active_unit_ids:
+                conn.execute(
+                    "UPDATE monthly_recurring_costs SET recurring_charge=0,"
+                    "normalized_recurring_cost=0 "
+                    "WHERE account_id=? AND billing_unit_id NOT IN (%s)"
+                    % ",".join("?" for _ in active_unit_ids),
+                    (account_id, *sorted(active_unit_ids)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE monthly_recurring_costs SET recurring_charge=0,"
+                    "normalized_recurring_cost=0 WHERE account_id=?",
+                    (account_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()

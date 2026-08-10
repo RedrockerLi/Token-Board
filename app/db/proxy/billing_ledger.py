@@ -22,8 +22,8 @@ class ProxyBillingLedgerMixin:
         """Per normalized V1 account used today: actual/theoretical cost.
 
         Rows are grouped by stable ``account_id`` and display names are read
-        from the V1 ``accounts`` mirror. Aggregate routing and ordinary
-        accounts therefore use the same ledger query.
+        from the V1 ``accounts`` mirror. Aggregate route sets have no account
+        row and are excluded, matching the pre-V1 "real upstream" definition.
         """
         conn = self._connect()
         try:
@@ -36,7 +36,8 @@ class ProxyBillingLedgerMixin:
                        COUNT(*) AS requests
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
-                WHERE date(r.requested_at) = ?
+                WHERE a.id IS NOT NULL
+                  AND date(r.requested_at) = ?
                 GROUP BY r.account_id
                 ORDER BY theoretical_cost DESC
             """, (today,)).fetchall()
@@ -46,7 +47,13 @@ class ProxyBillingLedgerMixin:
 
     @staticmethod
     def _plan_key_billing_meta(conn: sqlite3.Connection) -> list[dict]:
-        """Build billable key lifecycles, including cloud-only masked keys."""
+        """Build billable key lifecycles (local plaintext credentials only).
+
+        Cloud-only rows (no ``upstream_secrets``) are metadata, not billable
+        keys: they cannot route on this machine, so they must not accrue a
+        subscription either.  Duplicate local+cloud rows with the same masked
+        identity are collapsed to the local slot.
+        """
         now = _utc_now()
         result = []
         contracts = conn.execute(
@@ -62,9 +69,22 @@ class ProxyBillingLedgerMixin:
                 credentials = conn.execute(
                         "SELECT c.runtime_id,c.uuid,c.key_masked,c.created_at,c.valid_from,c.deleted_at "
                         "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
-                        "WHERE u.account_id=?", (contract["account_id"],)
+                        "WHERE u.account_id=? "
+                        "AND EXISTS(SELECT 1 FROM upstream_secrets s "
+                        "WHERE s.credential_uuid=c.uuid) "
+                        "AND (c.disabled_at IS NULL OR c.disabled_at>?) "
+                        "AND (c.deleted_at IS NULL OR c.deleted_at>?) "
+                        "ORDER BY c.position,c.runtime_id",
+                        (contract["account_id"], now.isoformat(
+                            timespec="seconds").replace("+00:00", "Z"),
+                         now.isoformat(timespec="seconds").replace("+00:00", "Z")),
                     ).fetchall()
+                seen_masks: set[tuple[int, str]] = set()
                 for credential in credentials:
+                    identity = (contract["account_id"], credential["key_masked"])
+                    if identity in seen_masks:
+                        continue
+                    seen_masks.add(identity)
                     anchor = (_parse_iso_date(credential["valid_from"])
                               or _parse_utc_timestamp(credential["created_at"]).date())
                     end = min((value for value in (

@@ -142,6 +142,7 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
         # distinct UUIDs instead of aborting or overwriting each other.
         local_masks: set[tuple[int, str]] = set()
         credential_map: dict[int, str] = {}
+        credential_masks: dict[tuple[int, str], str] = {}
         for row in local_keys:
             masked = mask_key(row["key_value"])
             identity = (row["account_id"], masked)
@@ -149,6 +150,7 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
             credential_uuid = stable_uuid(
                 "credential", row["account_id"], row["id"], masked)
             credential_map[row["id"]] = credential_uuid
+            credential_masks[identity] = credential_uuid
             new.execute(
                 "INSERT INTO upstream_credentials(uuid,runtime_id,upstream_id,position,key_masked,"
                 "valid_from,created_at,deleted_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -282,6 +284,7 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
         new.execute("UPDATE config_state SET generation=generation+1")
         new.commit()
         return {"credential_map": credential_map,
+                "credential_masks": credential_masks,
                 "legacy_account_id": legacy_account_id,
                 "account_types": {row["id"]: row["account_type"] for row in real_accounts}}
     except Exception:
@@ -348,9 +351,18 @@ def transform_dashboard(source: Path, shadow: Path, proxy_source: Path | None,
                 for row in proxy.execute("SELECT id,account_id,key_value FROM upstream_keys"):
                     local_by_mask[(row["account_id"], mask_key(row["key_value"]))] = (
                         proxy_mapping["credential_map"].get(row["id"]))
+        account_contract_uuid = {
+            account_id: stable_uuid("contract", account_id)
+            for account_id in {row["account_id"]
+                               for row in old.execute(
+                                   "SELECT account_id FROM proxy_plan_summary")}
+        }
         for row in old.execute("SELECT * FROM proxy_plan_summary"):
-            unit = local_by_mask.get((row["account_id"], row["key_masked"])) or stable_uuid(
-                "credential", row["account_id"], row["key_masked"])
+            unit = local_by_mask.get((row["account_id"], row["key_masked"]))
+            if unit is None and row["key_masked"] == "subscription":
+                unit = f"contract:{account_contract_uuid[row['account_id']]}"
+            if unit is None:
+                unit = stable_uuid("credential", row["account_id"], row["key_masked"])
             new.execute(
                 "INSERT INTO monthly_recurring_costs(month,account_id,billing_unit_id,"
                 "recurring_charge,equivalent_cost,normalized_recurring_cost,"
@@ -451,7 +463,8 @@ def main() -> None:
         manifest["stage"] = "shadows_created"; write_manifest(manifest_path, manifest)
         inject("shadows_created")
         mapping = transform_proxy(proxy, proxy_shadow, source_tz, spool_records)
-        transform_dashboard(dashboard, dashboard_shadow, proxy, mapping)
+        transform_dashboard(dashboard, dashboard_shadow, proxy, mapping,
+                            mapping.get("credential_masks"))
         manifest["stage"] = "transformed"; write_manifest(manifest_path, manifest)
         inject("transformed")
         manifest["verification"] = {

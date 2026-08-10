@@ -70,6 +70,13 @@ class ProxyBillingReadMixin:
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
                 WHERE 1=1
+                  AND a.id IS NOT NULL
+                  AND NOT EXISTS(SELECT 1 FROM billing_contracts bc
+                                 WHERE bc.account_id=r.account_id
+                                 AND bc.charge_type='recurring'
+                                 AND bc.valid_from<=r.requested_at
+                                 AND (bc.valid_until IS NULL
+                                      OR bc.valid_until>r.requested_at))
             """
             params = []
             if account_id:
@@ -220,7 +227,14 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
-                WHERE r.requested_at >= datetime('now', '-' || ? || ' days')
+                WHERE a.id IS NOT NULL
+                  AND NOT EXISTS(SELECT 1 FROM billing_contracts bc
+                                 WHERE bc.account_id=r.account_id
+                                 AND bc.charge_type='recurring'
+                                 AND bc.valid_from<=r.requested_at
+                                 AND (bc.valid_until IS NULL
+                                      OR bc.valid_until>r.requested_at))
+                  AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at), r.account_id
                 ORDER BY date, r.account_id
             """, (str(days),)).fetchall()
@@ -243,7 +257,8 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost
                 FROM request_log r
-                WHERE r.requested_at >= datetime('now', '-' || ? || ' days')
+                WHERE EXISTS(SELECT 1 FROM accounts a WHERE a.id=r.account_id)
+                  AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at)
                 ORDER BY date
             """, (str(days),)).fetchall()

@@ -1,7 +1,7 @@
 """ProxyDatabase methods for ProxyAccountReadMixin."""
 
 from app.db.proxy.common import *  # noqa: F401,F403
-from app.domain.account_template import AccountTemplateAdapter
+from app.domain.account_template import AccountTemplate, AccountTemplateAdapter
 
 
 class ProxyAccountReadMixin:
@@ -18,8 +18,14 @@ class ProxyAccountReadMixin:
                     "COALESCE(bc.currency,'CNY') currency,"
                     "COALESCE(i.importer_kind,'') importer_kind,"
                     "COALESCE(a.valid_from,'') valid_from,u.max_concurrency,a.created_at,a.deleted_at,"
-                    "(SELECT count(*) FROM upstream_credentials c WHERE c.upstream_id=u.id "
-                    "AND c.deleted_at IS NULL) key_count "
+                    "(SELECT count(*) FROM upstream_credentials c "
+                    "LEFT JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+                    "WHERE c.upstream_id=u.id "
+                    "AND (c.deleted_at IS NULL OR c.deleted_at>"
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                    "AND s.secret_value IS NOT NULL "
+                    "AND (c.disabled_at IS NULL OR c.disabled_at>"
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now'))) key_count "
                     "FROM route_sets rs JOIN accounts a ON a.id=rs.account_id "
                     "JOIN upstreams u ON u.account_id=a.id AND u.enabled=1 "
                     "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.valid_until IS NULL "
@@ -53,25 +59,50 @@ class ProxyAccountReadMixin:
                         row.get("currency") or "CNY")
                 acc = template.to_dict()
                 route = self._v1_route_account(conn, acc["id"])
-                keys = []
+                local_keys: list[dict] = []
+                cloud_keys: list[dict] = []
                 if route and route["upstream_id"] is not None:
-                    keys = conn.execute(
+                    rows = conn.execute(
                         "SELECT c.runtime_id,s.secret_value,c.key_masked,c.valid_from,c.deleted_at "
                         "FROM upstream_credentials c LEFT JOIN upstream_secrets s "
                         "ON s.credential_uuid=c.uuid WHERE c.upstream_id=? "
-                        "AND c.deleted_at IS NULL ORDER BY c.position,c.runtime_id",
+                        "AND (c.deleted_at IS NULL OR c.deleted_at>"
+                        "strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                        "AND (c.disabled_at IS NULL OR c.disabled_at>"
+                        "strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                        "ORDER BY c.position,c.runtime_id",
                         (route["upstream_id"],),
                     ).fetchall()
-                acc["keys"] = [
-                    {"id": key["runtime_id"], "masked": key["key_masked"],
-                     "valid_from": key["valid_from"], "deleted_at": key["deleted_at"]}
-                    for key in keys if key["secret_value"] is not None
-                ]
-                acc["cloud_keys"] = [
-                    {"masked": key["key_masked"], "valid_from": key["valid_from"]}
-                    for key in keys if key["secret_value"] is None
-                ]
+                    for key in rows:
+                        if key["secret_value"] is not None:
+                            local_keys.append({
+                                "id": key["runtime_id"],
+                                "masked": key["key_masked"],
+                                "valid_from": key["valid_from"],
+                                "deleted_at": key["deleted_at"],
+                            })
+                        else:
+                            cloud_keys.append({
+                                "masked": key["key_masked"],
+                                "valid_from": key["valid_from"],
+                            })
+                    local_masked = {key["masked"] for key in local_keys}
+                    cloud_keys = [key for key in cloud_keys
+                                  if key["masked"] not in local_masked]
+                acc["keys"] = local_keys
+                acc["cloud_keys"] = cloud_keys
                 accounts.append(acc)
+            # Aggregate route sets are valid local-key targets (they expose a
+            # model catalog and resolve to real upstreams per request), so
+            # they belong in the accounts payload exactly like the pre-V1 API.
+            for row in conn.execute(
+                "SELECT id,name,created_at FROM route_sets "
+                "WHERE account_id IS NULL AND enabled=1 ORDER BY id"):
+                accounts.append(AccountTemplate(
+                    id=int(row["id"]), name=row["name"],
+                    is_aggregate=True, account_type="api",
+                    created_at=row["created_at"],
+                ).to_dict())
             return accounts
         finally:
             conn.close()

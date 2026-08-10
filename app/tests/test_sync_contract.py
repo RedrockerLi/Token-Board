@@ -15,6 +15,7 @@ from app.services.sync.webdav import (
     WebDAVConflict,
     _upload_versioned_artifact,
 )
+from app.services.sync.config_merge import _merge_config_tables
 from app.services.sync.config_sync import sync_config_upload
 from app.services.sync.dashboard_sync import sync_dashboard
 
@@ -22,6 +23,66 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class SyncContractTest(unittest.TestCase):
+    def _seed_credential(self, db_path: str, credential_uuid: str,
+                         secret: str | None, disabled_at: str | None = None
+                         ) -> None:
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO accounts(id,uuid,name) "
+                "VALUES(1,'acct-1','local')")
+            conn.execute(
+                "INSERT OR IGNORE INTO upstreams(id,account_id,name,base_url,enabled) "
+                "VALUES(1,1,'upstream','http://example.test',1)")
+            conn.execute(
+                "INSERT INTO upstream_credentials(uuid,runtime_id,upstream_id,"
+                "position,key_masked,disabled_at) VALUES(?,1,1,0,'sk-local',?)",
+                (credential_uuid, disabled_at))
+            if secret is not None:
+                conn.execute(
+                    "INSERT INTO upstream_secrets(credential_uuid,secret_value) "
+                    "VALUES(?,?)", (credential_uuid, secret))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_cloud_merge_never_disables_local_plaintext_credentials(self) -> None:
+        temp = tempfile.mkdtemp()
+        try:
+            shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
+            local = str(Path(temp) / "local.db")
+            remote = str(Path(temp) / "remote.db")
+            migrate(local, str(Path(temp) / "schema"), "proxy")
+            migrate(remote, str(Path(temp) / "schema"), "proxy")
+            self._seed_credential(local, "credential-local",
+                                  "sk-local-secret")
+            # Remote does not know this credential at all.
+            _merge_config_tables(remote, local)
+            conn = sqlite3.connect(local)
+            row = conn.execute(
+                "SELECT disabled_at FROM upstream_credentials "
+                "WHERE uuid='credential-local'").fetchone()
+            secret = conn.execute(
+                "SELECT secret_value FROM upstream_secrets "
+                "WHERE credential_uuid='credential-local'").fetchone()
+            conn.close()
+            self.assertIsNone(row[0])
+            self.assertEqual(secret[0], "sk-local-secret")
+
+            # Even a remote row that carries a disabled timestamp must not be
+            # able to disable the local plaintext credential.
+            self._seed_credential(remote, "credential-local", None,
+                                  "2026-08-10T04:01:36Z")
+            _merge_config_tables(remote, local)
+            conn = sqlite3.connect(local)
+            row = conn.execute(
+                "SELECT disabled_at FROM upstream_credentials "
+                "WHERE uuid='credential-local'").fetchone()
+            conn.close()
+            self.assertIsNone(row[0])
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
     def test_versioned_upload_refuses_stale_remote_etag(self) -> None:
         config = SyncConfig("https://dav.example", "token-board", "u", "p")
         expected = RemoteArtifact("proxy_config_20260809_010000.db", etag='"old"')

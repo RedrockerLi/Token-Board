@@ -62,6 +62,14 @@ def verify_proxy(v0_path: str, v1_path: str, expected_version: int | None = None
         if token_before + spool_tokens != token_after or not math.isclose(
                 cost_before + spool_cost, cost_after, rel_tol=1e-10, abs_tol=1e-8):
             raise VerificationError("proxy token/cost totals changed")
+        disabled_with_secret = scalar(
+            new, "SELECT count(*) FROM upstream_credentials c WHERE EXISTS("
+                 "SELECT 1 FROM upstream_secrets s WHERE s.credential_uuid=c.uuid)"
+                 " AND c.disabled_at IS NOT NULL")
+        if disabled_with_secret:
+            raise VerificationError(
+                f"migration changed local credential state: "
+                f"{disabled_with_secret} secret-bearing credential(s) disabled")
         fk = new.execute("PRAGMA foreign_key_check").fetchall()
         if fk:
             raise VerificationError(f"proxy foreign_key_check failed: {fk[:10]}")

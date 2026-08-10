@@ -20,9 +20,14 @@ class DashboardReportsTest(AppDatabaseTestCase):
     def setUp(self) -> None:
         super().setUp()
         database = self.proxy_database()
-        self.account_id = database.create_account({
+        self.api_account_id = database.create_account({
             "name": "report-account", "account_type": "api",
             "base_url": "http://report.test", "upstream_keys": ["sk-report"],
+        })
+        self.plan_account_id = database.create_account({
+            "name": "report-plan", "account_type": "plan",
+            "base_url": "http://report-plan.test",
+            "monthly_price": 12, "upstream_keys": ["sk-report-plan"],
         })
         migrate(str(self.dashboard_path), str(self.root / "schema"), "dashboard")
         reconcile_accounts(str(self.dashboard_path), str(self.proxy_path))
@@ -31,24 +36,24 @@ class DashboardReportsTest(AppDatabaseTestCase):
                 "INSERT INTO daily_usage(date,account_id,model,input_tokens,"
                 "cache_tokens,output_tokens,request_count,equivalent_cost,"
                 "billed_usage_cost) VALUES('2026-08-09',?,?,40,0,10,2,7.0,3.0)",
-                (self.account_id, "model-a"))
+                (self.api_account_id, "model-a"))
             conn.execute(
                 "INSERT INTO daily_usage(date,account_id,model,input_tokens,"
                 "cache_tokens,output_tokens,request_count,equivalent_cost,"
                 "billed_usage_cost) VALUES('2026-08-10',?,?,10,0,20,1,4.0,2.0)",
-                (self.account_id, "model-b"))
+                (self.api_account_id, "model-b"))
             conn.execute(
                 "INSERT INTO monthly_recurring_costs(month,account_id,"
                 "billing_unit_id,recurring_charge,equivalent_cost,currency,"
                 "normalized_recurring_cost) VALUES('2026-08',?,?,12,0,'CNY',12)",
-                (self.account_id, "unit-1"))
+                (self.plan_account_id, "unit-1"))
             # FX normalization pending: NULL normalized cost must surface as
             # billing_incomplete instead of counting as zero.
             conn.execute(
                 "INSERT INTO monthly_recurring_costs(month,account_id,"
                 "billing_unit_id,recurring_charge,equivalent_cost,currency,"
                 "normalized_recurring_cost) VALUES('2026-08',?,?,9,0,'USD',NULL)",
-                (self.account_id, "unit-2"))
+                (self.plan_account_id, "unit-2"))
             conn.commit()
         self.app = create_app(str(self.proxy_path), testing=True,
                               start_background_tasks=False)
@@ -57,8 +62,9 @@ class DashboardReportsTest(AppDatabaseTestCase):
 
     def test_summary_and_monthly_use_canonical_ledger(self) -> None:
         summary = self.client.get("/api/summary").get_json()
-        # billed usage = 3.0 + 2.0; theoretical = 7.0 + 4.0.
-        self.assertAlmostEqual(summary["total_cost"], 5.0)
+        # Legacy `total_cost` keeps the api-equivalent meaning (7.0 + 4.0);
+        # the canonical V1 actual ledger is billed usage + recurring (5 + 12).
+        self.assertAlmostEqual(summary["total_cost"], 11.0)
         self.assertAlmostEqual(summary["theoretical_cost"], 11.0)
         # actual = billed usage + normalized recurring (12), never + virtual.
         self.assertAlmostEqual(summary["actual_cost"], 17.0)
@@ -68,7 +74,9 @@ class DashboardReportsTest(AppDatabaseTestCase):
 
         monthly = self.client.get("/api/monthly").get_json()
         aug = next(m for m in monthly if m["year"] == 2026 and m["month"] == 8)
-        self.assertAlmostEqual(aug["cost"], 5.0)
+        # `cost` keeps the historical api-equivalent meaning (7+4), while the
+        # metered bill plus recurring subscription is `actual_cost`.
+        self.assertAlmostEqual(aug["cost"], 11.0)
         self.assertAlmostEqual(aug["theoretical_cost"], 11.0)
         self.assertAlmostEqual(aug["actual_cost"], 17.0)
 
@@ -80,7 +88,7 @@ class DashboardReportsTest(AppDatabaseTestCase):
         self.assertTrue(flattened)
         costs = sum(row["cost"] for row in flattened)
         theoretical = sum(row["theoretical_cost"] for row in flattened)
-        self.assertAlmostEqual(costs, 5.0)
+        self.assertAlmostEqual(costs, 11.0)
         self.assertAlmostEqual(theoretical, 11.0)
 
     def test_all_public_facades_import(self) -> None:

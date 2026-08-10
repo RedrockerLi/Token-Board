@@ -53,6 +53,7 @@ class ProxyExportMixin:
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
                 WHERE r.id > ? AND r.id <= ?
+                  AND a.id IS NOT NULL
                   AND LOWER(r.model) != 'unknown' AND r.model != ''
                   AND r.account_id IS NOT NULL
                   -- Only successful requests carry real usage; failed/aborted
@@ -85,8 +86,11 @@ class ProxyExportMixin:
             metas = self._plan_key_billing_meta(conn)
             by_key_id = {meta["key_id"]: meta for meta in metas if meta["key_id"] is not None}
             by_account = {}
+            active_units: dict[int, set[str]] = {}
             for meta in metas:
                 by_account.setdefault(meta["account_id"], meta)
+                active_units.setdefault(meta["account_id"], set()).add(
+                    meta["billing_unit_id"])
                 charges = conn.execute(
                     "SELECT period_start,normalized_recurring_cost "
                     "FROM billing_period_charges WHERE contract_id=? "
@@ -103,6 +107,8 @@ class ProxyExportMixin:
                     meta["account_id"], meta["billing_unit_id"],
                     normalized_periods,
                 )
+            for account_id, unit_ids in active_units.items():
+                dash_db.cleanup_stale_subscription_units(account_id, unit_ids)
 
             virtual_buckets: dict[tuple[str, int, str], float] = {}
             plan_logs = conn.execute(

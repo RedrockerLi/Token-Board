@@ -66,7 +66,8 @@ class AppContractTest(AppDatabaseTestCase):
         }])
         rows = dashboard.load_rows()
         self.assertEqual(rows[1][0]["count"], 2)
-        self.assertAlmostEqual(rows[2][0]["cost"], 1.0)
+        self.assertAlmostEqual(rows[2][0]["cost"], 1.25)
+        self.assertAlmostEqual(rows[2][0]["actual_cost"], 1.0)
         self.assertAlmostEqual(rows[2][0]["theoretical_cost"], 1.25)
 
     def test_account_templates_aggregate_and_credential_identity(self) -> None:

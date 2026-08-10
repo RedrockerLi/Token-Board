@@ -119,6 +119,9 @@ class ProxyAccountWriteMixin:
             start = original["valid_from"]
         contract_start = (f"{start}T00:00:00Z" if start
                           else original["contract_valid_from"])
+        anchor_day = None
+        if "valid_from" in data and parsed_start is not None:
+            anchor_day = parsed_start.day
         conn.execute(
             "UPDATE accounts SET name=?,valid_from=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
             "WHERE id=?", (name, start, real_id),
@@ -127,10 +130,11 @@ class ProxyAccountWriteMixin:
         scope = "credential" if final_spec.subscription_unit == "per_key" else "account"
         conn.execute(
             "UPDATE billing_contracts SET charge_type=?,billing_scope=?,currency=?,"
-            "cooldown_policy_json=?,valid_from=? WHERE id=?",
+            "cooldown_policy_json=?,valid_from=?,"
+            "billing_anchor_day=COALESCE(?,billing_anchor_day) WHERE id=?",
             (charge, scope, currency,
              json.dumps({"kind": final_spec.cooldown or "none"}),
-             contract_start, original["contract_id"]),
+             contract_start, anchor_day, original["contract_id"]),
         )
         upstream = conn.execute(
             "SELECT id FROM upstreams WHERE account_id=? ORDER BY id LIMIT 1", (real_id,)

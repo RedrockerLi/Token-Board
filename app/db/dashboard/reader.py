@@ -42,12 +42,16 @@ class DashboardReaderMixin:
                 if amount:
                     token_usages.append({**base, "token_type": token_type, "amount": amount})
             request_usages.append({**base, "count": row["request_count"]})
-            # V1 keeps the two cost meanings separately. `cost` is the
-            # actual metered amount; `theoretical_cost` is the historical
-            # pricing equivalent. Consumers must never add these values.
+            # V1 keeps the two cost meanings separately. The legacy `cost`
+            # field keeps its historical meaning (api-equivalent cost, i.e.
+            # the theoretical amount for plan/agent accounts) so per-model
+            # charts render the same values as before the V1 migration;
+            # `actual_cost` is the metered bill and `theoretical_cost` is the
+            # same equivalent amount under its explicit name.
             cost_entries.append({
                 **base,
-                "cost": row["billed_usage_cost"],
+                "cost": row["equivalent_cost"],
+                "actual_cost": row["billed_usage_cost"],
                 "theoretical_cost": row["equivalent_cost"],
             })
             months_set.add((y, m)); names.add(name); models.add(row["model"])
