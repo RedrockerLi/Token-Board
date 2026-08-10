@@ -73,11 +73,15 @@ class ProxyDatabase(
     def get_stats(self) -> dict:
         """Proxy billing overview — 30-day rolling window.
 
-        ``total_cost`` is actual cost: billed metered usage plus recurring
-        charges normalized to the reporting currency. ``today_cost`` is the
-        separate theoretical cost: what the same traffic would cost at the
-        selected historical model rates. These figures must never be added,
-        because that would count the same usage twice.
+        Usage cards (``total_tokens``, ``total_requests``, ``today_requests``)
+        cover ALL traffic, including recurring-plan accounts, so the overview
+        matches the daily-usage chart. ``total_cost`` is actual cost: billed
+        metered usage plus recurring charges normalized to the reporting
+        currency (plan accounts produce no metered usage, so their requests do
+        not affect it). ``today_cost`` is the separate theoretical cost: what
+        the same traffic would cost at the selected historical model rates.
+        These figures must never be added, because that would count the same
+        usage twice.
         """
         conn = self._connect()
         try:
@@ -86,21 +90,13 @@ class ProxyDatabase(
                 "SELECT COUNT(*) total_requests,COALESCE(SUM(total_tokens),0) total_tokens,"
                 "COALESCE(SUM(r.billed_usage_cost),0) billed_usage_cost "
                 "FROM request_log r "
-                "WHERE r.requested_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days') "
-                "AND NOT EXISTS(SELECT 1 FROM billing_contracts bc "
-                "WHERE bc.account_id=r.account_id AND bc.charge_type='recurring' "
-                "AND bc.valid_from<=r.requested_at "
-                "AND (bc.valid_until IS NULL OR bc.valid_until>r.requested_at))"
+                "WHERE r.requested_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-30 days')"
             ).fetchone()
             daily = conn.execute(
                 "SELECT COUNT(*) today_requests,COALESCE(SUM(equivalent_cost),0) "
                 "today_theoretical_cost,COALESCE(SUM(r.billed_usage_cost),0) "
                 "today_billed_usage_cost FROM request_log r "
-                "WHERE date(r.requested_at)=? "
-                "AND NOT EXISTS(SELECT 1 FROM billing_contracts bc "
-                "WHERE bc.account_id=r.account_id AND bc.charge_type='recurring' "
-                "AND bc.valid_from<=r.requested_at "
-                "AND (bc.valid_until IS NULL OR bc.valid_until>r.requested_at))",
+                "WHERE date(r.requested_at)=?",
                 (today,),
             ).fetchone()
             recurring = conn.execute(
