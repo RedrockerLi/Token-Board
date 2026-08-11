@@ -156,9 +156,9 @@
 
 ### plan / agent 经济账 → proxy_plan_summary
 
-- **订阅费**是派生状态：每次导出按每把 Key（plan）或每账户（agent）的**生命周期 + 价格历史**重算行政月订阅费，`reconcile_plan_subscription` 保证改起始日/取消/调价能清掉旧周期；过去月份冻结、当前月按当月汇率刷新（[app/db/dashboard_db.py:154-187](app/db/dashboard_db.py#L154-L187)）。
+- **订阅费**是派生状态：每次导出按每把 Key（plan）或每账户（agent）的**生命周期 + 价格历史**重算行政月订阅费，`reconcile_plan_subscription` 保证改起始日/取消/调价能清掉旧周期；金额按**计费周期开始日的汇率**换算并锁定，过去周期冻结、当前周期也只在改价时随「新价 × 锁定汇率」刷新（[app/db/dashboard_db.py:154-187](app/db/dashboard_db.py#L154-L187)）。
 - **虚拟消费**是追加式：订阅类型的 `request_log` 行按 `(行政月, 账户, masked Key)` 累加进 `virtual_cost`，30 天后日志清理无法回填（[app/db/proxy_db.py:1635-1652](app/db/proxy_db.py#L1635-L1652)）。
-- USD 订阅按行政月取 USD→CNY 汇率换算（[app/services/fx.py:81-93](app/services/fx.py#L81-L93)）。
+- USD 订阅按**计费周期开始日**的 USD→CNY 汇率换算并锁定；缺失时通过 frankfurter 历史接口（`?date=period_start`）补拉，失败则用最近已存汇率作临时值持续重试（[app/db/proxy/billing.py](app/db/proxy/billing.py) `_normalized_charge`）。
 
 ### 高水位与云同步
 

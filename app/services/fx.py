@@ -1,10 +1,16 @@
 """Daily USD→CNY exchange-rate cache — local-only, never synced to cloud.
 
 Fetch-on-demand rule (per requirements):
-  * If today's rate is already stored → use it directly.
-  * If today's rate is missing → fetch from frankfurter.dev and store it.
+  * If the rate for the requested date is already stored → use it directly.
+  * If it is missing → fetch from frankfurter.dev (with ?date= when a
+    historical date is requested) and store it.
   * If the fetch fails (or returns the same old data) → keep using the most
     recent stored rate.
+
+Two callers share this module: the daily fx-prewarm fetches only today's
+rate (no ?date=), while the subscription materializer requests the rate of
+each billing period's start date (?date=YYYY-MM-DD, supported by
+frankfurter from 1999-01-04 on).
 
 The table lives in proxy.db (fx_rates) and is excluded from cloud sync.
 Every function is best-effort and never raises
@@ -61,6 +67,12 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
     """Return the rate for ``date`` (default today), fetching and storing it
     when the exact row is missing.  Falls back to the nearest stored rate on
     any error.  Never raises.
+
+    A historical ``date`` is fetched with ``?date=YYYY-MM-DD`` (frankfurter
+    covers 1999-01-04 on; earlier dates skip the fetch entirely).  The stored
+    row uses the response's own ``date`` — v2 echoes the requested date, so a
+    weekend request stores the requested date with the last trading day's
+    rate, which is what the period-start locking rule relies on.
     """
     date = date or _utc_date()
     row = conn.execute(
@@ -68,9 +80,15 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
         (base, quote, date)).fetchone()
     if row is not None:
         return float(row["rate"])
+    if date < "1999-01-01":
+        # frankfurter has no data before 1999; never hammer the API for a
+        # period start that can never resolve.
+        log.warning("FX date %s predates frankfurter coverage; skipping fetch", date)
+        return get_rate(conn, base, quote, date)
 
     try:
-        resp = requests.get(FRANKFURTER_URL, timeout=_FETCH_TIMEOUT)
+        resp = requests.get(FRANKFURTER_URL, timeout=_FETCH_TIMEOUT,
+                            params={"date": date})
         resp.raise_for_status()
         data = resp.json()
         rate = float(data.get("rate"))
@@ -88,18 +106,3 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
             on_error(exc)
 
     return get_rate(conn, base, quote, date)
-
-
-def rate_for_month(conn, month: str, base: str = "USD", quote: str = "CNY",
-                   today: str | None = None) -> float:
-    """Rate to apply when converting one billing month's subscription to CNY.
-
-    Past months must stay frozen, so they use the nearest stored rate as of the
-    month's first day (never re-fetched).  The current month (and any future
-    month) refreshes with today's rate, fetching on demand.  ``month`` is
-    ``YYYY-MM``.
-    """
-    today = today or _utc_date()
-    if month >= today[:7]:
-        return ensure_rate(conn, base, quote, today)
-    return get_rate(conn, base, quote, month + "-01")

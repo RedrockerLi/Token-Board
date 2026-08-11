@@ -123,7 +123,9 @@ class ProxyDatabase(
                 "SELECT COUNT(*) FROM billing_period_charges "
                 "WHERE period_start<=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
                 "AND period_end>strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                "AND finalized_at IS NULL AND normalized_recurring_cost IS NULL"
+                "AND finalized_at IS NULL "
+                "AND (normalized_recurring_cost IS NULL "
+                "OR (currency!='CNY' AND fx_rate_date!=date(period_start)))"
             ).fetchone()[0]
             active_accounts = conn.execute(
                 "SELECT COUNT(*) FROM accounts WHERE lifecycle_state='active'"

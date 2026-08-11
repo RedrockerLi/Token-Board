@@ -12,10 +12,11 @@ class ProxyExportMixin:
         row. The high-water mark is advanced by the caller ONLY after the whole
         pull-export-upload transaction succeeds, so nothing here marks rows.
 
-        plan subscription fees are persisted per (account, month): past months
-        frozen forever, current month refreshed from the current monthly_price
-        on every export regardless of the batch window (Requirement 4: price
-        edits affect only the current month).
+        plan subscription fees are persisted per (account, month), converted
+        to CNY at the billing period's start-date rate and locked once
+        determined; the current monthly_price still refreshes the current
+        month on every export regardless of the batch window (Requirement 4:
+        price edits affect only the current month).
         """
         from app.db.dashboard_db import DashboardDatabase
         from app.db.migrations import schema_dir_for
@@ -82,7 +83,7 @@ class ProxyExportMixin:
             # from usage.  Reconcile every known lifecycle on every export so an
             # edited start date, cancellation, or scheduled price cannot leave
             # stale subscription rows behind.  Native prices are converted to
-            # CNY per month (past months frozen, current month at today's rate).
+            # CNY at each period's start-date rate, locked once determined.
             metas = self._plan_key_billing_meta(conn)
             by_key_id = {meta["key_id"]: meta for meta in metas if meta["key_id"] is not None}
             by_account = {}

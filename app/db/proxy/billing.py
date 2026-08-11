@@ -1,4 +1,16 @@
-"""Recurring-charge ledger materialization for the normalized V1 schema."""
+"""Recurring-charge ledger materialization for the normalized V1 schema.
+
+Subscription fees in a foreign currency (USD) are converted to CNY at the
+rate on the billing period's start date (period_start), locked once
+determined: a USD row is locked as soon as fx_rates has an exact row for
+that date (fx_rate_date == period_start afterwards), and the rate is read
+from that row forever — price changes re-multiply the same rate, and later
+daily rate movements never touch it.  Missing historical rates are fetched
+on demand via fx.ensure_rate(?date=period_start); on failure the nearest
+stored rate is used as a provisional (unlocked) value retried on the next
+materialization.  Only locked USD rows and CNY rows are finalized when their
+period ends.
+"""
 
 from __future__ import annotations
 
@@ -63,20 +75,20 @@ def _rate(conn: sqlite3.Connection, contract_id: int, start: str,
     return float(row[0]) if row else 0.0
 
 
-def _fx_for_month(conn: sqlite3.Connection, currency: str, month: str,
-                  today: str) -> tuple[float, str | None]:
-    """Nearest stored rate for a billing month, with earliest-row fallback.
+def _nearest_rate(conn: sqlite3.Connection, currency: str,
+                  start_date: str) -> tuple[float, str | None]:
+    """Nearest stored rate for a period start, read-only (never fetches).
 
-    Mirrors ``app.services.fx.rate_for_month``: the current month prefers
-    today's rate, past months freeze at the rate on the month's first day,
-    dates before the first stored row use the earliest stored rate, and a
+    The exact row for *start_date* wins; otherwise the most recent earlier
+    row; when *start_date* precedes every stored row, the earliest stored row
+    (so pre-1999 or never-fetched periods are not silently undervalued); a
     currency pair that has never been stored degrades to 1.0 (no conversion).
+    Returns (rate, fx_date).
     """
-    boundary = today if month >= today[:7] else month + "-01"
     row = conn.execute(
         "SELECT rate,date FROM fx_rates WHERE base_currency=? "
         "AND quote_currency='CNY' AND date<=date(?) "
-        "ORDER BY date DESC LIMIT 1", (currency, boundary),
+        "ORDER BY date DESC LIMIT 1", (currency, start_date),
     ).fetchone()
     if row is None:
         row = conn.execute(
@@ -89,15 +101,39 @@ def _fx_for_month(conn: sqlite3.Connection, currency: str, month: str,
 
 
 def _normalized_charge(conn: sqlite3.Connection, price: float,
-                       currency: str, month: str, today: str
+                       currency: str, start_date: str,
+                       attempted: set[tuple[str, str]] | None = None
                        ) -> tuple[float, str | None]:
+    """Convert ``price`` to CNY at the rate locked on the period start date.
+
+    Locking rule: a USD row is locked as soon as fx_rates has an exact row
+    for *start_date* (fx_rate_date == start_date afterwards); the rate is
+    then read from that row forever (price changes re-multiply the same
+    rate).  When the exact row is missing, one best-effort historical fetch
+    (?date=start_date) is attempted per run; on failure the nearest stored
+    rate is used as a provisional (not locked) value and the row is retried
+    on the next materialization.
+    """
     if currency == "CNY":
         return price, None
-    if month >= today[:7]:
-        # Current month refreshes with today's rate (fetch-on-demand, best
-        # effort; failures fall back to stored rates inside fx.ensure_rate).
-        fx.ensure_rate(conn, currency, "CNY", date=today)
-    rate, fx_date = _fx_for_month(conn, currency, month, today)
+    exact = conn.execute(
+        "SELECT rate,date FROM fx_rates WHERE base_currency=? "
+        "AND quote_currency='CNY' AND date=?",
+        (currency, start_date)).fetchone()
+    if exact is not None:
+        return price * float(exact[0]), str(exact[1])  # locked, zero HTTP
+    key = (currency, start_date)
+    if attempted is None or key not in attempted:
+        fx.ensure_rate(conn, currency, "CNY", date=start_date)
+        if attempted is not None:
+            attempted.add(key)
+    exact = conn.execute(
+        "SELECT rate,date FROM fx_rates WHERE base_currency=? "
+        "AND quote_currency='CNY' AND date=?",
+        (currency, start_date)).fetchone()
+    if exact is not None:
+        return price * float(exact[0]), str(exact[1])  # locked by this fetch
+    rate, fx_date = _nearest_rate(conn, currency, start_date)  # provisional
     return price * rate, fx_date
 
 
@@ -106,7 +142,6 @@ def materialize_period_charges(db_path: str,
     """Create/update current charges idempotently and freeze closed periods."""
     moment = _utc(at)
     now = _stamp(moment)
-    today = now[:10]
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
     changed = 0
@@ -114,6 +149,7 @@ def materialize_period_charges(db_path: str,
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("BEGIN IMMEDIATE")
+        attempted: set[tuple[str, str]] = set()
         contracts = conn.execute(
             "SELECT bc.id,bc.account_id,bc.billing_scope,bc.currency,"
             "bc.valid_from,bc.valid_until,a.valid_from account_valid_from,"
@@ -168,7 +204,7 @@ def materialize_period_charges(db_path: str,
                     as_of = _stamp(min(moment, end_dt))
                     price = _rate(conn, contract["id"], start, as_of)
                     normalized, fx_date = _normalized_charge(
-                        conn, price, contract["currency"], start[:7], today)
+                        conn, price, contract["currency"], start[:10], attempted)
                     existing = conn.execute(
                         "SELECT id,finalized_at FROM billing_period_charges "
                         "WHERE contract_id=? AND credential_uuid IS ? AND period_start=?",
@@ -194,9 +230,13 @@ def materialize_period_charges(db_path: str,
                             (*values, existing["id"]),
                         )
                     start_dt, end_dt = _next_period(start_dt, anchor_day)
+        # Only locked rows may be frozen: a USD row whose rate is still a
+        # provisional (unlocked) value must keep retrying the historical
+        # fetch instead of being finalized on a degraded rate.
         finalized = conn.execute(
             "UPDATE billing_period_charges SET finalized_at=? "
             "WHERE finalized_at IS NULL AND normalized_recurring_cost IS NOT NULL "
+            "AND (currency='CNY' OR fx_rate_date=date(period_start)) "
             "AND period_end<=?", (now, now)
         )
         changed += max(finalized.rowcount, 0)
