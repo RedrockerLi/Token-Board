@@ -39,9 +39,13 @@ def _periodic(stop: threading.Event, interval: int, name: str, action,
 
 
 def start_runtime_tasks(flask_app, proxy_db, proxy_db_path: str) -> None:
-    """Start importer, FX, lifecycle and billing workers with shared logging."""
+    """Start FX, lifecycle and billing workers with shared logging.
+
+    Agent usage import (codex) is no longer in-process: it runs as an
+    independent systemd user timer (token-agent-import) every 30 minutes,
+    fully decoupled from this server.
+    """
     from app.services import fx
-    from app.services.codex_import import run_import
 
     def prewarm_fx() -> None:
         conn = proxy_db._connect()
@@ -73,30 +77,6 @@ def start_runtime_tasks(flask_app, proxy_db, proxy_db_path: str) -> None:
             daemon=True, name=name)
         threads.append(thread)
         thread.start()
-
-    importer_stop = threading.Event()
-    flask_app.config["CODEX_IMPORT_STOP"] = importer_stop
-    def importer_worker() -> None:
-        try:
-            _set_health(health, health_lock, "codex-importer", "running")
-            run_import(
-                proxy_db, importer_stop,
-                on_error=lambda exc: _set_health(
-                    health, health_lock, "codex-importer", "degraded",
-                    f"{type(exc).__name__}: {exc}"),
-                on_success=lambda _inserted: _set_health(
-                    health, health_lock, "codex-importer", "ok"),
-            )
-            _set_health(health, health_lock, "codex-importer", "stopped")
-        except Exception:
-            log.exception("background task failed: codex-importer")
-            _set_health(health, health_lock, "codex-importer", "degraded",
-                        "importer failed")
-
-    importer_thread = threading.Thread(
-        target=importer_worker, daemon=True, name="codex-importer")
-    threads.append(importer_thread)
-    importer_thread.start()
 
 
 def stop_runtime_tasks(flask_app, join_timeout: float = 2.0) -> None:

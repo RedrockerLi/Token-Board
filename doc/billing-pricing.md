@@ -71,8 +71,8 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 `account_type = 'agent'` 代表 Agent 订阅(目前仅 Codex),计费与 plan 一致:
 
 - 订阅按月计费(`monthly_price` × 每账户一个"订阅"生命周期,`proxy_plan_summary` 以 `key_masked='subscription'` 存档),与 plan 的差异是**不绑定任何上游密钥**。
-- agent 账户**不能**作为本地密钥的上游目标(`create_key` 拒绝),路由快照也会跳过它;其用量全部来自后台导入,不是代理转发。
-- Python 看板启动后,后台线程每 60 秒扫描 `~/.codex/sessions`(递归 `YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl`,兼容 `.jsonl.gz`),把每个 `token_count` 事件的 `last_token_usage`(每轮增量)写一行 `request_log`(`account_id` 指向第一个 `agent_kind='codex'` 账户,`event_id` 幂等)。用量进入消费报告与看板,口径同 plan:真实成本 = 订阅费,api_cost = 虚拟/理论消费。
+- agent 账户**不能**作为本地密钥的上游目标(`create_key` 拒绝),路由快照也会跳过它;其用量全部来自导入,不是代理转发。
+- 用量由**独立的 systemd 用户定时器 `token-agent-import` 每 30 分钟运行一次**(`start.sh --all` 安装,one-shot 进程跑完即退,日志走 journal),**与看板进程完全解耦**——看板关着也照常导入;定时器带 `Persistent=true`,服务器关机/未登录期间错过的时间窗会在下次登录时补跑。导入扫描 `~/.codex/sessions`(递归 `YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl`,兼容 `.jsonl.gz`),把每个 `token_count` 事件的 `last_token_usage`(每轮增量)写一行 `request_log`(`account_id` 指向第一个 `agent_kind='codex'` 账户,`event_id` 幂等,重复/并发运行不重复计数)。用量进入消费报告与看板,口径同 plan:真实成本 = 订阅费,api_cost = 虚拟/理论消费。
 - 导入游标存于本机 `codex_import_state` 表,不上云。
 
 ## 币种与汇率(CNY / USD)

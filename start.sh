@@ -18,6 +18,10 @@ PROXY_PORT="${TB_PROXY_PORT:-8800}"
 DASHBOARD_PORT="${TB_DASHBOARD_PORT:-}"
 SERVICE_NAME="${TB_SERVICE_NAME:-token-proxy}"
 SERVICE_FILE="${TB_SERVICE_FILE:-$HOME/.config/systemd/user/${SERVICE_NAME}.service}"
+IMPORT_NAME="${TB_IMPORT_SERVICE_NAME:-token-agent-import}"
+IMPORT_SERVICE_FILE="${TB_IMPORT_SERVICE_FILE:-$HOME/.config/systemd/user/${IMPORT_NAME}.service}"
+IMPORT_TIMER_FILE="${TB_IMPORT_TIMER_FILE:-$HOME/.config/systemd/user/${IMPORT_NAME}.timer}"
+PYTHON_BIN="$(command -v python3)"
 LEGACY_TIMEZONE="${TB_LEGACY_TIMEZONE:-Asia/Shanghai}"
 USE_SYSTEMD=true
 if [ "${TB_NO_SYSTEMD:-0}" = "1" ]; then USE_SYSTEMD=false; fi
@@ -186,6 +190,52 @@ raise SystemExit(0 if ok else 1)
         cleanup
     fi
     echo -e "${GREEN}✓ 代理健康${NC}"
+
+    # ── Agent usage import timer (every 30 minutes, decoupled) ────────────
+    # Codex usage import runs as its own systemd user timer, independent of
+    # the dashboard process (which used to scan in-process every 60s).
+    if $HAS_SYSTEMD; then
+        echo "[import] 更新用量导入定时器（每 30 分钟）..."
+        systemctl --user stop "$IMPORT_NAME.timer" "$IMPORT_NAME.service" 2>/dev/null || true
+        mkdir -p "$(dirname "$IMPORT_SERVICE_FILE")"
+        SERVICE_TMP="$IMPORT_SERVICE_FILE.tmp.$$"
+        cat > "$SERVICE_TMP" << EOF
+[Unit]
+Description=Token Board Codex Agent Usage Import (one-shot)
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=$SCRIPT_DIR
+ExecStart=$PYTHON_BIN $SCRIPT_DIR/agent_usage_import.py --proxy-db $PROXY_DB --schema-dir $SCHEMA_DIR --timezone $LEGACY_TIMEZONE
+StandardOutput=journal
+StandardError=journal
+EOF
+        mv -f "$SERVICE_TMP" "$IMPORT_SERVICE_FILE"
+        TIMER_TMP="$IMPORT_TIMER_FILE.tmp.$$"
+        cat > "$TIMER_TMP" << EOF
+[Unit]
+Description=Run Codex usage import every 30 minutes
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+AccuracySec=60
+Unit=$IMPORT_NAME.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        mv -f "$TIMER_TMP" "$IMPORT_TIMER_FILE"
+        systemctl --user daemon-reload
+        systemctl --user enable --now "$IMPORT_NAME.timer" > /dev/null 2>&1
+        # Run once immediately instead of waiting for the next :00/:30 edge.
+        systemctl --user start "$IMPORT_NAME.service"
+        echo -e "${GREEN}✓ 用量导入定时器已启用（每 30 分钟）${NC}"
+    else
+        echo "[import] 未检测到 systemd，用量导入定时器未安装。"
+        echo "        可手动添加 crontab："
+        echo "        0,30 * * * * cd $SCRIPT_DIR && python3 agent_usage_import.py --proxy-db $PROXY_DB >> $DATA_DIR/agent_import.log 2>&1"
+    fi
     echo ""
 fi
 

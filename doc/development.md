@@ -45,7 +45,7 @@ python3 scripts/mock_upstream.py --port 9100
 
 | 脚本 | 用途 |
 |------|------|
-| `bash start.sh` | 一键:找空闲端口 + 起看板;`--all` 加编译并起代理(systemd 开机自启);`--no-browser` 不开浏览器 |
+| `bash start.sh` | 一键:找空闲端口 + 起看板;`--all` 加编译并起代理(systemd 开机自启)并安装每 30 分钟的用量导入定时器;`--no-browser` 不开浏览器 |
 | `bash scripts/start-proxy.sh` | 代理:无参前台调试;`--daemon` 后台;`--install`/`--uninstall` 管理 systemd 用户服务 |
 | `bash scripts/start-dashboard.sh [--no-browser]` | 单独起看板(自动 `pip install flask` 兜底) |
 | `bash scripts/status.sh` | 状态检查:代理二进制、systemd、8800 健康、看板进程与端口、数据库行数 |

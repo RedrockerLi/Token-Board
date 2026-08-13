@@ -49,6 +49,27 @@ else
     fail "systemd 服务未安装，运行 bash start.sh 自动安装"
 fi
 
+# ── Usage import timer ──
+echo ""
+echo "── 用量导入定时器 ──"
+IMPORT_TIMER_FILE="$HOME/.config/systemd/user/token-agent-import.timer"
+if [ -f "$IMPORT_TIMER_FILE" ]; then
+    if systemctl --user is-active --quiet token-agent-import.timer 2>/dev/null; then
+        NEXT=$(systemctl --user list-timers token-agent-import.timer --no-pager 2>/dev/null \
+               | awk 'NR==2 {print $1, $2}' | head -1)
+        ok "定时器运行中 (每 30 分钟, 下次: ${NEXT:-未知})"
+    else
+        warn "定时器未运行 (systemctl --user start token-agent-import.timer)"
+    fi
+    if systemctl --user is-enabled --quiet token-agent-import.timer 2>/dev/null; then
+        ok "开机自启: 已启用"
+    else
+        warn "开机自启: 未启用 (systemctl --user enable token-agent-import.timer)"
+    fi
+else
+    fail "定时器未安装，运行 bash start.sh --all 自动安装"
+fi
+
 # ── Proxy connectivity ──
 echo ""
 echo "── 代理连通性 ──"
