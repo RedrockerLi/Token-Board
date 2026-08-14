@@ -4,6 +4,7 @@
 
 #include <string>
 #include <memory>
+#include <vector>
 
 namespace httplib { struct Request; }
 
@@ -13,6 +14,12 @@ struct RequestContext {
     std::string model;
     bool streaming = false;
     std::string session_id;
+    std::string previous_response_id;
+    bool state_expanded = false;
+    // For an expanded Responses request, this is the caller's new input
+    // only.  The serialized parsed_json contains the replayed parent chain;
+    // state recording must not append that chain a second time.
+    std::vector<nlohmann::json> state_current_input;
     std::string content_type = "application/json";
     int queue_ms = 0;
     nlohmann::json parsed_json;

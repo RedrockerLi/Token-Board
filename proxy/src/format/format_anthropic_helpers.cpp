@@ -1,4 +1,5 @@
 #include "format_anthropic_internal.h"
+#include "reasoning_bridge.h"
 
 #include <array>
 
@@ -42,6 +43,9 @@ void parse_anthropic_blocks(const json &value,
         } else if (type == "document") {
             fmt::parse_media_content(block, output, false);
             continue;
+        } else if (type == "audio" || type == "input_audio") {
+            fmt::parse_media_content(block, output, false);
+            continue;
         } else if (type == "tool_use") {
             item.kind = ContentKind::ToolUse;
             item.tool_call_id = block.value("id", "");
@@ -61,7 +65,16 @@ void parse_anthropic_blocks(const json &value,
                 item.extra["redacted"] = true;
                 if (block.contains("data")) item.extra["data"] = block["data"];
             }
-        } else continue;
+            item.extra["responses_reasoning_item"] =
+                fmt::responses_reasoning_from_anthropic_block(block);
+        } else {
+            // Preserve provider extensions and future block types as opaque
+            // content.  The capability preflight can then reject a
+            // cross-format conversion instead of silently deleting input;
+            // an Anthropic-to-Anthropic rewrite still remains lossless.
+            item.kind = ContentKind::Text;
+            item.extra["raw"] = block;
+        }
         output.push_back(std::move(item));
     }
 }

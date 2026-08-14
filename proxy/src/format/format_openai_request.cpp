@@ -73,15 +73,14 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
                         if (fn.contains("name") && fn["name"].is_string())
                             b.tool_name = fn["name"].get<std::string>();
                         if (fn.contains("arguments")) {
-                            std::string args =
-                                fn["arguments"].is_string()
-                                    ? fn["arguments"].get<std::string>()
-                                    : fn["arguments"].dump();
-                            try {
-                                b.tool_input = json::parse(args);
-                            } catch (...) {
-                                b.tool_input = json::object();
+                            if (!fn["arguments"].is_string()) {
+                                err = "tool call arguments must be a JSON string";
+                                return false;
                             }
+                            std::string args = fn["arguments"].get<std::string>();
+                            b.extra["raw_arguments"] = args;
+                            try { b.tool_input = json::parse(args); }
+                            catch (...) { err = "invalid JSON in tool call arguments"; return false; }
                         }
                     }
                     msg.content.push_back(std::move(b));
@@ -95,15 +94,14 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
                 if (fc.contains("name") && fc["name"].is_string())
                     b.tool_name = fc["name"].get<std::string>();
                 if (fc.contains("arguments")) {
-                    std::string args =
-                        fc["arguments"].is_string()
-                            ? fc["arguments"].get<std::string>()
-                            : fc["arguments"].dump();
-                    try {
-                        b.tool_input = json::parse(args);
-                    } catch (...) {
-                        b.tool_input = json::object();
+                    if (!fc["arguments"].is_string()) {
+                        err = "function_call arguments must be a JSON string";
+                        return false;
                     }
+                    std::string args = fc["arguments"].get<std::string>();
+                    b.extra["raw_arguments"] = args;
+                    try { b.tool_input = json::parse(args); }
+                    catch (...) { err = "invalid JSON in function_call arguments"; return false; }
                 }
                 msg.content.push_back(std::move(b));
             }
@@ -127,7 +125,7 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
                 ContentBlock b;
                 b.kind = ContentKind::Thinking;
                 b.text = m["reasoning_content"].get<std::string>();
-                msg.content.push_back(std::move(b));
+                msg.content.insert(msg.content.begin(), std::move(b));
             }
             if (m.contains("reasoning") && m["reasoning"].is_object() &&
                 m["reasoning"].contains("content") &&
@@ -135,7 +133,7 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
                 ContentBlock b;
                 b.kind = ContentKind::Thinking;
                 b.text = m["reasoning"]["content"].get<std::string>();
-                msg.content.push_back(std::move(b));
+                msg.content.insert(msg.content.begin(), std::move(b));
             }
 
             // Normalize: role=system content becomes top-level system blocks.
@@ -154,8 +152,14 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
             if (!t.is_object()) continue;
             Tool tool;
             const json *fn = &t;
-            if (t.contains("type") && t["type"].is_string())
+            if (t.contains("type") && t["type"].is_string()) {
                 tool.extra["type"] = t["type"];
+                tool.wire_type = t["type"].get<std::string>();
+                if (tool.wire_type == "custom") tool.kind = ToolKind::Custom;
+                else if (tool.wire_type == "tool_search") tool.kind = ToolKind::ToolSearch;
+                else if (tool.wire_type == "namespace") tool.kind = ToolKind::Namespace;
+                else if (tool.wire_type != "function") tool.kind = ToolKind::Hosted;
+            }
             if (t.contains("function") && t["function"].is_object())
                 fn = &t["function"];
             if (fn->contains("name") && (*fn)["name"].is_string())
@@ -164,11 +168,34 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
                 tool.description = (*fn)["description"].get<std::string>();
             if (fn->contains("parameters") && (*fn)["parameters"].is_object())
                 tool.input_schema = (*fn)["parameters"];
+            if (tool.kind == ToolKind::Namespace) parse_openai_namespace_children(t, tool);
+            tool.raw = t;
             out.tools.push_back(std::move(tool));
         }
     }
+    out.items = out.messages;
     if (in.contains("tool_choice"))
         out.tool_choice = in["tool_choice"];
+
+    if (in.contains("response_format") && in["response_format"].is_object()) {
+        const auto &rf = in["response_format"];
+        out.structured_output.raw = rf;
+        const std::string type = rf.value("type", "text");
+        if (type == "json_schema") {
+            out.structured_output.kind = StructuredOutputKind::JsonSchema;
+            const auto &schema = rf.contains("json_schema") &&
+                                         rf["json_schema"].is_object()
+                                     ? rf["json_schema"] : rf;
+            out.structured_output.name = schema.value("name", "");
+            out.structured_output.description = schema.value("description", "");
+            if (schema.contains("schema")) out.structured_output.schema = schema["schema"];
+            out.structured_output.strict = schema.value("strict", false);
+        } else if (type == "json_object") {
+            out.structured_output.kind = StructuredOutputKind::JsonObject;
+        } else {
+            out.structured_output.kind = StructuredOutputKind::Text;
+        }
+    }
 
     if (in.contains("reasoning_effort") && in["reasoning_effort"].is_string()) {
         out.reasoning.enabled = true;
@@ -207,19 +234,33 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
     return true;
 }
 
-json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
+json OpenAICodec::serialize_request(const ir::ChatRequest &in,
+                                    const ir::ConversionContext *context) const {
     json body = fmt::filter_keys(
         in.extras, {"seed", "user", "n", "top_p", "presence_penalty",
                     "frequency_penalty", "logprobs", "top_logprobs",
                     "response_format", "metadata", "store", "service_tier",
-                    "parallel_tool_calls", "web_search_options", "text",
+                    "parallel_tool_calls", "web_search_options",
                     "stream_options"});
-
     body["model"] = in.model;
     body["stream"] = in.stream;
+    if (in.structured_output.kind == StructuredOutputKind::JsonObject) {
+        body["response_format"] = json{{"type", "json_object"}};
+    } else if (in.structured_output.kind == StructuredOutputKind::JsonSchema) {
+        json schema{{"name", in.structured_output.name},
+                    {"description", in.structured_output.description},
+                    {"schema", in.structured_output.schema},
+                    {"strict", in.structured_output.strict}};
+        body["response_format"] = json{{"type", "json_schema"},
+                                        {"json_schema", std::move(schema)}};
+    } else if (in.structured_output.raw.is_object() &&
+               !in.structured_output.raw.empty()) {
+        body["response_format"] = in.structured_output.raw;
+    }
 
     if (!in.tool_choice.is_null() && !in.tool_choice.empty())
-        body["tool_choice"] = fmt::normalize_tool_choice_to_openai(in.tool_choice);
+        body["tool_choice"] = fmt::normalize_tool_choice_for_target(
+            in.tool_choice, context, ApiFormat::OpenAI);
     if (in.reasoning.enabled && !in.reasoning.effort.empty())
         body["reasoning_effort"] = in.reasoning.effort;
     else if (in.reasoning.enabled && !in.reasoning.extra.empty() &&
@@ -316,58 +357,26 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
                     ? std::move(body["messages"])
                     : json::array();
 
-    // Append one content block to the OpenAI parts/tool_calls/reasoning outputs.
-    // ToolResult is handled by callers (needs role:"tool" + tool_call_id).
-    auto append_content_part = [](json &parts, json &tool_calls, bool &has_tools,
-                                  std::string &reasoning_text,
-                                  const ContentBlock &b) {
-        switch (b.kind) {
-            case ContentKind::Text: {
-                if (b.extra.contains("raw") && b.extra["raw"].is_object()) {
-                    parts.push_back(b.extra["raw"]);
-                } else {
-                    json p;
-                    p["type"] = "text";
-                    p["text"] = b.text;
-                    parts.push_back(std::move(p));
-                }
-                break;
-            }
-            case ContentKind::Image: {
-                parts.push_back(fmt::image_block_to_openai_part(b));
-                break;
-            }
-            case ContentKind::File:
-                parts.push_back(fmt::serialize_openai_file_part(b));
-                break;
-            case ContentKind::Audio:
-                parts.push_back(fmt::serialize_openai_audio_part(b));
-                break;
-            case ContentKind::Thinking: {
-                if (b.extra.contains("raw") && b.extra["raw"].is_object())
-                    parts.push_back(b.extra["raw"]);
-                else
-                    reasoning_text += b.text;
-                break;
-            }
-            case ContentKind::ToolUse: {
-                has_tools = true;
-                json tc;
-                if (!b.tool_call_id.empty()) tc["id"] = b.tool_call_id;
-                tc["type"] = b.extra.contains("type") ? b.extra["type"].get<std::string>()
-                                                       : std::string("function");
-                tc["function"] = json::object();
-                tc["function"]["name"] = b.tool_name;
-                tc["function"]["arguments"] = b.tool_input.dump();
-                tool_calls.push_back(std::move(tc));
-                break;
-            }
-            default:
-                break;  // ToolResult handled by callers
+    const auto &source_items = in.items.empty() ? in.messages : in.items;
+    // A Chat assistant turn is represented by several ordered Agent Items
+    // (reasoning, visible text and parallel calls).  Chat Completions has one
+    // assistant message for that turn, so merge only continuous Items carrying
+    // the same non-zero group id and role.  Items without a group id retain
+    // their original message boundaries.
+    std::vector<Message> merged_items;
+    merged_items.reserve(source_items.size());
+    for (const auto &item : source_items) {
+        if (!merged_items.empty() && item.group_id != 0 &&
+            merged_items.back().group_id == item.group_id &&
+            merged_items.back().role == item.role) {
+            auto &merged = merged_items.back();
+            merged.content.insert(merged.content.end(), item.content.begin(),
+                                  item.content.end());
+            continue;
         }
-    };
-
-    for (const auto &m : in.messages) {
+        merged_items.push_back(item);
+    }
+    for (const auto &m : merged_items) {
         json jm;
         // OpenAI chat completions has no `developer` role; Codex sends
         // `role:"developer"` instruction messages that strict upstreams
@@ -414,7 +423,7 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
                     }
                     continue;
                 }
-                append_content_part(parts, tool_calls, has_tools, reasoning_text, b);
+                append_openai_content_part(parts, tool_calls, has_tools, reasoning_text, b);
             }
             // Emit role:"tool" messages FIRST so they immediately follow the
             // assistant message that made the tool calls (OpenAI requires tool
@@ -450,7 +459,7 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
         json tool_calls = json::array();
         std::string reasoning_text;
         for (const auto &b : m.content)
-            append_content_part(parts, tool_calls, has_tools, reasoning_text, b);
+            append_openai_content_part(parts, tool_calls, has_tools, reasoning_text, b);
         if (parts.size() == 1 && parts[0].value("type", "") == "text") {
             jm["content"] = parts[0]["text"];
         } else if (!parts.empty()) {
@@ -471,11 +480,15 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
             jm["reasoning_content"] = reasoning_text;
         if (has_tools && parts.empty())
             jm["content"] = nullptr;  // explicit empty content for tool-only messages
+        // Encrypted-only Responses reasoning is intentionally kept in the
+        // local Responses state chain; Chat has no opaque reasoning carrier.
+        // Do not manufacture an empty assistant message for it.
+        if (m.item_kind == ItemKind::Reasoning && parts.empty() &&
+            !has_tool_calls && reasoning_text.empty())
+            continue;
         msgs.push_back(std::move(jm));
     }
-
     body["messages"] = std::move(msgs);
-
     // OpenAI-compatible upstreams (MiniMax/DeepSeek/…) reject `system`
     // messages anywhere but the first slot; Codex produces several
     // (instructions + one per `developer` turn).  Merge every system message
@@ -484,5 +497,4 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
     collapse_openai_system_messages(body["messages"]);
     return body;
 }
-
 // ── Response ────────────────────────────────────────────────────────────

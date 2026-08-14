@@ -6,6 +6,9 @@ namespace {
 
 class OpenAIStreamParser : public StreamParser {
 public:
+    explicit OpenAIStreamParser(const ConversionContext *context)
+        : context_(context) {}
+
     bool feed(const char *data, size_t len, const EmitFn &emit) override {
         bool ok = true;
         auto guard = [&](const StreamEvent &ev) -> bool {
@@ -61,10 +64,18 @@ private:
         bool start_emitted = false;
     };
     fmt::SseFrameBuffer sse_;
+    const ConversionContext *context_ = nullptr;
     std::map<int, ActiveTool> tool_calls_;
     std::string id_, model_;
     bool started_ = false;
     bool failed_ = false;
+
+    const ToolMapping *mapping_for(const std::string &name) const {
+        if (!context_) return nullptr;
+        for (const auto &mapping : context_->tools.mappings)
+            if (mapping.flat_name == name) return &mapping;
+        return nullptr;
+    }
 
     void emit_failure(const EmitFn &emit, const std::string &message) {
         if (failed_) return;
@@ -231,6 +242,20 @@ private:
                         ev.index = tindex;
                         ev.text = at.id;
                         ev.arguments = at.name;
+                        if (const auto *mapping = mapping_for(at.name)) {
+                            ev.namespace_name = mapping->namespace_name;
+                            ev.item.name = mapping->original_name;
+                            ev.item.namespace_name = mapping->namespace_name;
+                            ev.item.item_kind = mapping->kind == ToolKind::Custom
+                                ? ItemKind::CustomToolCall
+                                : mapping->kind == ToolKind::ToolSearch
+                                    ? ItemKind::ToolSearchCall
+                                    : ItemKind::FunctionCall;
+                            ev.extra["tool_kind"] = mapping->kind == ToolKind::Custom
+                                ? "custom_tool_call"
+                                : mapping->kind == ToolKind::ToolSearch
+                                    ? "tool_search_call" : "function_call";
+                        }
                         if (!emit(ev)) return;
                         // Flush fragments buffered before the id arrived.
                         if (!at.arguments.empty()) {
@@ -436,8 +461,9 @@ private:
 
 }  // namespace
 
-std::unique_ptr<ir::StreamParser> make_openai_stream_parser_impl() {
-    return std::make_unique<OpenAIStreamParser>();
+std::unique_ptr<ir::StreamParser> make_openai_stream_parser_impl(
+    const ConversionContext *context) {
+    return std::make_unique<OpenAIStreamParser>(context);
 }
 
 std::unique_ptr<ir::StreamEmitter> make_openai_stream_emitter_impl() {

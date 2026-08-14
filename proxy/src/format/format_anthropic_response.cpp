@@ -3,7 +3,8 @@
 using namespace ir;
 
 bool AnthropicCodec::parse_response(const json &in, ir::ChatResponse &out,
-                                    std::string &err) const {
+                                    std::string &err,
+                                    const ir::ConversionContext *context) const {
     if (!in.is_object()) {
         err = "Anthropic response must be a JSON object";
         return false;
@@ -14,6 +15,84 @@ bool AnthropicCodec::parse_response(const json &in, ir::ChatResponse &out,
         out.model = in["model"].get<std::string>();
     if (in.contains("content") && in["content"].is_array())
         parse_anthropic_blocks(in["content"], out.content);
+    if (!out.content.empty()) {
+        // Preserve the provider's block order. Consecutive ordinary blocks
+        // share one assistant group and are merged by downstream Chat/
+        // Anthropic serializers; reasoning and tool blocks remain distinct
+        // Items at their original positions.
+        AgentItem message;
+        message.item_kind = ItemKind::Message;
+        message.role = "assistant"; message.group_id = 1;
+        auto flush_message = [&] {
+            if (!message.content.empty()) {
+                out.output_items.push_back(std::move(message));
+                message = AgentItem{};
+                message.item_kind = ItemKind::Message;
+                message.role = "assistant"; message.group_id = 1;
+            }
+        };
+        for (const auto &b : out.content) {
+            if (b.kind == ContentKind::Text || b.kind == ContentKind::Image ||
+                b.kind == ContentKind::File || b.kind == ContentKind::Audio) {
+                message.content.push_back(b);
+            } else if (b.kind == ContentKind::Thinking) {
+                flush_message();
+                AgentItem reasoning;
+                reasoning.item_kind = ItemKind::Reasoning;
+                reasoning.role = "assistant"; reasoning.group_id = 1;
+                reasoning.content.push_back(b);
+                if (b.extra.contains("signature"))
+                    reasoning.extra["signature"] = b.extra["signature"];
+                if (b.extra.contains("responses_reasoning_item") &&
+                    b.extra["responses_reasoning_item"].is_object())
+                    reasoning.extra["raw_item"] = b.extra["responses_reasoning_item"];
+                out.output_items.push_back(std::move(reasoning));
+            } else if (b.kind == ContentKind::ToolUse) {
+                flush_message();
+                if (!b.tool_input.is_object()) {
+                    err = "upstream Anthropic tool_use input must be an object";
+                    return false;
+                }
+                ContentBlock mapped = b;
+                if (context) {
+                    for (const auto &mapping : context->tools.mappings) {
+                        if (mapping.flat_name != mapped.tool_name) continue;
+                        mapped.tool_name = mapping.original_name;
+                        if (mapping.kind == ToolKind::Custom) {
+                            mapped.extra["type"] = "custom";
+                            mapped.tool_input = json{{"input", mapped.tool_input.value("input", "")}};
+                        } else if (mapping.kind == ToolKind::ToolSearch) {
+                            mapped.tool_name = "tool_search";
+                        }
+                        break;
+                    }
+                }
+                AgentItem call;
+                call.item_kind = ItemKind::FunctionCall;
+                call.role = "assistant"; call.group_id = 1;
+                call.call_id = mapped.tool_call_id;
+                call.name = mapped.tool_name;
+                call.payload = mapped.tool_input.dump();
+                if (context) {
+                    for (const auto &mapping : context->tools.mappings) {
+                        if (mapping.flat_name != b.tool_name) continue;
+                        call.name = mapping.original_name;
+                        call.namespace_name = mapping.namespace_name;
+                        if (mapping.kind == ToolKind::Custom) {
+                            call.item_kind = ItemKind::CustomToolCall;
+                            call.payload = mapped.tool_input.value("input", "");
+                        } else if (mapping.kind == ToolKind::ToolSearch) {
+                            call.item_kind = ItemKind::ToolSearchCall;
+                            call.execution = json{{"type", "client"}};
+                        }
+                        break;
+                    }
+                }
+                out.output_items.push_back(std::move(call));
+            }
+        }
+        flush_message();
+    }
     if (in.contains("stop_reason") && in["stop_reason"].is_string()) {
         std::string sr = in["stop_reason"].get<std::string>();
         out.stop_reason = fmt::anthropic_stop_reason_to_stop(sr);
@@ -38,7 +117,8 @@ bool AnthropicCodec::parse_response(const json &in, ir::ChatResponse &out,
     return true;
 }
 
-json AnthropicCodec::serialize_response(const ir::ChatResponse &in) const {
+json AnthropicCodec::serialize_response(const ir::ChatResponse &in,
+                                        const ir::ConversionContext *) const {
     json out;
     out["id"] = in.id.empty() ? "msg-proxy" : in.id;
     out["type"] = "message";  // forced — never inherit source format

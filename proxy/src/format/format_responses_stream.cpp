@@ -1,500 +1,282 @@
 #include "format_responses_internal.h"
-#include <set>
+#include "format_responses_emitter.h"
+
+#include <map>
+
 using namespace ir;
 namespace {
-class ResponsesStreamParser : public StreamParser {
+class ResponsesStreamParser final : public StreamParser {
 public:
-    bool feed(const char *data, size_t len, const EmitFn &emit) override {
-        bool ok = true;
-        auto guard = [&](const StreamEvent &ev) -> bool {
-            if (!ok) return false;
-            ok = emit(ev);
-            return ok;
-        };
-        sse_.feed(data, len, [&](const std::string &frame) {
-            if (!ok) return;
-            std::string event_name, payload;
-            if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
-            if (payload.empty()) return;
-            json j;
-            try {
-                j = json::parse(payload);
-            } catch (...) {
-                return;
-            }
-            handle_frame(j, guard);
-        });
-        return ok;
-    }
-
-    bool finish(const EmitFn &emit) override {
-        bool ok = true;
-        auto guard = [&](const StreamEvent &ev) -> bool {
-            if (!ok) return false;
-            ok = emit(ev);
-            return ok;
-        };
-        sse_.finish([&](const std::string &frame) {
-            if (!ok) return;
-            std::string event_name, payload;
-            if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
-            if (payload.empty()) return;
-            json j;
-            try {
-                j = json::parse(payload);
-            } catch (...) {
-                return;
-            }
-            handle_frame(j, guard);
-        });
-        return ok;
-    }
-
+    explicit ResponsesStreamParser(const ConversionContext *ctx) : context_(ctx) {}
+    bool feed(const char *data, size_t len, const EmitFn &emit) override { return frames(data, len, emit, false); }
+    bool finish(const EmitFn &emit) override { return frames(nullptr, 0, emit, true); }
 private:
+    const ConversionContext *context_ = nullptr;
     fmt::SseFrameBuffer sse_;
+    std::map<int, json> pending_items_;
+
+    const ToolMapping *mapping_for(const std::string &wire_name,
+                                   const std::string &namespace_name) const {
+        if (!context_) return nullptr;
+        for (const auto &mapping : context_->tools.mappings) {
+            if (mapping.flat_name == wire_name) return &mapping;
+            if (mapping.original_name == wire_name &&
+                mapping.namespace_name == namespace_name) return &mapping;
+        }
+        return nullptr;
+    }
+
+    void restore_tool_identity(StreamEvent &event, const json &item,
+                               const std::string &wire_kind,
+                               bool terminal) const {
+        // A Responses target still needs the flattened wire name so the
+        // Responses emitter can apply the reverse mapping itself.  Restoring
+        // here would make its flat-name lookup miss the namespace/custom map.
+        if (context_ && context_->target == ApiFormat::OpenAIResponses)
+            return;
+        const std::string wire_name = item.value("name", "");
+        const std::string ns = item.value("namespace", "");
+        const ToolMapping *mapping = mapping_for(wire_name, ns);
+        if (!mapping) return;
+        event.namespace_name = mapping->namespace_name;
+        event.item.name = mapping->original_name;
+        event.item.namespace_name = mapping->namespace_name;
+        if (!terminal) event.arguments = mapping->original_name;
+        if (mapping->kind == ToolKind::Custom) {
+            event.item.item_kind = ItemKind::CustomToolCall;
+            event.extra["tool_kind"] = "custom_tool_call";
+        } else if (mapping->kind == ToolKind::ToolSearch) {
+            event.item.item_kind = ItemKind::ToolSearchCall;
+            event.extra["tool_kind"] = "tool_search_call";
+        }
+        (void)wire_kind;
+    }
+
+    bool frames(const char *data, size_t len, const EmitFn &emit, bool final) {
+        bool ok = true;
+        auto handle = [&](const std::string &frame) {
+            if (!ok) return;
+            std::string event, payload;
+            if (!fmt::parse_sse_frame(frame, &event, &payload) || payload.empty()) return;
+            json j; try { j = json::parse(payload); } catch (...) { return; }
+            EmitFn downstream = [&](const StreamEvent &ev) { ok = ok && emit(ev); return ok; };
+            handle_frame(j, downstream);
+        };
+        if (final) sse_.finish(handle); else sse_.feed(data, len, handle);
+        return ok;
+    }
     void handle_frame(const json &j, const EmitFn &emit) {
-        std::string type;
-        if (j.is_object() && j.contains("type") && j["type"].is_string())
-            type = j["type"].get<std::string>();
+        const std::string type = j.value("type", "");
         if (type == "response.created") {
-            StreamEvent ev;
-            ev.type = StreamEventType::MessageStart;
+            StreamEvent ev; ev.type = StreamEventType::MessageStart;
             if (j.contains("response") && j["response"].is_object()) {
-                const json &r = j["response"];
-                if (r.contains("id") && r["id"].is_string())
-                    ev.extra["id"] = r["id"];
-                if (r.contains("model") && r["model"].is_string())
-                    ev.extra["model"] = r["model"];
+                const auto &r = j["response"]; ev.extra["id"] = r.value("id", "");
+                ev.extra["model"] = r.value("model", "");
             }
-            if (!emit(ev)) return;
-        } else if (type == "response.output_item.added") {
-            int index = j.value("output_index", 0);
-            if (j.contains("item") && j["item"].is_object()) {
-                const json &item = j["item"];
-                std::string itype = item.value("type", "");
-                if (itype == "function_call") {
+            emit(ev); return;
+        }
+        if (type == "response.output_item.added") {
+            if (!j.contains("item") || !j["item"].is_object()) return;
+            const auto &item = j["item"]; const std::string kind = item.value("type", "");
+            if (kind == "message" || kind == "reasoning") {
+                pending_items_[j.value("output_index", 0)] = item;
+                // The Responses target is the only target that can represent
+                // an empty output Item without inventing text/tool content.
+                // Reuse the legacy lifecycle event with item_kind metadata so
+                // existing Chat/Anthropic emitters remain unchanged.
+                if (context_ && context_->target == ApiFormat::OpenAIResponses) {
                     StreamEvent ev;
                     ev.type = StreamEventType::ToolCallStart;
-                    ev.index = index;
-                    ev.text = item.value("call_id", "");
-                    ev.arguments = item.value("name", "");
-                    if (!emit(ev)) return;
+                    ev.index = j.value("output_index", 0);
+                    ev.output_index = ev.index;
+                    ev.item_id = item.value("id", "");
+                    ev.item.id = ev.item_id;
+                    ev.item.status = item.value("status", "");
+                    ev.item.phase = item.value("phase", "");
+                    ev.item.extra["raw_item"] = item;
+                    ev.item.item_kind = kind == "message"
+                        ? ItemKind::Message : ItemKind::Reasoning;
+                    emit(ev);
+                } else if (kind == "reasoning" && context_ &&
+                           context_->target == ApiFormat::Anthropic) {
+                    // An encrypted/redacted reasoning Item may have no
+                    // visible summary deltas.  Still open one IR block so the
+                    // Anthropic emitter can carry the opaque envelope.
+                    StreamEvent ev;
+                    ev.type = StreamEventType::ContentThinkingDelta;
+                    ev.index = j.value("output_index", 0);
+                    ev.item_id = item.value("id", "");
+                    ev.item.id = ev.item_id;
+                    ev.item.status = item.value("status", "");
+                    ev.item.phase = item.value("phase", "");
+                    ev.item.item_kind = ItemKind::Reasoning;
+                    ev.item.extra["raw_item"] = item;
+                    emit(ev);
                 }
+                return;
             }
-        } else if (type == "response.output_text.delta") {
-            int index = j.value("output_index", 0);
-            StreamEvent ev;
-            ev.type = StreamEventType::ContentTextDelta;
-            ev.index = index;
-            ev.text = j.value("delta", "");
-            if (!emit(ev)) return;
-        } else if (type == "response.refusal.delta") {
-            int index = j.value("output_index", 0);
-            StreamEvent ev;
-            ev.type = StreamEventType::ContentTextDelta;
-            ev.index = index;
-            if (j.contains("delta") && j["delta"].is_string())
-                ev.text = j["delta"].get<std::string>();
-            if (!emit(ev)) return;
-        } else if (type == "response.reasoning_text.delta" ||
-                   type == "response.reasoning_summary_text.delta") {
-            int index = j.value("output_index", 0);
-            StreamEvent ev;
-            ev.type = StreamEventType::ContentThinkingDelta;
-            ev.index = index;
-            ev.text = j.value("delta", "");
-            if (!emit(ev)) return;
-        } else if (type == "response.function_call_arguments.delta") {
-            int index = j.value("output_index", 0);
-            StreamEvent ev;
-            ev.type = StreamEventType::ToolCallArgumentDelta;
-            ev.index = index;
-            ev.arguments = j.value("delta", "");
-            if (!emit(ev)) return;
-        } else if (type == "response.output_item.done") {
-            int index = j.value("output_index", 0);
-            if (j.contains("item") && j["item"].is_object() &&
-                j["item"].value("type", "") == "function_call") {
-                const json &item = j["item"];
-                StreamEvent ev;
-                ev.type = StreamEventType::ToolCallDone;
-                ev.index = index;
-                if (item.contains("arguments") && item["arguments"].is_string())
-                    ev.arguments = item["arguments"].get<std::string>();
-                if (!emit(ev)) return;
-            }
-        } else if (type == "response.completed" || type == "response.incomplete") {
-            if (j.contains("response") && j["response"].is_object()) {
-                const json &r = j["response"];
-                StreamEvent fin;
-                fin.type = StreamEventType::MessageFinish;
-                fin.stop_reason = fmt::responses_status_to_stop(r.value("status", type));
-                if (!emit(fin)) return;
-                if (r.contains("usage") && r["usage"].is_object()) {
-                    StreamEvent u;
-                    u.type = StreamEventType::UsageEvent;
-                    u.usage = fmt::parse_usage_json(r["usage"]);
-                    if (!emit(u)) return;
+            if (kind != "function_call" && kind != "custom_tool_call" && kind != "tool_search_call") {
+                if (context_ && context_->target == ApiFormat::OpenAIResponses) {
+                    StreamEvent ev;
+                    ev.type = StreamEventType::ToolCallStart;
+                    ev.index = j.value("output_index", 0);
+                    ev.output_index = ev.index;
+                    ev.item_id = item.value("id", "");
+                    ev.item.id = ev.item_id;
+                    ev.item.status = item.value("status", "");
+                    ev.item.phase = item.value("phase", "");
+                    ev.item.item_kind = ItemKind::Opaque;
+                    ev.item.extra["raw_item"] = item;
+                    emit(ev);
+                    return;
                 }
+                StreamEvent error;
+                error.type = StreamEventType::ErrorEvent;
+                error.extra["error"] = json{
+                    {"type", "unsupported_feature"},
+                    {"code", "unsupported_item"},
+                    {"message", "Responses output Item type cannot be converted"},
+                    {"item_type", kind}};
+                emit(error);
+                return;
             }
-        } else if (type == "response.failed" || type == "response.error" ||
-                   type == "error") {
-            StreamEvent ev;
-            ev.type = StreamEventType::ErrorEvent;
-            if (j.contains("response") && j["response"].is_object() &&
-                j["response"].contains("error"))
-                ev.extra["error"] = j["response"]["error"];
-            else if (j.contains("error"))
-                ev.extra["error"] = j["error"];
-            else if (type == "error")
-                ev.extra["error"] = j;
-            else
-                ev.extra["error"] = json{{"message", "upstream error"}};
-            if (!emit(ev)) return;
+            StreamEvent ev; ev.type = StreamEventType::ToolCallStart; ev.index = j.value("output_index", 0); ev.output_index = ev.index;
+            ev.text = item.value("call_id", ""); ev.arguments = item.value("name", ""); ev.item_id = item.value("id", "");
+            ev.call_id = ev.text;
+            ev.item.id = ev.item_id; ev.item.call_id = ev.text; ev.item.name = ev.arguments;
+            ev.item.status = item.value("status", "");
+            ev.item.phase = item.value("phase", "");
+            ev.item.namespace_name = item.value("namespace", "");
+            ev.item.execution = item.value("execution", json::object());
+            ev.item.item_kind = kind == "custom_tool_call" ? ItemKind::CustomToolCall : kind == "tool_search_call" ? ItemKind::ToolSearchCall : ItemKind::FunctionCall;
+            ev.item.extra["raw_item"] = item; ev.extra["tool_kind"] = kind;
+            restore_tool_identity(ev, item, kind, false);
+            emit(ev); return;
+        }
+        if (type == "response.output_text.delta" || type == "response.refusal.delta") {
+            StreamEvent ev; ev.type = StreamEventType::ContentTextDelta; ev.index = j.value("output_index", 0); ev.output_index = ev.index; ev.content_index = j.value("content_index", 0);
+            ev.item_id = j.value("item_id", ""); ev.text = j.value("delta", "");
+            if (const auto it = pending_items_.find(ev.output_index); it != pending_items_.end()) {
+                ev.item.id = it->second.value("id", ev.item_id);
+                ev.item.status = it->second.value("status", "");
+                ev.item.phase = it->second.value("phase", "");
+                ev.item.item_kind = ItemKind::Message;
+                ev.item.extra["raw_item"] = it->second;
+            }
+            emit(ev); return;
+        }
+        if (type == "response.reasoning_text.delta" || type == "response.reasoning_summary_text.delta") {
+            StreamEvent ev; ev.type = StreamEventType::ContentThinkingDelta; ev.index = j.value("output_index", 0); ev.output_index = ev.index; ev.summary_index = j.value("summary_index", 0);
+            ev.item_id = j.value("item_id", ""); ev.text = j.value("delta", "");
+            if (const auto it = pending_items_.find(ev.output_index); it != pending_items_.end()) {
+                ev.item.id = it->second.value("id", ev.item_id);
+                ev.item.status = it->second.value("status", "");
+                ev.item.phase = it->second.value("phase", "");
+                ev.item.item_kind = ItemKind::Reasoning;
+                ev.item.extra["raw_item"] = it->second;
+            }
+            emit(ev); return;
+        }
+        if (type == "response.function_call_arguments.delta" || type == "response.custom_tool_call_input.delta") {
+            // A native Responses custom input is a raw string, while Chat and
+            // Anthropic compatibility functions require the {input:string}
+            // envelope.  Hold native custom deltas and emit one valid JSON
+            // fragment when the terminal Item arrives.
+            if (type == "response.custom_tool_call_input.delta" && context_ &&
+                context_->target != ApiFormat::OpenAIResponses)
+                return;
+            StreamEvent ev; ev.type = StreamEventType::ToolCallArgumentDelta; ev.index = j.value("output_index", 0); ev.output_index = ev.index;
+            ev.item_id = j.value("item_id", ""); ev.arguments = j.value("delta", ""); emit(ev); return;
+        }
+        if (type == "response.output_item.done") {
+            if (!j.contains("item") || !j["item"].is_object()) return;
+            const auto &item = j["item"]; const std::string kind = item.value("type", "");
+            if (kind == "message" || kind == "reasoning") {
+                if (context_ && context_->target == ApiFormat::OpenAIResponses) {
+                    StreamEvent ev;
+                    ev.type = StreamEventType::ToolCallDone;
+                    ev.index = j.value("output_index", 0);
+                    ev.output_index = ev.index;
+                    ev.item_id = item.value("id", "");
+                    ev.item.id = ev.item_id;
+                    ev.item.status = item.value("status", "");
+                    ev.item.phase = item.value("phase", "");
+                    ev.item.extra["raw_item"] = item;
+                    ev.item.item_kind = kind == "message"
+                        ? ItemKind::Message : ItemKind::Reasoning;
+                    emit(ev);
+                }
+                return;
+            }
+            if (kind != "function_call" && kind != "custom_tool_call" && kind != "tool_search_call") {
+                if (context_ && context_->target == ApiFormat::OpenAIResponses) {
+                    StreamEvent ev;
+                    ev.type = StreamEventType::ToolCallDone;
+                    ev.index = j.value("output_index", 0);
+                    ev.output_index = ev.index;
+                    ev.item_id = item.value("id", "");
+                    ev.item.id = ev.item_id;
+                    ev.item.status = item.value("status", "");
+                    ev.item.phase = item.value("phase", "");
+                    ev.item.item_kind = ItemKind::Opaque;
+                    ev.item.extra["raw_item"] = item;
+                    emit(ev);
+                    return;
+                }
+                StreamEvent error;
+                error.type = StreamEventType::ErrorEvent;
+                error.extra["error"] = json{
+                    {"type", "unsupported_feature"},
+                    {"code", "unsupported_item"},
+                    {"message", "Responses output Item type cannot be converted"},
+                    {"item_type", kind}};
+                emit(error);
+                return;
+            }
+            StreamEvent ev; ev.type = StreamEventType::ToolCallDone; ev.index = j.value("output_index", 0); ev.output_index = ev.index;
+            ev.item_id = item.value("id", ""); ev.item.id = ev.item_id; ev.item.call_id = item.value("call_id", "");
+            ev.call_id = ev.item.call_id;
+            ev.item.name = item.value("name", ""); ev.item.item_kind = kind == "custom_tool_call" ? ItemKind::CustomToolCall : kind == "tool_search_call" ? ItemKind::ToolSearchCall : ItemKind::FunctionCall;
+            ev.item.status = item.value("status", "");
+            ev.item.phase = item.value("phase", "");
+            ev.item.namespace_name = item.value("namespace", "");
+            ev.item.execution = item.value("execution", json::object());
+            ev.arguments = kind == "custom_tool_call" ? item.value("input", "") : item.value("arguments", "");
+            const std::string payload = ev.arguments;
+            ev.item.payload = payload; ev.item.extra["raw_item"] = item; ev.extra["tool_kind"] = kind;
+            restore_tool_identity(ev, item, kind, true);
+            if (context_ && context_->target != ApiFormat::OpenAIResponses &&
+                kind == "custom_tool_call") {
+                ev.arguments = json{{"input", payload}}.dump();
+                StreamEvent delta;
+                delta.type = StreamEventType::ToolCallArgumentDelta;
+                delta.index = ev.index;
+                delta.output_index = ev.output_index;
+                delta.item_id = ev.item_id;
+                delta.arguments = ev.arguments;
+                emit(delta);
+            } else {
+                ev.arguments = payload;
+            }
+            ev.item.payload = ev.arguments;
+            emit(ev); return;
+        }
+        if (type == "response.completed" || type == "response.incomplete") {
+            if (!j.contains("response") || !j["response"].is_object()) return;
+            const auto &r = j["response"]; StreamEvent fin; fin.type = StreamEventType::MessageFinish;
+            fin.stop_reason = fmt::responses_status_to_stop(r.value("status", type)); emit(fin);
+            if (r.contains("usage") && r["usage"].is_object()) { StreamEvent u; u.type = StreamEventType::UsageEvent; u.usage = fmt::parse_usage_json(r["usage"]); emit(u); }
+            return;
+        }
+        if (type == "response.failed" || type == "response.error" || type == "error") {
+            StreamEvent ev; ev.type = StreamEventType::ErrorEvent;
+            if (j.contains("response") && j["response"].is_object()) ev.extra["error"] = j["response"].value("error", json{{"message", "upstream error"}});
+            else ev.extra["error"] = j.value("error", json{{"message", "upstream error"}});
+            emit(ev);
         }
     }
 };
-
-class ResponsesStreamEmitter : public StreamEmitter {
-public:
-    bool emit(const StreamEvent &ev, const Sink &sink) override {
-        switch (ev.type) {
-            case StreamEventType::MessageStart:
-                id_ = ev.extra.value("id", id_);
-                model_ = ev.extra.value("model", model_);
-                if (!started_) return emit_response_created(sink);
-                return true;
-            case StreamEventType::ContentTextDelta: {
-                if (!started_ && !emit_response_created(sink)) return false;
-                int oi = out_index_for(ev.index, kTextStream);
-                if (!text_started_.count(oi) &&
-                    !emit_text_item_start(sink, oi)) return false;
-                {
-                    json d;
-                    d["type"] = "response.output_text.delta";
-                    d["item_id"] = item_id(oi);
-                    d["output_index"] = oi;
-                    d["content_index"] = 0;
-                    d["delta"] = ev.text;
-                    if (!sink(frame("response.output_text.delta", d))) return false;
-                }
-                text_[oi] += ev.text;
-                return true;
-            }
-            case StreamEventType::ContentThinkingDelta: {
-                if (!started_ && !emit_response_created(sink)) return false;
-                int oi = out_index_for(ev.index, kReasoningStream);
-                if (!text_started_.count(oi) &&
-                    !emit_reasoning_item_start(sink, oi)) return false;
-                {
-                    json d;
-                    d["type"] = "response.reasoning_summary_text.delta";
-                    d["item_id"] = item_id(oi);
-                    d["output_index"] = oi;
-                    d["summary_index"] = 0;
-                    d["delta"] = ev.text;
-                    if (!sink(frame("response.reasoning_summary_text.delta", d))) return false;
-                }
-                reasoning_text_[oi] += ev.text;
-                return true;
-            }
-            case StreamEventType::ToolCallStart:
-                if (!started_ && !emit_response_created(sink)) return false;
-                {
-                    int oi = out_index_for(ev.index, kToolStream);
-                    item_kind_[oi] = 1;
-                    json item;
-                    item["type"] = "function_call";
-                    item["id"] = item_id(oi);
-                    item["call_id"] = ev.text;
-                    item["name"] = ev.arguments;
-                    item["arguments"] = "";
-                    item["status"] = "in_progress";
-                    json d;
-                    d["type"] = "response.output_item.added";
-                    d["output_index"] = oi;
-                    d["item"] = item;
-                    tools_[oi] = {ev.text, ev.arguments, ""};
-                    if (!sink(frame("response.output_item.added", d))) return false;
-                }
-                return true;
-            case StreamEventType::ToolCallArgumentDelta:
-                {
-                    int oi = out_index_for(ev.index, kToolStream);
-                    json d;
-                    d["type"] = "response.function_call_arguments.delta";
-                    d["item_id"] = item_id(oi);
-                    d["output_index"] = oi;
-                    d["delta"] = ev.arguments;
-                    tools_[oi].arguments += ev.arguments;
-                    return sink(frame("response.function_call_arguments.delta", d));
-                }
-            case StreamEventType::ToolCallDone:
-                {
-                    int oi = out_index_for(ev.index, kToolStream);
-                    json item;
-                    item["type"] = "function_call";
-                    item["id"] = item_id(oi);
-                    item["call_id"] = tools_[oi].call_id;
-                    item["name"] = tools_[oi].name;
-                    item["arguments"] = ev.arguments.empty() ? tools_[oi].arguments : ev.arguments;
-                    item["status"] = "completed";
-                    json d;
-                    d["type"] = "response.output_item.done";
-                    d["output_index"] = oi;
-                    d["item"] = item;
-                    tools_[oi].arguments = item["arguments"];
-                    return sink(frame("response.output_item.done", d));
-                }
-            case StreamEventType::MessageFinish:
-                if (!close_open_items(sink)) return false;
-                deferred_status_ = fmt::stop_reason_to_responses(ev.stop_reason);
-                return true;  // response.completed deferred until usage or finish
-            case StreamEventType::UsageEvent:
-                last_usage_ = ev.usage;
-                if (!deferred_status_.empty() && !completed_emitted_)
-                    return emit_completed(sink);
-                return true;
-            case StreamEventType::ErrorEvent: {
-                finished_ = true;
-                json err = ev.extra.contains("error") ? ev.extra["error"]
-                                                      : json{{"message", ev.extra.value("message", "upstream error")}};
-                json r;
-                r["id"] = id_;
-                r["object"] = "response";
-                r["status"] = "failed";
-                r["error"] = err;
-                return sink(frame("response.failed", json{{"type", "response.failed"}, {"response", r}}));
-            }
-        }
-        return true;
-    }
-
-    bool finish(const Sink &sink) override {
-        if (!started_) return true;
-        if (!finished_ && !completed_emitted_)
-            return emit_completed(sink);
-        return true;
-    }
-
-private:
-    struct ToolItem {
-        std::string call_id, name, arguments;
-    };
-    std::string id_ = "resp-proxy", model_ = "unknown";
-    bool started_ = false;
-    bool finished_ = false;
-    bool completed_emitted_ = false;
-    std::string deferred_status_ = "completed";
-    Usage last_usage_;
-    std::map<int, std::string> text_;
-    std::map<int, std::string> reasoning_text_;
-    std::map<int, ToolItem> tools_;
-    std::map<int, int> item_kind_;               // 0=message, 1=tool, 2=reasoning
-    std::map<std::pair<int, int>, int> out_index_;
-    std::set<int> text_started_;                 // output_index already started
-    std::set<int> text_finished_;
-    int next_output_index_ = 0;
-    enum { kReasoningStream = 0, kTextStream = 1, kToolStream = 2 };
-
-    std::string item_id(int index) {
-        return "item_" + std::to_string(index);
-    }
-
-    static std::string frame(const std::string &event, const json &payload) {
-        return "event: " + event + "\ndata: " + payload.dump() + "\n\n";
-    }
-
-    int out_index_for(int ir_index, int stream_kind) {
-        auto key = std::make_pair(stream_kind, ir_index);
-        auto it = out_index_.find(key);
-        if (it != out_index_.end()) return it->second;
-        int oi = next_output_index_++;
-        out_index_[key] = oi;
-        return oi;
-    }
-
-    bool emit_response_created(const Sink &sink) {
-        started_ = true;
-        json r;
-        r["id"] = id_;
-        r["object"] = "response";
-        r["status"] = "in_progress";
-        r["model"] = model_;
-        r["output"] = json::array();
-        r["usage"] = nullptr;
-        const json created{{"type", "response.created"}, {"response", r}};
-        if (!sink(frame("response.created", created))) return false;
-        json progress{{"type", "response.in_progress"}, {"response", r}};
-        return sink(frame("response.in_progress", progress));
-    }
-
-    bool emit_text_item_start(const Sink &sink, int index) {
-        text_started_.insert(index);
-        item_kind_[index] = 0;
-        json item;
-        item["id"] = item_id(index);
-        item["type"] = "message";
-        item["role"] = "assistant";
-        item["status"] = "in_progress";
-        item["content"] = json::array();
-        json d;
-        d["type"] = "response.output_item.added";
-        d["output_index"] = index;
-        d["item"] = item;
-        if (!sink(frame("response.output_item.added", d))) return false;
-        json part;
-        part["type"] = "output_text";
-        part["text"] = "";
-        part["annotations"] = json::array();
-        json p;
-        p["type"] = "response.content_part.added";
-        p["item_id"] = item_id(index);
-        p["output_index"] = index;
-        p["content_index"] = 0;
-        p["part"] = part;
-        return sink(frame("response.content_part.added", p));
-    }
-
-    bool emit_reasoning_item_start(const Sink &sink, int index) {
-        text_started_.insert(index);
-        item_kind_[index] = 2;
-        json item;
-        item["id"] = item_id(index);
-        item["type"] = "reasoning";
-        item["summary"] = json::array();
-        json d;
-        d["type"] = "response.output_item.added";
-        d["output_index"] = index;
-        d["item"] = item;
-        if (!sink(frame("response.output_item.added", d))) return false;
-        json part{{"type", "summary_text"}, {"text", ""}};
-        json p{{"type", "response.reasoning_summary_part.added"},
-               {"item_id", item_id(index)}, {"output_index", index},
-               {"summary_index", 0}, {"part", part}};
-        return sink(frame("response.reasoning_summary_part.added", p));
-    }
-
-    bool close_open_items(const Sink &sink) {
-        for (const auto &entry : out_index_) {
-            const int oi = entry.second;
-            if (text_finished_.count(oi)) continue;
-            const int kind = item_kind_.count(oi) ? item_kind_[oi] : 0;
-            if (kind == 1) {
-                text_finished_.insert(oi);
-                continue;
-            }
-            if (kind == 0) {
-                json done{{"type", "response.output_text.done"},
-                          {"item_id", item_id(oi)}, {"output_index", oi},
-                          {"content_index", 0}, {"text", text_[oi]}};
-                if (!sink(frame("response.output_text.done", done))) return false;
-                json part{{"type", "output_text"}, {"text", text_[oi]},
-                          {"annotations", json::array()}};
-                json part_done{{"type", "response.content_part.done"},
-                               {"item_id", item_id(oi)}, {"output_index", oi},
-                               {"content_index", 0}, {"part", part}};
-                if (!sink(frame("response.content_part.done", part_done))) return false;
-            } else if (kind == 2) {
-                json done{{"type", "response.reasoning_summary_text.done"},
-                           {"item_id", item_id(oi)}, {"output_index", oi},
-                           {"summary_index", 0}, {"text", reasoning_text_[oi]}};
-                if (!sink(frame("response.reasoning_summary_text.done", done))) return false;
-                json part{{"type", "summary_text"}, {"text", reasoning_text_[oi]}};
-                json part_done{{"type", "response.reasoning_summary_part.done"},
-                               {"item_id", item_id(oi)}, {"output_index", oi},
-                               {"summary_index", 0}, {"part", part}};
-                if (!sink(frame("response.reasoning_summary_part.done", part_done))) return false;
-            }
-            json item;
-            item["id"] = item_id(oi);
-            item["type"] = kind == 2 ? "reasoning" : "message";
-            item["status"] = "completed";
-            if (kind == 2) {
-                item["summary"] = json::array({json{{"type", "summary_text"},
-                                                       {"text", reasoning_text_[oi]}}});
-            } else {
-                item["role"] = "assistant";
-                item["content"] = json::array({json{{"type", "output_text"},
-                                                       {"text", text_[oi]},
-                                                       {"annotations", json::array()}}});
-            }
-            json item_done{{"type", "response.output_item.done"},
-                           {"output_index", oi}, {"item", item}};
-            if (!sink(frame("response.output_item.done", item_done))) return false;
-            text_finished_.insert(oi);
-        }
-        return true;
-    }
-
-    json build_output() {
-        json output = json::array();
-        std::set<int> idxs;
-        for (auto &kv : out_index_) idxs.insert(kv.second);
-        for (int idx : idxs) {
-            int kind = item_kind_.count(idx) ? item_kind_[idx] : 0;
-            if (kind == 1) {
-                json item;
-                item["id"] = item_id(idx);
-                item["type"] = "function_call";
-                item["call_id"] = tools_[idx].call_id;
-                item["name"] = tools_[idx].name;
-                item["arguments"] = tools_[idx].arguments;
-                item["status"] = "completed";
-                output.push_back(std::move(item));
-            } else if (kind == 2) {
-                json item;
-                item["id"] = item_id(idx);
-                item["type"] = "reasoning";
-                json summ;
-                summ["type"] = "summary_text";
-                summ["text"] = reasoning_text_[idx];
-                item["summary"] = json::array({std::move(summ)});
-                output.push_back(std::move(item));
-            } else {
-                json item;
-                item["id"] = item_id(idx);
-                item["type"] = "message";
-                item["status"] = "completed";
-                item["role"] = "assistant";
-                json part;
-                part["type"] = "output_text";
-                part["text"] = text_[idx];
-                part["annotations"] = json::array();
-                item["content"] = json::array({part});
-                output.push_back(std::move(item));
-            }
-        }
-        return output;
-    }
-
-    bool emit_completed(const Sink &sink) {
-        completed_emitted_ = true;
-        json r;
-        r["id"] = id_;
-        r["object"] = "response";
-        r["status"] = deferred_status_;
-        r["model"] = model_;
-        r["output"] = build_output();
-        json usage;
-        usage["input_tokens"] = last_usage_.prompt_tokens;
-        usage["output_tokens"] = last_usage_.completion_tokens;
-        usage["total_tokens"] = last_usage_.total_tokens;
-        r["usage"] = usage;
-        const std::string event = deferred_status_ == "incomplete"
-            ? "response.incomplete" : "response.completed";
-        r["error"] = nullptr;
-        r["incomplete_details"] = nullptr;
-        return sink(frame(event, json{{"type", event}, {"response", r}}));
-    }
-};
-
-}  // namespace
-
-std::unique_ptr<ir::StreamParser> make_responses_stream_parser_impl() {
-    return std::make_unique<ResponsesStreamParser>();
 }
 
-std::unique_ptr<ir::StreamEmitter> make_responses_stream_emitter_impl() {
-    return std::make_unique<ResponsesStreamEmitter>();
-}
+std::unique_ptr<ir::StreamParser> make_responses_stream_parser_impl(const ir::ConversionContext *ctx) { return std::make_unique<ResponsesStreamParser>(ctx); }
+std::unique_ptr<ir::StreamEmitter> make_responses_stream_emitter_impl(const ir::ConversionContext *ctx) { return std::make_unique<ResponsesStreamEmitter>(ctx); }

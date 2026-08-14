@@ -24,6 +24,16 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             "application/json");
         return;
     }
+    if (context.client_format == ir::ApiFormat::OpenAIResponses &&
+        !expand_responses_state(*this, codecs_, context, parse_error)) {
+        res.status = 400;
+        res.set_content(codecs_.get(context.client_format).serialize_error_body(
+            json{{"message", parse_error}, {"type", "invalid_request_error"},
+                 {"code", "previous_response_not_found"},
+                 {"param", "previous_response_id"}}).dump(),
+            "application/json");
+        return;
+    }
 
     // Aggregate accounts need the request model to pick the real upstream
     // account, so resolution happens here — before the passthrough/converted
@@ -38,27 +48,69 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         return;
     }
     const ir::ApiFormat harness = context.client_format;
-    const bool conversion_needed = std::any_of(
+    bool conversion_needed = std::any_of(
         cands.begin(), cands.end(), [harness](const UpstreamCandidate &candidate) {
             return ir::parse_api_format(candidate.account().api_format) != harness;
         });
-    if (conversion_needed && !ensure_request_ir(codecs_, context, parse_error)) {
+    if (!ensure_request_ir(codecs_, context, parse_error)) {
         res.status = 400;
         res.set_content(codecs_.get(harness).serialize_error_body(
             json{{"message", parse_error}, {"type", "parse_error"}}).dump(),
             "application/json");
         return;
     }
-    if (conversion_needed) {
+    conversion_needed = conversion_needed || context.state_expanded;
+    ir::ConversionContext request_conversion;
+    request_conversion.source = harness;
+    request_conversion.target = harness;
+    std::string tool_error;
+    if (!fmt::build_tool_context(context.parsed_ir.tools,
+                                 request_conversion.tools, tool_error)) {
+        res.status = 422;
+        res.set_content(codecs_.get(harness).serialize_error_body(
+            json{{"message", tool_error}, {"type", "unsupported_feature"},
+                 {"code", "tool_name_collision"}}).dump(),
+            "application/json");
+        return;
+    }
+    if (harness == ir::ApiFormat::OpenAIResponses &&
+        responses_request_needs_tool_adapter(context.parsed_ir))
+        conversion_needed = true;
+    if (harness == ir::ApiFormat::OpenAIResponses && conversion_needed)
+        request_conversion.generated_response_id = fmt::generate_response_id();
+    {
         const auto requirements = fmt::request_media_requirements(context.parsed_ir);
         std::vector<UpstreamCandidate> compatible;
         compatible.reserve(cands.size());
         std::string incompatibility;
+        bool feature_failure = false;
+        json unsupported_details = json::array();
         for (const auto &candidate : cands) {
             const auto target = ir::parse_api_format(candidate.account().api_format);
-            if (target == harness || fmt::target_supports_media(
-                    target, requirements, incompatibility))
+            const auto feature_failures = request_feature_failures(
+                target, harness, context.parsed_ir);
+            const bool feature_ok = feature_failures.empty();
+            std::string media_reason;
+            const bool media_ok = fmt::target_supports_media(
+                target, requirements, media_reason);
+            if (feature_ok && media_ok)
                 compatible.push_back(candidate);
+            else {
+                for (const auto &failure : feature_failures)
+                    unsupported_details.push_back(json{
+                        {"feature", failure.feature},
+                        {"target", ir::to_string(target)},
+                        {"reason", failure.reason}});
+                if (!media_ok && !media_reason.empty())
+                    unsupported_details.push_back(json{
+                        {"feature", "media"}, {"target", ir::to_string(target)},
+                        {"reason", media_reason}});
+                if (!feature_ok) {
+                    if (!feature_failure && incompatibility.empty())
+                        incompatibility = feature_failures.front().reason;
+                    feature_failure = true;
+                } else if (incompatibility.empty()) incompatibility = media_reason;
+            }
         }
         if (compatible.empty()) {
             res.status = 422;
@@ -66,7 +118,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 json{{"message", incompatibility.empty()
                                       ? "No configured upstream supports the request media"
                                       : incompatibility},
-                     {"type", "unsupported_media"}}).dump(),
+                     {"type", "unsupported_feature"},
+                     {"code", "unsupported_feature"},
+                     {"details", unsupported_details}}).dump(),
                 "application/json");
             return;
         }
@@ -87,6 +141,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         auto candidate_bodies = candidate_request_bodies(
             context.raw_body, context.parsed_json, context.model, cands, harness);
         std::shared_ptr<const json> parsed_json;
+        if (harness == ir::ApiFormat::OpenAIResponses)
+            parsed_json = std::make_shared<const json>(context.parsed_json);
         for (const auto &candidate : cands) {
             if (ir::parse_api_format(candidate.account().api_format) == harness &&
                 candidate.upstream_model() != context.model) {
@@ -110,12 +166,19 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         // handler's scope guard would release capacity before the stream can
         // enqueue its final UsageEvent.
         auto reservation = detach_accounting_reservation();
+        auto conversion_context = std::make_shared<const ir::ConversionContext>(
+            request_conversion);
         const std::string &session_id = context.session_id;
         const auto scope = affinity_scope(ar.route.local_key_id, harness);
         size_t start = affinity_start(affinity_, scope, session_id, cands);
         handle_streaming(cands, candidate_bodies, start, session_id,
                          ar.route.local_key_id, harness, model,
                          std::move(parsed_json), std::move(parsed_request),
+                         std::move(conversion_context),
+                         context.state_expanded
+                             ? std::make_shared<const std::vector<json>>(
+                                   context.state_current_input)
+                             : nullptr,
                          reservation, req, res, t0);
         return;
     }
@@ -143,6 +206,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     ir::ApiFormat used_upstream_fmt = harness;
     const FormatCodec *upstream_codec = nullptr;
     std::optional<ir::ChatResponse> converted_response;
+    const bool responses_item_adapter =
+        harness == ir::ApiFormat::OpenAIResponses &&
+        responses_request_needs_tool_adapter(context.parsed_ir);
 
     // Session-affinity spillover: start at the session's preferred candidate
     // and wrap around in fixed order (P, P+1, …, n-1, 0, …, P-1).
@@ -179,12 +245,26 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 c.upstream_model().c_str(), concurrent_count);
 
         UpstreamClient::ForwardResult result;
-        if (harness == upstream) {
-            result = forward_endpoint_attempt(
-                upstream_, chat_endpoint_policy(harness), c,
-                body_cache.for_candidate(c), content_type,
-                attempt.remaining_budget_ms, attempt_timeouts,
-                req.client_socket);
+        if (harness == upstream && !responses_item_adapter) {
+            if (harness == ir::ApiFormat::OpenAIResponses && conversion_needed) {
+                cReq = context.parsed_ir;
+                cReq.model = c.upstream_model();
+                cReq.tools = request_conversion.tools.target_tools;
+                auto same_context = request_conversion;
+                same_context.target = upstream;
+                const std::string body = codecs_.get(upstream).serialize_request(
+                    cReq, &same_context).dump();
+                result = forward_endpoint_attempt(
+                    upstream_, chat_endpoint_policy(harness), c, body,
+                    "application/json", attempt.remaining_budget_ms,
+                    attempt_timeouts, req.client_socket);
+            } else {
+                result = forward_endpoint_attempt(
+                    upstream_, chat_endpoint_policy(harness), c,
+                    body_cache.for_candidate(c), content_type,
+                    attempt.remaining_budget_ms, attempt_timeouts,
+                    req.client_socket);
+            }
             think_filter = (upstream == ir::ApiFormat::OpenAI);
             converted_response.reset();
         } else {
@@ -195,10 +275,14 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             }
             cReq = context.parsed_ir;
             cReq.model = c.upstream_model();
+            cReq.tools = request_conversion.tools.target_tools;
             upstream_codec = &codecs_.get(upstream);
             const std::string &body = body_cache.for_transformed(
                 ir::to_string(upstream), c.upstream_model(), [&] {
-                    return upstream_codec->serialize_request(cReq).dump();
+                    auto request_context = request_conversion;
+                    request_context.target = upstream;
+                    return upstream_codec->serialize_request(
+                        cReq, &request_context).dump();
                 });
             result = forward_endpoint_attempt(
                 upstream_, chat_endpoint_policy(harness), c, body,
@@ -206,19 +290,39 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 attempt_timeouts, req.client_socket);
             think_filter = false;
             converted_response.reset();
+            upstream_codec = &codecs_.get(upstream);
         }
         used_upstream_fmt = upstream;
 
         // A 2xx body in the wrong protocol is a failed candidate, not a
         // successful response that can be forwarded verbatim to the harness.
-        if (harness != upstream && result.success &&
+        if ((harness != upstream || responses_item_adapter) && result.success &&
             result.status_code >= 200 && result.status_code < 300) {
             ir::ChatResponse parsed;
             bool parsed_ok = false;
             perr.clear();
             try {
+                auto response_context = request_conversion;
+                response_context.target = upstream;
                 parsed_ok = upstream_codec->parse_response(json::parse(result.body),
-                                                            parsed, perr);
+                                                            parsed, perr,
+                                                            &response_context);
+                if (parsed_ok && harness != ir::ApiFormat::OpenAIResponses) {
+                    for (const auto &item : parsed.output_items) {
+                        if (item.item_kind == ir::ItemKind::Opaque) {
+                            parsed_ok = false;
+                            perr = "upstream output Item cannot be represented by " +
+                                   ir::to_string(harness);
+                            break;
+                        }
+                        if (parsed_ok && has_raw_content(item.content)) {
+                            parsed_ok = false;
+                            perr = "upstream output content block cannot be represented by " +
+                                   ir::to_string(harness);
+                            break;
+                        }
+                    }
+                }
             } catch (const std::exception &e) {
                 perr = e.what();
             } catch (...) {
@@ -284,7 +388,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
     // ── Non-streaming response handling (passthrough vs converted) ──
-    if (used_upstream_fmt == harness) {
+    const bool response_converted = used_upstream_fmt != harness ||
+        (harness == ir::ApiFormat::OpenAIResponses && responses_item_adapter);
+    if (!response_converted) {
         if (fwd.success) {
             auto usage = parse_usage_for_format(ir::to_string(used_upstream_fmt),
                                                 fwd.body);
@@ -311,6 +417,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             else
                 res.set_content(fwd.body, "application/json");
             res.status = fwd.status_code;
+            if (harness == ir::ApiFormat::OpenAIResponses)
+                record_responses_state(
+                    *this, context.parsed_json, fwd.body,
+                    context.state_expanded ? &context.state_current_input : nullptr);
         } else {
             // Upstream error / timeout: record the failed attempt (zero
             // tokens, truthful status — 504 on timeout, else upstream code).
@@ -329,17 +439,26 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     } else {
         if (fwd.success && fwd.status_code >= 200 && fwd.status_code < 300) {
             if (converted_response.has_value()) {
-                const auto &cResp = *converted_response;
+                auto &cResp = *converted_response;
+                if (harness == ir::ApiFormat::OpenAIResponses &&
+                    used_upstream_fmt != ir::ApiFormat::OpenAIResponses)
+                    cResp.id = request_conversion.generated_response_id.empty()
+                        ? fmt::generate_response_id()
+                        : request_conversion.generated_response_id;
                 auto usage_info = usage_from_ir(cResp.usage, used_upstream_fmt);
                 usage_info.model = model;
                 enqueue_log(used->account().id, ar.route.local_key_id,
                                      usage_info, false,
                                      fwd.status_code, fwd.duration_ms, used->key_slot_id,
                                      -1, -1, -1.0, -1, -1, attempts_made, attempts);
-                std::string outgoing_body = harness_codec.serialize_response(cResp).dump();
+                auto response_context = request_conversion;
+                response_context.target = harness;
+                std::string outgoing_body = harness_codec.serialize_response(
+                    cResp, &response_context).dump();
                 if (harness == ir::ApiFormat::OpenAIResponses)
-                    affinity_.bind(scope, response_id_from_body(outgoing_body),
-                                   used->key_slot_id);
+                    record_responses_state(
+                        *this, context.parsed_json, outgoing_body,
+                        context.state_expanded ? &context.state_current_input : nullptr);
                 res.status = fwd.status_code;
                 res.set_content(std::move(outgoing_body), "application/json");
             } else {
@@ -374,8 +493,6 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
 
     if (fwd.success && fwd.status_code >= 200 && fwd.status_code < 300) {
         affinity_.bind(scope, session_id, used->key_slot_id);
-        if (harness == ir::ApiFormat::OpenAIResponses)
-            affinity_.bind(scope, response_id_from_body(fwd.body), used->key_slot_id);
     }
 }
 

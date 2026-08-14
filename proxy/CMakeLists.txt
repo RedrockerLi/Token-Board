@@ -24,8 +24,11 @@ set(FORMAT_SOURCES
     src/format/format_anthropic_helpers.cpp src/format/format_anthropic_request.cpp
     src/format/format_anthropic_response.cpp src/format/format_anthropic_stream.cpp
     src/format/format_responses.cpp src/format/format_responses_helpers.cpp
-    src/format/format_responses_request.cpp src/format/format_responses_response.cpp
-    src/format/format_responses_stream.cpp src/format/format_media.cpp
+    src/format/format_responses_request.cpp src/format/format_responses_request_items.cpp
+    src/format/format_responses_response.cpp
+    src/format/format_responses_stream.cpp src/format/format_responses_emitter.cpp
+    src/format/format_media.cpp
+    src/format/reasoning_bridge.cpp
     src/format/think_filter.cpp)
 
 set(NET_SOURCES
@@ -49,6 +52,8 @@ set(RUNTIME_SOURCES
     src/core/proxy_accounting.cpp
     src/core/proxy_routing_runtime.cpp
     src/core/proxy_chat.cpp
+    src/core/responses_state_store.cpp
+    src/core/responses_state_helpers.cpp
     src/core/stream_pipeline.cpp
     src/core/proxy_models.cpp
     src/core/proxy_embeddings.cpp
@@ -81,7 +86,7 @@ foreach(target token_proxy_format token_proxy_net token_proxy_store token_proxy_
 endforeach()
 target_include_directories(token_proxy PRIVATE ${PROXY_INCLUDE_DIRS})
 
-target_link_libraries(token_proxy_format PRIVATE Threads::Threads)
+target_link_libraries(token_proxy_format PRIVATE OpenSSL::Crypto Threads::Threads)
 target_link_libraries(token_proxy_net PRIVATE
     OpenSSL::SSL
     OpenSSL::Crypto

@@ -1,9 +1,10 @@
 #include "format_anthropic_internal.h"
 
-std::unique_ptr<ir::StreamParser> AnthropicCodec::make_stream_parser() const {
-    return make_anthropic_stream_parser_impl();
+std::unique_ptr<ir::StreamParser> AnthropicCodec::make_stream_parser(
+    const ir::ConversionContext *context) const {
+    return make_anthropic_stream_parser_impl(context);
 }
-std::unique_ptr<ir::StreamEmitter> AnthropicCodec::make_stream_emitter() const {
+std::unique_ptr<ir::StreamEmitter> AnthropicCodec::make_stream_emitter(const ir::ConversionContext *) const {
     return make_anthropic_stream_emitter_impl();
 }
 

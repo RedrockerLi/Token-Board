@@ -1,4 +1,5 @@
 #include "format_anthropic_internal.h"
+#include "reasoning_bridge.h"
 
 using namespace ir;
 
@@ -6,6 +7,9 @@ namespace {
 
 class AnthropicStreamParser : public StreamParser {
 public:
+    explicit AnthropicStreamParser(const ConversionContext *context)
+        : context_(context) {}
+
     bool feed(const char *data, size_t len, const EmitFn &emit) override {
         bool ok = true;
         auto guard = [&](const StreamEvent &ev) -> bool {
@@ -56,10 +60,20 @@ public:
 
 private:
     fmt::SseFrameBuffer sse_;
+    const ConversionContext *context_ = nullptr;
     std::map<int, std::string> tool_args_;
     std::map<int, bool> open_tool_;
+    std::map<int, bool> thinking_blocks_;
+    std::map<int, std::string> thinking_signatures_, redacted_data_;
     Usage usage_;
     bool failed_ = false;
+
+    const ToolMapping *mapping_for(const std::string &name) const {
+        if (!context_) return nullptr;
+        for (const auto &mapping : context_->tools.mappings)
+            if (mapping.flat_name == name) return &mapping;
+        return nullptr;
+    }
 
     void emit_failure(const EmitFn &emit, const std::string &message) {
         if (failed_) return;
@@ -120,7 +134,27 @@ private:
                     ev.index = index;
                     ev.text = cb.value("id", "");
                     ev.arguments = cb.value("name", "");
+                    if (const auto *mapping = mapping_for(ev.arguments)) {
+                        ev.namespace_name = mapping->namespace_name;
+                        ev.item.name = mapping->original_name;
+                        ev.item.namespace_name = mapping->namespace_name;
+                        ev.item.item_kind = mapping->kind == ToolKind::Custom
+                            ? ItemKind::CustomToolCall
+                            : mapping->kind == ToolKind::ToolSearch
+                                ? ItemKind::ToolSearchCall
+                                : ItemKind::FunctionCall;
+                        ev.extra["tool_kind"] = mapping->kind == ToolKind::Custom
+                            ? "custom_tool_call"
+                            : mapping->kind == ToolKind::ToolSearch
+                                ? "tool_search_call" : "function_call";
+                    }
                     if (!emit(ev)) return;
+                } else if (ctype == "thinking" || ctype == "redacted_thinking") {
+                    thinking_blocks_[index] = true;
+                    if (cb.contains("signature") && cb["signature"].is_string())
+                        thinking_signatures_[index] = cb["signature"];
+                    if (cb.contains("data") && cb["data"].is_string())
+                        redacted_data_[index] = cb["data"];
                 }
             }
         } else if (type == "content_block_delta") {
@@ -156,6 +190,16 @@ private:
                     ev.index = index;
                     ev.arguments = frag;
                     if (!emit(ev)) return;
+                } else if (dtype == "signature_delta" &&
+                           d.contains("signature") && d["signature"].is_string()) {
+                    thinking_signatures_[index] = d["signature"];
+                    if (context_ && context_->target == ApiFormat::OpenAIResponses) {
+                        StreamEvent ev;
+                        ev.type = StreamEventType::ContentThinkingDelta;
+                        ev.index = index;
+                        ev.extra["reasoning_signature"] = d["signature"];
+                        if (!emit(ev)) return;
+                    }
                 }
             }
         } else if (type == "content_block_stop") {
@@ -168,6 +212,18 @@ private:
                 ev.arguments = tool_args_.count(index) ? tool_args_[index] : std::string();
                 tool_args_.erase(index);
                 if (!emit(ev)) return;
+            } else if (thinking_blocks_.count(index)) {
+                if (context_ && context_->target == ApiFormat::OpenAIResponses) {
+                    StreamEvent ev;
+                    ev.type = StreamEventType::ContentThinkingDelta;
+                    ev.index = index;
+                    if (thinking_signatures_.count(index))
+                        ev.extra["reasoning_signature"] = thinking_signatures_[index];
+                    if (redacted_data_.count(index))
+                        ev.extra["reasoning_redacted_data"] = redacted_data_[index];
+                    if (!emit(ev)) return;
+                }
+                thinking_blocks_.erase(index);
             }
         } else if (type == "message_delta") {
             if (j.contains("delta") && j["delta"].is_object()) {
@@ -217,15 +273,27 @@ public:
                     {"type", "content_block_delta"},
                     {"index", open_blocks_[ev.index].anthro_index},
                     {"delta", {{"type", "text_delta"}, {"text", ev.text}}}}));
-            case StreamEventType::ContentThinkingDelta:
-                if (ev.text.empty()) return true;  // suppress spurious empty fragments
+            case StreamEventType::ContentThinkingDelta: {
+                const bool has_raw_reasoning = ev.item.extra.contains("raw_item") &&
+                    ev.item.extra["raw_item"].is_object();
+                if (ev.text.empty() && !has_raw_reasoning) return true;
                 if (!started_ && !emit_message_start(sink)) return false;
+                json thinking_block{{"type", "thinking"}, {"thinking", ""}};
+                if (ev.item.extra.contains("raw_item") &&
+                    ev.item.extra["raw_item"].is_object()) {
+                    thinking_block = fmt::anthropic_block_from_responses_reasoning(
+                        ev.item.extra["raw_item"]);
+                    if (thinking_block.value("type", "") == "thinking")
+                        thinking_block["thinking"] = "";
+                }
                 if (!open_block(sink, ev.index, ContentKind::Thinking,
-                                json{{"type", "thinking"}, {"thinking", ""}})) return false;
+                                thinking_block)) return false;
+                if (ev.text.empty()) return true;
                 return sink(frame("content_block_delta", json{
                     {"type", "content_block_delta"},
                     {"index", open_blocks_[ev.index].anthro_index},
                     {"delta", {{"type", "thinking_delta"}, {"thinking", ev.text}}}}));
+            }
             case StreamEventType::ToolCallStart: {
                 if (!started_ && !emit_message_start(sink)) return false;
                 if (open_blocks_.count(ev.index) &&
@@ -402,8 +470,9 @@ private:
 
 }  // namespace
 
-std::unique_ptr<ir::StreamParser> make_anthropic_stream_parser_impl() {
-    return std::make_unique<AnthropicStreamParser>();
+std::unique_ptr<ir::StreamParser> make_anthropic_stream_parser_impl(
+    const ConversionContext *context) {
+    return std::make_unique<AnthropicStreamParser>(context);
 }
 
 std::unique_ptr<ir::StreamEmitter> make_anthropic_stream_emitter_impl() {

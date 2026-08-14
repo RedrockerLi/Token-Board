@@ -82,7 +82,23 @@ bool strict_terminal_enabled();
 size_t affinity_start(SessionAffinity &affinity, const std::string &scope,
                       const std::string &session_id,
                       const std::vector<UpstreamCandidate> &candidates);
-std::string response_id_from_body(const std::string &body);
+void record_responses_state(ProxyServer &server, const json &request_body,
+                            const std::string &response_body,
+                            const std::vector<json> *current_input = nullptr);
+bool expand_responses_state(ProxyServer &server, CodecRegistry &codecs,
+                            RequestContext &context, std::string &error);
+bool target_supports_request(ir::ApiFormat target, ir::ApiFormat harness,
+                             const ir::ChatRequest &request,
+                             std::string &reason);
+struct RequestFeatureFailure {
+    std::string feature;
+    std::string reason;
+};
+bool has_raw_content(const std::vector<ir::ContentBlock> &blocks);
+std::vector<RequestFeatureFailure> request_feature_failures(
+    ir::ApiFormat target, ir::ApiFormat harness,
+    const ir::ChatRequest &request);
+bool responses_request_needs_tool_adapter(const ir::ChatRequest &request);
 std::string json_error(const std::string &message, int code);
 int stream_error_status(const json &error);
 std::string stream_error_message(const json &error);

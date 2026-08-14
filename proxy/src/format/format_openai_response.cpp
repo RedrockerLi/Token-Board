@@ -3,7 +3,8 @@
 using namespace ir;
 
 bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
-                                 std::string &err) const {
+                                 std::string &err,
+                                 const ir::ConversionContext *context) const {
     if (!in.is_object()) {
         err = "OpenAI response must be a JSON object";
         return false;
@@ -49,11 +50,30 @@ bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
                     }
                 }
             }
+            AgentItem message_item;
+            message_item.item_kind = ItemKind::Message;
+            message_item.role = "assistant";
+            message_item.group_id = 1;
+            if (msg.contains("content")) {
+                const json &c = msg["content"];
+                if (c.is_string()) {
+                    ContentBlock b; b.kind = ContentKind::Text; b.text = c.get<std::string>();
+                    message_item.content.push_back(std::move(b));
+                } else if (c.is_array()) {
+                    fmt::parse_media_content(c, message_item.content, false);
+                }
+            }
             if (msg.contains("reasoning_content") && msg["reasoning_content"].is_string()) {
                 ContentBlock b;
                 b.kind = ContentKind::Thinking;
                 b.text = msg["reasoning_content"].get<std::string>();
                 out.content.push_back(std::move(b));
+                AgentItem reasoning; reasoning.item_kind = ItemKind::Reasoning;
+                reasoning.role = "assistant"; reasoning.group_id = 1;
+                ContentBlock rb; rb.kind = ContentKind::Thinking;
+                rb.text = msg["reasoning_content"].get<std::string>();
+                reasoning.content.push_back(std::move(rb));
+                out.output_items.push_back(std::move(reasoning));
             }
             if (msg.contains("reasoning") && msg["reasoning"].is_object() &&
                 msg["reasoning"].contains("content") && msg["reasoning"]["content"].is_string()) {
@@ -62,6 +82,7 @@ bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
                 b.text = msg["reasoning"]["content"].get<std::string>();
                 out.content.push_back(std::move(b));
             }
+            if (!message_item.content.empty()) out.output_items.push_back(std::move(message_item));
             if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
                 for (const auto &tc : msg["tool_calls"]) {
                     if (!tc.is_object()) continue;
@@ -74,18 +95,73 @@ bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
                         if (fn.contains("name") && fn["name"].is_string())
                             b.tool_name = fn["name"].get<std::string>();
                         if (fn.contains("arguments")) {
-                            std::string args =
-                                fn["arguments"].is_string()
-                                    ? fn["arguments"].get<std::string>()
-                                    : fn["arguments"].dump();
-                            try {
-                                b.tool_input = json::parse(args);
-                            } catch (...) {
-                                b.tool_input = json::object();
+                            if (!fn["arguments"].is_string()) {
+                                err = "upstream tool call arguments must be a JSON string";
+                                return false;
                             }
+                            std::string args = fn["arguments"].get<std::string>();
+                            b.extra["raw_arguments"] = args;
+                            try { b.tool_input = json::parse(args); }
+                            catch (...) { err = "invalid JSON in upstream tool call arguments"; return false; }
+                        }
+                    }
+                    if (context) {
+                        for (const auto &mapping : context->tools.mappings) {
+                            if (mapping.flat_name != b.tool_name) continue;
+                            b.tool_name = mapping.original_name;
+                            if (mapping.kind == ToolKind::Custom) {
+                                b.extra["type"] = "custom";
+                                b.tool_input = json{{"input", b.tool_input.is_object()
+                                    ? b.tool_input.value("input", "") : ""}};
+                            } else if (mapping.kind == ToolKind::ToolSearch) {
+                                if (!b.tool_input.is_object()) {
+                                    err = "upstream tool_search arguments must be an object";
+                                    return false;
+                                }
+                                b.tool_name = "tool_search";
+                            }
+                            break;
                         }
                     }
                     out.content.push_back(std::move(b));
+                    AgentItem call;
+                    call.item_kind = ItemKind::FunctionCall;
+                    call.role = "assistant"; call.group_id = 1;
+                    call.call_id = tc.value("id", "");
+                    const json fn_copy = tc.value("function", json::object());
+                    call.name = fn_copy.value("name", "");
+                    if (fn_copy.contains("arguments") &&
+                        !fn_copy["arguments"].is_string()) {
+                        err = "upstream tool call arguments must be a JSON string";
+                        return false;
+                    }
+                    call.payload = fn_copy.value("arguments", "");
+                    if (context) {
+                        for (const auto &mapping : context->tools.mappings) {
+                            if (mapping.flat_name != call.name) continue;
+                            call.name = mapping.original_name;
+                            call.namespace_name = mapping.namespace_name;
+                            if (mapping.kind == ToolKind::Custom) {
+                                call.item_kind = ItemKind::CustomToolCall;
+                                try { call.payload = json::parse(call.payload).value("input", ""); }
+                                catch (...) { err = "invalid JSON in upstream custom tool arguments"; return false; }
+                            } else if (mapping.kind == ToolKind::ToolSearch) {
+                                try {
+                                    if (!json::parse(call.payload).is_object()) {
+                                        err = "upstream tool_search arguments must be an object";
+                                        return false;
+                                    }
+                                } catch (...) {
+                                    err = "invalid JSON in upstream tool_search arguments";
+                                    return false;
+                                }
+                                call.item_kind = ItemKind::ToolSearchCall;
+                                call.execution = json{{"type", "client"}};
+                            }
+                            break;
+                        }
+                    }
+                    out.output_items.push_back(std::move(call));
                 }
             }
         }
@@ -113,7 +189,8 @@ bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
     return true;
 }
 
-json OpenAICodec::serialize_response(const ir::ChatResponse &in) const {
+json OpenAICodec::serialize_response(const ir::ChatResponse &in,
+                                     const ir::ConversionContext *) const {
     json out;
     out["id"] = in.id.empty() ? "chatcmpl-proxy" : in.id;
     out["object"] = "chat.completion";  // forced — never inherit source format
@@ -159,7 +236,9 @@ json OpenAICodec::serialize_response(const ir::ChatResponse &in) const {
                 tc["type"] = "function";
                 tc["function"] = json::object();
                 tc["function"]["name"] = b.tool_name;
-                tc["function"]["arguments"] = b.tool_input.dump();
+                tc["function"]["arguments"] = b.extra.value("raw_arguments", "");
+                if (tc["function"]["arguments"].get<std::string>().empty())
+                    tc["function"]["arguments"] = b.tool_input.dump();
                 tool_calls.push_back(std::move(tc));
                 break;
             }

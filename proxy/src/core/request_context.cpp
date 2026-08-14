@@ -19,9 +19,6 @@ std::string session_id(const httplib::Request &request,
         if (metadata.contains("user_id") && metadata["user_id"].is_string())
             return metadata["user_id"].get<std::string>();
     }
-    if (body.contains("previous_response_id") &&
-        body["previous_response_id"].is_string())
-        return body["previous_response_id"].get<std::string>();
     return {};
 }
 }
@@ -62,15 +59,30 @@ bool parse_request_context(const httplib::Request &request,
         return false;
     }
     context.session_id = session_id(request, context.parsed_json);
+    if (context.parsed_json.contains("previous_response_id") &&
+        !context.parsed_json["previous_response_id"].is_string()) {
+        error = "previous_response_id must be a string";
+        return false;
+    }
+    if (context.parsed_json.contains("previous_response_id"))
+        context.previous_response_id = context.parsed_json["previous_response_id"].get<std::string>();
     return true;
 }
 
 bool ensure_request_ir(const CodecRegistry &codecs, RequestContext &context,
                        std::string &error) {
     if (context.ir_ready) return true;
-    if (!codecs.get(context.client_format).parse_request(
-            context.parsed_json, context.parsed_ir, error))
+    try {
+        if (!codecs.get(context.client_format).parse_request(
+                context.parsed_json, context.parsed_ir, error))
+            return false;
+    } catch (const std::exception &e) {
+        error = e.what();
         return false;
+    } catch (...) {
+        error = "invalid request fields";
+        return false;
+    }
     context.ir_ready = true;
     return true;
 }

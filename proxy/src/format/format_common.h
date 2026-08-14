@@ -4,9 +4,22 @@
 
 #include <cstddef>
 #include <optional>
+#include <string>
+#include <vector>
 
 /// Shared helpers for the three wire-format codecs.
 namespace fmt {
+
+/// Generate a proxy-owned response identifier that cannot collide across
+/// converted responses in one process.
+std::string generate_response_id();
+std::string generate_call_id();
+
+/// Build the deterministic client-tool view used by Chat/Anthropic bridges.
+/// Returns false on a name collision; callers must surface the error instead
+/// of silently dropping one of the tools.
+bool build_tool_context(const std::vector<ir::Tool> &source,
+                        ir::ToolContext &context, std::string &error);
 
 // Streaming wire/state limits.  They are deliberately larger than normal LLM
 // deltas while still preventing one unterminated SSE frame or tool call from
@@ -47,6 +60,9 @@ json normalize_tool_choice_to_openai(const json &tc);
 ///   {"type":"auto"|"any"|"none"} or {"type":"tool","name":...}.
 /// OpenAI shapes are translated; anything already Anthropic-shaped passes through.
 json normalize_tool_choice_to_anthropic(const json &tc);
+json normalize_tool_choice_for_target(
+    const json &tc, const ir::ConversionContext *context,
+    ir::ApiFormat target);
 
 /// Normalize an arbitrary error object to {message, type, code} (json object).
 json normalize_error_body(const json &body);

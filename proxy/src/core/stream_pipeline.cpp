@@ -1,13 +1,11 @@
 #include "proxy_server_internal.h"
-
 void ProxyServer::handle_streaming(
     const std::vector<UpstreamCandidate> &cands,
     const std::vector<CandidateRequestBody> &candidate_bodies, size_t start,
     const std::string &session_id, int local_key_id, ir::ApiFormat harness,
-    const std::string &resolved_model,
-    std::shared_ptr<const json> parsed_json,
-    std::shared_ptr<const ir::ChatRequest> parsed_request,
-    std::shared_ptr<UsageReservation> reservation,
+    const std::string &resolved_model, std::shared_ptr<const json> parsed_json,
+    std::shared_ptr<const ir::ChatRequest> parsed_request, std::shared_ptr<const ir::ConversionContext> conversion_context,
+    std::shared_ptr<const std::vector<json>> state_current_input, std::shared_ptr<UsageReservation> reservation,
     const httplib::Request &req,
     httplib::Response &res, std::chrono::steady_clock::time_point t0) {
     const FormatCodec &harness_codec = codecs_.get(harness);
@@ -24,17 +22,13 @@ void ProxyServer::handle_streaming(
     res.set_chunked_content_provider(
         "text/event-stream",
         [this, cands, candidate_bodies, order, session_id, scope, local_key_id,
-         harness, resolved_model, parsed_json, parsed_request, reservation,
+         harness, resolved_model, parsed_json, parsed_request, conversion_context,
+         state_current_input, reservation,
          base_timeouts, deadline, budget_seconds,
          content_type, t0, &res,
          client_sock = req.client_socket](size_t, httplib::DataSink &sink) -> bool {
-            const FormatCodec &out_codec = codecs_.get(harness);
-            std::uint64_t inflight_id = 0;
+            const FormatCodec &out_codec = codecs_.get(harness); std::uint64_t inflight_id = 0;
             adopt_accounting_reservation(reservation);
-            // Committed to contacting an upstream: if the provider exits
-            // without a completed UsageEvent (exception, or the provider is
-            // destroyed before running), the reservation destructor writes an
-            // internal_abort record instead of silently dropping the slot.
             mark_accounting_upstream_started(
                 cands.empty() ? 0 : cands.front().account().id, local_key_id,
                 resolved_model, true);
@@ -57,18 +51,34 @@ void ProxyServer::handle_streaming(
             std::chrono::steady_clock::time_point first_semantic_at;
             std::chrono::steady_clock::time_point last_semantic_at;
             int upstream_semantic_ttft = -1;
-            std::string emitted_response_id;
-            bool client_write_failed = false;
-            bool terminal_error_forwarded = false;
-            ir::Usage final_stream_usage;
+            bool client_write_failed = false, terminal_error_forwarded = false;
+            bool source_terminal_seen = false; ir::Usage final_stream_usage;
+            json responses_terminal; fmt::SseFrameBuffer responses_state_sse;
             AttemptExecutor attempt_executor(gate_);
             std::unordered_map<std::string, std::string> converted_bodies;
-
             auto write_to_sink = [&](const std::string &data) -> bool {
                 if (data.empty()) return true;
                 bool ok = sink.write(data.data(), data.size());
-                if (ok) committed = true;
-                else client_write_failed = true;
+                if (ok) {
+                    committed = true;
+                    if (harness == ir::ApiFormat::OpenAIResponses) {
+                        responses_state_sse.feed(data.data(), data.size(),
+                            [&](const std::string &frame) {
+                                std::string event_name, payload;
+                                if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
+                                try {
+                                    const json j = json::parse(payload);
+                                    const std::string type = j.value("type", "");
+                                    if ((type == "response.completed" ||
+                                         type == "response.incomplete") &&
+                                        j.contains("response"))
+                                        responses_terminal = j["response"];
+                                } catch (...) {}
+                            });
+                    }
+                } else {
+                    client_write_failed = true;
+                }
                 return ok;
             };
             auto emit_error = [&](const json &normalized) {
@@ -79,20 +89,22 @@ void ProxyServer::handle_streaming(
                 emitter->emit(event, write_to_sink);
                 emitter->finish(write_to_sink);
             };
-
             auto outcome = attempt_executor.execute(
                 {&cands, order, deadline, budget_seconds,
                  {}, {},  // empty inflight hooks: streaming keeps its own request_started
                  [&](const AttemptRequest &attempt_request) {
                 const auto &candidate = attempt_request.candidate;
                 terminal_error_forwarded = false;
-
                 if (inflight_id == 0) {
                     inflight_id = request_started(candidate.upstream_model(), true);
                 }
-
                 const auto upstream = ir::parse_api_format(candidate.account().api_format);
-                const bool passthrough = harness == upstream;
+                const bool responses_item_adapter =
+                    harness == ir::ApiFormat::OpenAIResponses &&
+                    parsed_request &&
+                    responses_request_needs_tool_adapter(*parsed_request);
+                const bool passthrough = harness == upstream &&
+                    !responses_item_adapter;
                 const bool filter_thinking = passthrough && upstream == ir::ApiFormat::OpenAI;
                 auto attempt_timeouts = base_timeouts;
                 if (!clamp_to_remaining_budget(attempt_timeouts, deadline, true)) {
@@ -106,6 +118,21 @@ void ProxyServer::handle_streaming(
                 ++attempts_made;
                 const std::string *body = nullptr;
                 if (passthrough) {
+                    if (harness == ir::ApiFormat::OpenAIResponses && parsed_request) {
+                        auto converted = *parsed_request;
+                        converted.model = candidate.upstream_model();
+                        if (conversion_context)
+                            converted.tools = conversion_context->tools.target_tools;
+                        const std::string cache_key =
+                            std::to_string(static_cast<int>(upstream)) + "\n" + candidate.upstream_model();
+                        auto found = converted_bodies.find(cache_key);
+                        if (found == converted_bodies.end())
+                        found = converted_bodies.emplace(
+                            cache_key,
+                            codecs_.get(upstream).serialize_request(
+                                converted, conversion_context.get()).dump()).first;
+                        body = &found->second;
+                    } else {
                     const auto &cached =
                         candidate_bodies[attempt_request.candidate_index];
                     if (cached) {
@@ -129,6 +156,7 @@ void ProxyServer::handle_streaming(
                         }
                         body = &found->second;
                     }
+                    }
                 } else {
                     const std::string cache_key =
                         std::to_string(static_cast<int>(upstream)) + "\n" +
@@ -143,18 +171,25 @@ void ProxyServer::handle_streaming(
                         }
                         auto converted = *parsed_request;
                         converted.model = candidate.upstream_model();
+                        if (conversion_context)
+                            converted.tools = conversion_context->tools.target_tools;
                         found = converted_bodies.emplace(
                             cache_key,
-                            codecs_.get(upstream).serialize_request(converted).dump()
+                            codecs_.get(upstream).serialize_request(
+                                converted, conversion_context.get()).dump()
                         ).first;
                     }
                     body = &found->second;
                 }
-
-                // One protocol parser per attempt.  It feeds the metrics
-                // observer and, for converted streams, the emitter from the
-                // same decoded event; passthrough still forwards raw bytes.
-                auto parser = codecs_.get(upstream).make_stream_parser();
+                auto response_context = conversion_context
+                    ? std::make_shared<ir::ConversionContext>(*conversion_context)
+                    : std::make_shared<ir::ConversionContext>();
+                response_context->source = upstream;
+                response_context->target = harness;
+                if (response_context->source == response_context->target)
+                    response_context->generated_response_id.clear();
+                auto parser = codecs_.get(upstream).make_stream_parser(
+                    response_context.get());
                 std::unique_ptr<ir::StreamEmitter> emitter;
                 ThinkStreamFilter think_filter;
                 bool attempt_first_semantic = true;
@@ -162,9 +197,6 @@ void ProxyServer::handle_streaming(
                     std::make_shared<std::atomic<bool>>(false);
                 auto attempt_semantic_progress =
                     std::make_shared<std::atomic<std::uint64_t>>(0);
-                // Set once a protocol-complete terminal event has been
-                // processed.  Its absence at a clean EOF classifies the
-                // attempt as truncated rather than a full 2xx success.
                 auto attempt_terminal_seen =
                     std::make_shared<std::atomic<bool>>(false);
                 std::chrono::steady_clock::time_point attempt_first_semantic_at;
@@ -174,7 +206,8 @@ void ProxyServer::handle_streaming(
                 int attempt_stream_error_status = 502;
                 ir::Usage attempt_usage;
                 if (!passthrough) {
-                    emitter = out_codec.make_stream_emitter();
+                    emitter = out_codec.make_stream_emitter(
+                        response_context.get());
                 }
                 auto record_attempt_semantic =
                     [&](std::chrono::steady_clock::time_point now) {
@@ -213,22 +246,11 @@ void ProxyServer::handle_streaming(
                             : json{{"message", "upstream stream error"}};
                         attempt_stream_error_status =
                             stream_error_status(attempt_stream_error);
-                        // Stop before the raw/converted error frame is written.
-                        // If nothing semantic was committed, the next candidate
-                        // can now be tried safely.
                         return false;
                     }
-                    if (event.type == ir::StreamEventType::MessageStart &&
-                        event.extra.contains("id") && event.extra["id"].is_string())
-                        emitted_response_id = event.extra["id"].get<std::string>();
                     if (event.type == ir::StreamEventType::UsageEvent ||
                         event.type == ir::StreamEventType::MessageStart)
                         ir::usage_merge(attempt_usage, event.usage);
-                    // A protocol-complete terminal event is the only thing that
-                    // makes a clean EOF a full 2xx success.  The metrics parser
-                    // runs for passthrough and converted streams alike, so this
-                    // single set covers both; codec finish() synthesis must NOT
-                    // set it (that would hide a truncation).
                     if (event.type == ir::StreamEventType::MessageFinish)
                         attempt_terminal_seen->store(true,
                                                      std::memory_order_release);
@@ -244,10 +266,10 @@ void ProxyServer::handle_streaming(
                     return true;
                 };
                 auto on_combined_event = [&](const ir::StreamEvent &event) -> bool {
-                    // Metrics are observational.  Even when an upstream error
-                    // is recognized, let the response emitter see the same
-                    // event so protocol conversion remains lossless.
-                    on_metrics_event(event);
+                    const bool metrics_ok = on_metrics_event(event);
+                    if (!metrics_ok && event.type == ir::StreamEventType::ErrorEvent &&
+                        !committed)
+                        return false;
                     return on_event(event);
                 };
                 bool metrics_enabled = true;
@@ -258,9 +280,6 @@ void ProxyServer::handle_streaming(
                                 ? parser->feed(data, len, on_metrics_event)
                                 : true;
                             if (!observed && !attempt_has_stream_error) {
-                                // Observability is best-effort. A provider
-                                // extension the metrics parser cannot consume
-                                // must never stop or delay passthrough traffic.
                                 metrics_enabled = false;
                             }
                         } catch (const std::exception &e) {
@@ -274,12 +293,7 @@ void ProxyServer::handle_streaming(
                             metrics_enabled = false;
                         }
                     }
-
-                    // An error in the first upstream frame can still fall back
-                    // without committing headers. Once anything was sent, the
-                    // same frame must be forwarded and the stream terminated.
                     if (attempt_has_stream_error && !committed) return false;
-
                     bool forwarded = true;
                     if (!passthrough) {
                         forwarded = parser->feed(data, len, on_combined_event);
@@ -293,7 +307,6 @@ void ProxyServer::handle_streaming(
                         terminal_error_forwarded = true;
                     return forwarded && !attempt_has_stream_error;
                 };
-
                 const auto attempt_started = std::chrono::steady_clock::now();
                 auto result = forward_endpoint_attempt(
                     upstream_, chat_endpoint_policy(harness), candidate, *body,
@@ -303,18 +316,11 @@ void ProxyServer::handle_streaming(
                     [&](ForwardOptions &opts) {
                         opts.semantic_seen = attempt_semantic_seen;
                         opts.semantic_progress = attempt_semantic_progress;
-                        // Usage and response IDs are extracted incrementally above;
-                        // retain only a bounded diagnostic tail for upstream errors.
                         opts.streaming_body_buffer_limit = 256 * 1024;
-                        // Strict mode wires the truncation detector; disabled leaves
-                        // opts.terminal_seen null so forward() keeps old behavior.
                         if (strict_terminal_enabled())
                             opts.terminal_seen = attempt_terminal_seen;
                     });
-
-                // Flush the observer before classifying a 2xx response. SSE
-                // permits the final frame to end at EOF without a blank line.
-                if (metrics_enabled || !passthrough) {
+                    if (metrics_enabled || !passthrough) {
                     try {
                         const ir::StreamParser::EmitFn finish_events =
                             passthrough ? ir::StreamParser::EmitFn(on_metrics_event)
@@ -337,7 +343,6 @@ void ProxyServer::handle_streaming(
                     result.error = stream_error_message(attempt_stream_error);
                 }
                 if (committed) promote_attempt_metrics();
-
                 bool filter_tail_flushed = false;
                 if (passthrough && filter_thinking && !client_write_failed &&
                     (committed ||
@@ -357,10 +362,7 @@ void ProxyServer::handle_streaming(
                             terminal_error_forwarded = true;
                     }
                 }
-
                 if (attempt_has_stream_error && committed && !passthrough) {
-                    // The conversion parser may still hold the EOF-terminated
-                    // frame; flush it through the existing stateful emitter.
                     emitter->finish(write_attempt);
                     terminal_error_forwarded = true;
                 } else if (attempt_has_stream_error && committed && passthrough &&
@@ -371,7 +373,6 @@ void ProxyServer::handle_streaming(
                            (result.body.size() < 4 ||
                             result.body.compare(result.body.size() - 4, 4,
                                                 "\r\n\r\n") != 0)) {
-                    // Complete an EOF-terminated passthrough SSE frame.
                     if (write_attempt("\n\n")) terminal_error_forwarded = true;
                 }
                 if (result.success && result.status_code >= 200 && result.status_code < 300) {
@@ -384,9 +385,10 @@ void ProxyServer::handle_streaming(
                                 attempt_first_semantic_at - attempt_started).count());
                     }
                     final_stream_usage = attempt_usage;
+                    source_terminal_seen = attempt_terminal_seen->load(
+                        std::memory_order_acquire);
                     return result;
                 }
-
                 last_timeout = result.is_timeout;
                 last_status = result.status_code;
                 last_account_id = candidate.account().id;
@@ -397,11 +399,6 @@ void ProxyServer::handle_streaming(
                 return result;
                 },
                 [&](const UpstreamClient::ForwardResult &result) {
-                    // Once a stream has committed bytes, a timeout or parser
-                    // failure cannot safely fall back: the downstream has
-                    // already received the first response.  The executor
-                    // still records the attempt and releases its gate, but
-                    // must stop the candidate loop here.
                     return result.client_disconnected || client_write_failed ||
                            (committed && !result.success) ||
                            client_socket_gone(client_sock);
@@ -417,7 +414,6 @@ void ProxyServer::handle_streaming(
             last_timeout = final_result.is_timeout;
             last_status = final_result.status_code;
             last_duration_ms = final_result.duration_ms;
-
             inflight_guard.run_now();
             if (used && client_write_failed) {
                 enqueue_zero_usage(used->account().id, local_key_id,
@@ -438,8 +434,6 @@ void ProxyServer::handle_streaming(
                 const int generation_ms = first_semantic ? -1 : static_cast<int>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         last_semantic_at - first_semantic_at).count());
-                // The interval starts when the first output arrives, so it
-                // contains completion_tokens-1 generation intervals.
                 const double output_tps = generation_ms > 0 && usage.completion_tokens > 1
                     ? (usage.completion_tokens - 1) * 1000.0 / generation_ms : -1.0;
                 enqueue_log(used->account().id, local_key_id, usage, true,
@@ -448,13 +442,28 @@ void ProxyServer::handle_streaming(
                                      upstream_semantic_ttft, final_result.duration_ms,
                                      attempts_made, attempts);
                 affinity_.bind(scope, session_id, used->key_slot_id);
-                if (harness == ir::ApiFormat::OpenAIResponses) {
-                    affinity_.bind(scope, emitted_response_id, used->key_slot_id);
-                }
+                if (harness == ir::ApiFormat::OpenAIResponses && parsed_json &&
+                    source_terminal_seen)
+                    responses_state_sse.finish([&](const std::string &frame) {
+                        std::string event_name, payload;
+                        if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
+                        try {
+                            const json j = json::parse(payload);
+                            if ((j.value("type", "") == "response.completed" ||
+                                 j.value("type", "") == "response.incomplete") &&
+                                j.contains("response")) responses_terminal = j["response"];
+                        } catch (...) {}
+                    });
                 sink.done();
+                if (harness == ir::ApiFormat::OpenAIResponses &&
+                    parsed_json && source_terminal_seen &&
+                    !responses_terminal.is_null())
+                    record_responses_state(*this, *parsed_json,
+                                           responses_terminal.dump(),
+                                           state_current_input ? state_current_input.get()
+                                                                : nullptr);
                 return true;
             }
-
             if (client_write_failed || final_result.client_disconnected ||
                 client_socket_gone(client_sock)) {
                 if (last_account_id) {
@@ -488,5 +497,4 @@ void ProxyServer::handle_streaming(
             return true;
         },
         nullptr);
-    res.set_deferred_chunked_headers();
-}
+    res.set_deferred_chunked_headers(); }

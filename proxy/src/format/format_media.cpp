@@ -12,6 +12,15 @@ bool is_image_type(const std::string &media) {
     return media.size() >= 6 && media.compare(0, 6, "image/") == 0;
 }
 
+bool has_raw_blocks(const std::vector<ir::ContentBlock> &blocks) {
+    for (const auto &block : blocks) {
+        if (block.extra.contains("raw") && block.extra["raw"].is_object())
+            return true;
+        if (has_raw_blocks(block.nested)) return true;
+    }
+    return false;
+}
+
 bool looks_base64ish(const std::string &value) {
     if (value.size() < 16 * 1024) return false;
     size_t valid = 0;
@@ -128,7 +137,10 @@ void append_audio(const json &v, std::vector<ir::ContentBlock> &out) {
 bool append_object(const json &v, std::vector<ir::ContentBlock> &out,
                    bool parse_json_strings, int depth) {
     if (depth > kMaxMediaDepth) {
-        out.push_back(ir::ContentBlock{ir::ContentKind::Text, v.dump()});
+        ir::ContentBlock raw;
+        raw.kind = ir::ContentKind::Text;
+        raw.extra["raw"] = v;
+        out.push_back(std::move(raw));
         return false;
     }
     if (!v.is_object()) {
@@ -210,7 +222,10 @@ bool append_object(const json &v, std::vector<ir::ContentBlock> &out,
         out.insert(out.end(), nested.begin(), nested.end());
         return !nested.empty();
     }
-    out.push_back(ir::ContentBlock{ir::ContentKind::Text, v.dump()});
+    ir::ContentBlock raw;
+    raw.kind = ir::ContentKind::Text;
+    raw.extra["raw"] = v;
+    out.push_back(std::move(raw));
     return false;
 }
 
@@ -346,11 +361,16 @@ json serialize_openai_content_blocks(const std::vector<ir::ContentBlock> &blocks
 }
 
 json serialize_responses_tool_result_value(const ir::ContentBlock &result) {
-    const bool media = tool_result_has_media(result);
+    const bool media = tool_result_has_media(result) || has_raw_blocks(result.nested);
     if (!media) return result.text;
     json parts = json::array();
     for (const auto &b : result.nested) {
-        if (b.kind == ir::ContentKind::Text) parts.push_back(json{{"type", "input_text"}, {"text", b.text}});
+        if (b.kind == ir::ContentKind::Text) {
+            if (b.extra.contains("raw") && b.extra["raw"].is_object())
+                parts.push_back(b.extra["raw"]);
+            else
+                parts.push_back(json{{"type", "input_text"}, {"text", b.text}});
+        }
         else if (b.kind == ir::ContentKind::Image) parts.push_back(json{{"type", "input_image"}, {"image_url", b.image_url.empty() ? build_data_uri(b.media_type, b.image_data_b64) : b.image_url}});
         else if (b.kind == ir::ContentKind::File) parts.push_back(serialize_responses_file_part(b));
         else if (b.kind == ir::ContentKind::Audio) parts.push_back(serialize_responses_audio_part(b));
@@ -361,7 +381,12 @@ json serialize_responses_tool_result_value(const ir::ContentBlock &result) {
 json serialize_anthropic_tool_result_content(const ir::ContentBlock &result) {
     json parts = json::array();
     for (const auto &b : result.nested) {
-        if (b.kind == ir::ContentKind::Text) parts.push_back(json{{"type", "text"}, {"text", b.text}});
+        if (b.kind == ir::ContentKind::Text) {
+            if (b.extra.contains("raw") && b.extra["raw"].is_object())
+                parts.push_back(b.extra["raw"]);
+            else
+                parts.push_back(json{{"type", "text"}, {"text", b.text}});
+        }
         else if (b.kind == ir::ContentKind::Image) {
             json image{{"type", "image"}};
             if (!b.image_data_b64.empty()) image["source"] = {{"type", "base64"}, {"media_type", b.media_type}, {"data", b.image_data_b64}};
@@ -392,7 +417,13 @@ bool tool_result_has_media(const ir::ContentBlock &result) {
 MediaRequirements request_media_requirements(const ir::ChatRequest &request) {
     MediaRequirements r;
     collect_requirements(request.system, r);
-    for (const auto &m : request.messages) collect_requirements(m.content, r);
+    // Responses requests use the ordered Item view.  Keep the legacy message
+    // fallback for callers that have not migrated yet, but never inspect both
+    // views: parsers mirror Items into messages and double traversal is both
+    // wasteful and, more importantly, makes it easy to miss media carried by
+    // a non-message Item such as function_call_output.
+    const auto &items = request.items.empty() ? request.messages : request.items;
+    for (const auto &m : items) collect_requirements(m.content, r);
     return r;
 }
 

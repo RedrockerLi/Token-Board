@@ -41,12 +41,17 @@ public:
     // Request: wire JSON → IR ; IR → wire JSON.
     virtual bool parse_request(const json &in, ir::ChatRequest &out,
                                std::string &err) const = 0;
-    virtual json serialize_request(const ir::ChatRequest &in) const = 0;
+    virtual json serialize_request(
+        const ir::ChatRequest &in,
+        const ir::ConversionContext *context = nullptr) const = 0;
 
     // Response (non-streaming): wire JSON → IR ; IR → wire JSON.
     virtual bool parse_response(const json &in, ir::ChatResponse &out,
-                                std::string &err) const = 0;
-    virtual json serialize_response(const ir::ChatResponse &in) const = 0;
+                                std::string &err,
+                                const ir::ConversionContext *context = nullptr) const = 0;
+    virtual json serialize_response(
+        const ir::ChatResponse &in,
+        const ir::ConversionContext *context = nullptr) const = 0;
 
     // Error bodies: upstream wire error → normalized {message,type,code} →
     // harness wire error.
@@ -54,8 +59,10 @@ public:
     virtual json serialize_error_body(const json &normalized) const = 0;
 
     // Streaming: per-request instances.
-    virtual std::unique_ptr<ir::StreamParser> make_stream_parser() const = 0;
-    virtual std::unique_ptr<ir::StreamEmitter> make_stream_emitter() const = 0;
+    virtual std::unique_ptr<ir::StreamParser> make_stream_parser(
+        const ir::ConversionContext *context = nullptr) const = 0;
+    virtual std::unique_ptr<ir::StreamEmitter> make_stream_emitter(
+        const ir::ConversionContext *context = nullptr) const = 0;
 
 protected:
     explicit FormatCodec(ir::ApiFormat f) : fmt_(f) {}

@@ -187,11 +187,48 @@ def main() -> None:
             direct_body = {
                 "model": "direct-model", "stream": False,
                 "input": [{"role": "user", "content": "direct"}],
-                "background": True, "previous_response_id": "resp-prev",
+                "background": True,
             }
             status, direct_result = post(proxy_port, "tb-responses", direct_body)
             assert status == 200
             assert json.loads(direct_result)["output"][0]["content"][0]["text"] == "direct-ok"
+
+            # A converted second Responses turn must receive the complete
+            # cached Item chain, not an upstream previous_response_id.
+            state_first = {
+                "model": "state-first", "stream": False,
+                "input": [{"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "first"}]}],
+            }
+            status, state_first_result = post(proxy_port, "tb-responses", state_first)
+            assert status == 200
+            state_id = json.loads(state_first_result)["id"]
+            state_second = {
+                "model": "state-second", "stream": False,
+                "previous_response_id": state_id,
+                "input": [{"type": "function_call_output", "call_id": "state-call",
+                            "output": "result"}],
+            }
+            status, state_second_result = post(proxy_port, "tb-responses", state_second)
+            assert status == 200, state_second_result
+            with FakeResponsesUpstream.lock:
+                state_requests = [item for item in FakeResponsesUpstream.requests
+                                  if item["auth"] == "Bearer sk-responses" and
+                                  item["body"].get("model") in {"state-first", "state-second"}]
+            second_upstream = next(item for item in state_requests
+                                   if item["body"].get("model") == "state-second")
+            assert "previous_response_id" not in second_upstream["body"]
+            assert [item.get("type") for item in second_upstream["body"]["input"]] == [
+                "message", "message", "function_call_output"]
+
+            before = len(FakeResponsesUpstream.requests)
+            status, missing_result = post(proxy_port, "tb-responses", {
+                "model": "missing-state", "stream": False,
+                "previous_response_id": "does-not-exist",
+                "input": "should fail",
+            })
+            assert status == 400 and "previous_response_not_found" in missing_result
+            assert len(FakeResponsesUpstream.requests) == before
 
             converted_body = {
                 "model": "chat-model", "stream": True,

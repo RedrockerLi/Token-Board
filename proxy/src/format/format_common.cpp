@@ -1,11 +1,138 @@
 #include "format_common.h"
-
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
-
+#include <iomanip>
+#include <map>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <sstream>
 namespace fmt {
-
+std::string generate_response_id() {
+    unsigned char bytes[16] = {};
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        static std::atomic<unsigned long long> fallback{1};
+        const auto value = fallback.fetch_add(1, std::memory_order_relaxed);
+        std::ostringstream out;
+        out << "resp_tb_" << std::hex << value;
+        return out.str();
+    }
+    std::ostringstream out;
+    out << "resp_tb_";
+    for (unsigned char byte : bytes)
+        out << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<unsigned int>(byte);
+    return out.str();
+} std::string generate_call_id() {
+    unsigned char bytes[16] = {};
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        static std::atomic<unsigned long long> fallback{1};
+        return "call_tb_" + std::to_string(fallback.fetch_add(1, std::memory_order_relaxed));
+    }
+    std::ostringstream out;
+    out << "call_tb_";
+    for (unsigned char byte : bytes)
+        out << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<unsigned int>(byte);
+    return out.str();
+}
+namespace {
+std::string flat_tool_name(const std::string &ns, const std::string &name) {
+    const std::string full = ns + "__" + name;
+    if (full.size() <= 64) return full;
+    unsigned char digest[SHA256_DIGEST_LENGTH] = {};
+    SHA256(reinterpret_cast<const unsigned char *>(full.data()), full.size(), digest);
+    std::ostringstream hash;
+    for (int i = 0; i < 8; ++i)
+        hash << std::hex << std::setw(2) << std::setfill('0')
+             << static_cast<unsigned int>(digest[i]);
+    const std::string suffix = "__" + hash.str();
+    std::size_t prefix_len = 64 > suffix.size() ? 64 - suffix.size() : 0;
+    std::string prefix;
+    for (std::size_t i = 0; i < full.size();) {
+        unsigned char lead = static_cast<unsigned char>(full[i]);
+        std::size_t width = lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+        if (i + width > full.size() || prefix.size() + width > prefix_len) break;
+        prefix.append(full, i, width);
+        i += width;
+    }
+    return prefix + suffix;
+}}
+bool build_tool_context(const std::vector<ir::Tool> &source,
+                        ir::ToolContext &context, std::string &error) {
+    context = ir::ToolContext{};
+    context.source_tools = source;
+    std::map<std::string, ir::ToolMapping> owners;
+    auto add = [&](ir::Tool tool, const std::string &flat,
+                   const std::string &original, const std::string &ns,
+                   ir::ToolKind kind) -> bool {
+        if (flat.empty()) return true;
+        auto it = owners.find(flat);
+        if (it != owners.end()) {
+            error = "tool name collision after namespace flattening: " + flat;
+            return false;
+        }
+        tool.name = flat;
+        tool.kind = kind;
+        tool.wire_type = kind == ir::ToolKind::Custom ? "custom" : "function";
+        tool.extra["type"] = tool.wire_type;
+        if (kind == ir::ToolKind::Custom) {
+            if (!tool.description.empty()) tool.description += "\n\n";
+            tool.description += "Original custom tool definition:\n" +
+                (tool.raw.is_object() ? tool.raw.dump() : json::object().dump());
+            tool.input_schema = json{
+                {"type", "object"},
+                {"properties", json{{"input", json{{"type", "string"}}}}},
+                {"required", json::array({"input"})}};
+        }
+        context.target_tools.push_back(std::move(tool));
+        owners.emplace(flat, ir::ToolMapping{flat, original, ns, kind});
+        return true;
+    };
+    for (const auto &tool : source) {
+        if (tool.kind == ir::ToolKind::Namespace) {
+            bool hosted_child = tool.children.empty();
+            for (const auto &child : tool.children)
+                hosted_child = hosted_child ||
+                    (child.kind != ir::ToolKind::Function && child.kind != ir::ToolKind::Custom);
+            if (hosted_child) {
+                ir::Tool hosted = tool; hosted.kind = ir::ToolKind::Hosted;
+                hosted.wire_type = "namespace"; context.target_tools.push_back(std::move(hosted));
+                if (!tool.name.empty()) owners.emplace(tool.name,
+                    ir::ToolMapping{tool.name, tool.name, "", ir::ToolKind::Hosted});
+                continue;
+            }
+            for (const auto &child : tool.children)
+                if (!add(child, flat_tool_name(tool.name, child.name), child.name,
+                         tool.name, child.kind)) return false;
+        } else if (tool.kind == ir::ToolKind::ToolSearch) {
+            ir::Tool search;
+            search.kind = ir::ToolKind::ToolSearch;
+            search.wire_type = "function";
+            search.name = "tool_search";
+            search.description = "Search and load tools, plugins, connectors, and MCP namespaces.";
+            search.input_schema = json{{"type", "object"}, {"properties", {
+                {"query", {{"type", "string"}}},
+                {"limit", {{"type", "integer"}}}
+            }}, {"required", json::array({"query"})}};
+            if (!add(std::move(search), "tool_search", "tool_search", "",
+                     ir::ToolKind::ToolSearch)) return false;
+        } else if (tool.kind == ir::ToolKind::Hosted) {
+            if (!tool.name.empty() && owners.count(tool.name)) {
+                error = "tool name collision after namespace flattening: " + tool.name;
+                return false;
+            }
+            context.target_tools.push_back(tool);
+            if (!tool.name.empty())
+                owners.emplace(tool.name, ir::ToolMapping{tool.name, tool.name, "", ir::ToolKind::Hosted});
+        } else if (!add(tool, tool.name, tool.name, "", tool.kind)) {
+            return false;
+        }
+    }
+    for (const auto &entry : owners) context.mappings.push_back(entry.second);
+    return true;
+}
 std::string strip_one_m_suffix_for_upstream(const std::string &model) {
     static const char kMarker[] = "[1m]";
     static const size_t kLen = 4;
@@ -28,7 +155,6 @@ std::string strip_one_m_suffix_for_upstream(const std::string &model) {
     }
     return model;
 }
-
 bool is_reasoning_vendor(const std::string &model) {
     static const char *kHints[] = {"deepseek", "kimi", "moonshot", "mimo"};
     std::string t = model;
@@ -37,7 +163,6 @@ bool is_reasoning_vendor(const std::string &model) {
         if (t.find(h) != std::string::npos) return true;
     return false;
 }
-
 bool parse_data_uri(const std::string &uri, std::string &media_type,
                     std::string &b64) {
     static const char prefix[] = "data:";
@@ -52,12 +177,10 @@ bool parse_data_uri(const std::string &uri, std::string &media_type,
     b64 = uri.substr(comma + 1);
     return true;
 }
-
 std::string build_data_uri(const std::string &media_type,
                            const std::string &b64) {
     return "data:" + media_type + ";base64," + b64;
 }
-
 ir::ContentBlock openai_image_part_to_block(const json &part) {
     ir::ContentBlock b;
     b.kind = ir::ContentKind::Image;
@@ -79,7 +202,6 @@ ir::ContentBlock openai_image_part_to_block(const json &part) {
     }
     return b;
 }
-
 json image_block_to_openai_part(const ir::ContentBlock &b) {
     json part;
     part["type"] = "image_url";
@@ -188,6 +310,52 @@ json normalize_tool_choice_to_anthropic(const json &tc) {
         return out;
     }
     return tc;  // already Anthropic-shaped or unknown → pass through
+}
+
+json normalize_tool_choice_for_target(const json &tc,
+                                      const ir::ConversionContext *context,
+                                      ir::ApiFormat target) {
+    if (!tc.is_object())
+        return target == ir::ApiFormat::Anthropic
+            ? normalize_tool_choice_to_anthropic(tc)
+            : target == ir::ApiFormat::OpenAI
+                ? normalize_tool_choice_to_openai(tc) : tc;
+    if (!context)
+        return target == ir::ApiFormat::Anthropic
+            ? normalize_tool_choice_to_anthropic(tc)
+            : target == ir::ApiFormat::OpenAI
+                ? normalize_tool_choice_to_openai(tc) : tc;
+    std::string type = tc.value("type", "");
+    std::string name = tc.value("name", "");
+    if (type == "function" && tc.contains("function") &&
+        tc["function"].is_object())
+        name = tc["function"].value("name", name);
+    const std::string ns = tc.value("namespace", "");
+    const ir::ToolMapping *mapping = nullptr;
+    for (const auto &candidate : context->tools.mappings) {
+        if (candidate.original_name == name &&
+            (ns.empty() || candidate.namespace_name == ns)) {
+            mapping = &candidate;
+            break;
+        }
+    }
+    const std::string wire_name = mapping ? mapping->flat_name : name;
+    if (target == ir::ApiFormat::OpenAIResponses) {
+        if (context->source == ir::ApiFormat::OpenAIResponses &&
+            context->target == ir::ApiFormat::OpenAIResponses &&
+            (!mapping || mapping->kind == ir::ToolKind::Custom)) return tc;
+        return json{{"type", "function"}, {"name", wire_name}};
+    }
+    if (type == "custom" || type == "tool_search" ||
+        (mapping && !mapping->namespace_name.empty())) {
+        if (target == ir::ApiFormat::Anthropic)
+            return json{{"type", "tool"}, {"name", wire_name}};
+        return json{{"type", "function"},
+                    {"function", {{"name", wire_name}}}};
+    }
+    return target == ir::ApiFormat::Anthropic
+        ? normalize_tool_choice_to_anthropic(tc)
+        : normalize_tool_choice_to_openai(tc);
 }
 
 json normalize_error_body(const json &body) {

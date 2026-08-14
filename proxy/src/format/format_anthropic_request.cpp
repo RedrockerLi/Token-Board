@@ -1,4 +1,5 @@
 #include "format_anthropic_internal.h"
+#include "reasoning_bridge.h"
 
 using namespace ir;
 
@@ -40,6 +41,23 @@ bool AnthropicCodec::parse_request(const json &in, ir::ChatRequest &out,
                 parse_anthropic_blocks(c, msg.content);
             }
             out.messages.push_back(std::move(msg));
+        }
+    }
+    // Anthropic tool_use.input is an object on the request wire.  Reject an
+    // invalid client shape here so it becomes a 400 instead of being
+    // silently replaced with {} by the serializer.
+    for (const auto &block : out.system) {
+        if (block.kind == ContentKind::ToolUse && !block.tool_input.is_object()) {
+            err = "tool_use input must be an object";
+            return false;
+        }
+    }
+    for (const auto &message : out.messages) {
+        for (const auto &block : message.content) {
+            if (block.kind == ContentKind::ToolUse && !block.tool_input.is_object()) {
+                err = "tool_use input must be an object";
+                return false;
+            }
         }
     }
 
@@ -84,6 +102,7 @@ bool AnthropicCodec::parse_request(const json &in, ir::ChatRequest &out,
         if (!anthropic_request_key_consumed(it.key()))
             out.extras[it.key()] = it.value();
     }
+    out.items = out.messages;
     return true;
 }
 
@@ -92,6 +111,10 @@ json serialize_anthropic_blocks(const std::vector<ContentBlock> &blocks) {
     for (const auto &b : blocks) {
         switch (b.kind) {
             case ContentKind::Text: {
+                if (b.extra.contains("raw") && b.extra["raw"].is_object()) {
+                    arr.push_back(b.extra["raw"]);
+                    break;
+                }
                 json j;
                 j["type"] = "text";
                 j["text"] = b.text;
@@ -136,6 +159,12 @@ json serialize_anthropic_blocks(const std::vector<ContentBlock> &blocks) {
                 break;
             }
             case ContentKind::Thinking: {
+                if (b.extra.contains("responses_reasoning_item") &&
+                    b.extra["responses_reasoning_item"].is_object()) {
+                    arr.push_back(fmt::anthropic_block_from_responses_reasoning(
+                        b.extra["responses_reasoning_item"]));
+                    break;
+                }
                 json j;
                 if (b.extra.contains("redacted") && b.extra["redacted"].get<bool>()) {
                     j["type"] = "redacted_thinking";
@@ -154,7 +183,8 @@ json serialize_anthropic_blocks(const std::vector<ContentBlock> &blocks) {
     return arr;
 }
 
-json AnthropicCodec::serialize_request(const ir::ChatRequest &in) const {
+json AnthropicCodec::serialize_request(const ir::ChatRequest &in,
+                                       const ir::ConversionContext *context) const {
     json body = fmt::filter_keys(in.extras, {"top_p", "top_k", "metadata",
                                              "service_tier"});
 
@@ -183,7 +213,8 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in) const {
     if (in.temperature.has_value()) body["temperature"] = *in.temperature;
     if (!in.stop_sequences.empty()) body["stop_sequences"] = in.stop_sequences;
     if (!in.tool_choice.is_null() && !in.tool_choice.empty())
-        body["tool_choice"] = fmt::normalize_tool_choice_to_anthropic(in.tool_choice);
+        body["tool_choice"] = fmt::normalize_tool_choice_for_target(
+            in.tool_choice, context, ApiFormat::Anthropic);
 
     if (!in.tools.empty()) {
         json arr = json::array();
@@ -215,7 +246,36 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in) const {
     }
 
     json msgs = json::array();
-    for (const auto &m : in.messages) {
+    const auto &source_items = in.items.empty() ? in.messages : in.items;
+    std::vector<Message> normalized_items;
+    normalized_items.reserve(source_items.size());
+    for (const auto &source : source_items) {
+        Message item = source;
+        // A Responses reasoning Item is opaque apart from its visible summary;
+        // carry the complete raw Item through the bridge envelope instead of
+        // exposing encrypted material as ordinary text.
+        if (source.item_kind == ItemKind::Reasoning &&
+            source.extra.contains("raw_item") &&
+            source.extra["raw_item"].is_object()) {
+            item.content.clear();
+            ContentBlock thinking;
+            thinking.kind = ContentKind::Thinking;
+            thinking.extra["responses_reasoning_item"] = source.extra["raw_item"];
+            item.content.push_back(std::move(thinking));
+        }
+        if (!normalized_items.empty() && item.group_id != 0 &&
+            normalized_items.back().group_id == item.group_id &&
+            normalized_items.back().role == item.role) {
+            auto &merged = normalized_items.back();
+            merged.content.insert(merged.content.end(), item.content.begin(),
+                                  item.content.end());
+            merged.item_kind = ItemKind::Message;
+            merged.extra = json::object();
+        } else {
+            normalized_items.push_back(std::move(item));
+        }
+    }
+    for (const auto &m : normalized_items) {
         json jm;
         bool has_tool_result = false;
         for (const auto &b : m.content)

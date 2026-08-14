@@ -23,12 +23,6 @@ using json = nlohmann::json;
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Best-effort session identifier for session-affinity routing.
-///
-/// Precedence: an explicit `x-session-id` / `x-conversation-id` header, then a
-/// stable body field the client actually sends (OpenAI `user`, Anthropic
-/// `metadata.user_id`, Responses `previous_response_id`).  Empty result →
-/// plain fill-first (no affinity).  A stable value keeps the same session on
-/// the same upstream key for cache affinity.
 std::string affinity_scope(int local_key_id, ir::ApiFormat harness) {
     return std::to_string(local_key_id) + ":" + ir::to_string(harness);
 }
@@ -58,36 +52,6 @@ size_t affinity_start(SessionAffinity &affinity,
     slots.reserve(cands.size());
     for (const auto &cand : cands) slots.push_back(cand.key_slot_id);
     return affinity.preferred_index(scope, session_id, slots);
-}
-
-/// Responses API chains carry the previous response ID, so retain the ID
-/// emitted by a successful response as an alias for the same key slot.
-std::string response_id_from_body(const std::string &body) {
-    auto read_id = [](const json &j) -> std::string {
-        if (j.is_object() && j.contains("id") && j["id"].is_string())
-            return j["id"].get<std::string>();
-        if (j.is_object() && j.contains("response") && j["response"].is_object() &&
-            j["response"].contains("id") && j["response"]["id"].is_string())
-            return j["response"]["id"].get<std::string>();
-        return "";
-    };
-    try {
-        if (auto id = read_id(json::parse(body)); !id.empty()) return id;
-    } catch (...) {}
-    // Streaming SSE: inspect each complete `data:` JSON payload.  The first
-    // response.created event normally carries the stable Responses id.
-    size_t pos = 0;
-    while ((pos = body.find("data:", pos)) != std::string::npos) {
-        size_t end = body.find('\n', pos);
-        std::string payload = body.substr(pos + 5,
-            end == std::string::npos ? std::string::npos : end - pos - 5);
-        while (!payload.empty() && (payload.front() == ' ' || payload.front() == '\r'))
-            payload.erase(payload.begin());
-        try { if (auto id = read_id(json::parse(payload)); !id.empty()) return id; }
-        catch (...) {}
-        pos = end == std::string::npos ? body.size() : end + 1;
-    }
-    return "";
 }
 
 /// Build a JSON error response.
@@ -241,4 +205,3 @@ resolve_candidates_uncached(Router &router, const Router::RouteResult &route,
     }
     return cands;
 }
-

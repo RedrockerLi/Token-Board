@@ -9,6 +9,7 @@
 #include "router.h"
 #include "session_affinity.h"
 #include "usage_tracker.h"
+#include "responses_state_store.h"
 
 #include <atomic>
 #include <algorithm>
@@ -110,6 +111,7 @@ public:
     std::size_t accounting_queue_depth() {
         return db_.log_queue_depth();
     }
+    ResponsesStateStore &responses_state() noexcept { return responses_state_; }
     bool try_reserve_accounting() {
         if (auto reservation = db_.reserve_usage_event()) {
             accounting_reservation_ = std::move(reservation);
@@ -196,6 +198,8 @@ private:
                           const std::string &resolved_model,
                           std::shared_ptr<const json> parsed_json,
                           std::shared_ptr<const ir::ChatRequest> parsed_request,
+                          std::shared_ptr<const ir::ConversionContext> conversion_context,
+                          std::shared_ptr<const std::vector<json>> state_current_input,
                           std::shared_ptr<UsageReservation> reservation,
                           const httplib::Request &req,
                           httplib::Response &res,
@@ -219,6 +223,7 @@ private:
     AccountGate gate_;           // per-key-slot concurrency + plan cooldown
     KeyCostLedger cost_ledger_;  // accrued cost per key slot (cold-start bias)
     SessionAffinity affinity_;   // session → preferred key (in-memory)
+    ResponsesStateStore responses_state_; // complete bounded Responses chains
 
     struct LiveRequest {
         std::string model;

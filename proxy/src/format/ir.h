@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,25 @@ std::string to_string(ApiFormat f);
 
 enum class ContentKind { Text, Image, File, Audio, ToolUse, ToolResult, Thinking };
 enum class StopReason { Stop, Length, ToolUse, ContentFilter, Unknown };
+
+// Responses is an ordered Item protocol.  Keep this metadata alongside the
+// legacy Message/ContentBlock view so codecs can migrate incrementally without
+// turning unknown Items into prompt text.
+enum class ItemKind {
+    Message,
+    Reasoning,
+    FunctionCall,
+    FunctionCallOutput,
+    CustomToolCall,
+    CustomToolCallOutput,
+    ToolSearchCall,
+    ToolSearchOutput,
+    Opaque,
+};
+
+enum class ToolKind { Function, Custom, ToolSearch, Namespace, Hosted };
+
+enum class StructuredOutputKind { Text, JsonObject, JsonSchema };
 
 /// A single normalized content block (request and response share this).
 /// Only the fields relevant to the block's kind are populated.
@@ -49,13 +69,63 @@ struct Message {
     std::string role;                   // "user" | "assistant" | "system" | "tool"
     std::vector<ContentBlock> content;  // normalized block array
     json extra = json::object();
+
+    // Ordered Responses Item metadata.  For ordinary Chat messages these are
+    // left at their defaults; Responses parsers populate them exactly.
+    ItemKind item_kind = ItemKind::Message;
+    std::uint64_t group_id = 0;
+    std::string id;
+    std::string status;
+    std::string phase;
+    std::string call_id;
+    std::string name;
+    std::string namespace_name;
+    std::string payload;              // raw function arguments/custom input
+    std::string encrypted_content;
+    json execution = json::object();
 };
 
+using AgentItem = Message;
+
 struct Tool {
+    ToolKind kind = ToolKind::Function;
+    std::string wire_type = "function";
     std::string name;
     std::string description;
     json input_schema = json::object();  // OpenAI "parameters" / Anthropic input_schema / Responses parameters
+    std::vector<Tool> children;
+    json raw = json::object();
     json extra = json::object();
+};
+
+struct StructuredOutput {
+    StructuredOutputKind kind = StructuredOutputKind::Text;
+    std::string name;
+    std::string description;
+    json schema = json::object();
+    bool strict = false;
+    json raw = json::object();
+};
+
+struct ToolMapping {
+    std::string flat_name;
+    std::string original_name;
+    std::string namespace_name;
+    ToolKind kind = ToolKind::Function;
+};
+
+struct ToolContext {
+    std::vector<Tool> source_tools;
+    std::vector<Tool> target_tools;
+    std::vector<ToolMapping> mappings;
+    json raw = json::object();
+};
+
+struct ConversionContext {
+    ApiFormat source = ApiFormat::OpenAI;
+    ApiFormat target = ApiFormat::OpenAI;
+    ToolContext tools;
+    std::string generated_response_id;
 };
 
 struct ReasoningConfig {
@@ -78,7 +148,11 @@ struct ChatRequest {
     std::string model;
     std::vector<ContentBlock> system;  // system prompt as blocks
     std::vector<Message> messages;
+    // New ordered view.  Parsers populate this for Responses/state-aware
+    // conversions; serializers fall back to messages for old callers.
+    std::vector<AgentItem> items;
     std::vector<Tool> tools;
+    StructuredOutput structured_output;
     json tool_choice = json::object();  // raw; enum shapes differ per format
     bool stream = false;
     ReasoningConfig reasoning;
@@ -92,6 +166,7 @@ struct ChatResponse {
     std::string id;
     std::string model;
     std::vector<ContentBlock> content;  // text / thinking / tool_use
+    std::vector<AgentItem> output_items; // ordered Responses output view
     StopReason stop_reason = StopReason::Unknown;
     std::optional<std::string> stop_sequence;
     Usage usage;
@@ -108,15 +183,34 @@ enum class StreamEventType {
     MessageFinish,         // stop_reason (+ stop_sequence in extra)
     UsageEvent,            // usage snapshot (last wins)
     ErrorEvent,            // in-stream upstream error; envelope in `extra`
+    // Typed Item/Event vocabulary used by Responses adapters.  Aliases keep
+    // existing Chat/Anthropic parsers source-compatible while exposing the
+    // lifecycle names to new codecs and tests.
+    ResponseStart = MessageStart,
+    ItemStart = ToolCallStart,
+    TextDelta = ContentTextDelta,
+    ReasoningDelta = ContentThinkingDelta,
+    ToolPayloadDelta = ToolCallArgumentDelta,
+    ItemDone = ToolCallDone,
+    ResponseFinish = MessageFinish,
+    Usage = UsageEvent,
+    Error = ErrorEvent,
 };
 
 struct StreamEvent {
     StreamEventType type;
     int index = 0;                    // content-block / tool index
+    int output_index = 0;
+    int content_index = 0;
+    int summary_index = 0;
     std::string text;                 // text/thinking delta, or tool id / tool name
     std::string arguments;            // tool-call arguments (delta or final)
     StopReason stop_reason = StopReason::Unknown;
     Usage usage;
+    AgentItem item;
+    std::string item_id;
+    std::string call_id;
+    std::string namespace_name;
     json extra = json::object();
 };
 

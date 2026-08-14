@@ -37,17 +37,31 @@ add_executable(format_conv_test format_conv_test.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_helpers.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_request.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_responses_request_items.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_response.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_responses_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_media.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/reasoning_bridge.cpp
 )
 target_include_directories(format_conv_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(format_conv_test PRIVATE cxx_std_17)
+target_link_libraries(format_conv_test PRIVATE OpenSSL::Crypto Threads::Threads)
 
 # Standalone regression test for the process-local session affinity store.
 add_executable(session_affinity_test session_affinity_test.cpp)
 target_include_directories(session_affinity_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(session_affinity_test PRIVATE cxx_std_17)
+
+add_executable(responses_state_store_test responses_state_store_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/responses_state_store.cpp)
+target_include_directories(responses_state_store_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(responses_state_store_test PRIVATE cxx_std_17)
+
+add_executable(responses_semantics_test responses_semantics_test.cpp)
+target_include_directories(responses_semantics_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(responses_semantics_test PRIVATE cxx_std_17)
+target_link_libraries(responses_semantics_test PRIVATE token_proxy_format OpenSSL::Crypto Threads::Threads)
 
 # Endpoint policy metadata is the single source of truth for management and
 # usage endpoints. Keep a small standalone guard so embeddings/models cannot
@@ -172,6 +186,8 @@ add_test(NAME accounting_abort COMMAND accounting_abort_test
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME format_conversion COMMAND format_conv_test)
 add_test(NAME session_affinity COMMAND session_affinity_test)
+add_test(NAME responses_state_store COMMAND responses_state_store_test)
+add_test(NAME responses_semantics COMMAND responses_semantics_test)
 add_test(NAME endpoint_policy COMMAND endpoint_policy_test)
 add_test(
     NAME schema_version
