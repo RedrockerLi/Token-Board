@@ -2,6 +2,7 @@
 
 #include "format_anthropic.h"
 #include "format_common.h"
+#include "format_media.h"
 #include "core/logging.h"
 
 class AnthropicCodec final : public FormatCodec {

@@ -20,7 +20,7 @@ enum class ApiFormat { OpenAI, OpenAIResponses, Anthropic };
 ApiFormat parse_api_format(const std::string &s);
 std::string to_string(ApiFormat f);
 
-enum class ContentKind { Text, Image, ToolUse, ToolResult, Thinking };
+enum class ContentKind { Text, Image, File, Audio, ToolUse, ToolResult, Thinking };
 enum class StopReason { Stop, Length, ToolUse, ContentFilter, Unknown };
 
 /// A single normalized content block (request and response share this).
@@ -31,10 +31,17 @@ struct ContentBlock {
     std::string image_url;        // Image: http(s) URL
     std::string image_data_b64;   // Image: base64 payload
     std::string media_type;       // Image: "image/png", ...
+    std::string file_id;          // File: provider-managed file id
+    std::string file_url;         // File: remote URL (Responses/Anthropic)
+    std::string file_data_b64;    // File: base64 payload (without data URI)
+    std::string filename;         // File: optional display name
+    std::string audio_data_b64;   // Audio: base64 payload
+    std::string audio_format;     // Audio: wav/mp3/...
     std::string tool_use_id;      // ToolResult: the tool_use block being answered
     std::string tool_call_id;     // ToolUse: this call's id
     std::string tool_name;        // ToolUse
     json tool_input = json::object();  // ToolUse arguments (object form)
+    std::vector<ContentBlock> nested;   // ToolResult text/media blocks
     json extra = json::object();       // per-block extra (thinking signature, raw part, ...)
 };
 

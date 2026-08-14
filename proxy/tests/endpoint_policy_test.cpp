@@ -37,5 +37,10 @@ int main() {
                           "http://upstream/v1", "", path, path_is_full);
     assert(path == "/chat/completions");
     assert(!path_is_full);
+    resolve_upstream_path(endpoint_policy(EndpointKind::Responses),
+                          "openai_responses", "http://upstream/v1/", "",
+                          path, path_is_full);
+    assert(path == "/responses");
+    assert(!path_is_full);
     return 0;
 }

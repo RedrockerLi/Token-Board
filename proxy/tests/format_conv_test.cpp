@@ -18,6 +18,7 @@
 #include "codec.h"
 #include "format_anthropic.h"
 #include "format_common.h"
+#include "format_media.h"
 #include "format_openai.h"
 #include "format_responses.h"
 
@@ -151,7 +152,7 @@ static void run_request_roundtrip(const CodecRegistry &reg, ApiFormat from,
     if (to == from) {
         check(request_matches(a, b), label);
     } else {
-        check(true, label + " [converted, key fields checked below]");
+        printf("  converted: %s [key fields checked below]\n", label.c_str());
         check(b.model == a.model, "  model preserved");
         check(!b.system.empty() && b.system[0].text == a.system[0].text,
               "  system preserved");
@@ -601,6 +602,212 @@ static void test_strip_one_m_suffix(const CodecRegistry & /*reg*/) {
     }
 }
 
+static void test_responses_optional_message_and_tool_choice(const CodecRegistry &reg) {
+    printf("--- Responses optional message discriminator ---\n");
+    const FormatCodec &rc = reg.get(ApiFormat::OpenAIResponses);
+    const FormatCodec &oc = reg.get(ApiFormat::OpenAI);
+    ir::ChatRequest req;
+    std::string err;
+    const json input = json{
+        {"model", "gpt-test"},
+        {"input", json::array({json{{"role", "user"},
+                                     {"content", "hello"}}})},
+        {"tool_choice", json{{"type", "function"}, {"name", "lookup"}}},
+        {"previous_response_id", "resp_prev"},
+        {"background", true},
+        {"top_p", 0.9},
+    };
+    check(rc.parse_request(input, req, err),
+          "Responses optional message: parse succeeds");
+    check(req.messages.size() == 1 && req.messages[0].role == "user" &&
+              req.messages[0].content.size() == 1 &&
+              req.messages[0].content[0].text == "hello",
+          "Responses optional message: user content is retained");
+    const json out = oc.serialize_request(req);
+    check(out.contains("messages") && out["messages"].size() == 1 &&
+              out["messages"][0].value("content", "") == "hello",
+          "Responses optional message: converted Chat message is present");
+    check(out.value("tool_choice", json()) ==
+              json{{"type", "function"}, {"function", {{"name", "lookup"}}}},
+          "Responses tool_choice: converted to Chat function shape");
+    const json roundtrip = rc.serialize_request(req);
+    check(roundtrip.value("previous_response_id", "") == "resp_prev" &&
+              roundtrip.value("background", false) &&
+              roundtrip.value("top_p", 0.0) == 0.9,
+          "Responses known fields: preserved by Responses serialization");
+    ir::ChatRequest rich;
+    const json rich_input = json{
+        {"model", "gpt-test"},
+        {"input", json::array({json{{"role", "user"}, {"content", json::array({
+            json{{"type", "input_file"}, {"file_id", "file_1"}},
+            json{{"type", "input_audio"}, {"data", "AQI="}, {"format", "wav"}},
+        })}}})},
+    };
+    check(rc.parse_request(rich_input, rich, err),
+          "Responses file/audio parts: parse succeeds");
+    const json rich_roundtrip = rc.serialize_request(rich);
+    check(rich_roundtrip["input"][0]["content"][0].value("type", "") == "input_file" &&
+              rich_roundtrip["input"][0]["content"][1].value("type", "") == "input_audio",
+          "Responses file/audio parts: native parts preserved");
+}
+
+static void test_responses_custom_tool_items(const CodecRegistry &reg) {
+    printf("--- Responses custom tool items ---\n");
+    const FormatCodec &rc = reg.get(ApiFormat::OpenAIResponses);
+    const FormatCodec &oc = reg.get(ApiFormat::OpenAI);
+    ir::ChatRequest req;
+    std::string err;
+    const json input = json{
+        {"model", "gpt-test"},
+        {"input", json::array({
+            json{{"type", "custom_tool_call"}, {"call_id", "call_1"},
+                 {"name", "apply_patch"}, {"input", "*** patch ***"}},
+            json{{"type", "custom_tool_call_output"}, {"call_id", "call_1"},
+                 {"output", "ok"}},
+        })},
+        {"tools", json::array({json{{"type", "custom"},
+                                      {"name", "apply_patch"},
+                                      {"description", "patch files"},
+                                      {"format", json{{"type", "grammar"},
+                                                       {"syntax", "lark"}}}}})},
+    };
+    check(rc.parse_request(input, req, err), "Responses custom tool: parse succeeds");
+    const json out = oc.serialize_request(req);
+    bool tool_call = false, tool_result = false;
+    for (const auto &m : out.value("messages", json::array())) {
+        if (m.value("role", "") == "assistant" && m.contains("tool_calls"))
+            tool_call = true;
+        if (m.value("role", "") == "tool" &&
+            m.value("tool_call_id", "") == "call_1" &&
+            m.value("content", "") == "ok")
+            tool_result = true;
+    }
+    check(tool_call, "Responses custom tool: assistant tool call retained");
+    check(tool_result, "Responses custom tool: tool output retained");
+    check(!out.value("tools", json::array()).empty() &&
+              out["tools"][0].value("type", "") == "function",
+          "Responses custom tool: Chat function adapter emitted");
+    const json same = rc.serialize_request(req);
+    check(same["tools"][0].value("format", json()) ==
+              json{{"type", "grammar"}, {"syntax", "lark"}},
+          "Responses custom tool: raw format preserved");
+    check(same["input"][0].value("type", "") == "custom_tool_call" &&
+              same["input"][0].value("input", "") == "*** patch ***" &&
+              same["input"][1].value("type", "") == "custom_tool_call_output",
+          "Responses custom tool: call/output item types preserved");
+    ir::ChatResponse response;
+    const json response_input = json{
+        {"id", "resp-custom"}, {"model", "gpt-test"}, {"status", "completed"},
+        {"output", json::array({json{{"id", "cc_1"},
+            {"type", "custom_tool_call"}, {"call_id", "call_1"},
+            {"name", "apply_patch"}, {"input", "*** patch ***"}}})},
+    };
+    check(rc.parse_response(response_input, response, err),
+          "Responses custom tool response: parse succeeds");
+    const json response_roundtrip = rc.serialize_response(response);
+    check(response_roundtrip["output"][0].value("type", "") == "custom_tool_call" &&
+              response_roundtrip["output"][0].value("input", "") == "*** patch ***",
+          "Responses custom tool response: native item preserved");
+}
+
+static void test_responses_stream_lifecycle(const CodecRegistry &reg) {
+    printf("--- Responses stream lifecycle ---\n");
+    const std::string openai_sse =
+        "data: {\"id\":\"chat-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Think\"},\"finish_reason\":null}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n"
+        "data: [DONE]\n\n";
+    const std::string out = convert_stream(reg, ApiFormat::OpenAI,
+                                           ApiFormat::OpenAIResponses,
+                                           openai_sse);
+    check(out.find("event: response.created\n") != std::string::npos,
+          "Responses stream: response.created event line");
+    check(out.find("event: response.in_progress\n") != std::string::npos,
+          "Responses stream: response.in_progress event");
+    check(out.find("response.output_text.done") != std::string::npos &&
+              out.find("response.content_part.done") != std::string::npos &&
+              out.find("response.output_item.done") != std::string::npos,
+          "Responses stream: text/content/item done events");
+    check(out.find("response.reasoning_summary_part.added") != std::string::npos &&
+              out.find("response.reasoning_summary_text.delta") != std::string::npos &&
+              out.find("response.reasoning_summary_text.done") != std::string::npos &&
+              out.find("response.reasoning_summary_part.done") != std::string::npos,
+          "Responses stream: reasoning summary lifecycle");
+    check(out.find("event: response.completed\n") != std::string::npos,
+          "Responses stream: response.completed event");
+}
+
+static void test_native_media_bridges(const CodecRegistry &reg) {
+    printf("--- Native multimodal tool-result bridges ---\n");
+    const auto &rc = reg.get(ApiFormat::OpenAIResponses);
+    const auto &oc = reg.get(ApiFormat::OpenAI);
+    const auto &ac = reg.get(ApiFormat::Anthropic);
+    std::string err;
+    const json responses = {
+        {"model", "m"}, {"input", json::array({json{
+            {"type", "function_call_output"}, {"call_id", "c1"},
+            {"output", json::array({
+                json{{"type", "input_text"}, {"text", "ok"}},
+                json{{"type", "input_image"}, {"image_url", "data:image/png;base64,IMG_SENTINEL"}},
+                json{{"type", "input_file"}, {"file_data", "data:application/pdf;base64,FILE_SENTINEL"}, {"filename", "a.pdf"}},
+                json{{"type", "input_audio"}, {"input_audio", {{"data", "AUDIO_SENTINEL"}, {"format", "wav"}}}}
+            })}
+        }})}
+    };
+    ChatRequest req;
+    check(rc.parse_request(responses, req, err), "media: Responses parse");
+    json chat = oc.serialize_request(req);
+    bool native_image = false, native_file = false, native_audio = false;
+    bool base64_in_tool = false;
+    for (const auto &m : chat["messages"]) {
+        if (m.value("role", "") == "tool" && m.dump().find("SENTINEL") != std::string::npos)
+            base64_in_tool = true;
+        if (m.value("role", "") != "user" || !m["content"].is_array()) continue;
+        for (const auto &p : m["content"]) {
+            native_image = native_image || p.value("type", "") == "image_url";
+            native_file = native_file || p.value("type", "") == "file";
+            native_audio = native_audio || p.value("type", "") == "input_audio";
+        }
+    }
+    check(native_image && native_file && native_audio,
+          "media: Responses→Chat emits native image/file/audio parts");
+    check(!base64_in_tool, "media: tool message does not contain media payload");
+
+    ChatRequest anthropic_req;
+    const json anthropic = json::parse(R"({
+      "model":"m", "max_tokens":10,
+      "messages":[
+        {"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"x","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":[
+          {"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMG_SENTINEL"}}
+        ]}]}
+      ]
+    })");
+    check(ac.parse_request(anthropic, anthropic_req, err), "media: Anthropic parse");
+    json response_input = rc.serialize_request(anthropic_req);
+    check(response_input["input"][1]["output"][0].value("type", "") == "input_image",
+          "media: Anthropic→Responses restores input_image");
+    json anthropic_output = ac.serialize_request(req);
+    check(anthropic_output["messages"].empty() || anthropic_output["messages"][0].value("role", "") != "tool",
+          "media: Anthropic tool results use role user");
+
+    const auto requirements = fmt::request_media_requirements(req);
+    std::string reason;
+    check(!fmt::target_supports_media(ApiFormat::Anthropic, requirements, reason),
+          "media: audio rejects Anthropic target");
+    check(fmt::target_supports_media(ApiFormat::OpenAI, requirements, reason),
+          "media: Chat target accepts image/file/audio");
+
+    std::string huge(17 * 1024, 'A');
+    ContentBlock clamped;
+    fmt::parse_tool_result_content(json::array({
+        json{{"type", "image"}, {"data", "IMG"}, {"mimeType", "image/png"}},
+        huge}), clamped);
+    check(fmt::tool_result_text(clamped).find("[large media payload omitted]") != std::string::npos,
+          "media: residual base64-like text is clamped after media detection");
+}
+
 static int self_test() {
     CodecRegistry reg;
     reg.add(make_openai_codec());
@@ -648,6 +855,10 @@ static int self_test() {
     test_anthropic_to_openai_tool_choice(reg);
     test_openai_to_anthropic_tool_choice(reg);
     test_strip_one_m_suffix(reg);
+    test_responses_optional_message_and_tool_choice(reg);
+    test_responses_custom_tool_items(reg);
+    test_responses_stream_lifecycle(reg);
+    test_native_media_bridges(reg);
 
     printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILED",
            g_failures, g_failures == 1 ? "" : "s");

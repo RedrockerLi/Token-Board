@@ -45,6 +45,9 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
                         msg.content.push_back(std::move(b));
                     } else if (type == "image_url") {
                         msg.content.push_back(fmt::openai_image_part_to_block(part));
+                    } else if (type == "file" || type == "input_audio" ||
+                               type == "audio") {
+                        fmt::parse_media_content(part, msg.content, false);
                     } else {
                         // Unknown part type — keep raw so it survives round-trip.
                         ContentBlock b;
@@ -111,11 +114,8 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
                 b.kind = ContentKind::ToolResult;
                 if (m.contains("tool_call_id") && m["tool_call_id"].is_string())
                     b.tool_use_id = m["tool_call_id"].get<std::string>();
-                if (!msg.content.empty()) {
-                    b.text = msg.content[0].text;
-                } else if (m.contains("content") && m["content"].is_string()) {
-                    b.text = m["content"].get<std::string>();
-                }
+                fmt::parse_tool_result_content(
+                    m.contains("content") ? m["content"] : json(nullptr), b);
                 msg.content.clear();
                 msg.content.push_back(std::move(b));
             }
@@ -141,12 +141,7 @@ bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
             // Normalize: role=system content becomes top-level system blocks.
             if (role == "system") {
                 for (auto &b : msg.content) {
-                    if (b.kind == ContentKind::Text) {
-                        ContentBlock sys;
-                        sys.kind = ContentKind::Text;
-                        sys.text = b.text;
-                        out.system.push_back(std::move(sys));
-                    }
+                    out.system.push_back(std::move(b));
                 }
             } else {
                 out.messages.push_back(std::move(msg));
@@ -299,10 +294,14 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
         std::string sys_text;
         for (const auto &b : in.system)
             if (b.kind == ContentKind::Text) sys_text += b.text;
-        if (!sys_text.empty()) {
+        if (!in.system.empty()) {
             json sys = json::object();
             sys["role"] = "system";
-            sys["content"] = sys_text;
+            bool only_text = true;
+            for (const auto &b : in.system)
+                only_text = only_text && b.kind == ContentKind::Text;
+            sys["content"] = only_text ? json(sys_text)
+                                        : fmt::serialize_openai_content_blocks(in.system);
             // Insert system first if body already has messages.
             if (body.contains("messages") && body["messages"].is_array())
                 body["messages"].insert(body["messages"].begin(), std::move(sys));
@@ -338,6 +337,12 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
                 parts.push_back(fmt::image_block_to_openai_part(b));
                 break;
             }
+            case ContentKind::File:
+                parts.push_back(fmt::serialize_openai_file_part(b));
+                break;
+            case ContentKind::Audio:
+                parts.push_back(fmt::serialize_openai_audio_part(b));
+                break;
             case ContentKind::Thinking: {
                 if (b.extra.contains("raw") && b.extra["raw"].is_object())
                     parts.push_back(b.extra["raw"]);
@@ -383,6 +388,7 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
             json parts = json::array();
             bool has_tools = false;
             json tool_calls = json::array();
+            json tool_media = json::array();
             std::string reasoning_text;
             std::vector<std::pair<std::string, std::string>> tr_by_id;
             for (const auto &b : m.content) {
@@ -391,12 +397,14 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
                         bool found = false;
                         for (auto &kv : tr_by_id) {
                             if (kv.first == b.tool_use_id) {
-                                kv.second += b.text;
+                                kv.second += fmt::tool_result_text(b);
                                 found = true;
                                 break;
                             }
                         }
-                        if (!found) tr_by_id.emplace_back(b.tool_use_id, b.text);
+                        if (!found) tr_by_id.emplace_back(b.tool_use_id, fmt::tool_result_text(b));
+                        json media = fmt::serialize_openai_tool_media_parts(b);
+                        for (const auto &part : media) tool_media.push_back(part);
                     } else {
                         // No id → cannot be a tool message; keep as text part.
                         json p;
@@ -419,6 +427,8 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in) const {
                 jt["content"] = kv.second;
                 msgs.push_back(std::move(jt));
             }
+            if (!tool_media.empty())
+                msgs.push_back(json{{"role", "user"}, {"content", tool_media}});
             // Non-tool parts become a normal user message after the tool results.
             if (parts.size() == 1 && parts[0].value("type", "") == "text")
                 jm["content"] = parts[0]["text"];

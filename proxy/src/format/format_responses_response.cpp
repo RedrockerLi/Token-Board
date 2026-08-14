@@ -30,6 +30,14 @@ bool ResponsesCodec::parse_response(const json &in, ir::ChatResponse &out,
                 if (item.contains("arguments") && item["arguments"].is_string())
                     b.tool_input = parse_responses_arguments(item["arguments"].get<std::string>());
                 out.content.push_back(std::move(b));
+            } else if (type == "custom_tool_call") {
+                ContentBlock b;
+                b.kind = ContentKind::ToolUse;
+                b.extra["type"] = "custom";
+                b.tool_call_id = item.value("call_id", "");
+                b.tool_name = item.value("name", "custom_tool");
+                b.tool_input = json{{"input", item.value("input", "")}};
+                out.content.push_back(std::move(b));
             } else if (type == "reasoning") {
                 if (item.contains("summary") && item["summary"].is_array()) {
                     for (const auto &s : item["summary"]) {
@@ -96,12 +104,16 @@ json ResponsesCodec::serialize_response(const ir::ChatResponse &in) const {
                 break;
             case ContentKind::ToolUse: {
                 json item;
-                item["type"] = "function_call";
+                const bool custom = b.extra.value("type", "") == "custom";
+                item["type"] = custom ? "custom_tool_call" : "function_call";
                 item["id"] = b.tool_call_id.empty() ? "fc_" + std::to_string((uintptr_t)&b)
                                                      : b.tool_call_id;
                 item["call_id"] = b.tool_call_id;
                 item["name"] = b.tool_name;
-                item["arguments"] = b.tool_input.dump();
+                if (custom)
+                    item["input"] = b.tool_input.value("input", "");
+                else
+                    item["arguments"] = b.tool_input.dump();
                 item["status"] = "completed";
                 output.push_back(std::move(item));
                 break;

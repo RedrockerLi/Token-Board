@@ -61,19 +61,21 @@ std::string build_data_uri(const std::string &media_type,
 ir::ContentBlock openai_image_part_to_block(const json &part) {
     ir::ContentBlock b;
     b.kind = ir::ContentKind::Image;
-    if (part.contains("image_url") && part["image_url"].is_object()) {
+    if (part.contains("image_url")) {
         const auto &iu = part["image_url"];
-        if (iu.contains("url") && iu["url"].is_string())
-            b.image_url = iu["url"].get<std::string>();
-        if (iu.contains("detail") && iu["detail"].is_string())
-            b.extra["detail"] = iu["detail"];
+        if (iu.is_string()) b.image_url = iu.get<std::string>();
+        else if (iu.is_object()) {
+            if (iu.contains("url") && iu["url"].is_string())
+                b.image_url = iu["url"].get<std::string>();
+            if (iu.contains("detail") && iu["detail"].is_string())
+                b.extra["detail"] = iu["detail"];
+        }
     }
     std::string media, b64;
     if (parse_data_uri(b.image_url, media, b64)) {
         b.image_data_b64 = b64;
         b.media_type = media;
         b.image_url.clear();  // keep the data URI form only in extra
-        b.extra["data_uri"] = "data:" + media + ";base64," + b64;
     }
     return b;
 }
@@ -151,6 +153,15 @@ json normalize_tool_choice_to_openai(const json &tc) {
         out["function"] = {{"name", tc.value("name", "")}};
         return out;
     }
+    // Responses function tool choice: {"type":"function","name":"foo"}
+    // differs from Chat Completions' nested function shape.
+    if (type == "function" && tc.contains("name") &&
+        !tc.contains("function")) {
+        json out;
+        out["type"] = "function";
+        out["function"] = {{"name", tc.value("name", "")}};
+        return out;
+    }
     if (type == "any") return json("required");  // Anthropic "any" → OpenAI "required"
     if (type == "auto") return json("auto");
     if (type == "none") return json("none");
@@ -169,6 +180,8 @@ json normalize_tool_choice_to_anthropic(const json &tc) {
         std::string name;
         if (tc.contains("function") && tc["function"].is_object())
             name = tc["function"].value("name", "");
+        else if (tc.contains("name") && tc["name"].is_string())
+            name = tc["name"].get<std::string>();
         json out;
         out["type"] = "tool";
         if (!name.empty()) out["name"] = name;

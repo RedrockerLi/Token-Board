@@ -39,6 +39,9 @@ void parse_anthropic_blocks(const json &value,
                 item.image_data_b64 = source.value("data", "");
                 item.media_type = source.value("media_type", "");
             } else item.image_url = source.value("url", "");
+        } else if (type == "document") {
+            fmt::parse_media_content(block, output, false);
+            continue;
         } else if (type == "tool_use") {
             item.kind = ContentKind::ToolUse;
             item.tool_call_id = block.value("id", "");
@@ -47,12 +50,9 @@ void parse_anthropic_blocks(const json &value,
         } else if (type == "tool_result") {
             item.kind = ContentKind::ToolResult;
             item.tool_use_id = block.value("tool_use_id", "");
+            if (block.contains("is_error")) item.extra["is_error"] = block["is_error"];
             const json content = block.value("content", json());
-            if (content.is_string()) item.text = content.get<std::string>();
-            else if (content.is_array())
-                for (const auto &part : content)
-                    if (part.is_object() && part.value("type", "") == "text")
-                        item.text += part.value("text", "");
+            fmt::parse_tool_result_content(content, item);
         } else if (type == "thinking" || type == "redacted_thinking") {
             item.kind = ContentKind::Thinking;
             item.text = block.value("thinking", "");
@@ -65,4 +65,3 @@ void parse_anthropic_blocks(const json &value,
         output.push_back(std::move(item));
     }
 }
-

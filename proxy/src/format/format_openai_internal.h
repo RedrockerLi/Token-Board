@@ -2,6 +2,7 @@
 
 #include "format_openai.h"
 #include "format_common.h"
+#include "format_media.h"
 
 class OpenAICodec final : public FormatCodec {
 public:
@@ -26,4 +27,3 @@ bool openai_request_key_consumed(const std::string &key);
 void collapse_openai_system_messages(json &messages);
 std::unique_ptr<ir::StreamParser> make_openai_stream_parser_impl();
 std::unique_ptr<ir::StreamEmitter> make_openai_stream_emitter_impl();
-

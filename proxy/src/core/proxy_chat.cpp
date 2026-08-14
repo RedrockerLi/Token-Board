@@ -42,6 +42,36 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         cands.begin(), cands.end(), [harness](const UpstreamCandidate &candidate) {
             return ir::parse_api_format(candidate.account().api_format) != harness;
         });
+    if (conversion_needed && !ensure_request_ir(codecs_, context, parse_error)) {
+        res.status = 400;
+        res.set_content(codecs_.get(harness).serialize_error_body(
+            json{{"message", parse_error}, {"type", "parse_error"}}).dump(),
+            "application/json");
+        return;
+    }
+    if (conversion_needed) {
+        const auto requirements = fmt::request_media_requirements(context.parsed_ir);
+        std::vector<UpstreamCandidate> compatible;
+        compatible.reserve(cands.size());
+        std::string incompatibility;
+        for (const auto &candidate : cands) {
+            const auto target = ir::parse_api_format(candidate.account().api_format);
+            if (target == harness || fmt::target_supports_media(
+                    target, requirements, incompatibility))
+                compatible.push_back(candidate);
+        }
+        if (compatible.empty()) {
+            res.status = 422;
+            res.set_content(codecs_.get(harness).serialize_error_body(
+                json{{"message", incompatibility.empty()
+                                      ? "No configured upstream supports the request media"
+                                      : incompatibility},
+                     {"type", "unsupported_media"}}).dump(),
+                "application/json");
+            return;
+        }
+        cands = std::move(compatible);
+    }
     RequestBodyCache body_cache(req.body, context.parsed_json, context.model,
                                 ir::to_string(harness));
 
@@ -51,15 +81,6 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     // next key when an upstream returns 429/5xx before emitting any bytes.
     if (context.streaming) {
         std::shared_ptr<const ir::ChatRequest> parsed_request;
-        if (conversion_needed &&
-            !ensure_request_ir(codecs_, context, parse_error)) {
-            res.status = 400;
-            res.set_content(codecs_.get(harness).serialize_error_body(
-                json{{"message", parse_error},
-                     {"type", "parse_error"}}).dump(),
-                "application/json");
-            return;
-        }
         if (conversion_needed)
             parsed_request = std::make_shared<const ir::ChatRequest>(
                 context.parsed_ir);

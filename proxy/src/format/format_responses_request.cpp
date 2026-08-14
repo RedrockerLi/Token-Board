@@ -20,18 +20,7 @@ bool ResponsesCodec::parse_request(const json &in, ir::ChatRequest &out,
             b.kind = ContentKind::Text;
             b.text = ins.get<std::string>();
             out.system.push_back(std::move(b));
-        } else if (ins.is_array()) {
-            for (const auto &part : ins) {
-                if (!part.is_object()) continue;
-                if (part.value("type", "") == "input_text" &&
-                    part.contains("text") && part["text"].is_string()) {
-                    ContentBlock b;
-                    b.kind = ContentKind::Text;
-                    b.text = part["text"].get<std::string>();
-                    out.system.push_back(std::move(b));
-                }
-            }
-        }
+        } else if (ins.is_array()) parse_responses_content(ins, out.system);
     }
 
     if (in.contains("input")) {
@@ -48,7 +37,13 @@ bool ResponsesCodec::parse_request(const json &in, ir::ChatRequest &out,
             for (const auto &item : input) {
                 if (!item.is_object()) continue;
                 std::string type = item.value("type", "");
-                if (type == "message") {
+                // EasyInputMessage.type is optional in the Responses API.
+                // The SDK commonly emits {role, content} without the
+                // discriminator, so treat a role/content object as a message
+                // instead of silently parking it in raw_input_items.
+                if (type == "message" ||
+                    (type.empty() && item.contains("role") &&
+                     item.contains("content"))) {
                     Message msg;
                     msg.role = item.value("role", "user");
                     if (item.contains("content"))
@@ -65,14 +60,39 @@ bool ResponsesCodec::parse_request(const json &in, ir::ChatRequest &out,
                         b.tool_input = parse_responses_arguments(item["arguments"].get<std::string>());
                     msg.content.push_back(std::move(b));
                     out.messages.push_back(std::move(msg));
-                } else if (type == "function_call_output") {
+                } else if (type == "function_call_output" ||
+                           type == "tool_search_output") {
                     Message msg;
                     msg.role = "tool";
                     ContentBlock b;
                     b.kind = ContentKind::ToolResult;
                     b.tool_use_id = item.value("call_id", "");
                     const json &o = item.contains("output") ? item["output"] : json(nullptr);
-                    if (o.is_string()) b.text = o.get<std::string>();
+                    fmt::parse_tool_result_content(o, b);
+                    msg.content.push_back(std::move(b));
+                    out.messages.push_back(std::move(msg));
+                } else if (type == "custom_tool_call") {
+                    Message msg;
+                    msg.role = "assistant";
+                    ContentBlock b;
+                    b.kind = ContentKind::ToolUse;
+                    b.tool_call_id = item.value("call_id", "");
+                    b.tool_name = item.value("name", "custom_tool");
+                    b.extra["type"] = "custom";
+                    // Chat-completions custom-tool compatibility uses one
+                    // required string parameter named input.
+                    b.tool_input = json{{"input", item.value("input", "")}};
+                    msg.content.push_back(std::move(b));
+                    out.messages.push_back(std::move(msg));
+                } else if (type == "custom_tool_call_output") {
+                    Message msg;
+                    msg.role = "tool";
+                    ContentBlock b;
+                    b.kind = ContentKind::ToolResult;
+                    b.extra["type"] = "custom";
+                    b.tool_use_id = item.value("call_id", "");
+                    const json &o = item.contains("output") ? item["output"] : json(nullptr);
+                    fmt::parse_tool_result_content(o, b);
                     msg.content.push_back(std::move(b));
                     out.messages.push_back(std::move(msg));
                 } else {
@@ -122,15 +142,30 @@ bool ResponsesCodec::parse_request(const json &in, ir::ChatRequest &out,
         if (!responses_request_key_consumed(it.key()))
             out.extras[it.key()] = it.value();
     }
-    if (in.contains("previous_response_id"))
-        out.extras["previous_response_id"] = in["previous_response_id"];
+    // These parameters have no dedicated IR fields but must survive a
+    // Responses→Responses round-trip and same-format model rewrite.
+    static constexpr const char *passthrough_keys[] = {
+        "background", "context_management", "conversation", "include",
+        "max_tool_calls", "metadata", "moderation", "parallel_tool_calls",
+        "previous_response_id", "prompt", "prompt_cache_key",
+        "prompt_cache_options", "prompt_cache_retention", "safety_identifier",
+        "service_tier", "store", "stream_options", "text", "top_logprobs",
+        "top_p", "truncation", "user",
+    };
+    for (const char *key : passthrough_keys)
+        if (in.contains(key)) out.extras[key] = in[key];
     return true;
 }
 
 json ResponsesCodec::serialize_request(const ir::ChatRequest &in) const {
-    json body = fmt::filter_keys(in.extras, {"store", "include", "metadata",
-                                             "user", "text",
-                                             "parallel_tool_calls"});
+    json body = fmt::filter_keys(
+        in.extras,
+        {"background", "context_management", "conversation", "include",
+         "max_tool_calls", "metadata", "moderation", "parallel_tool_calls",
+         "previous_response_id", "prompt", "prompt_cache_key",
+         "prompt_cache_options", "prompt_cache_retention", "safety_identifier",
+         "service_tier", "store", "stream_options", "text", "top_logprobs",
+         "top_p", "truncation", "user"});
     body["model"] = in.model;
     body["stream"] = in.stream;
     if (in.max_tokens.has_value())
@@ -149,9 +184,22 @@ json ResponsesCodec::serialize_request(const ir::ChatRequest &in) const {
     if (!in.tools.empty()) {
         json arr = json::array();
         for (const auto &t : in.tools) {
+            const std::string type =
+                t.extra.contains("type") && t.extra["type"].is_string()
+                    ? t.extra["type"].get<std::string>() : "function";
+            if (type == "custom" && t.extra.contains("raw") &&
+                t.extra["raw"].is_object()) {
+                // Preserve custom-tool format/grammar fields that are not in
+                // the common IR; dropping them makes same-format rewrites
+                // unusable for free-form tools such as apply_patch.
+                json raw = t.extra["raw"];
+                if (!t.name.empty()) raw["name"] = t.name;
+                if (!t.description.empty()) raw["description"] = t.description;
+                arr.push_back(std::move(raw));
+                continue;
+            }
             json j;
-            j["type"] = t.extra.contains("type") ? t.extra["type"].get<std::string>()
-                                                 : std::string("function");
+            j["type"] = type;
             j["name"] = t.name;
             j["description"] = t.description;
             j["parameters"] = t.input_schema.is_object() ? t.input_schema : json::object();
@@ -192,19 +240,24 @@ json ResponsesCodec::serialize_request(const ir::ChatRequest &in) const {
             for (const auto &b : m.content) {
                 if (b.kind != ContentKind::ToolResult) continue;
                 json item;
-                item["type"] = "function_call_output";
+                item["type"] = b.extra.value("type", "") == "custom"
+                    ? "custom_tool_call_output" : "function_call_output";
                 item["call_id"] = b.tool_use_id;
-                item["output"] = b.text;
+                item["output"] = fmt::serialize_responses_tool_result_value(b);
                 input.push_back(std::move(item));
             }
         } else if (has_tool_use) {
             for (const auto &b : m.content) {
                 if (b.kind != ContentKind::ToolUse) continue;
                 json item;
-                item["type"] = "function_call";
+                item["type"] = b.extra.value("type", "") == "custom"
+                    ? "custom_tool_call" : "function_call";
                 item["call_id"] = b.tool_call_id;
                 item["name"] = b.tool_name;
-                item["arguments"] = b.tool_input.dump();
+                if (b.extra.value("type", "") == "custom")
+                    item["input"] = b.tool_input.value("input", "");
+                else
+                    item["arguments"] = b.tool_input.dump();
                 input.push_back(std::move(item));
             }
         } else {

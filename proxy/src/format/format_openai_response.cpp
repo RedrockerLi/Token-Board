@@ -37,6 +37,9 @@ bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
                             b.kind = ContentKind::Text;
                             b.text = part["text"].get<std::string>();
                             out.content.push_back(std::move(b));
+                        } else if (type == "image_url" || type == "file" ||
+                                   type == "input_audio") {
+                            fmt::parse_media_content(part, out.content, false);
                         } else {
                             ContentBlock b;
                             b.kind = ContentKind::Text;
@@ -140,6 +143,12 @@ json OpenAICodec::serialize_response(const ir::ChatResponse &in) const {
             }
             case ContentKind::Image:
                 content.push_back(fmt::image_block_to_openai_part(b));
+                break;
+            case ContentKind::File:
+                content.push_back(fmt::serialize_openai_file_part(b));
+                break;
+            case ContentKind::Audio:
+                content.push_back(fmt::serialize_openai_audio_part(b));
                 break;
             case ContentKind::Thinking:
                 reasoning_text += b.text;

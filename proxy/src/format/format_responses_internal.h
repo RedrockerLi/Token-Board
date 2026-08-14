@@ -2,6 +2,7 @@
 
 #include "format_responses.h"
 #include "format_common.h"
+#include "format_media.h"
 
 class ResponsesCodec final : public FormatCodec {
 public:
@@ -30,4 +31,3 @@ json serialize_responses_content(const std::vector<ir::ContentBlock> &blocks,
                                  bool output_style);
 std::unique_ptr<ir::StreamParser> make_responses_stream_parser_impl();
 std::unique_ptr<ir::StreamEmitter> make_responses_stream_emitter_impl();
-

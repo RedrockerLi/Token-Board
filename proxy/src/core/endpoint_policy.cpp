@@ -72,6 +72,8 @@ void resolve_upstream_path(const EndpointPolicy &policy,
         if (path_start != std::string::npos)
             base_path = base_url.substr(path_start);
     }
+    while (base_path.size() > 1 && base_path.back() == '/')
+        base_path.pop_back();
 
     const auto format = ir::parse_api_format(api_format);
     if (policy.kind == EndpointKind::Embeddings ||

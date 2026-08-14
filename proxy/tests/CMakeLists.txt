@@ -39,6 +39,7 @@ add_executable(format_conv_test format_conv_test.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_request.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_response.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_media.cpp
 )
 target_include_directories(format_conv_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(format_conv_test PRIVATE cxx_std_17)
@@ -213,6 +214,14 @@ add_test(
             ${CMAKE_SOURCE_DIR}/..
 )
 add_test(
+    NAME responses_forwarding
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/responses_forwarding_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
     NAME v1_admin
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/v1_admin_test.py
@@ -343,7 +352,7 @@ set_tests_properties(format_conversion session_affinity endpoint_policy source_s
     PROPERTIES LABELS "unit")
 set_tests_properties(upstream_client PROPERTIES LABELS "integration")
 set_tests_properties(
-    proxy_forwarding v1_routing v1_admin cooldown_discrimination
+    proxy_forwarding v1_routing responses_forwarding v1_admin cooldown_discrimination
     fallback_matrix cooldown_probe error_shape
     PROPERTIES LABELS "integration"
 )

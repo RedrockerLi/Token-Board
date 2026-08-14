@@ -25,7 +25,8 @@ set(FORMAT_SOURCES
     src/format/format_anthropic_response.cpp src/format/format_anthropic_stream.cpp
     src/format/format_responses.cpp src/format/format_responses_helpers.cpp
     src/format/format_responses_request.cpp src/format/format_responses_response.cpp
-    src/format/format_responses_stream.cpp src/format/think_filter.cpp)
+    src/format/format_responses_stream.cpp src/format/format_media.cpp
+    src/format/think_filter.cpp)
 
 set(NET_SOURCES
     src/net/upstream_client.cpp src/net/upstream_forward.cpp)

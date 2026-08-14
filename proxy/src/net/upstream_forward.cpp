@@ -35,6 +35,8 @@ UpstreamClient::forward(const std::string &method,
     } else {
         scheme_host = base_url.substr(0, path_start);
         url_path = base_url.substr(path_start);
+        while (url_path.size() > 1 && url_path.back() == '/')
+            url_path.pop_back();
     }
 
     std::string full_path = opts.path_is_full ? path : url_path + path;

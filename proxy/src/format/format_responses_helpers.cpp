@@ -5,11 +5,18 @@
 using namespace ir;
 
 bool responses_request_key_consumed(const std::string &key) {
-    static constexpr std::array<const char *, 16> consumed{{
-        "model", "instructions", "input", "tools", "tool_choice",
-        "reasoning", "max_output_tokens", "temperature", "stream",
-        "previous_response_id", "store", "include", "metadata", "user",
-        "text", "parallel_tool_calls",
+    // Keep this list aligned with the public Responses create parameters.
+    // Unknown provider extensions are still retained in extras, but known
+    // fields must survive a Responses→Responses codec round-trip.
+    static constexpr std::array<const char *, 31> consumed{{
+        "background", "context_management", "conversation", "include",
+        "input", "instructions", "max_output_tokens", "max_tool_calls",
+        "metadata", "model", "moderation", "parallel_tool_calls",
+        "previous_response_id", "prompt", "prompt_cache_key",
+        "prompt_cache_options", "prompt_cache_retention", "reasoning",
+        "safety_identifier", "service_tier", "store", "stream",
+        "stream_options", "temperature", "text", "tool_choice", "tools",
+        "top_logprobs", "top_p", "truncation", "user",
     }};
     for (const char *item : consumed)
         if (key == item) return true;
@@ -55,7 +62,17 @@ void parse_responses_content(const json &content,
                 block.image_data_b64 = std::move(encoded);
                 block.image_url.clear();
             }
-        } else continue;
+        } else if (type == "input_file" || type == "input_audio" ||
+                   type == "file" || type == "audio") {
+            fmt::parse_media_content(part, output, false);
+            continue;
+        } else {
+            // File/audio/computer-use parts have no lossless equivalent in
+            // the common IR. Preserve the native Responses object so a
+            // same-format rewrite does not silently discard user input.
+            block.kind = ContentKind::Text;
+            block.extra["raw"] = part;
+        }
         output.push_back(std::move(block));
     }
 }
@@ -76,8 +93,11 @@ json serialize_responses_content(const std::vector<ContentBlock> &blocks,
                 : fmt::build_data_uri(block.media_type, block.image_data_b64);
             if (block.extra.contains("detail")) value["detail"] = block.extra["detail"];
             result.push_back(std::move(value));
+        } else if (block.kind == ContentKind::File) {
+            result.push_back(fmt::serialize_responses_file_part(block));
+        } else if (block.kind == ContentKind::Audio) {
+            result.push_back(fmt::serialize_responses_audio_part(block));
         }
     }
     return result;
 }
-

@@ -114,6 +114,9 @@ json serialize_anthropic_blocks(const std::vector<ContentBlock> &blocks) {
                 arr.push_back(std::move(j));
                 break;
             }
+            case ContentKind::File:
+                arr.push_back(fmt::serialize_anthropic_file_part(b));
+                break;
             case ContentKind::ToolUse: {
                 json j;
                 j["type"] = "tool_use";
@@ -127,7 +130,8 @@ json serialize_anthropic_blocks(const std::vector<ContentBlock> &blocks) {
                 json j;
                 j["type"] = "tool_result";
                 j["tool_use_id"] = b.tool_use_id;
-                j["content"] = b.text;
+                j["content"] = fmt::serialize_anthropic_tool_result_content(b);
+                if (b.extra.contains("is_error")) j["is_error"] = b.extra["is_error"];
                 arr.push_back(std::move(j));
                 break;
             }
@@ -213,7 +217,10 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in) const {
     json msgs = json::array();
     for (const auto &m : in.messages) {
         json jm;
-        jm["role"] = m.role;
+        bool has_tool_result = false;
+        for (const auto &b : m.content)
+            has_tool_result = has_tool_result || b.kind == ContentKind::ToolResult;
+        jm["role"] = has_tool_result ? "user" : m.role;
         jm["content"] = serialize_anthropic_blocks(m.content);
         msgs.push_back(std::move(jm));
     }

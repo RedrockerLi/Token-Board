@@ -1,11 +1,7 @@
 #include "format_responses_internal.h"
-
 #include <set>
-
 using namespace ir;
-
 namespace {
-
 class ResponsesStreamParser : public StreamParser {
 public:
     bool feed(const char *data, size_t len, const EmitFn &emit) override {
@@ -56,7 +52,6 @@ public:
 
 private:
     fmt::SseFrameBuffer sse_;
-
     void handle_frame(const json &j, const EmitFn &emit) {
         std::string type;
         if (j.is_object() && j.contains("type") && j["type"].is_string())
@@ -94,9 +89,6 @@ private:
             ev.text = j.value("delta", "");
             if (!emit(ev)) return;
         } else if (type == "response.refusal.delta") {
-            // Refusals are semantic, user-visible output.  Treat the delta as
-            // text in the format-neutral IR so converted streams preserve it
-            // and passthrough TTFT detection does not wait until EOF.
             int index = j.value("output_index", 0);
             StreamEvent ev;
             ev.type = StreamEventType::ContentTextDelta;
@@ -155,8 +147,6 @@ private:
             else if (j.contains("error"))
                 ev.extra["error"] = j["error"];
             else if (type == "error")
-                // Native Responses error events keep code/message/param at
-                // the top level rather than under an `error` member.
                 ev.extra["error"] = j;
             else
                 ev.extra["error"] = json{{"message", "upstream error"}};
@@ -164,8 +154,6 @@ private:
         }
     }
 };
-
-// ── Streaming: emitter (IR events → Responses SSE frames) ───────────────
 
 class ResponsesStreamEmitter : public StreamEmitter {
 public:
@@ -188,7 +176,7 @@ public:
                     d["output_index"] = oi;
                     d["content_index"] = 0;
                     d["delta"] = ev.text;
-                    if (!sink("data: " + d.dump() + "\n\n")) return false;
+                    if (!sink(frame("response.output_text.delta", d))) return false;
                 }
                 text_[oi] += ev.text;
                 return true;
@@ -200,12 +188,12 @@ public:
                     !emit_reasoning_item_start(sink, oi)) return false;
                 {
                     json d;
-                    d["type"] = "response.reasoning_text.delta";
+                    d["type"] = "response.reasoning_summary_text.delta";
                     d["item_id"] = item_id(oi);
                     d["output_index"] = oi;
-                    d["content_index"] = 0;
+                    d["summary_index"] = 0;
                     d["delta"] = ev.text;
-                    if (!sink("data: " + d.dump() + "\n\n")) return false;
+                    if (!sink(frame("response.reasoning_summary_text.delta", d))) return false;
                 }
                 reasoning_text_[oi] += ev.text;
                 return true;
@@ -227,7 +215,7 @@ public:
                     d["output_index"] = oi;
                     d["item"] = item;
                     tools_[oi] = {ev.text, ev.arguments, ""};
-                    if (!sink("data: " + d.dump() + "\n\n")) return false;
+                    if (!sink(frame("response.output_item.added", d))) return false;
                 }
                 return true;
             case StreamEventType::ToolCallArgumentDelta:
@@ -239,7 +227,7 @@ public:
                     d["output_index"] = oi;
                     d["delta"] = ev.arguments;
                     tools_[oi].arguments += ev.arguments;
-                    return sink("data: " + d.dump() + "\n\n");
+                    return sink(frame("response.function_call_arguments.delta", d));
                 }
             case StreamEventType::ToolCallDone:
                 {
@@ -256,9 +244,10 @@ public:
                     d["output_index"] = oi;
                     d["item"] = item;
                     tools_[oi].arguments = item["arguments"];
-                    return sink("data: " + d.dump() + "\n\n");
+                    return sink(frame("response.output_item.done", d));
                 }
             case StreamEventType::MessageFinish:
+                if (!close_open_items(sink)) return false;
                 deferred_status_ = fmt::stop_reason_to_responses(ev.stop_reason);
                 return true;  // response.completed deferred until usage or finish
             case StreamEventType::UsageEvent:
@@ -275,7 +264,7 @@ public:
                 r["object"] = "response";
                 r["status"] = "failed";
                 r["error"] = err;
-                return sink("data: " + json{{"type", "response.failed"}, {"response", r}}.dump() + "\n\n");
+                return sink(frame("response.failed", json{{"type", "response.failed"}, {"response", r}}));
             }
         }
         return true;
@@ -298,16 +287,13 @@ private:
     bool completed_emitted_ = false;
     std::string deferred_status_ = "completed";
     Usage last_usage_;
-    std::map<int, std::string> text_;            // output_index → message text
-    std::map<int, std::string> reasoning_text_;  // output_index → reasoning text
-    std::map<int, ToolItem> tools_;              // output_index → tool item
+    std::map<int, std::string> text_;
+    std::map<int, std::string> reasoning_text_;
+    std::map<int, ToolItem> tools_;
     std::map<int, int> item_kind_;               // 0=message, 1=tool, 2=reasoning
-    // IR event index → output_index. The OpenAI stream parser reuses choice
-    // index 0 for reasoning AND text, and a separate tool index space (0..n)
-    // for tool calls, so key by (kind, ir_index) to keep every Responses item
-    // distinct.
     std::map<std::pair<int, int>, int> out_index_;
     std::set<int> text_started_;                 // output_index already started
+    std::set<int> text_finished_;
     int next_output_index_ = 0;
     enum { kReasoningStream = 0, kTextStream = 1, kToolStream = 2 };
 
@@ -315,8 +301,10 @@ private:
         return "item_" + std::to_string(index);
     }
 
-    // Assign a unique Responses output_index per IR item stream (reasoning,
-    // message and tool-call are distinct Responses items).
+    static std::string frame(const std::string &event, const json &payload) {
+        return "event: " + event + "\ndata: " + payload.dump() + "\n\n";
+    }
+
     int out_index_for(int ir_index, int stream_kind) {
         auto key = std::make_pair(stream_kind, ir_index);
         auto it = out_index_.find(key);
@@ -335,7 +323,10 @@ private:
         r["model"] = model_;
         r["output"] = json::array();
         r["usage"] = nullptr;
-        return sink("data: " + json{{"type", "response.created"}, {"response", r}}.dump() + "\n\n");
+        const json created{{"type", "response.created"}, {"response", r}};
+        if (!sink(frame("response.created", created))) return false;
+        json progress{{"type", "response.in_progress"}, {"response", r}};
+        return sink(frame("response.in_progress", progress));
     }
 
     bool emit_text_item_start(const Sink &sink, int index) {
@@ -351,7 +342,7 @@ private:
         d["type"] = "response.output_item.added";
         d["output_index"] = index;
         d["item"] = item;
-        if (!sink("data: " + d.dump() + "\n\n")) return false;
+        if (!sink(frame("response.output_item.added", d))) return false;
         json part;
         part["type"] = "output_text";
         part["text"] = "";
@@ -362,7 +353,7 @@ private:
         p["output_index"] = index;
         p["content_index"] = 0;
         p["part"] = part;
-        return sink("data: " + p.dump() + "\n\n");
+        return sink(frame("response.content_part.added", p));
     }
 
     bool emit_reasoning_item_start(const Sink &sink, int index) {
@@ -376,7 +367,64 @@ private:
         d["type"] = "response.output_item.added";
         d["output_index"] = index;
         d["item"] = item;
-        return sink("data: " + d.dump() + "\n\n");
+        if (!sink(frame("response.output_item.added", d))) return false;
+        json part{{"type", "summary_text"}, {"text", ""}};
+        json p{{"type", "response.reasoning_summary_part.added"},
+               {"item_id", item_id(index)}, {"output_index", index},
+               {"summary_index", 0}, {"part", part}};
+        return sink(frame("response.reasoning_summary_part.added", p));
+    }
+
+    bool close_open_items(const Sink &sink) {
+        for (const auto &entry : out_index_) {
+            const int oi = entry.second;
+            if (text_finished_.count(oi)) continue;
+            const int kind = item_kind_.count(oi) ? item_kind_[oi] : 0;
+            if (kind == 1) {
+                text_finished_.insert(oi);
+                continue;
+            }
+            if (kind == 0) {
+                json done{{"type", "response.output_text.done"},
+                          {"item_id", item_id(oi)}, {"output_index", oi},
+                          {"content_index", 0}, {"text", text_[oi]}};
+                if (!sink(frame("response.output_text.done", done))) return false;
+                json part{{"type", "output_text"}, {"text", text_[oi]},
+                          {"annotations", json::array()}};
+                json part_done{{"type", "response.content_part.done"},
+                               {"item_id", item_id(oi)}, {"output_index", oi},
+                               {"content_index", 0}, {"part", part}};
+                if (!sink(frame("response.content_part.done", part_done))) return false;
+            } else if (kind == 2) {
+                json done{{"type", "response.reasoning_summary_text.done"},
+                           {"item_id", item_id(oi)}, {"output_index", oi},
+                           {"summary_index", 0}, {"text", reasoning_text_[oi]}};
+                if (!sink(frame("response.reasoning_summary_text.done", done))) return false;
+                json part{{"type", "summary_text"}, {"text", reasoning_text_[oi]}};
+                json part_done{{"type", "response.reasoning_summary_part.done"},
+                               {"item_id", item_id(oi)}, {"output_index", oi},
+                               {"summary_index", 0}, {"part", part}};
+                if (!sink(frame("response.reasoning_summary_part.done", part_done))) return false;
+            }
+            json item;
+            item["id"] = item_id(oi);
+            item["type"] = kind == 2 ? "reasoning" : "message";
+            item["status"] = "completed";
+            if (kind == 2) {
+                item["summary"] = json::array({json{{"type", "summary_text"},
+                                                       {"text", reasoning_text_[oi]}}});
+            } else {
+                item["role"] = "assistant";
+                item["content"] = json::array({json{{"type", "output_text"},
+                                                       {"text", text_[oi]},
+                                                       {"annotations", json::array()}}});
+            }
+            json item_done{{"type", "response.output_item.done"},
+                           {"output_index", oi}, {"item", item}};
+            if (!sink(frame("response.output_item.done", item_done))) return false;
+            text_finished_.insert(oi);
+        }
+        return true;
     }
 
     json build_output() {
@@ -433,7 +481,11 @@ private:
         usage["output_tokens"] = last_usage_.completion_tokens;
         usage["total_tokens"] = last_usage_.total_tokens;
         r["usage"] = usage;
-        return sink("data: " + json{{"type", "response.completed"}, {"response", r}}.dump() + "\n\n");
+        const std::string event = deferred_status_ == "incomplete"
+            ? "response.incomplete" : "response.completed";
+        r["error"] = nullptr;
+        r["incomplete_details"] = nullptr;
+        return sink(frame(event, json{{"type", event}, {"response", r}}));
     }
 };
 
