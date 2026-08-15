@@ -97,7 +97,15 @@ std::vector<RequestFeatureFailure> request_feature_failures(
         add("structured_output", "structured JSON output is not representable by Anthropic Messages");
     }
     for (const char *key : {"conversation", "background", "prompt", "context_management"}) {
-        if (target != ir::ApiFormat::OpenAIResponses && request.extras.contains(key)) {
+        if (!request.extras.contains(key)) continue;
+
+        if (std::string(key) == "context_management") {
+            if (target != ir::ApiFormat::OpenAIResponses)
+                add(key, "context_management cannot be represented by the target protocol");
+            continue;
+        }
+
+        if (target != ir::ApiFormat::OpenAIResponses) {
             add(key, std::string("Responses ") + key + " cannot be represented by the target protocol");
         }
     }

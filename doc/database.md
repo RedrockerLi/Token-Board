@@ -2,7 +2,7 @@
 
 两个 SQLite 库都开在 WAL 模式，统一 `busy_timeout=5000`、`foreign_keys=ON`；V1 新库启用 `auto_vacuum=INCREMENTAL`。schema 位于 `schema/<库>/v<major>/<major>-<minor>_*.sql`。
 
-时间字段统一存 UTC(`datetime('now')`),看板界面一律转 UTC+8 显示,峰谷档位边界也按 UTC+0 分钟存储(见 [billing-pricing.md](billing-pricing.md))。
+时间字段统一存 UTC(`datetime('now')`),前端按浏览器当地时区显示,峰谷档位边界按 UTC+0 分钟存储(见 [billing-pricing.md](billing-pricing.md))。
 
 ## V1 当前结构
 

@@ -126,6 +126,8 @@ UpstreamClient::forward(const std::string &method,
             {"Content-Type", content_type},
         };
     }
+    if (!opts.anthropic_beta.empty())
+        headers.emplace("anthropic-beta", opts.anthropic_beta);
 
     if (streaming) {
         watch->set_initial_deadlines(deadline_started_ms,

@@ -12,6 +12,9 @@
 struct ForwardOptions {
     std::string auth_scheme = "bearer";  // "bearer" → Authorization: Bearer <key>
                                          // "x-api-key" → x-api-key: <key> + anthropic-version
+    // Allowlisted Anthropic beta features from the client request.  The
+    // proxy rebuilds upstream headers, so this must be carried explicitly.
+    std::string anthropic_beta;
     bool path_is_full = false;           // true → use `path` verbatim (skip base_url path prepend)
 
     // Upstream timeouts, in seconds (0 = disabled).

@@ -201,6 +201,7 @@ private:
                           std::shared_ptr<const ir::ConversionContext> conversion_context,
                           std::shared_ptr<const std::vector<json>> state_current_input,
                           std::shared_ptr<UsageReservation> reservation,
+                          const std::string &anthropic_beta,
                           const httplib::Request &req,
                           httplib::Response &res,
                           std::chrono::steady_clock::time_point t0);

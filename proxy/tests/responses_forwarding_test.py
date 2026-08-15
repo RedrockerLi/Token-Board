@@ -34,6 +34,7 @@ class FakeResponsesUpstream(BaseHTTPRequestHandler):
             self.requests.append({
                 "path": self.path,
                 "auth": self.headers.get("Authorization") or self.headers.get("x-api-key"),
+                "anthropic_beta": self.headers.get("anthropic-beta"),
                 "body": body,
             })
         if self.path.endswith("/responses"):
@@ -123,12 +124,16 @@ def post(port: int, key: str, body: dict) -> tuple[int, str]:
     return post_path(port, key, "/v1/responses", body)
 
 
-def post_path(port: int, key: str, path: str, body: dict) -> tuple[int, str]:
+def post_path(port: int, key: str, path: str, body: dict,
+              extra_headers: dict[str, str] | None = None) -> tuple[int, str]:
+    headers = {"Authorization": f"Bearer {key}",
+               "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {key}",
-                 "Content-Type": "application/json"},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=8) as response:
@@ -311,6 +316,26 @@ def main() -> None:
                        if m.get("role") == "user" and isinstance(m.get("content"), list)
                        for p in m["content"])
 
+            anthropic_context = {
+                "model": "anthropic-context", "max_tokens": 20, "stream": False,
+                "messages": [{"role": "user", "content": "keep going"}],
+                "context_management": {
+                    "edits": [{"type": "clear_tool_uses_20250919"}]
+                },
+            }
+            status, context_result = post_path(
+                proxy_port, "tb-anthropic", "/v1/messages", anthropic_context,
+                {"anthropic-beta": "prompt-caching-2024-07-31"})
+            assert status == 200, context_result
+            with FakeResponsesUpstream.lock:
+                context_request = next(item for item in reversed(FakeResponsesUpstream.requests)
+                                       if item["auth"] == "sk-anthropic" and
+                                       item["body"].get("model") == "anthropic-context")
+            assert context_request["body"]["context_management"] == \
+                anthropic_context["context_management"]
+            assert context_request["anthropic_beta"] == \
+                "prompt-caching-2024-07-31,context-management-2025-06-27"
+
             responses_to_anthropic = {
                 "model": "anthropic-image", "stream": False,
                 "input": [{"type": "function_call_output", "call_id": "r-image",
@@ -328,6 +353,19 @@ def main() -> None:
             assert target_anthropic["body"]["messages"][0]["role"] == "user"
             assert tool_content["type"] == "tool_result"
             assert tool_content["content"][0]["type"] == "image"
+
+            cross_format_context = {
+                "model": "anthropic-context-cross", "stream": False,
+                "input": "must not be converted",
+                "context_management": {
+                    "edits": [{"type": "clear_tool_uses_20250919"}]
+                },
+            }
+            before = len(FakeResponsesUpstream.requests)
+            status, cross_result = post_path(
+                proxy_port, "tb-anthropic", "/v1/responses", cross_format_context)
+            assert status == 422 and "context_management" in cross_result
+            assert len(FakeResponsesUpstream.requests) == before
 
             unsupported_audio = {
                 "model": "anthropic-audio", "stream": False,

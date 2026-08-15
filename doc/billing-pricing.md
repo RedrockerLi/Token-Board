@@ -23,7 +23,12 @@ V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库按 `requested
 
 请求命中时段:取 `requested_at`(UTC)换算成当日分钟 `M = CAST(strftime('%s', requested_at) AS INTEGER) % 86400 / 60`,落在档位区间即命中,倍率乘到三档基础价上。`start > end` 表示跨午夜档(如 22:00–06:00),命中条件是 `M >= start OR M < end`。同一 pricing 有多档命中时取 `id` 最小的一档。
 
-界面按 UTC+8 输入:`proxy_manager.js` 里 `minutes8to0` / `minutes0to8` 做 ±480 分钟换算,存入库的是 UTC+0 分钟。换句话说,用户在界面上看到的 08:00 对应 UTC+0 的 00:00。
+界面按浏览器所在时区输入和显示,存入库的仍是 UTC+0 当日分钟。换算使用浏览器当前的 `getTimezoneOffset()`:
+
+- 本地分钟 → UTC 分钟: `local + offset`;
+- UTC 分钟 → 本地分钟: `utc - offset`。
+
+因此同一组数据库档位在不同电脑时区会显示为不同的当地时间,但代理后端始终按原 UTC 区间匹配。电脑时区变化不会改数据库值,夏令时只会改变前端看到的当地时刻。
 
 ## 写时计价固化
 

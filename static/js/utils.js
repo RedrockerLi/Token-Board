@@ -24,24 +24,55 @@ function fmtLocalHHMM(isoStr) {
     return s ? s.slice(11, 16) : '';
 }
 
-/** Local calendar date "YYYY-MM-DD" → UTC calendar date "YYYY-MM-DD". */
+function normalizeMinute(minute) {
+    return ((Math.round(minute) % 1440) + 1440) % 1440;
+}
+
+/** Convert a recurring local minute-of-day to UTC minute-of-day. */
+function localMinuteToUtc(minute, offsetMinutes) {
+    var offset = offsetMinutes == null ? new Date().getTimezoneOffset() : offsetMinutes;
+    return normalizeMinute(minute + offset);
+}
+
+/** Convert a recurring UTC minute-of-day to browser-local minute-of-day. */
+function utcMinuteToLocal(minute, offsetMinutes) {
+    var offset = offsetMinutes == null ? new Date().getTimezoneOffset() : offsetMinutes;
+    return normalizeMinute(minute - offset);
+}
+
+function _parseCalendarDate(value) {
+    if (!value) return null;
+    var p = String(value).split('-').map(Number);
+    if (p.length !== 3 || p.some(isNaN)) return null;
+    return p;
+}
+
+function _formatUtcDate(date) {
+    return date.getUTCFullYear() + '-' + _pad2(date.getUTCMonth() + 1) + '-' + _pad2(date.getUTCDate());
+}
+
+function _formatLocalDate(date) {
+    return date.getFullYear() + '-' + _pad2(date.getMonth() + 1) + '-' + _pad2(date.getDate());
+}
+
+/** Local date → the UTC date whose midnight is shown on that local date. */
 function localDateToUtcDate(localDate) {
-    if (!localDate) return '';
-    var p = String(localDate).split('-').map(Number);
-    if (p.length !== 3 || isNaN(p[0]) || isNaN(p[1]) || isNaN(p[2])) return '';
-    var d = new Date(p[0], p[1] - 1, p[2]);
-    if (isNaN(d.getTime())) return '';
-    return d.getUTCFullYear() + '-' + _pad2(d.getUTCMonth() + 1) + '-' + _pad2(d.getUTCDate());
+    var p = _parseCalendarDate(localDate);
+    if (!p) return '';
+    for (var delta = -1; delta <= 1; delta++) {
+        var candidate = new Date(Date.UTC(p[0], p[1] - 1, p[2] + delta));
+        if (_formatLocalDate(candidate) === String(localDate)) return _formatUtcDate(candidate);
+    }
+    return '';
 }
 
 /** UTC calendar date "YYYY-MM-DD" → local calendar date "YYYY-MM-DD". */
 function utcDateToLocalDate(utcDate) {
-    if (!utcDate) return '';
-    var p = String(utcDate).split('-').map(Number);
-    if (p.length !== 3 || isNaN(p[0]) || isNaN(p[1]) || isNaN(p[2])) return '';
+    var p = _parseCalendarDate(utcDate);
+    if (!p) return '';
     var d = new Date(Date.UTC(p[0], p[1] - 1, p[2]));
     if (isNaN(d.getTime())) return '';
-    return d.getFullYear() + '-' + _pad2(d.getMonth() + 1) + '-' + _pad2(d.getDate());
+    return _formatLocalDate(d);
 }
 
 /** Local date "YYYY-MM-DD" → [UTC start ISO, UTC end ISO] covering the local day. */

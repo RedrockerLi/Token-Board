@@ -185,7 +185,7 @@ function addKeyRow(value, validFrom) {
     date.className = 'key-valid-from';
     date.style.display = keyDateDisplay();
     date.name = 'upstream_valid_froms[]';
-    date.title = '订阅起始日（本地日期，存储 UTC，留空=创建日期）';
+    date.title = '订阅起始日（留空=创建日期）';
     date.value = validFrom ? utcDateToLocalDate(validFrom) : '';
     date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
@@ -215,7 +215,7 @@ function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion) {
     date.type = 'date';
     date.className = 'existing-key-valid-from key-valid-from';
     date.style.display = keyDateDisplay();
-    date.title = '订阅起始日（本地日期，存储 UTC，留空=创建日期）';
+    date.title = '订阅起始日（留空=创建日期）';
     date.value = validFrom ? utcDateToLocalDate(validFrom) : '';
     date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
@@ -680,7 +680,7 @@ function initAccountsPage() {
                             <option value="USD">USD</option>
                         </select>
                     </label>
-                    <label id="agentValidFromField" style="display:none;">订阅起始日（本地日期，存储 UTC，留空=创建日期）
+                    <label id="agentValidFromField" style="display:none;">订阅起始日
                         <input name="valid_from" type="date">
                     </label>
                     <div style="display:flex; gap:8px;">
@@ -1100,11 +1100,11 @@ function initAggregatesPage() {
 // Cached pricing rows (with slots) so the edit modal can look up by id.
 let _pricingCache = [];
 
-// ── Time-slot helpers (UTC+0 storage ↔ browser-local UI) ────────────────
-// Slot boundaries are stored as minute-of-day in UTC+0; the UI enters and
-// shows them in the computer's local timezone.
+// ── Time-slot helpers (UTC storage ↔ browser-local UI) ──────────────────
+// Slot boundaries are stored as UTC minute-of-day; the UI enters and shows
+// them in the computer's local timezone.
 function minutesToHHMM(m) {
-    m = ((Math.round(m) % 1440) + 1440) % 1440;
+    m = normalizeMinute(m);
     return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
 }
 function hhmmToMinutes(hhmm) {
@@ -1112,19 +1112,14 @@ function hhmmToMinutes(hhmm) {
     if (p.length < 2 || isNaN(p[0]) || isNaN(p[1])) return NaN;
     return p[0] * 60 + p[1];
 }
-/** getTimezoneOffset() = UTC − local (minutes). */
-function localTzOffsetMinutes() { return new Date().getTimezoneOffset(); }
-function minutesLocalToUtc(minLocal) { return ((minLocal - localTzOffsetMinutes()) % 1440 + 1440) % 1440; }
-function minutesUtcToLocal(minUtc) { return ((minUtc + localTzOffsetMinutes()) % 1440 + 1440) % 1440; }
-
 function addSlotRow(slot) {
     var rows = document.getElementById('slotRows');
     if (!rows) return;
     var div = document.createElement('div');
     div.className = 'slot-row';
     div.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:6px;';
-    var startVal = slot ? minutesToHHMM(minutesUtcToLocal(slot.start_minute)) : '08:00';
-    var endVal = slot ? minutesToHHMM(minutesUtcToLocal(slot.end_minute)) : '23:00';
+    var startVal = slot ? minutesToHHMM(utcMinuteToLocal(slot.start_minute)) : '08:00';
+    var endVal = slot ? minutesToHHMM(utcMinuteToLocal(slot.end_minute)) : '23:00';
     var multVal = slot ? slot.multiplier : 1.0;
     div.innerHTML =
         '<input type="time" class="slot-start" step="60" value="' + startVal + '">' +
@@ -1150,8 +1145,8 @@ function collectSlots() {
         if (isNaN(start) || isNaN(end) || isNaN(mult)) return;  // skip incomplete rows
         if (start === end) return;  // zero-length window is meaningless
         slots.push({
-            start_minute: minutesLocalToUtc(start),
-            end_minute: minutesLocalToUtc(end),
+            start_minute: localMinuteToUtc(start),
+            end_minute: localMinuteToUtc(end),
             multiplier: mult,
         });
     });
@@ -1161,7 +1156,7 @@ function collectSlots() {
 function slotsSummary(slots) {
     if (!slots || !slots.length) return '<span style="color:var(--color-text-tertiary);">无</span>';
     return slots.map(function (s) {
-        return minutesToHHMM(minutesUtcToLocal(s.start_minute)) + '-' + minutesToHHMM(minutesUtcToLocal(s.end_minute)) + ' ×' + s.multiplier;
+        return minutesToHHMM(utcMinuteToLocal(s.start_minute)) + '-' + minutesToHHMM(utcMinuteToLocal(s.end_minute)) + ' ×' + s.multiplier;
     }).join('、');
 }
 
@@ -1288,7 +1283,7 @@ function initPricingPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">模型定价管理</h1>
-            <p class="page-subtitle">配置模型价格（百万元 token 价格，CNY 默认 / 可选 USD）· 时段倍率按本机当地时间设置（存储 UTC）</p>
+            <p class="page-subtitle">配置模型价格（百万元 token 价格，CNY 默认 / 可选 USD）· 时段倍率按本机当地时间设置</p>
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
         <table class="mgmt-table" id="pricingTable">
@@ -1314,7 +1309,7 @@ function initPricingPage() {
                     </label>
                     <div style="margin:10px 0;">
                         <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:6px;">
-                            时段倍率（每日生效，按本机当地时间设置，存储 UTC+0；倍率作用于输入/输出/缓存三档价格）
+                            时段倍率（每日生效，倍率作用于输入/输出/缓存三档价格）
                         </div>
                         <div id="slotRows"></div>
                         <button type="button" class="btn btn--sm" onclick="addSlotRow(null)">+ 添加时段</button>

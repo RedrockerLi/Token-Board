@@ -1,5 +1,40 @@
 #include "proxy_server_internal.h"
 
+namespace {
+constexpr const char *kContextManagementBeta =
+    "context-management-2025-06-27";
+
+bool has_anthropic_beta(const std::string &header, const std::string &token) {
+    size_t begin = 0;
+    while (begin <= header.size()) {
+        size_t end = header.find(',', begin);
+        if (end == std::string::npos) end = header.size();
+        size_t first = begin;
+        while (first < end && std::isspace(static_cast<unsigned char>(header[first])))
+            ++first;
+        size_t last = end;
+        while (last > first && std::isspace(static_cast<unsigned char>(header[last - 1])))
+            --last;
+        if (header.compare(first, last - first, token) == 0) return true;
+        if (end == header.size()) break;
+        begin = end + 1;
+    }
+    return false;
+}
+
+std::string prepare_anthropic_beta(const httplib::Request &request,
+                                   const RequestContext &context) {
+    std::string header = request.get_header_value("anthropic-beta");
+    if (context.client_format != ir::ApiFormat::Anthropic ||
+        !context.parsed_json.contains("context_management") ||
+        has_anthropic_beta(header, kContextManagementBeta))
+        return header;
+    if (!header.empty()) header += ",";
+    header += kContextManagementBeta;
+    return header;
+}
+}
+
 void ProxyServer::handle_chat_request(const httplib::Request &req,
                                       httplib::Response &res) {
     auto accounting_cleanup = make_scope_exit(
@@ -59,6 +94,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             "application/json");
         return;
     }
+    const std::string anthropic_beta = prepare_anthropic_beta(req, context);
     conversion_needed = conversion_needed || context.state_expanded;
     ir::ConversionContext request_conversion;
     request_conversion.source = harness;
@@ -87,12 +123,21 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         json unsupported_details = json::array();
         for (const auto &candidate : cands) {
             const auto target = ir::parse_api_format(candidate.account().api_format);
-            const auto feature_failures = request_feature_failures(
-                target, harness, context.parsed_ir);
+            // Direct same-format passthrough does not need cross-protocol
+            // capability validation.  Responses namespace/tool-search
+            // requests are the one same-format exception: they still need
+            // the Responses item/tool adapter below.
+            const bool candidate_needs_conversion =
+                target != harness ||
+                (harness == ir::ApiFormat::OpenAIResponses &&
+                 responses_request_needs_tool_adapter(context.parsed_ir));
+            const auto feature_failures = candidate_needs_conversion
+                ? request_feature_failures(target, harness, context.parsed_ir)
+                : std::vector<RequestFeatureFailure>{};
             const bool feature_ok = feature_failures.empty();
             std::string media_reason;
-            const bool media_ok = fmt::target_supports_media(
-                target, requirements, media_reason);
+            const bool media_ok = !candidate_needs_conversion ||
+                fmt::target_supports_media(target, requirements, media_reason);
             if (feature_ok && media_ok)
                 compatible.push_back(candidate);
             else {
@@ -179,7 +224,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                              ? std::make_shared<const std::vector<json>>(
                                    context.state_current_input)
                              : nullptr,
-                         reservation, req, res, t0);
+                         reservation, anthropic_beta, req, res, t0);
         return;
     }
 
@@ -245,6 +290,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 c.upstream_model().c_str(), concurrent_count);
 
         UpstreamClient::ForwardResult result;
+        const auto configure_forward = [&](ForwardOptions &opts) {
+            if (upstream == ir::ApiFormat::Anthropic)
+                opts.anthropic_beta = anthropic_beta;
+        };
         if (harness == upstream && !responses_item_adapter) {
             if (harness == ir::ApiFormat::OpenAIResponses && conversion_needed) {
                 cReq = context.parsed_ir;
@@ -257,13 +306,14 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 result = forward_endpoint_attempt(
                     upstream_, chat_endpoint_policy(harness), c, body,
                     "application/json", attempt.remaining_budget_ms,
-                    attempt_timeouts, req.client_socket);
+                    attempt_timeouts, req.client_socket, nullptr,
+                    configure_forward);
             } else {
                 result = forward_endpoint_attempt(
                     upstream_, chat_endpoint_policy(harness), c,
                     body_cache.for_candidate(c), content_type,
                     attempt.remaining_budget_ms, attempt_timeouts,
-                    req.client_socket);
+                    req.client_socket, nullptr, configure_forward);
             }
             think_filter = (upstream == ir::ApiFormat::OpenAI);
             converted_response.reset();
@@ -287,7 +337,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             result = forward_endpoint_attempt(
                 upstream_, chat_endpoint_policy(harness), c, body,
                 "application/json", attempt.remaining_budget_ms,
-                attempt_timeouts, req.client_socket);
+                attempt_timeouts, req.client_socket, nullptr,
+                configure_forward);
             think_filter = false;
             converted_response.reset();
             upstream_codec = &codecs_.get(upstream);
