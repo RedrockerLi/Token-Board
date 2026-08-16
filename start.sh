@@ -8,7 +8,10 @@
 # ==============================================================================
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve the real script path so the launcher also works through a symlink
+# such as ~/.local/bin/Token-Board.
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 PROXY_BIN="${TB_PROXY_BIN:-$SCRIPT_DIR/proxy/build/token_proxy}"
 DATA_DIR="${TB_DATA_DIR:-$SCRIPT_DIR/data}"
 SCHEMA_DIR="${TB_SCHEMA_DIR:-$SCRIPT_DIR/schema}"
