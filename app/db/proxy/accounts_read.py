@@ -121,11 +121,21 @@ class ProxyAccountReadMixin:
 
     @staticmethod
     def _billing_config_conn(conn: sqlite3.Connection) -> sqlite3.Row:
-        return conn.execute(
+        row = conn.execute(
             "SELECT COALESCE((SELECT value FROM sync_settings WHERE key='billing.price_change_effective'),'current_period') "
-            "AS price_change_effective,COALESCE((SELECT value FROM sync_settings WHERE key='billing.cancellation_mode'),'period_end') "
+            "AS price_change_effective,COALESCE((SELECT value FROM sync_settings WHERE key='billing.cancellation_mode'),'end_of_period') "
             "AS cancellation_mode"
         ).fetchone()
+        # Legacy V0/V1 settings may use `period_end`, while the settings API
+        # and UI use `end_of_period`. Normalize that legacy value here so every
+        # caller sees the same public mode.
+        return {
+            "price_change_effective": row["price_change_effective"],
+            "cancellation_mode": (
+                "end_of_period" if row["cancellation_mode"] == "period_end"
+                else row["cancellation_mode"]
+            ),
+        }
 
     @staticmethod
     def _refresh_upstream_keys_cloud(conn: sqlite3.Connection, account_id: int) -> None:

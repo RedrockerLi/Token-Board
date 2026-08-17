@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from app.db.proxy.billing import materialize_period_charges
 from app.services.cost_allocator import (
@@ -183,6 +184,108 @@ class BillingTest(AppDatabaseTestCase):
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM route_sets WHERE id=? AND enabled=1",
                 (account_id,)).fetchone()[0], 0)
+
+    def test_account_delete_uses_current_global_mode(self) -> None:
+        db = self.proxy_database()
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_settings(key,value) VALUES(?,?)",
+                ("billing.cancellation_mode", "immediate"),
+            )
+            conn.commit()
+        account_id = db.create_account({
+            "name": "global-mode-plan", "account_type": "plan",
+            "monthly_price": 20, "base_url": "http://example.test",
+            "upstream_keys": ["sk-stale-policy"],
+        })
+
+        # The deletion mode is read from the global setting at deletion time.
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "UPDATE sync_settings SET value='period_end' "
+                "WHERE key='billing.cancellation_mode'"
+            )
+            conn.commit()
+
+        self.assertEqual(
+            db.get_plan_billing_config()["cancellation_mode"], "end_of_period"
+        )
+        result = db.delete_account(account_id)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["deferred"], result)
+        self.assertEqual(result["cancellation_mode"], "end_of_period")
+        self.assertIn(account_id, [a["id"] for a in db.get_accounts()])
+        with sqlite3.connect(self.proxy_path) as conn:
+            account = conn.execute(
+                "SELECT lifecycle_state,deleted_at FROM accounts WHERE id=?",
+                (account_id,),
+            ).fetchone()
+            self.assertEqual(account[0], "active")
+            self.assertIsNotNone(account[1])
+            columns = {row[1] for row in conn.execute(
+                "PRAGMA table_info(billing_contracts)"
+            )}
+            self.assertNotIn("cancellation_policy", columns)
+            self.assertEqual(conn.execute(
+                "SELECT enabled FROM upstreams WHERE account_id=?", (account_id,)
+            ).fetchone()[0], 1)
+
+    def test_account_delete_uses_latest_key_expiry(self) -> None:
+        db = self.proxy_database()
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_settings(key,value) VALUES(?,?)",
+                ("billing.cancellation_mode", "end_of_period"),
+            )
+            conn.commit()
+        account_id = db.create_account({
+            "name": "latest-key-expiry", "account_type": "plan",
+            "monthly_price": 20, "base_url": "http://example.test",
+            "upstream_keys": ["sk-early"],
+        })
+        fixed_now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        with sqlite3.connect(self.proxy_path) as conn:
+            upstream_id = conn.execute(
+                "SELECT id FROM upstreams WHERE account_id=?", (account_id,)
+            ).fetchone()[0]
+            first = conn.execute(
+                "SELECT uuid FROM upstream_credentials WHERE upstream_id=?",
+                (upstream_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE upstream_credentials SET valid_from=? WHERE uuid=?",
+                ("2026-08-01", first),
+            )
+            second = "credential-latest-expiry"
+            conn.execute(
+                "INSERT INTO upstream_credentials"
+                "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (second, 990001, upstream_id, 1, "sk-late", "2026-08-15",
+                 "2026-08-15T00:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO upstream_secrets(credential_uuid,secret_value) VALUES(?,?)",
+                (second, "sk-late"),
+            )
+            conn.commit()
+
+        with patch("app.db.proxy.lifecycle._utc_now", return_value=fixed_now):
+            result = db.delete_account(account_id)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["deferred"], result)
+        self.assertEqual(result["effective_deleted_at"], "2026-09-14T23:59:59Z")
+        with sqlite3.connect(self.proxy_path) as conn:
+            account_deleted_at = conn.execute(
+                "SELECT deleted_at FROM accounts WHERE id=?", (account_id,)
+            ).fetchone()[0]
+            self.assertEqual(account_deleted_at, "2026-09-14T23:59:59Z")
+            expiries = dict(conn.execute(
+                "SELECT uuid,deleted_at FROM upstream_credentials WHERE upstream_id=?",
+                (upstream_id,),
+            ).fetchall())
+            self.assertEqual(expiries[first], "2026-08-31T23:59:59Z")
+            self.assertEqual(expiries[second], "2026-09-14T23:59:59Z")
 
 
 if __name__ == "__main__":

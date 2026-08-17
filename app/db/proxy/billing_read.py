@@ -46,11 +46,6 @@ class ProxyBillingReadMixin:
                 [("billing.price_change_effective", mode),
                  ("billing.cancellation_mode", cancellation)],
             )
-            conn.execute(
-                "UPDATE billing_contracts SET cancellation_policy=? "
-                "WHERE charge_type='recurring' AND valid_until IS NULL",
-                ("immediate" if cancellation == "immediate" else "period_end",),
-            )
             conn.commit()
             return conn.total_changes > 0
         finally:

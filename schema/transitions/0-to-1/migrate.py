@@ -196,8 +196,6 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
         billing_config = old.execute(
             "SELECT price_change_effective,cancellation_mode FROM plan_billing_config WHERE id=1"
         ).fetchone()
-        cancellation = (billing_config["cancellation_mode"] if billing_config else "period_end")
-        cancellation = cancellation if cancellation in {"immediate", "period_end"} else "period_end"
         contract_ids: dict[int, int] = {}
         for row in real_accounts:
             recurring = row["account_type"] in {"plan", "agent"}
@@ -205,10 +203,10 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
                 "credential" if recurring else "account")
             cursor = new.execute(
                 "INSERT INTO billing_contracts(uuid,account_id,charge_type,billing_scope,"
-                "currency,cancellation_policy,valid_from,valid_until) VALUES(?,?,?,?,?,?,?,?)",
+                "currency,valid_from,valid_until) VALUES(?,?,?,?,?,?,?)",
                 (stable_uuid("contract", row["id"]), row["id"],
                  "recurring" if recurring else "metered", scope, row["currency"] or "CNY",
-                 cancellation, utc_timestamp(row["valid_from"], source_tz)
+                 utc_timestamp(row["valid_from"], source_tz)
                  or "1970-01-01",
                  utc_timestamp(row["deleted_at"], source_tz)),
             )
@@ -278,6 +276,21 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
                               routable_ids, legacy_upstream_id)
         for row in old.execute("SELECT key,value FROM sync_config"):
             new.execute("INSERT INTO sync_settings(key,value) VALUES(?,?)", tuple(row))
+        if billing_config:
+            legacy_mode = billing_config["cancellation_mode"]
+            mode = "immediate" if legacy_mode == "immediate" else "end_of_period"
+            new.execute(
+                "INSERT INTO sync_settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("billing.cancellation_mode", mode),
+            )
+            if billing_config["price_change_effective"]:
+                new.execute(
+                    "INSERT INTO sync_settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("billing.price_change_effective",
+                     billing_config["price_change_effective"]),
+                )
         for row in old.execute("SELECT key,value FROM sync_state"):
             new.execute("INSERT INTO sync_state(key,value) VALUES(?,?)", tuple(row))
 

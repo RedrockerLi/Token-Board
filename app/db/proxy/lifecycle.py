@@ -25,12 +25,13 @@ class ProxyLifecycleMixin:
         follow the configured default deletion operation:
           'immediate'     — deleted_at = now; local keys & aggregates cleaned up
                             right here.
-          'end_of_period' — deleted_at = end of each key's current billing
-                            period (the account keeps routing until then; local
-                            keys & aggregates are kept so clients can still
-                            reach it).  The cleanup intent is recorded in
-                            deferred_cleanup_mode and performed by the deletion
-                            finalizer once deleted_at has passed.
+          'end_of_period' — each key keeps its own current billing-period end;
+                            the account deleted_at is the latest of those key
+                            expiries (the account keeps routing until then;
+                            local keys & aggregates are kept so clients can
+                            still reach it).  The cleanup intent is recorded
+                            in deferred_cleanup_mode and performed by the
+                            deletion finalizer once deleted_at has passed.
         """
         conn = self._connect()
         try:
@@ -38,7 +39,7 @@ class ProxyLifecycleMixin:
             real_id = (route["account_id"] if route and route["account_id"] is not None
                        else account_id)
             account = conn.execute(
-                "SELECT a.created_at,a.valid_from,bc.charge_type,bc.cancellation_policy "
+                "SELECT a.created_at,a.valid_from,bc.charge_type "
                 "FROM accounts a LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
                 "AND bc.valid_until IS NULL WHERE a.id=? AND a.lifecycle_state='active'",
                 (real_id,),
@@ -48,8 +49,12 @@ class ProxyLifecycleMixin:
             now = _utc_now()
             anchor = (_parse_iso_date(account["valid_from"])
                       or _parse_utc_timestamp(account["created_at"]).date())
+            # The settings page and the delete confirmation both describe the
+            # current global default. Read that same setting in this transaction
+            # instead of relying on a client-side preview.
+            config = self._billing_config_conn(conn)
             deferred = (account["charge_type"] == "recurring" and
-                        account["cancellation_policy"] == "period_end")
+                        config["cancellation_mode"] == "end_of_period")
             effective = (_period_start(
                 _next_month(_billing_period_month(now, anchor.day)), anchor.day)
                          - timedelta(seconds=1)) if deferred else now
@@ -59,9 +64,49 @@ class ProxyLifecycleMixin:
                 "SELECT id FROM upstreams WHERE account_id=?", (real_id,))]
             if upstream_ids:
                 placeholders = ",".join("?" for _ in upstream_ids)
-                conn.execute(
-                    f"UPDATE upstream_credentials SET deleted_at=? WHERE upstream_id IN ({placeholders}) "
-                    "AND deleted_at IS NULL", (timestamp, *upstream_ids))
+                if deferred:
+                    # A plan's keys are independent subscription units.  Do
+                    # not anchor the whole upstream to the account/upstream
+                    # creation date: calculate each key's current period from
+                    # its own valid_from (or created_at), then keep the
+                    # account alive until the latest key expires.
+                    credential_rows = conn.execute(
+                        f"SELECT uuid,valid_from,created_at,deleted_at "
+                        f"FROM upstream_credentials WHERE upstream_id IN ({placeholders}) "
+                        "AND (disabled_at IS NULL OR disabled_at>?) "
+                        "AND (deleted_at IS NULL OR deleted_at>?)",
+                        (*upstream_ids, now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                         now.strftime("%Y-%m-%dT%H:%M:%SZ")),
+                    ).fetchall()
+                    key_expiries = []
+                    for credential in credential_rows:
+                        existing_end = _parse_utc_timestamp(credential["deleted_at"])
+                        if existing_end is not None and existing_end > now:
+                            end = existing_end
+                        else:
+                            key_anchor = (
+                                _parse_iso_date(credential["valid_from"])
+                                or _parse_utc_timestamp(credential["created_at"]).date()
+                            )
+                            end = _cancellation_end(
+                                config, now, key_anchor.day, "plan")
+                            conn.execute(
+                                "UPDATE upstream_credentials SET deleted_at=? "
+                                "WHERE uuid=? AND deleted_at IS NULL",
+                                (end.strftime("%Y-%m-%dT%H:%M:%SZ"), credential["uuid"]),
+                            )
+                        key_expiries.append(end)
+                    if key_expiries:
+                        effective = max(key_expiries)
+                        timestamp = effective.strftime("%Y-%m-%dT%H:%M:%SZ")
+                else:
+                    conn.execute(
+                        f"UPDATE upstream_credentials SET deleted_at=? WHERE upstream_id IN ({placeholders}) "
+                        "AND deleted_at IS NULL", (timestamp, *upstream_ids))
+            # The account boundary is derived from the final per-key expiry
+            # above, not necessarily from the account creation anchor.
+            conn.execute("UPDATE accounts SET deleted_at=? WHERE id=?",
+                         (timestamp, real_id))
             if not deferred:
                 conn.execute("UPDATE accounts SET lifecycle_state='deleted' WHERE id=?", (real_id,))
                 conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
@@ -78,7 +123,8 @@ class ProxyLifecycleMixin:
                         upstream_ids)
             conn.commit()
             return {"ok": conn.total_changes > 0, "error": "",
-                    "cancellation_mode": account["cancellation_policy"],
+                    "cancellation_mode": ("end_of_period" if deferred
+                                           else "immediate"),
                     "cancelled_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "effective_deleted_at": timestamp, "deferred": deferred}
         finally:

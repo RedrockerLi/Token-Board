@@ -64,7 +64,7 @@
 - **固定填充顺序**：`upstream_keys.position` 决定优先顺序，会话亲和与溢流都按 `(position, id)` 走（[proxy/src/core/proxy_server.cpp:462-496](proxy/src/core/proxy_server.cpp#L462-L496)）。
 - **会话亲和(session affinity)**：同一会话（`x-session-id` / OpenAI `user` / Anthropic `metadata.user_id` / Responses `previous_response_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/proxy_server.h:42-138](proxy/src/core/proxy_server.h#L42-L138)）。
 - **冷启动成本平衡**：新会话没有绑定记录时，优先选**累计消费最少**的 Key（进程内 `KeyCostLedger`，由记账线程异步喂数据），让多把 Key 按花费磨损得更均匀（[proxy/src/core/key_cost_ledger.h](proxy/src/core/key_cost_ledger.h)）。
-- **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `deleted_at`，月费按「锚点日」各自切周期。删除密钥/账户按设置页「删除默认操作」执行：`immediate`（本期立即删除，本期计费）或 `end_of_period`（到期立即删除，本期计费、下期不计费——`deleted_at` 设为本期期末，到期前仍保持可路由）。agent 同理，api 始终立即删除。
+- **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `deleted_at`，月费按「锚点日」各自切周期。删除密钥/账户按设置页「删除默认操作」执行：`immediate`（本期立即删除，本期计费）或 `end_of_period`（到期立即删除，本期计费、下期不计费——每把 Key 的 `deleted_at` 设为自己的本期期末，到期前仍保持可路由；账户的 `deleted_at` 取所有仍有效 Key 到期时间的最大值）。agent 同理，api 始终立即删除。
 - **观测**：会话→密钥分配记在本地 `session_key_log`（7 天滚动，不上云）。
 
 ### 兼容旧形态

@@ -26,17 +26,14 @@ class ProxyAccountWriteMixin:
                 "INSERT INTO accounts(id,uuid,name,valid_from) VALUES(?,?,?,?)",
                 (shared_id, str(uuid.uuid4()), data["name"], start_date),
             )
-            config = self._billing_config_conn(conn)
             contract_id = conn.execute(
                 "INSERT INTO billing_contracts"
                 "(uuid,account_id,charge_type,billing_scope,currency,billing_anchor_day,"
-                "cancellation_policy,cooldown_policy_json,valid_from) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "cooldown_policy_json,valid_from) VALUES(?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), shared_id,
                  "recurring" if is_subscription(account_type) else "metered",
                  "credential" if type_spec.subscription_unit == "per_key" else "account",
                  currency, valid_from.day if valid_from else 1,
-                 "immediate" if config["cancellation_mode"] == "immediate" else "period_end",
                  json.dumps({"kind": type_spec.cooldown or "none"}), contract_start),
             ).lastrowid
             if is_subscription(account_type):
@@ -91,7 +88,7 @@ class ProxyAccountWriteMixin:
         real_id = route["account_id"] if route and route["account_id"] is not None else external_id
         original = conn.execute(
             "SELECT a.*,bc.id contract_id,bc.charge_type,bc.billing_scope,bc.currency,"
-            "bc.cancellation_policy,bc.cooldown_policy_json,"
+            "bc.cooldown_policy_json,"
             "bc.valid_from contract_valid_from,"
             "(SELECT recurring_price FROM billing_rate_events WHERE contract_id=bc.id "
             "ORDER BY effective_at DESC,id DESC LIMIT 1) current_price,"
