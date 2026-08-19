@@ -2,6 +2,11 @@
 
 from app.routes.proxy.common import *  # noqa: F401,F403
 
+
+# Client wire-format groups accepted by the timeout configuration API.
+_TIMEOUT_GROUPS = ("anthropic", "openai_responses", "openai")
+
+
 @bp_proxy.route("/pricing", methods=["GET"])
 def list_pricing():
     return jsonify(_proxy_db().get_pricing())

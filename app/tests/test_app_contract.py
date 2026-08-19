@@ -41,7 +41,7 @@ class AppContractTest(AppDatabaseTestCase):
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT major,minor FROM schema_version WHERE id=1"
-            ).fetchone(), (1, 4))
+            ).fetchone(), (1, 5))
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM accounts WHERE id=?", (account_id,)
             ).fetchone()[0], 1)
@@ -53,6 +53,41 @@ class AppContractTest(AppDatabaseTestCase):
                 "ON c.uuid=s.credential_uuid JOIN upstreams u ON u.id=c.upstream_id "
                 "WHERE u.account_id=?", (account_id,)
             ).fetchone()[0], 1)
+
+    def test_timeout_config_can_be_saved_through_http(self) -> None:
+        app = create_app(str(self.proxy_path), testing=True,
+                         start_background_tasks=False)
+        client = app.test_client()
+        payload = {
+            "anthropic": {
+                "streaming_first_byte_timeout": 91,
+                "streaming_idle_timeout": 181,
+                "non_streaming_timeout": 601,
+            },
+            "openai_responses": {
+                "streaming_first_byte_timeout": 61,
+                "streaming_idle_timeout": 121,
+                "non_streaming_timeout": 601,
+            },
+            "openai": {
+                "streaming_first_byte_timeout": 62,
+                "streaming_idle_timeout": 122,
+                "non_streaming_timeout": 602,
+            },
+        }
+
+        saved = client.put("/api/proxy/timeout-config", json=payload)
+        self.assertEqual(saved.status_code, 200,
+                         saved.get_data(as_text=True))
+        self.assertEqual(saved.get_json(), {"status": "ok"})
+
+        config = client.get("/api/proxy/timeout-config")
+        self.assertEqual(config.status_code, 200)
+        expected = {
+            group: {"app_type": group, **values}
+            for group, values in payload.items()
+        }
+        self.assertEqual(config.get_json(), expected)
 
     def test_dashboard_facade_uses_v1_grain(self) -> None:
         dashboard = DashboardDatabase(
