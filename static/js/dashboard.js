@@ -169,11 +169,10 @@ function clearDynamicCharts() {
     monthlyModelMap = {};
 }
 
-// Global (all users, all history) token share by display unit. Both the model
-// cards and the model pie use this same calculation. The promise prevents the
-// initial parallel loaders from issuing duplicate global summary requests.
+// All-history token share by display unit for the current user scope. Both the
+// model cards and the model pie use this same calculation.
 let globalTokenShares = null;
-let globalTokenSharesRequest = null;
+let globalTokenSharesKey = null;
 
 function calculateGlobalTokenShares(data) {
     var breakdown = data.model_breakdown || {};
@@ -199,28 +198,11 @@ function calculateGlobalTokenShares(data) {
     return shares;
 }
 
-function ensureGlobalTokenShares(summaryDataForCurrentUser) {
-    if (globalTokenShares !== null) return Promise.resolve(globalTokenShares);
-
-    // In overview mode the current summary already contains all users.
-    if (!currentKeyName && summaryDataForCurrentUser) {
-        globalTokenShares = calculateGlobalTokenShares(summaryDataForCurrentUser);
-        return Promise.resolve(globalTokenShares);
-    }
-
-    if (globalTokenSharesRequest) return globalTokenSharesRequest;
-
-    globalTokenSharesRequest = fetchJSON('/api/summary').then(function (data) {
-        globalTokenShares = calculateGlobalTokenShares(data);
-        return globalTokenShares;
-    }).catch(function (err) {
-        console.warn('Failed to load global model shares:', err);
-        return null;  // Fall back to the models used in the current month.
-    }).finally(function () {
-        globalTokenSharesRequest = null;
-    });
-
-    return globalTokenSharesRequest;
+function updateGlobalTokenShares(summaryDataForCurrentUser) {
+    var scopeKey = currentKeyName || '';
+    if (globalTokenSharesKey === scopeKey && globalTokenShares !== null) return;
+    globalTokenShares = calculateGlobalTokenShares(summaryDataForCurrentUser);
+    globalTokenSharesKey = scopeKey;
 }
 
 function fetchDashboardSummary() {
@@ -421,7 +403,7 @@ async function loadSummary() {
     // Models the current user actually used in the current month — one side of
     // the enabled-model condition.
     currentMonthUsedModels = await fetchCurrentMonthUsedModels();
-    await ensureGlobalTokenShares(data);
+    updateGlobalTokenShares(data);
 
     buildDynamicCharts(models, currentMonthUsedModels);
 
@@ -550,7 +532,7 @@ async function loadModelPie() {
     if (!loader) return;
     try {
         var data = await fetchDashboardSummary();
-        await ensureGlobalTokenShares(data);
+        updateGlobalTokenShares(data);
         var breakdown = data.model_breakdown || {};
         var aliasMaps = buildAliasMaps(Object.keys(breakdown));
         var modelToAlias = aliasMaps.modelToAlias;
@@ -727,7 +709,7 @@ async function refreshData() {
         summaryRequest = null;
         summaryRequestKey = null;
         globalTokenShares = null;
-        globalTokenSharesRequest = null;
+        globalTokenSharesKey = null;
         await loadSummary();
         await loadModelPie();
         await loadTypePie();
