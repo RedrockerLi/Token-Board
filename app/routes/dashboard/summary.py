@@ -73,6 +73,14 @@ def api_summary():
     model_cost = defaultdict(float)
     for ce in non_plan_costs:
         model_cost[ce["model"]] += float(ce.get("cost", 0) or 0)
+    # The model tooltip needs the token-equivalent amount. For plan/agent
+    # usage this is the virtual/theoretical value in daily_usage; the real
+    # subscription fee lives in plan_summary and has no model attribution,
+    # so it must not be included in this per-model value.
+    model_theoretical = defaultdict(float)
+    for ce in selected_costs:
+        model_theoretical[ce["model"]] += float(
+            ce.get("theoretical_cost", 0) or 0)
 
     # Plan economics (proxy-exported data). When a specific user is selected,
     # only that user's plan rows count (so a plan account shows its own
@@ -94,7 +102,8 @@ def api_summary():
     plan_virtual_cost = round(plan_virtual_cost, 4)
 
     # Build model breakdown
-    all_models = set(model_tokens.keys()) | set(model_cost.keys())
+    all_models = (set(model_tokens.keys()) | set(model_cost.keys()) |
+                  set(model_theoretical.keys()))
     model_breakdown = {}
     for m in sorted(all_models):
         mt = model_tokens[m]
@@ -105,6 +114,7 @@ def api_summary():
             "total_tokens": mt["output"] + mt["input_hit"] + mt["input_miss"],
             "requests": mt["requests"],
             "cost": round(model_cost.get(m, 0), 4),
+            "theoretical_cost": round(model_theoretical.get(m, 0), 4),
         }
 
     return jsonify({

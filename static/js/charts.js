@@ -143,7 +143,7 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
  * Render a donut pie chart.
  *
  * @param {string} domId     - DOM id of the chart container
- * @param {object[]} pieData - [{ name, value }, ...]
+ * @param {object[]} pieData - [{ name, value, theoretical_cost? }, ...]
  * @param {string[]} colors  - color array for slices
  */
 function renderPieChart(domId, pieData, colors) {
@@ -155,7 +155,13 @@ function renderPieChart(domId, pieData, colors) {
             borderColor: '#E8EBF0',
             textStyle: { color: '#020E36' },
             formatter: function (p) {
-                return p.name + '<br/>Tokens: ' + fmtNum(p.value) + ' (' + p.percent + '%)';
+                var html = p.name + '<br/>Tokens: ' + fmtNum(p.value) +
+                    ' (' + p.percent + '%)';
+                if (p.data && p.data.theoretical_cost != null) {
+                    html += '<br/>理论花费: ' +
+                        fmtCost(p.data.theoretical_cost);
+                }
+                return html;
             }
         },
         legend: {

@@ -524,19 +524,30 @@ async function loadModelPie() {
         var merged = {};
         Object.entries(breakdown).forEach(function (entry) {
             var modelName = entry[0];
-            var tokens = entry[1].total_tokens || 0;
+            var modelData = entry[1];
+            var tokens = modelData.total_tokens || 0;
+            // This is the token-equivalent amount only. A plan's real
+            // subscription fee is not a model cost and is never used here.
+            var theoreticalCost = modelData.theoretical_cost || 0;
             var lower = modelName.toLowerCase();
-            if (lower in modelToAlias) {
-                // This model belongs to an alias group → merge
-                var aliasName = modelToAlias[lower];
-                merged[aliasName] = (merged[aliasName] || 0) + tokens;
-            } else {
-                merged[modelName] = (merged[modelName] || 0) + tokens;
+            var displayName = (lower in modelToAlias)
+                ? modelToAlias[lower]
+                : modelName;
+            if (!merged[displayName]) {
+                merged[displayName] = { tokens: 0, theoretical_cost: 0 };
             }
+            merged[displayName].tokens += tokens;
+            merged[displayName].theoretical_cost += theoreticalCost || 0;
         });
 
         var pieData = Object.entries(merged)
-            .map(function (entry) { return { name: entry[0], value: entry[1] }; })
+            .map(function (entry) {
+                return {
+                    name: entry[0],
+                    value: entry[1].tokens,
+                    theoretical_cost: entry[1].theoretical_cost,
+                };
+            })
             .filter(function (d) { return d.value > 0; })
             .sort(function (a, b) { return b.value - a.value; });
 
