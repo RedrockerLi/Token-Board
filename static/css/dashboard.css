@@ -391,7 +391,7 @@ body {
 
 .sidebar--collapsed .sidebar__nav-item {
     justify-content: center;
-    padding: 10px;
+    padding: 10px 8px;
 }
 
 .sidebar--collapsed .sidebar__nav-item svg {
@@ -400,6 +400,7 @@ body {
 
 .sidebar--collapsed .sidebar__logo {
     justify-content: center;
+    padding: 48px 0 16px;
 }
 
 /* Sidebar Toggle */
