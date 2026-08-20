@@ -25,10 +25,6 @@ from pathlib import Path
 
 CODEX_DIR = Path.home() / ".codex" / "sessions"
 
-# Models that must never be imported (noise from Codex sub-agents / auto-review
-# turns).  Rows already imported for these models are deleted on every pass.
-EXCLUDED_MODELS = {"codex-auto-review"}
-
 
 def _iso_z_to_sqlite(ts: str) -> str | None:
     """'2026-08-04T16:37:44.757Z' → '2026-08-04T16:37:44Z' (ISO UTC)."""
@@ -127,8 +123,6 @@ def _parse_session(path: Path, stop_event: threading.Event | None = None):
                 last = info.get("last_token_usage") or {}
                 if not isinstance(last, dict):
                     continue
-                if model in EXCLUDED_MODELS:
-                    continue  # noise (auto-review sub-agent) — never imported
                 ts = _iso_z_to_sqlite(obj.get("timestamp"))
                 if ts is None:
                     continue
@@ -173,16 +167,6 @@ def import_once(pdb, stop_event: threading.Event | None = None) -> int:
     conn = pdb._connect()
     inserted = 0
     try:
-        # Purge any previously imported rows for excluded models (idempotent —
-        # only touches codex-imported rows, never real proxy traffic).
-        if EXCLUDED_MODELS:
-            placeholders = ",".join("?" * len(EXCLUDED_MODELS))
-            conn.execute(
-                f"DELETE FROM request_log WHERE model IN ({placeholders}) "
-                "AND event_id LIKE 'codex:%'",
-                tuple(EXCLUDED_MODELS),
-            )
-            conn.commit()
         cursor = conn.execute(
             "SELECT cursor_json FROM account_importers "
             "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
