@@ -25,7 +25,10 @@ async function loadDisplayConfig() {
 
 function fmtCost(n) {
     if (n == null || isNaN(n)) return '--';
-    return '¥' + n.toFixed(2);
+    return '¥' + Number(n).toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+    });
 }
 
 // ── Fetch primitives ──

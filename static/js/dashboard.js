@@ -56,22 +56,6 @@ function buildAliasMaps(apiModels) {
     return { aliasToModels: aliasToModels, modelToAlias: modelToAlias };
 }
 
-// ── Subtitle ──
-
-function updateSubtitle() {
-    var el = document.getElementById('pageSubtitle');
-    if (!el) return;
-    var parts = [];
-    if (currentKeyName) {
-        parts.push('筛选: ' + currentKeyName);
-        parts.push('消费按Token比例分摊');
-    } else {
-        parts.push('总览 (所有用户)');
-    }
-    parts.push('所有时间均按本机当地时间显示');
-    el.textContent = parts.join(' · ');
-}
-
 // ── Selector population ──
 
 function populateMonthSelector(months) {
@@ -411,7 +395,6 @@ async function loadSummary() {
         loadDailyCharts();
     }
 
-    updateSubtitle();
     loadMonthlyCharts();
 
     var lastUpdatedEl = document.getElementById('lastUpdated');
