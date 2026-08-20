@@ -7,7 +7,8 @@ from app.services.data_loader import DataStore
 
 def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
                *, testing: bool = False,
-               start_background_tasks: bool = True):
+               start_background_tasks: bool = True,
+               schema_dir: str | None = None):
     """Flask application factory.
 
     Explicitly sets template_folder and static_folder because Flask
@@ -27,6 +28,7 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
     from flask import Flask
 
     root = Path(__file__).resolve().parent.parent  # project root
+    schema_root = Path(schema_dir).resolve() if schema_dir else root / "schema"
 
     flask_app = Flask(
         __name__,
@@ -34,12 +36,14 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
         static_folder=str(root / "static"),
     )
     flask_app.config["TESTING"] = testing
+    flask_app.config["SCHEMA_DIR"] = str(schema_root)
     # Keep the dashboard archive next to an explicitly supplied proxy DB.
     # Embedded deployments and the App testbench must read the same
     # normalized V1 dataset, not the repository's default data/ directory.
     data_dir = (Path(proxy_db_path).resolve().parent
                 if proxy_db_path else root / "data")
-    flask_app.config["DATA_STORE"] = DataStore(data_dir)
+    flask_app.config["DATA_STORE"] = DataStore(
+        data_dir, schema_dir=str(schema_root))
 
     from app.routes.routes import bp  # noqa: E402
     flask_app.register_blueprint(bp)
@@ -56,11 +60,11 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
         dash_db_path = str(Path(proxy_db_path).resolve().parent / "dashboard.db")
         ensure_local_databases(
             proxy_db_path, dash_db_path,
-            str(root / "schema"),
+            str(schema_root),
             source_timezone="Asia/Shanghai",
         )
 
-        pdb = ProxyDatabase(proxy_db_path)
+        pdb = ProxyDatabase(proxy_db_path, schema_dir=str(schema_root))
         flask_app.config["PROXY_DB"] = pdb
         flask_app.register_blueprint(bp_proxy)
         print(f" * Proxy management enabled (DB: {proxy_db_path})")
@@ -70,7 +74,8 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
         if not testing:
             from app.services.sync import sync_config_download  # noqa: E402
             try:
-                if sync_config_download(proxy_db_path):
+                if sync_config_download(
+                        proxy_db_path, schema_dir=str(schema_root)):
                     print(" * Config synced from cloud")
             except Exception:
                 flask_app.logger.exception("startup config sync failed")
@@ -86,16 +91,19 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
         except Exception:
             flask_app.logger.exception("dashboard account reconcile failed")
 
-        if start_background_tasks:
-            from app.services.runtime_tasks import start_runtime_tasks  # noqa: E402
-            start_runtime_tasks(flask_app, pdb, proxy_db_path)
-
     # ── Access-token auth (off-loopback or TB_DASHBOARD_TOKEN) ──
     from app import dashboard_auth  # noqa: E402
-    token = dashboard_auth.resolve_token(host, root / "data")
+    token = dashboard_auth.resolve_token(host, data_dir)
     if token:
         dashboard_auth.install_auth(flask_app, token)
         print(" * Dashboard access token required: /login (loopback bypassed "
               "only when not exposed)")
+
+    # Start threads only after every fallible application-construction step.
+    # server.py opts out here and starts them after the initial DataStore load,
+    # giving its try/finally ownership of the complete worker lifetime.
+    if proxy_db_path and start_background_tasks:
+        from app.services.runtime_tasks import start_runtime_tasks  # noqa: E402
+        start_runtime_tasks(flask_app, pdb, proxy_db_path)
 
     return flask_app

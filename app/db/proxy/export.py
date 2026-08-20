@@ -19,7 +19,6 @@ class ProxyExportMixin:
         price edits affect only the current month).
         """
         from app.db.dashboard_db import DashboardDatabase
-        from app.db.migrations import schema_dir_for
         from app.db.proxy.billing import materialize_period_charges
 
         # Export is also a billing read boundary. Run the idempotent
@@ -28,12 +27,10 @@ class ProxyExportMixin:
         materialize_period_charges(self.db_path)
         conn = self._connect()
         try:
-            # The shadow may live outside data/ (e.g. data/tmp_dash/), so derive
-            # the schema dir from the canonical sibling dashboard.db path.
-            dash_schema_dir = schema_dir_for(
-                os.path.join(os.path.dirname(self.db_path), "dashboard.db"), "dashboard"
-            )
-            dash_db = DashboardDatabase(target_path, schema_dir=dash_schema_dir)
+            # The shadow may live outside data/ (e.g. data/tmp_dash/); use the
+            # canonical schema root carried by this ProxyDatabase instance.
+            dash_db = DashboardDatabase(
+                target_path, schema_dir=self.schema_dir)
 
             # A) usage + frozen cost: keyed by account_id (the identity). The
             #    display name comes from the dashboard `accounts` mirror.

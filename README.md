@@ -16,19 +16,19 @@
 ## 快速开始
 
 ```bash
-# 仅启动仪表板
+# 启动仪表板并设置开机自启（同时启动 Agent 用量采集）
 bash start.sh
 
-# 启动全部:编译并启动代理(开机自启)+ 仪表板
+# 启动全部:额外编译并设置代理开机自启
 bash start.sh --all
 
 # 不自动打开浏览器
 bash start.sh --no-browser
 ```
 
-浏览器会打开仪表板,通过左侧导航栏切换功能页面。端口约定:代理监听 **8800**,仪表板在 **5000–5099** 区间自动找一个空闲端口(启动时会打印实际地址)。两个服务都默认只绑定 `127.0.0.1`(仅本机可访问)——仪表板持有全部密钥,代理是本机工具的本地端点;需跨机器直连时用 `--host 0.0.0.0` + 反向代理鉴权/防火墙自行处理。
+浏览器会打开仪表板,通过左侧导航栏切换功能页面。端口约定:代理监听 **8800**,仪表板固定监听 **5000**（可用 `TB_DASHBOARD_PORT` 覆盖）,所以以后开机后直接访问 `http://localhost:5000` 即可。两个服务都默认只绑定 `127.0.0.1`(仅本机可访问)——仪表板持有全部密钥,代理是本机工具的本地端点;需跨机器直连时用反向代理鉴权/防火墙自行处理。
 
-> 代理的开机自启基于 systemd 用户服务。非 systemd 环境(如 macOS)用 `bash scripts/start-proxy.sh --daemon` 后台启动。
+> 仪表板和代理的开机自启基于 systemd 用户服务。非 systemd 环境(如 macOS)时,`start.sh` 会回退为前台运行。
 
 ## 配置 AI 工具
 
@@ -67,7 +67,7 @@ export OPENAI_API_KEY=<本地密钥>
 
 每个上游账户可配置:
 
-- **账户类型**:`api`(按量计费)、`plan`(订阅套餐)或 `agent`(Agent 订阅,如 Codex)。plan 按每把上游密钥的订阅周期收费,与调用量无关;调用仍会记录一笔 api 口径的**虚拟消费**,用于衡量套餐价值。密钥可设置订阅起始日,周期、价格变更与取消判断统一使用 UTC+0。`agent` 计费与 plan 一致,但不绑定上游密钥、不可作为本地密钥的上游目标,用量由独立 systemd 定时器每 30 分钟导入一次(与看板进程解耦,见 [doc/billing-pricing.md](doc/billing-pricing.md) 的 agent / 汇率小节)。
+- **账户类型**:`api`(按量计费)、`plan`(订阅套餐)或 `agent`(Agent 订阅,如 Codex)。plan 按每把上游密钥的订阅周期收费,与调用量无关;调用仍会记录一笔 api 口径的**虚拟消费**,用于衡量套餐价值。密钥可设置订阅起始日,周期、价格变更与取消判断统一使用 UTC+0。`agent` 计费与 plan 一致,但不绑定上游密钥、不可作为本地密钥的上游目标。Agent 用量由仪表板服务器内置 worker 采集:服务启动时一次、之后每 30 分钟一次,每次在浏览器打开仪表板时再触发一次(见 [doc/billing-pricing.md](doc/billing-pricing.md) 的 agent / 汇率小节)。
 - **并发限额**:同一账户同时进行中的请求数上限,留空 = 不限。超限的请求立即返回 HTTP 429;在聚合链里则自动切到下一个账户
 - **plan 冷却**:plan 的单把上游密钥只有收到**真正的配额耗尽错误**才会自动冷却 **5 小时**——即上游返回 `429` 且错误体是 `{"type":"error","error":{"type":"GoUsageLimitError",…}}`(如 opencode.ai 的"5 小时/每周使用限额")。普通的瞬时 `429`(限流/过载)只做几秒到几分钟的退避,不会锁死密钥;成功调用即清除退避。同账户的其他密钥在任何冷却下都仍可立即接管。冷却状态只存在内存中(重启即清),且冷却期内代理会**每隔 1 小时主动探测一次上游**的 `GET /models`:只要上游恢复返回 2xx,该密钥的冷却会提前解除、重新进入候选池,不必等满 5 小时(探测不产生任何请求日志、不占并发)。探测间隔默认 1h,可用环境变量 `TB_COOLDOWN_PROBE_SECS` 覆盖(单位秒)
 
@@ -148,24 +148,21 @@ cmake --build build -j$(nproc)
 
 ### systemd 服务
 
-`start.sh --all` 会自动编译并安装 `token-proxy` 用户服务(开机自启)和 `token-agent-import` 用量导入定时器(每 30 分钟运行一次,与看板进程完全解耦——看板关着也照常导入)。单独管理:
+`start.sh` 默认安装并启用 `token-dashboard` 用户服务；这个 Python 进程同时运行网页服务器和 Agent 用量导入 worker。`start.sh --all` 再额外编译、安装并启用 `token-proxy`。单独管理:
 
 ```bash
+systemctl --user status token-dashboard      # 仪表板 + 用量导入状态
+systemctl --user restart token-dashboard     # 重启（启动后立即导入一次）
+journalctl --user -u token-dashboard -f      # 网页与导入日志
+
 bash scripts/start-proxy.sh --install      # 安装为 systemd 用户服务
 bash scripts/start-proxy.sh --uninstall    # 移除服务
 systemctl --user status token-proxy        # 查看状态
 systemctl --user restart token-proxy       # 重启
 journalctl --user -u token-proxy -f        # 查看日志
-
-systemctl --user list-timers token-agent-import.timer   # 定时器状态 / 下次触发时间
-systemctl --user start token-agent-import.service       # 立即手动导入一次
-journalctl --user -u token-agent-import.service -f      # 查看导入日志
-systemctl --user disable --now token-agent-import.timer # 停用定时器
-# 完全移除定时器:
-rm -f ~/.config/systemd/user/token-agent-import.{service,timer} && systemctl --user daemon-reload
 ```
 
-用户定时器在登录会话内运行;若需无人值守(开机未登录也照常触发),可执行 `loginctl enable-linger <用户>` 启用 linger。
+用户服务通常在登录后启动;若需无人值守(开机未登录也启动),可执行 `sudo loginctl enable-linger <用户>` 启用 linger。`start.sh` 会检测并提示,不会自行提权。
 
 ### 状态检查
 
@@ -173,7 +170,7 @@ rm -f ~/.config/systemd/user/token-agent-import.{service,timer} && systemctl --u
 bash scripts/status.sh
 ```
 
-检查代理二进制、systemd 服务、8800 健康检查、仪表板进程与端口、数据库行数。
+检查代理二进制、systemd 服务、8800 健康检查、仪表板服务与固定端口、数据库行数。
 
 ### 数据目录
 

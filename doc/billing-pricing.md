@@ -77,8 +77,8 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 
 - 订阅按月计费(`monthly_price` × 每账户一个"订阅"生命周期,`proxy_plan_summary` 以 `key_masked='subscription'` 存档),与 plan 的差异是**不绑定任何上游密钥**。
 - agent 账户**不能**作为本地密钥的上游目标(`create_key` 拒绝),路由快照也会跳过它;其用量全部来自导入,不是代理转发。
-- 用量由**独立的 systemd 用户定时器 `token-agent-import` 每 30 分钟运行一次**(`start.sh --all` 安装,one-shot 进程跑完即退,日志走 journal),**与看板进程完全解耦**——看板关着也照常导入;定时器带 `Persistent=true`,服务器关机/未登录期间错过的时间窗会在下次登录时补跑。导入扫描 `~/.codex/sessions`(递归 `YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl`,兼容 `.jsonl.gz`),把每个 `token_count` 事件的 `last_token_usage`(每轮增量)写一行 `request_log`(`account_id` 指向第一个 `agent_kind='codex'` 账户,`event_id` 幂等,重复/并发运行不重复计数)。用量进入消费报告与看板,口径同 plan:真实成本 = 订阅费,api_cost = 虚拟/理论消费。
-- 导入游标存于本机 `codex_import_state` 表,不上云。
+- 用量由**仪表板服务器进程内的单一 worker** 导入:`token-dashboard` 启动时立即运行一次,之后每 30 分钟运行一次;浏览器每次打开仪表板还会通过非阻塞 POST 唤醒同一个 worker。启动、定时和浏览器触发串行执行,不会并发争抢 SQLite 游标。导入扫描 `~/.codex/sessions`(递归 `YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl`,兼容 `.jsonl.gz`),把每个 `token_count` 事件的 `last_token_usage`(每轮增量)写一行 `request_log`(`account_id` 指向第一个 `agent_kind='codex'` 账户,`event_id` 幂等,重复扫描不重复计数)。用量进入消费报告与后续看板导出,口径同 plan:真实成本 = 订阅费,api_cost = 虚拟/理论消费。
+- 导入游标存于本机 `account_importers.cursor_json`，不上云。
 
 ## 币种与汇率(CNY / USD)
 
@@ -88,4 +88,4 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 - 周期开始日无精确汇率时,按 `?date=period_start` 从 frankfurter **历史接口**拉取并落库后锁定(1999-01-04 起支持,早于此日期不发请求);拉取失败则用最近一条已存汇率作**临时值(provisional,不锁定)**,每轮物化重试;未锁定的 USD 行在周期结束后也**不会冻结**,直到锁定成功(网络恢复后同一次物化内完成锁定并冻结)。
 - 汇率来源 `GET https://api.frankfurter.dev/v2/rate/USD/CNY`(带 `?date=` 支持历史日期;v2 对周末请求回显请求日期、汇率为最近交易日值)。看板启动与首次使用时按 UTC 日拉取一次并存入本机 `fx_rate` 表;当天已有则直接用;拉取失败(或仍为旧数据)则用最近一条已存汇率。请求日期早于所有已存记录(如过去月份早于首次拉取)时用**最早一条已存汇率**,避免 USD 订阅被按 1.0 低估;只有该币种对从未存储过任何记录才按 1.0(等价不换算)。
 - 锁定承诺的是"不重新拉取、不随当天漂移";手工修改 `fx_rates` 行会被锁定行读到,不做防护。
-- `fx_rate` 与 `codex_import_state` 均**仅存本机**,同步到云时被剔除(`sync._RUNTIME_TABLES`)。
+- `fx_rates` 与 `account_importers.cursor_json` 均**仅存本机**,同步到云时被剔除(`sync._RUNTIME_TABLES`)。

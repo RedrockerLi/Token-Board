@@ -20,8 +20,9 @@ class DataStore:
         len(store.token_usages)
     """
 
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, schema_dir=None):
         self.data_dir = data_dir
+        self.schema_dir = schema_dir
         self.token_usages: list[dict] = []
         self.request_usages: list[dict] = []
         self.cost_entries: list[dict] = []
@@ -51,7 +52,7 @@ class DataStore:
         """Load all records from the dashboard SQLite database."""
         from app.db.dashboard_db import DashboardDatabase
 
-        db = DashboardDatabase(db_path)
+        db = DashboardDatabase(db_path, schema_dir=self.schema_dir)
         conn = db._connect()
         try:
             # Opening the façade already verified the V1 schema.  Do not probe

@@ -14,10 +14,10 @@ Token Board 由两个独立进程组成,共享同一份版本化数据库 schema
                  └──────────────────────────────────────────┘
 
                  ┌──────────────────────────────────────────┐
-                 │  server.py  (Python/Flask, 端口 5000+)   │
-                 │  配置管理 CRUD │ 数据看板 API │ 导出/同步   │
-                 │        │            │            │       │
-                 │        ▼            ▼            ▼       │
+                 │  server.py  (Python/Flask, 固定端口 5000) │
+                 │  配置 CRUD │ 看板 API │ Agent 导入 │ 同步  │
+                 │        │          │          │       │   │
+                 │        ▼          ▼          ▼       ▼   │
                  │   data/proxy.db  data/dashboard.db  WebDAV│
                  └──────────────────────────────────────────┘
 ```
@@ -32,11 +32,11 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 ## 目录结构
 
 ```
-├── server.py               看板入口(解析 --port / --host / --proxy-db,调 create_app)
-├── start.sh                一键启动:代理(systemd)+ 看板
+├── server.py               看板入口(解析参数、调 create_app、负责后台任务停机)
+├── start.sh                默认安装 token-dashboard 开机自启;--all 再启动代理
 ├── app/                    Flask 应用包
 │   ├── __init__.py         create_app() 应用工厂,按需挂代理管理蓝图,并启动
-│   │                       后台线程(汇率预热 + Codex 用量导入)
+│   │                       后台线程(汇率预热 + Codex 用量导入等)
 │   ├── config.py           应用常量与日志配置
 │   ├── routes.py           数据看板蓝图(/、/api/*)
 │   ├── proxy_routes.py     代理管理蓝图(/api/proxy/*,含并发测试、性能、同步)
@@ -48,7 +48,7 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 │   ├── cost_allocator.py   V1 已归属成本兼容读取
 │   ├── ir.py               平台无关 IR 数据类(TokenUsage/RequestUsage/CostEntry)
 │   ├── fx.py               USD→CNY 汇率拉取与缓存(本地,不上云)
-│   └── codex_import.py     Codex 会话用量后台导入(增量游标,幂等)
+│   └── services/codex_import.py  Codex 会话用量后台导入(增量游标,幂等)
 ├── proxy/                  C++17 代理(CMake 工程)
 │   ├── CMakeLists.txt      构建(OpenSSL + Threads,vendored sqlite3/httplib/json)
 │   ├── src/
@@ -89,6 +89,8 @@ schema 的单一来源是 `schema/` 目录下的版本化迁移文件,见 [datab
 请求进来先走代理这一路。客户端密钥经 `Router::route` 找到上游账户,请求按客户端 URL 路径识别格式,与上游格式不同时经 IR 编解码转换(见 [format-conversion.md](format-conversion.md)),随后由 `UpstreamClient` 转发。每次请求的结果写进 `proxy.db` 的 `request_log`(计费 + TTFT/速度指标)与 `request_attempts`(每次上游尝试),流式响应实时透传。
 
 看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。用量按 日×账户×模型 批量 upsert 到 Dashboard V1 的 `daily_usage`，再以「云端权威」模型同步到 WebDAV。
+
+Codex Agent 用量不再由独立进程采集。`token-dashboard` 内只有一个 importer worker:服务器启动立即执行一次,之后每 1800 秒执行一次;前端在每次页面加载时 POST `/api/proxy/agent-usage/import` 唤醒同一个 worker。所有触发都串行进入同一线程并写 `proxy.db/request_log`,避免定时任务与浏览器刷新并发扫描。
 
 dashboard.db 是**纯存档**，V1 仅有 `accounts`、`daily_usage`、`monthly_recurring_costs`；没有价格表和重算能力。
 

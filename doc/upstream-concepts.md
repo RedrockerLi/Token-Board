@@ -49,7 +49,7 @@
 ### agent 账户（Agent 订阅，目前仅 Codex）
 
 - **只计费、不路由**：`create_key` 拒绝把本地密钥绑到不可路由类型（`Agent 账户不能作为本地密钥的上游`，判定见 [app/db/proxy_db.py:828-842](app/db/proxy_db.py#L828-L842) 的 `_assert_routable_account`，由规格表 `routable` 驱动）；路由快照的 SQL 也用 `account_types::routable_filter_sql` 统一排除不可路由类型（[proxy/src/store/db.cpp:359-409](proxy/src/store/db.cpp#L359-L409)）。所以它永远不会收到代理转发来的请求。
-- 用量全部来自**独立导入**：systemd 用户定时器 `token-agent-import` 每 30 分钟运行一次 one-shot 导入（与看板进程解耦，看板关着也照常导入；[agent_usage_import.py](agent_usage_import.py) 调用 [app/services/codex_import.py](app/services/codex_import.py)），扫描 `~/.codex/sessions`，把 Codex 会话文件里的 `token_count` 事件写成 `request_log` 行，`account_id` 指向第一个 `agent_kind='codex'` 的账户。`event_id` 幂等，断点续传不重复计数。
+- 用量全部来自**服务器内置导入**：[runtime_tasks.py](../app/services/runtime_tasks.py) 管理唯一 worker,在看板服务器启动时立即运行、每 30 分钟运行,浏览器打开看板时再异步唤醒；worker 调用 [codex_import.py](../app/services/codex_import.py) 扫描 `~/.codex/sessions`，把 Codex 会话文件里的 `token_count` 事件写成 `request_log` 行，`account_id` 指向第一个 `agent_kind='codex'` 的账户。`event_id` 幂等，断点续传不重复计数。
 - 计费口径与 plan 一致：订阅费按月存入 `proxy_plan_summary`（`key_masked='subscription'`），导入的用量在 `request_log.api_cost` 记虚拟消费。
 - `agent_kind` 字段标记具体 Agent（当前仅 `codex`）。
 
@@ -139,7 +139,7 @@
 
 ### 哪些不上云
 
-`upstream_keys`（真实 Key 本身）、`session_key_log`、`fx_rate`、`codex_import_state` 都在同步时的 `_RUNTIME_TABLES` 里被剥离（[app/services/sync.py:288-302](app/services/sync.py#L288-L302)）；`upstream_keys_cloud` 只含 masked 元数据随配置同步。
+`upstream_keys`（真实 Key 本身）、`session_key_log`、`fx_rates`、`account_importers.cursor_json` 都在同步时的运行时表清理中被剥离；`upstream_keys_cloud` 只含 masked 元数据随配置同步。
 
 ## 七、数据导出链路行为
 

@@ -311,6 +311,13 @@ function resolveFn(nameOrFn) {
 document.addEventListener('DOMContentLoaded', () => {
     Sidebar.init();
 
+    // Opening the dashboard asks the server-owned importer for one extra
+    // pass.  The request returns immediately; the same serialized worker also
+    // handles startup and 30-minute imports, so multiple tabs are harmless.
+    fetch('/api/proxy/agent-usage/import', { method: 'POST' }).catch((error) => {
+        console.warn('Failed to schedule agent usage import:', error);
+    });
+
     // Click handler for sidebar nav items
     document.addEventListener('click', (e) => {
         const link = e.target.closest('.sidebar__nav-item');

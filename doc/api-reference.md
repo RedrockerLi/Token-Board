@@ -19,7 +19,7 @@
 
 ## 仪表板数据 API
 
-看板监听 5000-5099 区间自动选端口。数据来自 `dashboard.db`(`DataStore` 加载)。
+看板默认固定监听 5000（可用 `TB_DASHBOARD_PORT` 覆盖）。数据来自 `dashboard.db`(`DataStore` 加载)。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
@@ -39,6 +39,10 @@
 ## 代理管理 API
 
 前缀 `/api/proxy`,仅在 `server.py --proxy-db` 传入 `proxy.db` 时启用。账户、密钥、定价等配置在**退出设置类页面**时作为一次事务上传云端(见 [sync.md](sync.md))。
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/proxy/agent-usage/import` | POST | 非阻塞唤醒服务器内置 Agent 用量 worker；网页每次加载时调用一次，返回 202 |
 
 ### 账户与密钥
 

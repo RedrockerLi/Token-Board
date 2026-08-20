@@ -16,7 +16,7 @@
 - `upstream_keys.key_value` 与 `upstream_accounts.upstream_key` 的完整明文
 - `perf_events` 性能事件
 - `upstream_keys` 与 `session_key_log`(上游密钥本身、会话→密钥分配观测)
-- `fx_rate` 与 `codex_import_state`(汇率与 Codex 导入游标,仅本机)
+- `fx_rates` 与 `account_importers.cursor_json`(汇率与 Codex 导入游标,仅本机)
 - `in_flight_requests` 在途请求
 - `sync_config`(WebDAV 账号密码)
 

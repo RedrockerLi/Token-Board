@@ -14,7 +14,10 @@ def export_data():
     db_path = current_app.config["PROXY_DB"].db_path
     dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
 
-    result = sync_dashboard(db_path, dash_db_path)
+    result = sync_dashboard(
+        db_path, dash_db_path,
+        schema_dir=current_app.config.get("SCHEMA_DIR"),
+    )
 
     # Trigger dashboard data reload
     ds = current_app.config.get("DATA_STORE")
@@ -113,7 +116,8 @@ def upload_config():
     from app.services.sync import sync_config_upload
 
     db_path = current_app.config["PROXY_DB"].db_path
-    result = sync_config_upload(db_path)
+    result = sync_config_upload(
+        db_path, schema_dir=current_app.config.get("SCHEMA_DIR"))
     return jsonify(result)
 
 

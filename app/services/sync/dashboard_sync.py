@@ -42,7 +42,8 @@ def _count_dashboard_rows(db_path: str) -> int:
         conn.close()
 
 
-def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str) -> dict:
+def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str,
+                         schema_dir: str | None = None) -> dict:
     """Sync the dashboard archive via WebDAV — one atomic transaction.
 
     Flow: pull (cloud → shadow) → export (request_log → shadow) →
@@ -87,8 +88,10 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str) -> dict:
                 remote_version.major not in {0, local_version.major}):
             _set_sync_state(proxy_db_path, "sync_health", "remote major mismatch")
             return {"status": "error", "message": "云端 dashboard 跨 Major，已暂停同步"}
+        resolved_schema_dir = schema_dir or schema_dir_for(
+            dash_db_path, "dashboard")
         upgrade_downloaded_artifact(
-            shadow_path, "dashboard", schema_dir_for(dash_db_path, "dashboard"),
+            shadow_path, "dashboard", resolved_schema_dir,
             local_proxy_path=proxy_db_path)
         upgraded_version = inspect_version(Path(shadow_path), "dashboard")
         if (upgraded_version and local_version and
@@ -104,7 +107,7 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str) -> dict:
 
         # 3. Export: request_log rows in (mark, max_id] → shadow, additively.
         from app.db.proxy_db import ProxyDatabase
-        proxy_db = ProxyDatabase(proxy_db_path)
+        proxy_db = ProxyDatabase(proxy_db_path, schema_dir=resolved_schema_dir)
         mark = proxy_db.get_export_mark()
         max_id = proxy_db.get_max_log_id()
         export_result = proxy_db.export_to_dashboard(shadow_path, mark, max_id)
@@ -116,7 +119,7 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str) -> dict:
         #     archive would survive forever.
         from app.db.dashboard_db import DashboardDatabase
         purge_db = DashboardDatabase(
-            shadow_path, schema_dir=schema_dir_for(dash_db_path, "dashboard"))
+            shadow_path, schema_dir=resolved_schema_dir)
         purged = purge_db.purge_zero_usage_rows()
         if purged > 0:
             log.info("purged zero-usage archive rows: count=%d", purged)
@@ -165,12 +168,14 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str) -> dict:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def sync_dashboard(proxy_db_path: str, dash_db_path: str) -> dict:
+def sync_dashboard(proxy_db_path: str, dash_db_path: str,
+                   schema_dir: str | None = None) -> dict:
     """Run the cloud archive transaction with bounded conflict retries."""
     last_error = None
     for attempt in range(3):
         try:
-            return _sync_dashboard_once(proxy_db_path, dash_db_path)
+            return _sync_dashboard_once(
+                proxy_db_path, dash_db_path, schema_dir=schema_dir)
         except WebDAVConflict as exc:
             last_error = exc
             log.warning("dashboard upload raced with remote update; retry %d/3",

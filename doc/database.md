@@ -129,9 +129,9 @@ key/value 表,存 `last_exported_log_id`:最近一次**完整成功**的拉取-�
 
 key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。凭据只在此表,导出到云端的副本会先删除该表。
 
-### fx_rate 与 codex_import_state — 仅本机的运行时表
+### fx_rates 与 account_importers — 仅本机的运行时数据
 
-`fx_rate` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,触发器和代理快照计价按请求日期取最近一条;拉不到用最近存值,仍无则 1.0(不换算)。`codex_import_state` 是 Codex 会话导入的增量游标(`path` → `size`/`mtime`/`last_line`),保证幂等续传。两表都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
+`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,触发器和代理快照计价按请求日期取最近一条;拉不到用最近存值,仍无则 1.0(不换算)。`account_importers.cursor_json` 是 Codex 会话导入的增量游标(`path` → `size`/`mtime`/`last_line`),保证幂等续传。两类数据都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
 
 ## dashboard.db
 

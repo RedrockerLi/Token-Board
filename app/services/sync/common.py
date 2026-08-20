@@ -36,7 +36,7 @@ V1_CONFIG_TABLES = [
 _RUNTIME_TABLES = [
     "request_log", "request_attempts", "upstream_secrets", "billing_period_charges",
     "fx_rates", "sync_state", "sync_config", "perf_events", "in_flight_requests",
-    "session_key_log", "codex_import_state",
+    "session_key_log",
 ]
 
 

@@ -21,7 +21,7 @@ def _mark_sync_degraded(db_path: str, operation: str, exc: Exception) -> None:
         # failure.  Keep the health write best-effort, but never silent.
         log.exception("failed to persist sync health for %s", operation)
 
-def _sync_config_upload_once(db_path: str) -> dict:
+def _sync_config_upload_once(db_path: str, schema_dir: str | None = None) -> dict:
     """Upload local config to cloud as one conflict-checked transaction.
 
     Returns {status: 'ok'|'conflict'|'error', message, conflict}.
@@ -65,7 +65,8 @@ def _sync_config_upload_once(db_path: str) -> dict:
                 _set_sync_state(db_path, "sync_health", message)
                 return {"status": "error", "message": message, "conflict": False}
             upgrade_downloaded_artifact(
-                remote_path, "proxy", schema_dir_for(db_path, "proxy"),
+                remote_path, "proxy",
+                schema_dir or schema_dir_for(db_path, "proxy"),
                 local_proxy_path=db_path, configuration_only=True)
             upgraded_version = inspect_version(Path(remote_path), "proxy")
             if (upgraded_version and local_version and
@@ -134,7 +135,7 @@ def _sync_config_upload_once(db_path: str) -> dict:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def sync_config_upload(db_path: str) -> dict:
+def sync_config_upload(db_path: str, schema_dir: str | None = None) -> dict:
     """Upload configuration with bounded re-pull/rebuild retries.
 
     An immutable artifact can race with another node between the PROPFIND
@@ -144,7 +145,7 @@ def sync_config_upload(db_path: str) -> dict:
     last_error = None
     for attempt in range(3):
         try:
-            return _sync_config_upload_once(db_path)
+            return _sync_config_upload_once(db_path, schema_dir=schema_dir)
         except WebDAVConflict as exc:
             last_error = exc
             log.warning("config upload raced with remote update; retry %d/3",
@@ -154,7 +155,8 @@ def sync_config_upload(db_path: str) -> dict:
     return {"status": "conflict", "message": str(last_error), "conflict": True}
 
 
-def _sync_config_download_once(db_path: str) -> bool:
+def _sync_config_download_once(db_path: str,
+                               schema_dir: str | None = None) -> bool:
     """Pull the latest cloud config and merge cloud-authoritatively into the
     local DB. On success the snapshot + config hash are updated (commit point)."""
     config = load_sync_config(db_path)
@@ -191,7 +193,8 @@ def _sync_config_download_once(db_path: str) -> bool:
             _set_sync_state(db_path, "sync_health", "remote major mismatch")
             return False
         upgrade_downloaded_artifact(
-            remote_path, "proxy", schema_dir_for(db_path, "proxy"),
+            remote_path, "proxy",
+            schema_dir or schema_dir_for(db_path, "proxy"),
             local_proxy_path=db_path, configuration_only=True)
         upgraded_version = inspect_version(Path(remote_path), "proxy")
         if (upgraded_version and local_version and
@@ -245,11 +248,11 @@ def _sync_config_download_once(db_path: str) -> bool:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def sync_config_download(db_path: str) -> bool:
+def sync_config_download(db_path: str, schema_dir: str | None = None) -> bool:
     """Download configuration, retrying a concurrent immutable-artifact race."""
     for attempt in range(3):
         try:
-            return _sync_config_download_once(db_path)
+            return _sync_config_download_once(db_path, schema_dir=schema_dir)
         except WebDAVConflict:
             log.warning("config download raced with remote update; retry %d/3",
                         attempt + 1)

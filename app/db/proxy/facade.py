@@ -22,12 +22,13 @@ class ProxyDatabase(
         ProxyBillingLedgerMixin,
         ProxyExportMixin,
         ProxyPerformanceMixin):
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, schema_dir: str | None = None):
         self.db_path = db_path
         # Schema is owned by versioned migrations (schema/proxy/vN/*.sql); apply
         # once at construction. Fails fast (create_app aborts) on error.
         from app.db.migrations import MigrationError, migrate, schema_dir_for
-        migrate(self.db_path, schema_dir_for(self.db_path, "proxy"), "proxy")
+        self.schema_dir = schema_dir or schema_dir_for(self.db_path, "proxy")
+        migrate(self.db_path, self.schema_dir, "proxy")
         conn = sqlite3.connect(self.db_path)
         try:
             row = conn.execute(
