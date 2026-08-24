@@ -15,7 +15,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.tests.support import AppDatabaseTestCase
-from app.services import codex_import
+from app.services.agent_usage.adapters import codex as codex_adapter
+from app.services.agent_usage.importer import import_once
 
 
 SESSION_ID = "11111111-2222-3333-4444-555555555555"
@@ -42,11 +43,8 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
     def setUp(self) -> None:
         super().setUp()
         self._sessions = tempfile.TemporaryDirectory()
-        self.old_codx_dir = codex_import.CODEX_DIR
-        codex_import.CODEX_DIR = Path(self._sessions.name)
 
     def tearDown(self) -> None:
-        codex_import.CODEX_DIR = self.old_codx_dir
         self._sessions.cleanup()
         super().tearDown()
 
@@ -71,7 +69,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
 
     def _run_import(self) -> int:
         from app.db.proxy_db import ProxyDatabase
-        return codex_import.import_once(ProxyDatabase(str(self.proxy_path)))
+        return import_once(ProxyDatabase(str(self.proxy_path)))
 
     def test_imports_rows_and_is_idempotent(self) -> None:
         from app.db.proxy_db import ProxyDatabase
@@ -95,6 +93,40 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                 "ORDER BY requested_at LIMIT 1").fetchone()
         self.assertEqual(tuple(row), (
             "gpt-5.1-codex", 10, 20, 5, 35, "2026-08-13T01:00:00Z"))
+
+    def test_opencode_custom_sqlite_filename_uses_native_adapter(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode-data.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute("CREATE TABLE message(data TEXT, session_id TEXT)")
+                connection.execute(
+                    "INSERT INTO message(data,session_id) VALUES(?,?)",
+                    (json.dumps({
+                        "role": "assistant",
+                        "time": {"created": 1782720000000},
+                        "modelID": "opencode-model",
+                        "tokens": {"input": 10, "output": 2,
+                                    "reasoning": 1, "cache": {"read": 5}},
+                        "path": {"root": "/work/project"},
+                    }), "session-1"),
+                )
+            database.create_agent_software({
+                "name": "opencode-agent", "agent_kind": "opencode",
+                "config": {"data_root": str(path)},
+            })
+
+            self.assertEqual(import_once(database), 1)
+            with sqlite3.connect(self.proxy_path) as connection:
+                row = connection.execute(
+                    "SELECT model,prompt_tokens,completion_tokens,"
+                    "cache_read_tokens,total_tokens,project "
+                    "FROM request_log WHERE event_id LIKE 'opencode:%'"
+                ).fetchone()
+            self.assertEqual(tuple(row),
+                             ("opencode-model", 10, 3, 5, 13, "project"))
 
     def test_fork_replay_history_is_not_counted_twice(self) -> None:
         from app.db.proxy_db import ProxyDatabase
@@ -170,14 +202,16 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                             second_lines)
 
         barrier = threading.Barrier(2)
-        original_parse = codex_import._parse_session
+        original_parse = codex_adapter.parse
 
-        def parse_in_lockstep(path, stop_event=None):
-            result = original_parse(path, stop_event)
+        def parse_in_lockstep(item, stop_event=None, *, skip_token_count=0,
+                              **kwargs):
+            result = original_parse(
+                item, stop_event, skip_token_count=skip_token_count, **kwargs)
             barrier.wait(timeout=5)
             return result
 
-        with patch.object(codex_import, "_parse_session", parse_in_lockstep):
+        with patch.object(codex_adapter, "parse", parse_in_lockstep):
             threads = [threading.Thread(target=lambda: self._run_import())
                        for _ in range(2)]
             for thread in threads:

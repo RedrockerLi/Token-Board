@@ -143,7 +143,7 @@ def start_runtime_tasks(flask_app, proxy_db, token_board_db_path: str) -> None:
     flask_app.config["BACKGROUND_TASKS_STARTED"] = True
 
     from app.services import fx
-    from app.services.codex_import import import_once
+    from app.services.agent_usage.importer import import_once
 
     def prewarm_fx() -> None:
         conn = proxy_db._connect()

@@ -7,7 +7,6 @@ from app import create_app
 from app.db.dashboard_db import DashboardDatabase
 from app.db.proxy_db import ProxyDatabase
 from app.db.proxy.common import _parse_utc_timestamp
-from app.services.codex_import import _iso_z_to_sqlite
 
 from app.tests.support import AppDatabaseTestCase
 
@@ -289,8 +288,6 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertFalse(thread.is_alive())
 
     def test_time_conventions_are_iso_only(self) -> None:
-        self.assertEqual(_iso_z_to_sqlite("2026-08-04T16:37:44.757Z"),
-                         "2026-08-04T16:37:44Z")
         parsed = _parse_utc_timestamp("2026-08-04T16:37:44Z")
         self.assertEqual(parsed.year, 2026)
         self.assertEqual(parsed.hour, 16)

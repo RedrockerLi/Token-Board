@@ -48,7 +48,7 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/proxy/agent-types` | GET | 当前可用的软件解析类型（`codex`、`opencode`） |
+| `/api/proxy/agent-types` | GET | 当前可用的软件解析类型（由 Python adapter registry 提供，包含 27 种本地 agent） |
 | `/api/proxy/agent-subscriptions` | GET/POST | 查询/添加独立订阅（名称、开始时间、币种、一个或多个价格/开始日期实例） |
 | `/api/proxy/agent-subscriptions/<id>` | PUT/DELETE | 修改或删除订阅 |
 | `/api/proxy/agent-subscriptions/<id>/instances` | GET/POST | 查询或添加订阅实例（每个实例独立计费） |

@@ -293,7 +293,7 @@ function initAgentSoftwarePage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">软件管理</h1>
-            <p class="page-subtitle">配置智能体软件来源。当前支持 Codex、OpenCode，可继续扩展其他 agent 解析器。</p>
+            <p class="page-subtitle">配置智能体软件来源。用量类型由后端 adapter registry 提供，支持多种本地 agent。</p>
             <button class="btn btn--primary" onclick="openAgentSoftwareModal()">+ 添加软件</button>
         </div>
         <table class="mgmt-table" id="agentSoftwareTable">

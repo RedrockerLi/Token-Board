@@ -2,18 +2,13 @@
 
 from app.db.proxy.common import *  # noqa: F401,F403
 from app.db.proxy.agent_subscriptions import ProxySubscriptionMixin, _json_object
+from app.services.agent_usage.registry import AGENT_TYPES
 
 
-SUPPORTED_AGENT_TYPES = {
-    "codex": {
-        "label": "Codex", "description": "Codex CLI 会话用量",
-        "default_path": "~/.codex",
-    },
-    "opencode": {
-        "label": "OpenCode", "description": "OpenCode 本地数据库用量",
-        "default_path": "~/.local/share/opencode/opencode.db",
-    },
-}
+# Kept as the public compatibility name used by integrations.  The parser
+# registry is the single source of truth so a newly added adapter is accepted
+# by the API and is actually importable by the worker.
+SUPPORTED_AGENT_TYPES = AGENT_TYPES
 
 
 class ProxyAgentMixin(ProxySubscriptionMixin):

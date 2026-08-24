@@ -73,10 +73,10 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 
 ## 智能体订阅与软件用量
 
-智能体已从上游账户模型中独立出来。**订阅**记录名称、开始时间和币种，并可包含多个独立计费实例；实例记录自己的开始日期和价格，价格历史与周期物化存于 `agent_subscription_rate_events` / `agent_subscription_period_charges`。**软件**记录名称、类型和数据目录，当前支持 Codex 与 OpenCode。订阅和软件通过绑定表多对多关联：一个软件可以使用多个订阅，一个订阅也可以覆盖多个软件。
+智能体已从上游账户模型中独立出来。**订阅**记录名称、开始时间和币种，并可包含多个独立计费实例；实例记录自己的开始日期和价格，价格历史与周期物化存于 `agent_subscription_rate_events` / `agent_subscription_period_charges`。**软件**记录名称、类型和数据目录，类型由 Python agent adapter registry 提供（当前包含 27 种本地 agent）。订阅和软件通过绑定表多对多关联：一个软件可以使用多个订阅，一个订阅也可以覆盖多个软件。
 
 - 用量由**仪表板服务器进程内的单一 worker** 导入:`token-dashboard` 启动时立即运行一次,之后每 30 分钟运行一次;浏览器每次打开仪表板还会通过非阻塞 POST 唤醒同一个 worker。启动、定时和浏览器触发串行执行,不会并发争抢 SQLite 游标。
-- Codex 扫描 `$CODEX_HOME/sessions` 与 `$CODEX_HOME/archived_sessions`（默认 `~/.codex`）；OpenCode 解析配置数据目录下的 `opencode.db`。两者都按 `event_id` 幂等，把用量写入 `request_log` 的统一智能体身份，`project` 与 `session_id` 保存在本机，不展示在请求日志 API。
+- 各 agent adapter 读取自己的本地 JSONL、SQLite、JSON 或云端导出源，统一输出 `UsageEvent`；通用 importer 按 `event_id` 幂等，把用量写入 `request_log` 的统一智能体身份，`project` 与 `session_id` 保存在本机，不展示在请求日志 API。
 - 智能体用量和代理用量统一进入 dashboard 的 `daily_usage`；订阅周期费用按“绑定订阅实例 ÷ 同一实例当前绑定的启用软件数”分摊到 `monthly_recurring_costs`。dashboard 条目仍以软件为单位：实际消费来自绑定订阅，理论消费来自软件用量；没有绑定时实际消费为 0。
 
 ## 币种与汇率(CNY / USD)

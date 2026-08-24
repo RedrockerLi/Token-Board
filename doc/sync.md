@@ -21,7 +21,7 @@ Token Board 使用两条 WebDAV 数据链路：`token-board.db` 的配置镜像�
 本机生成、不会放进配置文件的内容包括：
 
 - `request_log`、`request_attempts`、性能事件和在途请求；
-- Codex 导入游标 (`agent_software_runtime.cursor_json`) 与旧 importer 游标；
+- Agent adapter 导入游标 (`agent_software_runtime.cursor_json`) 与旧 importer 游标；
 - 周期费用物化行、汇率缓存、同步状态和高水位检查点。
 
 ### Dashboard 云端文件

@@ -45,7 +45,7 @@ Dashboard V1.4；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原�
 │   ├── db/proxy/            token-board.db 访问层
 │   ├── db/dashboard/        dashboard.db 访问层
 │   ├── db/schema_upgrade/   Python 数据库升级边界与原子发布引擎
-│   ├── services/codex_import.py  Codex 会话用量导入器
+│   ├── services/agent_usage/     Usage IR、通用游标导入器与逐 agent adapter
 │   └── services/sync/       配置与 dashboard WebDAV 同步
 ├── proxy/                  C++17 代理 CMake 工程
 ├── schema/token-board/v0,v1/     Token Board 历史迁移与当前 V1

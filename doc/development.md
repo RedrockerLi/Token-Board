@@ -65,7 +65,7 @@ python3 scripts/mock_upstream.py --port 9100
 
 用量数据来自代理转发和已注册智能体软件:消费报告页点「导出数据」触发 `sync_dashboard`(见 [sync.md](sync.md)),把 `request_log`
 按 日×账户/软件(id)×模型 增量聚合写进 `dashboard.db`(纯存档,写时固化的费用直接入库,改价不回溯)。
-Codex 解析器参考 `ref/vibe-usage` 的 `token_count`、累计量去重和 live/archive 会话目录；`project`、`session_id` 只写本机 proxy 请求日志,不作为 API 字段。
+Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由通用 importer 负责游标、幂等和写入 `request_log`；Codex 额外处理 `token_count` 累计量、fork replay 和 live/archive 会话目录。`project`、`session_id` 只写本机 proxy 请求日志,不作为 API 字段。
 
 ## 前端
 

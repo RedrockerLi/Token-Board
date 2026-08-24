@@ -130,7 +130,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 ### fx_rates 与 account_importers — 仅本机的运行时数据
 
-`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,触发器和代理快照计价按请求日期取最近一条;拉不到用最近存值,仍无则 1.0(不换算)。`agent_software_runtime.cursor_json` 是 Codex/OpenCode 用量导入的增量游标,保证幂等续传。请求日志、导入游标和汇率缓存都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
+`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,触发器和代理快照计价按请求日期取最近一条;拉不到用最近存值,仍无则 1.0(不换算)。`agent_software_runtime.cursor_json` 是统一 agent adapter 用量导入的增量游标,保证幂等续传。请求日志、导入游标和汇率缓存都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
 
 ## dashboard.db
 
