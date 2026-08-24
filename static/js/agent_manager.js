@@ -306,7 +306,7 @@ function initAgentSoftwarePage() {
                 <form id="agentSoftwareForm" onsubmit="saveAgentSoftware(event)" data-edit-id="">
                     <label>名称 <input name="name" required placeholder="例如：我的 Codex"></label>
                     <label>Agent 类型 <select name="agent_kind" required></select></label>
-                    <label>数据目录（可选） <input name="data_root" placeholder="默认读取 ~/.codex"></label>
+                    <label>数据目录（可选） <input name="data_root" placeholder="留空使用该类型默认目录"></label>
                     <div class="agent-binding-list-wrap"><div class="form-label">绑定订阅</div><div id="agentSubscriptionBindings"></div><button type="button" class="btn btn--sm" onclick="addAgentSubscriptionBindingRow()">+ 添加订阅</button></div>
                     <button id="agentSoftwareSubmit" class="btn btn--primary" type="submit">添加软件</button>
                 </form>
