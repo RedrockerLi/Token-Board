@@ -25,9 +25,10 @@ def _sync_config_upload_once(db_path: str, schema_dir: str | None = None) -> dic
     """Upload local config to cloud as one conflict-checked transaction.
 
     Returns {status: 'ok'|'conflict'|'error', message, conflict}.
-    The uploaded file never carries upstream keys (stripped) or the WebDAV
-    credentials / runtime tables. On success the local snapshot and the
-    config hash are updated (commit point).
+    The uploaded file contains synchronized configuration and client_keys.
+    Upstream secret values and the WebDAV password are removed from the copy;
+    generated runtime tables are also removed. On success the local snapshot
+    and the sanitized config hash are updated (commit point).
     """
     config = load_sync_config(db_path)
     if not config:
@@ -36,18 +37,16 @@ def _sync_config_upload_once(db_path: str, schema_dir: str | None = None) -> dic
     project_root = Path(db_path).resolve().parent
     tmp_dir = project_root / "tmp"
     tmp_dir.mkdir(exist_ok=True)
-    config_path = str(tmp_dir / "proxy_config.db")
-    remote_path = str(tmp_dir / "proxy_config_remote.db")
+    config_path = str(tmp_dir / "token-board_config.db")
+    remote_path = str(tmp_dir / "token-board_config_remote.db")
 
     try:
         # ── 1. Conflict check: refuse if the cloud moved past our last sync. ──
-        remote_artifact = _latest_artifact(config, "proxy_config")
+        remote_artifact = _latest_artifact(config, "token-board_config")
         has_remote = bool(remote_artifact and _webdav_download(
             config, remote_path, remote_filename=remote_artifact.name))
-        if not remote_artifact and _webdav_download(
-                config, remote_path, remote_filename="proxy_config.db"):
-            remote_artifact = RemoteArtifact("proxy_config.db")
-            has_remote = True
+        if not remote_artifact:
+            has_remote = False
         if has_remote:
             # Hash on the same schema basis as sync_config_download: the cloud
             # copy may predate the current migration (e.g. still carrying a
@@ -87,7 +86,7 @@ def _sync_config_upload_once(db_path: str, schema_dir: str | None = None) -> dic
                     "conflict": True,
                 }
 
-        # ── 2. Build upload copy: strip secrets, drop runtime tables. ──
+        # ── 2. Build upload copy: keep configuration, drop runtime tables. ──
         _safe_copy_db(db_path, config_path)
         dst = sqlite3.connect(config_path)
         try:
@@ -104,8 +103,8 @@ def _sync_config_upload_once(db_path: str, schema_dir: str | None = None) -> dic
 
         # ── 3. Upload. ──
         published = _upload_versioned_artifact(
-            config, config_path, "proxy_config", remote_artifact)
-        _publish_schema_manifest(config, config_path, "proxy_config")
+            config, config_path, "token-board_config", remote_artifact)
+        _publish_schema_manifest(config, config_path, "token-board_config")
 
         # ── 4. Commit: record hash of what we uploaded + local snapshot. ──
         _set_sync_state(db_path, "config_hash", _config_hash_of_db(config_path))
@@ -166,16 +165,14 @@ def _sync_config_download_once(db_path: str,
     project_root = Path(db_path).resolve().parent
     tmp_dir = project_root / "tmp"
     tmp_dir.mkdir(exist_ok=True)
-    remote_path = str(tmp_dir / "proxy_config_remote.db")
+    remote_path = str(tmp_dir / "token-board_config_remote.db")
 
     try:
-        remote_artifact = _latest_artifact(config, "proxy_config")
+        remote_artifact = _latest_artifact(config, "token-board_config")
         has_remote = bool(remote_artifact and _webdav_download(
             config, remote_path, remote_filename=remote_artifact.name))
-        if not remote_artifact and _webdav_download(
-                config, remote_path, remote_filename="proxy_config.db"):
-            remote_artifact = RemoteArtifact("proxy_config.db")
-            has_remote = True
+        if not remote_artifact:
+            has_remote = False
         if not has_remote:
             return False
         # Raw identity of the downloaded cloud file, captured before the
@@ -204,7 +201,7 @@ def _sync_config_download_once(db_path: str,
             return False
         _merge_config_tables(remote_path, db_path)
         if remote_version and remote_version.major == 0:
-            publish_path = str(tmp_dir / "proxy_config_v1.db")
+            publish_path = str(tmp_dir / "token-board_config_v1.db")
             _safe_copy_db(db_path, publish_path)
             dst = sqlite3.connect(publish_path)
             try:
@@ -213,8 +210,8 @@ def _sync_config_download_once(db_path: str,
             finally:
                 dst.close()
             published = _upload_versioned_artifact(
-                config, publish_path, "proxy_config", remote_artifact)
-            _publish_schema_manifest(config, publish_path, "proxy_config")
+                config, publish_path, "token-board_config", remote_artifact)
+            _publish_schema_manifest(config, publish_path, "token-board_config")
             _set_sync_state(db_path, "config_hash", _config_hash_of_db(publish_path))
             _set_sync_state(db_path, "remote_artifact", published.name)
             if published.etag:

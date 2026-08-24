@@ -2,7 +2,7 @@
  * proxy_settings.js — Settings page: per-format proxy timeouts + WebDAV sync.
  *
  * Exports: initSettingsPage()
- * Lazy-loaded by app.js when navigating to #/proxy/settings.
+ * Lazy-loaded by app.js when navigating to #/settings/general.
  */
 
 // ── Timeout config ────────────────────────────────────────────────────────
@@ -172,7 +172,7 @@ async function testSyncConnection() {
 // ── Page ──────────────────────────────────────────────────────────────────
 
 function initSettingsPage() {
-    const el = document.getElementById('page-proxy-settings');
+    const el = document.getElementById('page-settings-general');
     if (!el || el.dataset.initialized) return;
     el.dataset.initialized = '1';
 
@@ -196,8 +196,8 @@ function initSettingsPage() {
 
     el.innerHTML = `
         <div class="page-header">
-            <h1 class="page-title">设置</h1>
-            <p class="page-subtitle">代理超时、Plan 计费与 WebDAV 同步设置</p>
+            <h1 class="page-title">通用设置</h1>
+            <p class="page-subtitle">代理超时、Plan/智能体订阅计费与 WebDAV 同步设置</p>
         </div>
 
         <!-- ═══ Timeout config ═══ -->
@@ -229,7 +229,7 @@ function initSettingsPage() {
         <!-- ═══ Plan billing config ═══ -->
         <div class="section">
             <div class="chart-card">
-                <div class="chart-card__title" style="margin-bottom:12px;">Plan 订阅计费</div>
+                <div class="chart-card__title" style="margin-bottom:12px;">Plan/智能体订阅计费</div>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
                     <label>修改月费的默认生效时间
                         <select id="billingPriceEffective">

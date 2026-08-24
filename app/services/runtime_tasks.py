@@ -8,7 +8,10 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from app.db.proxy.billing import materialize_period_charges
+from app.db.proxy.billing import (
+    materialize_all_period_charges,
+    materialize_period_charges,  # public compatibility hook for integrations/tests
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +62,7 @@ class AgentUsageImportWorker:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self.thread = threading.Thread(
-            target=self._run, daemon=True, name="codex-importer")
+            target=self._run, daemon=True, name="agent-usage-importer")
 
     def start(self) -> None:
         self.thread.start()
@@ -85,14 +88,14 @@ class AgentUsageImportWorker:
             inserted = self._action()
             _set_health(
                 self._health, self._health_lock,
-                "codex-importer", "ok")
+                "agent-usage-importer", "ok")
             with self._health_lock:
-                self._health["codex-importer"]["last_inserted"] = inserted
+                self._health["agent-usage-importer"]["last_inserted"] = inserted
         except Exception as exc:
-            log.exception("background task failed: codex-importer")
+            log.exception("background task failed: agent-usage-importer")
             _set_health(
                 self._health, self._health_lock,
-                "codex-importer", "degraded",
+                "agent-usage-importer", "degraded",
                 f"{type(exc).__name__}: {exc}")
 
     def _run(self) -> None:
@@ -130,7 +133,7 @@ class AgentUsageImportWorker:
         finally:
             _set_health(
                 self._health, self._health_lock,
-                "codex-importer", "stopped")
+                "agent-usage-importer", "stopped")
 
 
 def start_runtime_tasks(flask_app, proxy_db, proxy_db_path: str) -> None:
@@ -161,7 +164,7 @@ def start_runtime_tasks(flask_app, proxy_db, proxy_db_path: str) -> None:
         ("fx-prewarm", 86400, prewarm_fx),
         ("deletion-finalizer", 60, proxy_db.finalize_deferred_deletions),
         ("billing-materializer", 60,
-         lambda: materialize_period_charges(proxy_db_path)),
+         lambda: materialize_all_period_charges(proxy_db_path)),
     ]
     for name, interval, action in workers:
         stop = threading.Event()

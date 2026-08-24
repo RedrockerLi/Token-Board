@@ -126,7 +126,7 @@ def _list_folder_files(config, prefix: str) -> list[RemoteArtifact]:
 
 
 _ARTIFACT_RE = re.compile(
-    r"^(?P<base>proxy_config|dashboard_sync)_(?P<stamp>\d{8}_\d{6})(?:_\w+)?\.db$")
+    r"^(?P<base>token-board_config|dashboard_sync)_(?P<stamp>\d{8}_\d{6})(?:_\w+)?\.db$")
 
 
 def _artifact_sort_key(name: str) -> tuple[datetime, str]:

@@ -18,7 +18,8 @@ from zoneinfo import ZoneInfo
 
 from app.db.migrations import MigrationError, SchemaVersion, migrate
 from .artifact import strip_runtime_artifact
-
+from .sqlite_utils import copy_sqlite as _copy_sqlite
+from .agent_id_alignment import prepare_dashboard_agent_alignment
 
 class UpgradeError(RuntimeError):
     """Raised when a database cannot be upgraded safely."""
@@ -59,7 +60,6 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
 
-
 def inspect_version(path: Path, database_name: str) -> SchemaVersion | None:
     if not path.exists() or path.stat().st_size == 0:
         return None
@@ -91,7 +91,6 @@ def inspect_version(path: Path, database_name: str) -> SchemaVersion | None:
     finally:
         conn.close()
 
-
 def _latest_version(schema_root: Path, database_name: str, major: int) -> SchemaVersion:
     directory = schema_root / database_name / f"v{major}"
     versions = []
@@ -105,19 +104,6 @@ def _latest_version(schema_root: Path, database_name: str, major: int) -> Schema
     if not versions:
         raise UpgradeError(f"no schema files for {database_name} V{major}")
     return max(versions)
-
-
-def _copy_sqlite(source: Path, destination: Path) -> None:
-    destination.unlink(missing_ok=True)
-    src = sqlite3.connect(source)
-    dst = sqlite3.connect(destination)
-    try:
-        src.execute("PRAGMA busy_timeout=5000")
-        src.backup(dst)
-        dst.commit()
-    finally:
-        dst.close()
-        src.close()
 
 
 def _transition_module(name: str):
@@ -234,8 +220,8 @@ def _v1_dashboard_identity(proxy_path: Path) -> tuple[dict, dict]:
 
 
 def _rebuild_snapshot(proxy_path: Path) -> None:
-    snapshot = proxy_path.parent / "config_snapshot.db"
-    temporary = snapshot.with_name("config_snapshot.db.upgrade-new")
+    snapshot = proxy_path.parent / "token-board_config_snapshot.db"
+    temporary = snapshot.with_name("token-board_config_snapshot.db.upgrade-new")
     temporary.unlink(missing_ok=True)
     _copy_sqlite(proxy_path, temporary)
     conn = sqlite3.connect(temporary)
@@ -270,8 +256,8 @@ def _transition_pair_impl(proxy: Path, dashboard: Path, schema_root: Path,
     for base in (proxy, dashboard):
         backup_paths.extend(Path(str(base) + suffix) for suffix in ("-wal", "-shm"))
     backup_paths.extend((proxy.parent / name) for name in (
-        "sync_config.json", "config_snapshot.json", "config_snapshot.db",
-        "config_snapshot.db-wal", "config_snapshot.db-shm"))
+        "sync_config.json", "config_snapshot.json", "token-board_config_snapshot.db",
+        "token-board_config_snapshot.db-wal", "token-board_config_snapshot.db-shm"))
     backup_paths.append(Path(str(proxy) + ".request-log.spool"))
     manifest["backups"] = _backup_files(backup_paths, backup_dir)
     manifest["stage"] = "backed_up"
@@ -409,6 +395,9 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
                 finally:
                     shutil.rmtree(work, ignore_errors=True)
                 dv = inspect_version(dashboard, "dashboard")
+            if (dv is not None and dv.major == 1 and dv.minor < 4 and
+                    pv is not None and pv.major == 1):
+                prepare_dashboard_agent_alignment(dashboard, proxy, root)
             if pv is not None and pv.major != 1:
                 raise UpgradeError(f"unsupported proxy schema V{pv.major}.{pv.minor}")
             if dv is not None and dv.major != 1:
@@ -419,6 +408,13 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
                 migrate(str(dashboard), str(root), "dashboard")
             migrate(str(proxy), str(root), "proxy")
             migrate(str(dashboard), str(root), "dashboard")
+            snapshot = proxy.parent / "token-board_config_snapshot.db"
+            if snapshot.exists():
+                snapshot_version = inspect_version(snapshot, "proxy")
+                if snapshot_version is not None and snapshot_version.major == 1:
+                    migrate(str(snapshot), str(root), "proxy")
+                elif snapshot_version is not None and snapshot_version.major == 0:
+                    _rebuild_snapshot(proxy)
             return {
                 "proxy": UpgradeResult(str(proxy), "proxy", pv,
                                          inspect_version(proxy, "proxy"), pv is not None),
@@ -446,6 +442,9 @@ def upgrade_shadow(path: str, database_name: str,
         assert latest is not None
         return UpgradeResult(str(database), database_name, None, latest, True)
     if current.major == 1:
+        if (database_name == "dashboard" and current.minor < 4 and
+                local_proxy_path):
+            prepare_dashboard_agent_alignment(database, Path(local_proxy_path), root)
         migrate(str(database), str(root), database_name)
         if configuration_only:
             strip_runtime_artifact(database, database_name)

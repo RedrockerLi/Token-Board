@@ -5,6 +5,7 @@ from app.routes.proxy import accounts as _proxy_accounts
 from app.routes.proxy import routing as _proxy_routing
 from app.routes.proxy import billing as _proxy_billing
 from app.routes.proxy import agent_usage as _proxy_agent_usage
+from app.routes.proxy import agents as _proxy_agents
 from app.routes.proxy import sync as _proxy_sync
 from app.routes.proxy import performance as _proxy_performance
 

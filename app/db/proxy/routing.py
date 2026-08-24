@@ -28,7 +28,11 @@ class ProxyRoutingMixin:
                 "ck.created_at,ck.last_used_at FROM client_keys ck "
                 "JOIN route_sets rs ON rs.id=ck.route_set_id "
                 "LEFT JOIN upstreams u ON u.account_id=rs.account_id AND u.enabled=1 "
-                "WHERE ck.enabled=1 AND ck.deleted_at IS NULL ORDER BY ck.id"
+                "LEFT JOIN accounts a ON a.id=rs.account_id "
+                "WHERE ck.enabled=1 AND ck.deleted_at IS NULL "
+                "AND (rs.account_id IS NULL OR "
+                "(a.account_kind='proxy' AND a.lifecycle_state='active')) "
+                "ORDER BY ck.id"
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -38,14 +42,17 @@ class ProxyRoutingMixin:
     def _assert_routable_account(conn: sqlite3.Connection, account_id):
         """Reject binding a local key to a non-routable account.
 
-        Non-routable types (e.g. agent / Codex) are subscription-only: they
-        must never be used as a routable upstream, so no local key may point
-        at one.
+        Legacy non-routable rows must never be used as a routable upstream,
+        so no local key may point at one.
         """
         if account_id is None:
             return
         row = conn.execute(
-            "SELECT 1 FROM route_sets WHERE id=? AND enabled=1", (account_id,)
+            "SELECT 1 FROM route_sets rs LEFT JOIN accounts a "
+            "ON a.id=rs.account_id WHERE rs.id=? AND rs.enabled=1 "
+            "AND (rs.account_id IS NULL OR "
+            "(a.account_kind='proxy' AND a.lifecycle_state='active'))",
+            (account_id,),
         ).fetchone()
         if row is None:
             raise ValueError("账户不可路由")
@@ -100,36 +107,14 @@ class ProxyRoutingMixin:
         finally:
             conn.close()
 
-    def get_agent_accounts(self) -> list[dict]:
-        """Agent (subscription-only, import-driven) accounts, e.g. Codex.
-
-        Never routable.  The import-driven type set comes from the spec so a
-        future import-driven type flows through automatically.
-        """
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT a.id,a.name,COALESCE(i.importer_kind,'') AS agent_kind,"
-                "COALESCE(bc.currency,'CNY') AS currency,"
-                "COALESCE((SELECT brecurring.recurring_price FROM billing_rate_events "
-                "brecurring WHERE brecurring.contract_id=bc.id "
-                "ORDER BY brecurring.effective_at DESC,brecurring.id DESC LIMIT 1),0) "
-                "AS monthly_price FROM account_importers i "
-                "JOIN accounts a ON a.id=i.account_id "
-                "LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
-                "AND bc.valid_until IS NULL WHERE i.enabled=1 "
-                "AND a.lifecycle_state='active' ORDER BY a.id"
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
-
     @staticmethod
-    def _insert_agent_usage_row(conn, account_id: int, model: str,
+    def _insert_agent_usage_row(conn, software_id: int, model: str,
                                 prompt_tokens: int, completion_tokens: int,
                                 cache_read_tokens: int, total_tokens: int,
-                                requested_at: str, event_id: str) -> bool:
-        """Insert one agent (Codex) usage row on the caller's connection.
+                                requested_at: str, event_id: str,
+                                project: str | None = None,
+                                session_id: str | None = None) -> bool:
+        """Insert one imported software usage row on the caller's connection.
 
         A pending V1 event lets SQLite select the historical rate and FX.  The
         event_id UNIQUE constraint makes INSERT OR IGNORE idempotent across
@@ -138,20 +123,22 @@ class ProxyRoutingMixin:
         """
         cur = conn.execute(
             "INSERT OR IGNORE INTO request_log"
-            "(event_id,source_kind,account_id,model,prompt_tokens,completion_tokens,"
+            "(event_id,source_kind,account_id,agent_software_id,model,prompt_tokens,completion_tokens,"
             "cache_read_tokens,total_tokens,equivalent_cost,billed_usage_cost,"
-            "is_streaming,status_code,duration_ms,requested_at,pricing_status) "
-            "VALUES(?,'import',?,?,?,?,?,?,0,0,0,200,0,?,'pending')",
-            (event_id, account_id, model, int(prompt_tokens), int(completion_tokens),
-             int(cache_read_tokens), int(total_tokens), requested_at),
+            "is_streaming,status_code,duration_ms,requested_at,pricing_status,project,session_id) "
+            "VALUES(?,'import',?,?,?, ?,?,?,?,0,0,0,200,0,?,'pending',?,?)",
+            (event_id, software_id, software_id, model, int(prompt_tokens), int(completion_tokens),
+             int(cache_read_tokens), int(total_tokens), requested_at, project, session_id),
         )
         return cur.rowcount > 0
 
-    def insert_agent_usage(self, account_id: int, model: str,
+    def insert_agent_usage(self, software_id: int, model: str,
                            prompt_tokens: int, completion_tokens: int,
                            cache_read_tokens: int, total_tokens: int,
-                           requested_at: str, event_id: str) -> bool:
-        """Insert one imported agent (Codex) usage row into request_log.
+                           requested_at: str, event_id: str,
+                           project: str | None = None,
+                           session_id: str | None = None) -> bool:
+        """Insert one imported software usage row into request_log.
 
         Convenience wrapper opening its own connection (for manual/API use);
         the background importer calls :meth:`_insert_agent_usage_row` on a
@@ -160,8 +147,9 @@ class ProxyRoutingMixin:
         conn = self._connect()
         try:
             ok = self._insert_agent_usage_row(
-                conn, account_id, model, prompt_tokens, completion_tokens,
-                cache_read_tokens, total_tokens, requested_at, event_id)
+                conn, software_id, model, prompt_tokens, completion_tokens,
+                cache_read_tokens, total_tokens, requested_at, event_id,
+                project, session_id)
             conn.commit()
             return ok
         finally:

@@ -42,34 +42,27 @@ class ProxyAccountWriteMixin:
                     "(contract_id,recurring_price,effective_at,effective_rule) VALUES(?,?,?,'immediate')",
                     (contract_id, float(data.get("monthly_price", 0) or 0), effective_at),
                 )
-            if type_spec.usage_source == "import":
-                conn.execute(
-                    "INSERT INTO account_importers(uuid,account_id,importer_kind) VALUES(?,?,?)",
-                    (str(uuid.uuid4()), shared_id,
-                     str(data.get("agent_kind") or "codex")),
-                )
-            else:
-                upstream_id = conn.execute(
-                    "INSERT INTO upstreams"
-                    "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,max_concurrency) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (shared_id, data["name"], data.get("base_url", ""),
-                     data.get("api_format", "openai"), data.get("auth_header", "bearer"),
-                     data.get("endpoint_path", ""), int(data.get("max_concurrency") or 0)),
-                ).lastrowid
-                conn.execute(
-                    "INSERT INTO route_sets(id,uuid,account_id,name) VALUES(?,?,?,?)",
-                    (shared_id, str(uuid.uuid4()), shared_id, data["name"]),
-                )
-                conn.execute(
-                    "INSERT INTO route_rules(route_set_id,model_pattern,priority,upstream_id) "
-                    "VALUES(?,'*',0,?)", (shared_id, upstream_id),
-                )
-                if keys and type_spec.holds_keys:
-                    self._set_upstream_keys(
-                        conn, shared_id, [], keys,
-                        new_valid_froms=data.get("new_valid_froms"),
-                        account_type=account_type)
+            upstream_id = conn.execute(
+                "INSERT INTO upstreams"
+                "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,max_concurrency) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (shared_id, data["name"], data.get("base_url", ""),
+                 data.get("api_format", "openai"), data.get("auth_header", "bearer"),
+                 data.get("endpoint_path", ""), int(data.get("max_concurrency") or 0)),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO route_sets(id,uuid,account_id,name) VALUES(?,?,?,?)",
+                (shared_id, str(uuid.uuid4()), shared_id, data["name"]),
+            )
+            conn.execute(
+                "INSERT INTO route_rules(route_set_id,model_pattern,priority,upstream_id) "
+                "VALUES(?,'*',0,?)", (shared_id, upstream_id),
+            )
+            if keys and type_spec.holds_keys:
+                self._set_upstream_keys(
+                    conn, shared_id, [], keys,
+                    new_valid_froms=data.get("new_valid_froms"),
+                    account_type=account_type)
             conn.commit()
             return shared_id
         finally:
@@ -91,16 +84,14 @@ class ProxyAccountWriteMixin:
             "bc.cooldown_policy_json,"
             "bc.valid_from contract_valid_from,"
             "(SELECT recurring_price FROM billing_rate_events WHERE contract_id=bc.id "
-            "ORDER BY effective_at DESC,id DESC LIMIT 1) current_price,"
-            "i.id importer_id,i.importer_kind FROM accounts a "
+            "ORDER BY effective_at DESC,id DESC LIMIT 1) current_price FROM accounts a "
             "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.valid_until IS NULL "
-            "LEFT JOIN account_importers i ON i.account_id=a.id AND i.enabled=1 "
-            "WHERE a.id=? AND a.lifecycle_state='active'", (real_id,),
+            "WHERE a.id=? AND a.account_kind='proxy' AND a.lifecycle_state='active'",
+            (real_id,),
         ).fetchone()
         if original is None:
             return False
-        original_type = ("agent" if original["importer_id"] is not None else
-                         "plan" if original["charge_type"] == "recurring" else "api")
+        original_type = ("plan" if original["charge_type"] == "recurring" else "api")
         final_type = data.get("account_type", original_type)
         if final_type not in ACCOUNT_TYPES:
             raise ValueError("账户类型必须是 " + " / ".join(ACCOUNT_TYPES))
@@ -157,7 +148,6 @@ class ProxyAccountWriteMixin:
                      data.get("auth_header"), data.get("endpoint_path"),
                      data.get("max_concurrency"), upstream_id),
                 )
-            conn.execute("UPDATE account_importers SET enabled=0 WHERE account_id=?", (real_id,))
             route_row = conn.execute("SELECT id FROM route_sets WHERE id=?", (external_id,)).fetchone()
             if route_row is None:
                 conn.execute(
@@ -177,15 +167,6 @@ class ProxyAccountWriteMixin:
                     conn, external_id, keep_ids, self._normalize_keys(data),
                     keep_valid_froms=data.get("keep_valid_froms"),
                     new_valid_froms=data.get("new_valid_froms"), account_type=final_type)
-        else:
-            conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
-            conn.execute("UPDATE route_sets SET enabled=0 WHERE account_id=?", (real_id,))
-            importer_kind = str(data.get("agent_kind") or original["importer_kind"] or "codex")
-            conn.execute(
-                "INSERT INTO account_importers(uuid,account_id,importer_kind,enabled) VALUES(?,?,?,1) "
-                "ON CONFLICT(account_id,importer_kind) DO UPDATE SET enabled=1",
-                (str(uuid.uuid4()), real_id, importer_kind),
-            )
         if is_subscription(final_type) and ("monthly_price" in data or
                                              original_type != final_type):
             mode = data.get("price_effective") or self._billing_config_conn(conn)["price_change_effective"]

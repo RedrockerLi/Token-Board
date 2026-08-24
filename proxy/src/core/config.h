@@ -4,7 +4,7 @@
 
 /// Parsed command-line arguments for the proxy.
 struct Config {
-    std::string db_path = "data/proxy.db";
+    std::string db_path = "data/token-board.db";
     std::string schema_dir;      // schema root or schema/proxy[/vN]
     int port = 8800;
     std::string host = "127.0.0.1";  // loopback only — the proxy is a local endpoint

@@ -19,24 +19,21 @@ class ProxyBillingLedgerMixin:
             conn.close()
 
     def get_today_upstream_usage(self) -> list[dict]:
-        """Per normalized V1 account used today: actual/theoretical cost.
-
-        Rows are grouped by stable ``account_id`` and display names are read
-        from the V1 ``accounts`` mirror. Aggregate route sets have no account
-        row and are excluded, matching the pre-V1 "real upstream" definition.
-        """
+        """Per proxy account or agent software used today."""
         conn = self._connect()
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             rows = conn.execute("""
                 SELECT COALESCE(a.name, 'unknown') AS account_name,
+                       CASE WHEN a.account_kind='agent' THEN 'agent'
+                            ELSE r.source_kind END AS source_kind,
                        COALESCE(SUM(r.billed_usage_cost), 0) AS real_cost,
                        COALESCE(SUM(r.equivalent_cost), 0) AS theoretical_cost,
                        COALESCE(SUM(r.total_tokens), 0) AS tokens,
                        COUNT(*) AS requests
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
-                WHERE a.id IS NOT NULL
+                WHERE a.account_kind IN ('proxy','agent')
                   AND date(r.requested_at) = ?
                 GROUP BY r.account_id
                 ORDER BY theoretical_cost DESC
@@ -47,11 +44,12 @@ class ProxyBillingLedgerMixin:
 
     @staticmethod
     def _plan_key_billing_meta(conn: sqlite3.Connection) -> list[dict]:
-        """Build billable key lifecycles (local plaintext credentials only).
+        """Build plan key lifecycles from synchronized credential metadata.
 
-        Cloud-only rows (no ``upstream_secrets``) are metadata, not billable
-        keys: they cannot route on this machine, so they must not accrue a
-        subscription either.  Duplicate local+cloud rows with the same masked
+        A plan is priced by its configured key slots, not by whether this
+        machine has filled in the local plaintext key.  Cloud-only rows are
+        therefore billable metadata; they still cannot route until a local
+        secret is entered. Duplicate local+cloud rows with the same masked
         identity are collapsed to the local slot.
         """
         now = _utc_now()
@@ -61,6 +59,7 @@ class ProxyBillingLedgerMixin:
                 "bc.valid_until contract_valid_until "
                 "FROM billing_contracts bc JOIN accounts a ON a.id=bc.account_id "
                 "WHERE bc.charge_type='recurring' "
+                "AND a.account_kind='proxy' "
                 "AND bc.valid_from<=?",
                 (now.isoformat(timespec="seconds").replace("+00:00", "Z"),)
             ).fetchall()
@@ -70,8 +69,6 @@ class ProxyBillingLedgerMixin:
                         "SELECT c.runtime_id,c.uuid,c.key_masked,c.created_at,c.valid_from,c.deleted_at "
                         "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
                         "WHERE u.account_id=? "
-                        "AND EXISTS(SELECT 1 FROM upstream_secrets s "
-                        "WHERE s.credential_uuid=c.uuid) "
                         "AND (c.disabled_at IS NULL OR c.disabled_at>?) "
                         "AND (c.deleted_at IS NULL OR c.deleted_at>?) "
                         "ORDER BY c.position,c.runtime_id",

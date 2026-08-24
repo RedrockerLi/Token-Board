@@ -11,8 +11,9 @@ def strip_runtime_artifact(path: Path, database_name: str) -> None:
     if database_name != "proxy":
         return
     runtime_tables = (
-        "request_log", "request_attempts", "upstream_secrets",
-        "billing_period_charges", "fx_rates", "sync_state",
+        "request_log", "request_attempts", "billing_period_charges",
+        "agent_subscription_period_charges", "agent_software_runtime",
+        "fx_rates", "sync_state",
     )
     conn = sqlite3.connect(path)
     try:

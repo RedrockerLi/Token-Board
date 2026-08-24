@@ -396,7 +396,7 @@ def transform_dashboard(source: Path, shadow: Path, proxy_source: Path | None,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--proxy-db", default="data/proxy.db")
+    parser.add_argument("--proxy-db", default="data/token-board.db")
     parser.add_argument("--dashboard-db", default="data/dashboard.db")
     parser.add_argument("--schema-dir", default=str(REPO / "schema"))
     parser.add_argument("--timezone", default="Asia/Shanghai")

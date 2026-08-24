@@ -18,6 +18,7 @@ from app.services.sync.webdav import (
 from app.services.sync.config_merge import _merge_config_tables
 from app.services.sync.config_sync import sync_config_upload
 from app.services.sync.dashboard_sync import sync_dashboard
+from app.services.sync.snapshot import _config_hash_of_db
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -46,7 +47,7 @@ class SyncContractTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_cloud_merge_never_disables_local_plaintext_credentials(self) -> None:
+    def test_cloud_merge_preserves_local_secrets_but_syncs_metadata(self) -> None:
         temp = tempfile.mkdtemp()
         try:
             shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
@@ -66,11 +67,11 @@ class SyncContractTest(unittest.TestCase):
                 "SELECT secret_value FROM upstream_secrets "
                 "WHERE credential_uuid='credential-local'").fetchone()
             conn.close()
-            self.assertIsNone(row[0])
+            self.assertIsNotNone(row[0])
             self.assertEqual(secret[0], "sk-local-secret")
 
-            # Even a remote row that carries a disabled timestamp must not be
-            # able to disable the local plaintext credential.
+            # A remote disabled timestamp is configuration state and is
+            # authoritative in the new sync contract.
             self._seed_credential(remote, "credential-local", None,
                                   "2026-08-10T04:01:36Z")
             _merge_config_tables(remote, local)
@@ -78,15 +79,36 @@ class SyncContractTest(unittest.TestCase):
             row = conn.execute(
                 "SELECT disabled_at FROM upstream_credentials "
                 "WHERE uuid='credential-local'").fetchone()
+            secret = conn.execute(
+                "SELECT secret_value FROM upstream_secrets "
+                "WHERE credential_uuid='credential-local'").fetchone()
             conn.close()
-            self.assertIsNone(row[0])
+            self.assertEqual(row[0], "2026-08-10T04:01:36Z")
+            self.assertEqual(secret[0], "sk-local-secret")
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
+    def test_config_hash_excludes_secrets_and_webdav_password(self) -> None:
+        temp, proxy, _ = self._repo_layout()
+        try:
+            self._seed_credential(proxy, "credential-local", "sk-local-secret")
+            before = _config_hash_of_db(proxy)
+            conn = sqlite3.connect(proxy)
+            conn.execute(
+                "UPDATE upstream_secrets SET secret_value='sk-changed' "
+                "WHERE credential_uuid='credential-local'")
+            conn.execute(
+                "UPDATE sync_settings SET value='another-password' WHERE key='password'")
+            conn.commit()
+            conn.close()
+            self.assertEqual(before, _config_hash_of_db(proxy))
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
     def test_versioned_upload_refuses_stale_remote_etag(self) -> None:
         config = SyncConfig("https://dav.example", "token-board", "u", "p")
-        expected = RemoteArtifact("proxy_config_20260809_010000.db", etag='"old"')
-        current = RemoteArtifact("proxy_config_20260809_010001.db", etag='"new"')
+        expected = RemoteArtifact("token-board_config_20260809_010000.db", etag='"old"')
+        current = RemoteArtifact("token-board_config_20260809_010001.db", etag='"new"')
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "config.db"
             source.write_bytes(b"fixture")
@@ -94,7 +116,7 @@ class SyncContractTest(unittest.TestCase):
                        return_value=current), patch(
                            "app.services.sync.webdav._webdav_upload") as upload:
                 with self.assertRaises(WebDAVConflict):
-                    _upload_versioned_artifact(config, str(source), "proxy_config",
+                    _upload_versioned_artifact(config, str(source), "token-board_config",
                                                expected)
                 upload.assert_not_called()
 
@@ -161,6 +183,55 @@ class SyncContractTest(unittest.TestCase):
             self.assertEqual(rows["proxy_remote_major"], "1")
             version = inspect_version(Path(proxy), "proxy")
             self.assertEqual(rows["proxy_remote_minor"], str(version.minor))
+        finally:
+            patch.stopall()
+            shutil.rmtree(temp, ignore_errors=True)
+
+    def test_config_upload_strips_sensitive_values_but_keeps_client_keys(self) -> None:
+        temp, proxy, _ = self._repo_layout()
+        captured: dict[str, object] = {}
+        try:
+            self._seed_credential(proxy, "credential-local", "sk-local-secret")
+            conn = sqlite3.connect(proxy)
+            conn.execute(
+                "INSERT INTO route_sets(id,uuid,account_id,name) "
+                "VALUES(1,'route-1',1,'local')")
+            conn.execute(
+                "INSERT INTO client_keys(uuid,key_value,label,route_set_id) "
+                "VALUES('client-1','tb-local-key','local key',1)")
+            conn.commit()
+            conn.close()
+
+            self._webdav_mocks()
+
+            def capture(config, path, base, remote_artifact):
+                check = sqlite3.connect(path)
+                captured["secret_count"] = check.execute(
+                    "SELECT count(*) FROM upstream_secrets").fetchone()[0]
+                captured["password"] = check.execute(
+                    "SELECT value FROM sync_settings WHERE key='password'").fetchone()
+                captured["client_key"] = check.execute(
+                    "SELECT key_value FROM client_keys WHERE uuid='client-1'").fetchone()[0]
+                check.close()
+                return RemoteArtifact("token-board_config_20260824_120000.db",
+                                      etag='"etag"')
+
+            with patch("app.services.sync.config_sync._upload_versioned_artifact",
+                       side_effect=capture):
+                result = sync_config_upload(proxy)
+            self.assertEqual(result["status"], "ok", result)
+            self.assertEqual(captured["secret_count"], 0)
+            self.assertIsNone(captured["password"])
+            self.assertEqual(captured["client_key"], "tb-local-key")
+
+            conn = sqlite3.connect(proxy)
+            self.assertEqual(
+                conn.execute("SELECT secret_value FROM upstream_secrets").fetchone()[0],
+                "sk-local-secret")
+            self.assertEqual(
+                conn.execute("SELECT value FROM sync_settings WHERE key='password'").fetchone()[0],
+                "pass")
+            conn.close()
         finally:
             patch.stopall()
             shutil.rmtree(temp, ignore_errors=True)

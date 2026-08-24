@@ -9,7 +9,7 @@ class SyncConfig:
     folder: str       # e.g. "token-board-sync" — subfolder to store files in
     username: str
     password: str
-    filename: str = "proxy_sync.db"  # default filename for proxy DB
+    filename: str = "token-board_config.db"  # default filename for proxy config DB
 
     @property
     def full_url(self) -> str:

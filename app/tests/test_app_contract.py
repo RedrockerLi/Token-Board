@@ -20,8 +20,7 @@ class AppContractTest(AppDatabaseTestCase):
 
         account_types = client.get("/api/proxy/account-types")
         self.assertEqual(account_types.status_code, 200)
-        self.assertEqual(set(account_types.get_json()),
-                         {"api", "plan", "agent"})
+        self.assertEqual(set(account_types.get_json()), {"api", "plan"})
 
         created = client.post("/api/proxy/accounts", json={
             "name": "metered-main",
@@ -41,7 +40,7 @@ class AppContractTest(AppDatabaseTestCase):
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT major,minor FROM schema_version WHERE id=1"
-            ).fetchone(), (1, 5))
+            ).fetchone(), (1, 9))
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM accounts WHERE id=?", (account_id,)
             ).fetchone()[0], 1)
@@ -132,9 +131,12 @@ class AppContractTest(AppDatabaseTestCase):
             "base_url": "http://recurring.test", "monthly_price": 20,
             "upstream_keys": ["sk-same-prefix-222222-tail"],
         })
-        imported = database.create_account({
-            "name": "imported", "account_type": "agent",
-            "agent_kind": "codex", "monthly_price": 10,
+        software_id = database.create_agent_software({
+            "name": "imported", "agent_kind": "codex",
+        })
+        subscription_id = database.create_agent_subscription({
+            "name": "codex-subscription", "valid_from": "2026-08-01",
+            "monthly_price": 10, "currency": "CNY",
         })
         aggregate = database.create_aggregate({
             "name": "combined", "entries": [{
@@ -154,8 +156,11 @@ class AppContractTest(AppDatabaseTestCase):
                 "SELECT charge_type FROM billing_contracts WHERE account_id=?",
                 (recurring,)).fetchone()[0], "recurring")
             self.assertEqual(conn.execute(
-                "SELECT importer_kind FROM account_importers WHERE account_id=?",
-                (imported,)).fetchone()[0], "codex")
+                "SELECT agent_kind FROM agent_software WHERE id=?",
+                (software_id,)).fetchone()[0], "codex")
+            self.assertEqual(conn.execute(
+                "SELECT name FROM agent_subscriptions WHERE id=?",
+                (subscription_id,)).fetchone()[0], "codex-subscription")
             self.assertEqual(conn.execute(
                 "SELECT account_id FROM route_sets WHERE id=?",
                 (aggregate,)).fetchone()[0], None)
@@ -164,6 +169,41 @@ class AppContractTest(AppDatabaseTestCase):
             ).fetchall()
             self.assertEqual(len(credentials), 2)
             self.assertEqual(len({row[0] for row in credentials}), 2)
+
+    def test_agent_subscription_has_no_public_lifecycle_status(self) -> None:
+        database = self.proxy_database()
+        subscription_id = database.create_agent_subscription({
+            "name": "status-free-subscription", "valid_from": "2026-08-01",
+            "monthly_price": 20, "currency": "USD",
+        })
+        rows = database.get_agent_subscriptions()
+        row = next(item for item in rows if item["id"] == subscription_id)
+        self.assertNotIn("lifecycle_state", row)
+        self.assertNotIn("valid_until", row)
+        self.assertTrue(database.update_agent_subscription(subscription_id, {
+            "name": "renamed-subscription", "monthly_price": 21,
+        }))
+
+    def test_account_key_count_deduplicates_cloud_metadata(self) -> None:
+        database = self.proxy_database()
+        account_id = database.create_account({
+            "name": "deduplicated-plan", "account_type": "plan",
+            "base_url": "http://dedup.test", "monthly_price": 20,
+            "upstream_keys": ["sk-dedup-local"],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            upstream_id = conn.execute(
+                "SELECT id FROM upstreams WHERE account_id=?", (account_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO upstream_credentials"
+                "(uuid,runtime_id,upstream_id,position,key_masked) "
+                "VALUES('cloud-duplicate',999,?,?,?)",
+                (upstream_id, 1, "sk-ded…ocal"),
+            )
+        account = next(item for item in database.get_accounts()
+                       if item["id"] == account_id)
+        self.assertEqual(account["key_count"], 1)
 
     def test_actual_and_theoretical_cost_are_not_added_together(self) -> None:
         database = self.proxy_database()
@@ -258,7 +298,7 @@ class AppContractTest(AppDatabaseTestCase):
         with self.assertRaises(ValueError):
             _parse_utc_timestamp("2026-08-04 16:37:44")
 
-    def test_request_logs_filter_by_iso_range(self) -> None:
+    def test_request_logs_use_simple_pagination(self) -> None:
         db = self.proxy_database()
         account_id = db.create_account({
             "name": "iso-filter", "account_type": "api",
@@ -273,13 +313,13 @@ class AppContractTest(AppDatabaseTestCase):
                     "VALUES(?,?,?,'model',200,?,'frozen')",
                     ("iso-filter:" + ts, "proxy", account_id, ts))
             conn.commit()
-        result = db.get_request_logs(
-            date_from="2026-08-04T00:00:00Z",
-            date_to="2026-08-04T23:59:59.999Z")
-        self.assertEqual(result["total"], 2)
-        self.assertEqual(
-            {item["requested_at"] for item in result["items"]},
-            {"2026-08-04T01:00:00Z", "2026-08-04T12:00:00Z"})
+        result = db.get_request_logs(page=2, per_page=2)
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["page"], 2)
+        self.assertEqual([item["requested_at"] for item in result["items"]],
+                         ["2026-08-04T01:00:00Z"])
+        self.assertNotIn("project", result["items"][0])
+        self.assertNotIn("session_id", result["items"][0])
 
     def test_perf_bucket_is_iso(self) -> None:
         db = self.proxy_database()
@@ -354,28 +394,20 @@ class AppContractTest(AppDatabaseTestCase):
                 (account_id,)).fetchone()[0], 0)
         self.assertNotIn(account_id, [a["id"] for a in database.get_accounts()])
 
-    def test_agent_template_has_no_upstream_credential(self) -> None:
+    def test_agent_software_has_no_upstream_credential(self) -> None:
         database = self.proxy_database()
-        agent_id = database.create_account({
-            "name": "codex-agent", "account_type": "agent",
-            "agent_kind": "codex", "monthly_price": 10,
+        software_id = database.create_agent_software({
+            "name": "codex-agent", "agent_kind": "codex",
         })
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM upstreams WHERE account_id=?",
-                (agent_id,)).fetchone()[0], 0)
+                (software_id,)).fetchone()[0], 0)
             self.assertEqual(conn.execute(
-                "SELECT importer_kind FROM account_importers WHERE account_id=?",
-                (agent_id,)).fetchone()[0], "codex")
-        # The template must not synthesize a routable shape for an agent.
-        account = next(a for a in database.get_accounts() if a["id"] == agent_id)
-        self.assertEqual(account["account_type"], "agent")
-        self.assertEqual(account["keys"], [])
-        self.assertEqual(account["cloud_keys"], [])
-        self.assertEqual(account["is_aggregate"], 0)
-        # An agent (non-routable) must refuse a local key binding.
-        with self.assertRaises(ValueError):
-            database.create_key({"account_id": agent_id, "label": "no"})
+                "SELECT agent_kind FROM agent_software WHERE id=?",
+                (software_id,)).fetchone()[0], "codex")
+        self.assertEqual(database.get_agent_software()[0]["id"], software_id)
+        self.assertNotIn(software_id, [account["id"] for account in database.get_accounts()])
 
     def test_aggregate_route_set_and_model_catalog(self) -> None:
         database = self.proxy_database()

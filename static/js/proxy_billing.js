@@ -241,7 +241,6 @@ function initBillingPage() {
 // ── Logs Page ────────────────────────────────────────────────────────────
 
 let logsPage = 1;
-let logsFilters = {};
 
 async function loadLogsTable() {
     const tbody = document.querySelector('#logsTable tbody');
@@ -251,8 +250,6 @@ async function loadLogsTable() {
     const params = new URLSearchParams({
         page: logsPage,
         per_page: 50,
-        include_attempts: 0,
-        ...logsFilters,
     });
 
     try {
@@ -268,13 +265,13 @@ async function loadLogsTable() {
         tbody.innerHTML = data.items.map((r) => `
             <tr>
                 <td>${esc(fmtLocal(r.requested_at))}</td>
-                <td>${esc(r.account_name || `ID:${r.account_id}`)}</td>
+                <td>${esc(r.account_name || `ID:${r.account_id ?? r.agent_software_id}`)}${r.source_kind === 'agent' ? ' <span class="badge">智能体</span>' : ''}</td>
                 <td><code>${esc(r.model)}</code></td>
                 <td>${fmtNum(r.prompt_tokens)} / ${fmtNum(r.cache_read_tokens || 0)} / ${fmtNum(r.completion_tokens)} / ${fmtNum(r.total_tokens)}</td>
                 <td>¥${(r.cost || 0).toFixed(4)}</td>
                 <td>${r.ttft_ms == null ? '—' : `${r.ttft_ms}ms`}</td>
                 <td>${r.output_tps == null ? '—' : `${Number(r.output_tps).toFixed(2)} tokens/s`}</td>
-                <td>${r.is_streaming ? 'SSE' : 'REST'}</td>
+                <td>${r.source_kind === 'agent' ? '导入' : (r.is_streaming ? 'SSE' : 'REST')}</td>
                 <td><span class="badge ${r.status_code >= 200 && r.status_code < 300 ? 'badge--active' : 'badge--inactive'}">${r.status_code}</span></td>
             </tr>
         `).join('');
@@ -290,23 +287,6 @@ async function loadLogsTable() {
 function logPageNext() { logsPage++; loadLogsTable(); }
 function logPagePrev() { if (logsPage > 1) { logsPage--; loadLogsTable(); } }
 
-function applyLogFilters() {
-    logsPage = 1;
-    const form = document.getElementById('logsFilterForm');
-    const fd = new FormData(form);
-    logsFilters = {};
-    for (const [k, v] of fd.entries()) {
-        if (v) logsFilters[k] = v;
-    }
-    // Date pickers are local calendar days; the backend filters on ISO UTC
-    // timestamps, so convert each day to its UTC range here.
-    const fromRange = logsFilters.from ? localDateToUtcRange(logsFilters.from) : null;
-    const toRange = logsFilters.to ? localDateToUtcRange(logsFilters.to) : null;
-    if (fromRange) logsFilters.from = fromRange[0];
-    if (toRange) logsFilters.to = toRange[1];
-    loadLogsTable();
-}
-
 function initLogsPage() {
     const el = document.getElementById('page-proxy-logs');
     if (!el || el.dataset.initialized) return;
@@ -315,19 +295,7 @@ function initLogsPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">请求日志</h1>
-            <p class="page-subtitle">所有通过代理转发的 API 请求记录</p>
-        </div>
-
-        <!-- Filters -->
-        <div class="section">
-            <form id="logsFilterForm" onsubmit="event.preventDefault(); applyLogFilters();" class="filter-bar">
-                <label>日期从 <input type="date" name="from"></label>
-                <label>到 <input type="date" name="to"></label>
-                <label>模型 <input type="text" name="model" placeholder="模型名称"></label>
-                <label>账户ID <input type="number" name="account_id" placeholder="账户ID"></label>
-                <button type="submit" class="btn btn--sm">筛选</button>
-                <button type="button" class="btn btn--sm" onclick="logsFilters={}; logsPage=1; loadLogsTable();">重置</button>
-            </form>
+            <p class="page-subtitle">代理请求和智能体本地用量记录</p>
         </div>
 
         <!-- Log Table -->

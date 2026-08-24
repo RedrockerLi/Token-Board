@@ -10,7 +10,7 @@ static void print_help(const char *argv0) {
         "Token Board Proxy — OpenAI-compatible API proxy for CSTCloud\n"
         "Usage: %s [OPTIONS]\n"
         "Options:\n"
-        "  --db PATH       SQLite database path (default: data/proxy.db)\n"
+        "  --db PATH       SQLite database path (default: data/token-board.db)\n"
         "  --schema-dir PATH\n"
         "                  Migration file directory (default: derived from --db\n"
         "                  as <db_dir>/../schema)\n"

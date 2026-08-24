@@ -328,16 +328,12 @@ async function loadSummary() {
     if (elStatCacheHitTokens) elStatCacheHitTokens.textContent = fmtNum(data.total_input_cache_hit_tokens);
     if (elStatRequests) elStatRequests.textContent = fmtNum(data.total_requests);
 
-    // Real consumption = api/platform costs + plan subscriptions (a plan
-    // account's own subscription is included even when filtered by user).
-    // Theoretical consumption (api costs + plan virtual cost) is shown in
-    // the card subtitle — for plan, api and imported (CSV) users alike.
-    var planSub = data.plan_subscription_cost || 0;
-    var planVirt = data.plan_virtual_cost || 0;
-    if (elStatCost) elStatCost.textContent = fmtCost(data.total_cost + planSub);
+    // Actual consumption is the metered bill plus the subscription allocation
+    // attached to each agent. The theoretical card is usage-derived only.
+    if (elStatCost) elStatCost.textContent = fmtCost(data.actual_cost || 0);
     var statCostSub = document.getElementById('statCostSub');
     if (statCostSub) {
-        statCostSub.textContent = '理论消费 ' + fmtCost(data.total_cost + planVirt);
+        statCostSub.textContent = '理论消费 ' + fmtCost(data.theoretical_total_cost || 0);
     }
 
     var months = data.available_months || [];

@@ -42,8 +42,8 @@ class AccountTypeSpec:
         }
 
 
-# The three current types are fixed points in the property space above.
-# 添加新上游类型：在此表加一行，然后同步 proxy/src/core/account_types.h。
+# Only routable proxy upstream types live in this table.  Agent software is
+# managed by agent_software and must never be exposed as an upstream type.
 ACCOUNT_TYPES: dict[str, AccountTypeSpec] = {
     "api": AccountTypeSpec(
         billing="usage",
@@ -66,17 +66,6 @@ ACCOUNT_TYPES: dict[str, AccountTypeSpec] = {
         subscription_unit="per_key",
         label="plan — 订阅套餐，调用免费",
         short_label="Plan",
-    ),
-    "agent": AccountTypeSpec(
-        billing="subscription",
-        routable=False,
-        holds_keys=False,
-        usage_source="import",
-        deletion="configurable",
-        cooldown=None,
-        subscription_unit="per_account",
-        label="agent — Agent 订阅（如 Codex）",
-        short_label="Agent",
     ),
 }
 
@@ -116,7 +105,7 @@ def usage_billed_types() -> tuple[str, ...]:
 
 
 def subscription_types() -> tuple[str, ...]:
-    """account types billed as a subscription (plan + agent today)."""
+    """Proxy account types billed as a subscription (plan today)."""
     return _types_with(lambda s: s.billing == "subscription")
 
 
@@ -126,7 +115,7 @@ def routable_types() -> tuple[str, ...]:
 
 
 def import_types() -> tuple[str, ...]:
-    """account types whose usage arrives via background import (agent today)."""
+    """Legacy import-driven account types; agent software is separate now."""
     return _types_with(lambda s: s.usage_source == "import")
 
 

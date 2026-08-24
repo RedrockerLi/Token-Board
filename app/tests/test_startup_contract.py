@@ -37,7 +37,6 @@ class StartupContractTest(unittest.TestCase):
                       script)
         self.assertIn('disable --now "$LEGACY_IMPORT_NAME.timer"', script)
         self.assertNotIn('OnCalendar=', script)
-        self.assertNotIn('agent_usage_import.py', script)
 
         app_js = (root / "static" / "js" / "app.js").read_text(
             encoding="utf-8")
@@ -59,7 +58,7 @@ class StartupContractTest(unittest.TestCase):
             curl.write_text(
                 "#!/bin/sh\n"
                 "case \"$*\" in\n"
-                "  *perf/realtime*) printf '%s\\n' '{\"background_tasks\":{\"codex-importer\":{\"status\":\"ok\"}}}' ;;\n"
+                "  *perf/realtime*) printf '%s\\n' '{\"background_tasks\":{\"agent-usage-importer\":{\"status\":\"ok\"}}}' ;;\n"
                 "  *) printf '%s\\n' '{}' ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -67,11 +66,14 @@ class StartupContractTest(unittest.TestCase):
             curl.chmod(0o755)
 
             dashboard_service = tmp / "token-dashboard.service"
+            proxy_service = tmp / "token-proxy.service"
+            proxy_service.write_text("old-proxy\n", encoding="utf-8")
             env = os.environ.copy()
             env.update({
                 "PATH": f"{fake_bin}:/usr/bin:/bin",
                 "TB_PYTHON_BIN": str(python),
                 "TB_DATA_DIR": str(tmp / "data"),
+                "TB_SERVICE_FILE": str(proxy_service),
                 "TB_DASHBOARD_SERVICE_FILE": str(dashboard_service),
                 "TB_IMPORT_SERVICE_FILE": str(tmp / "legacy-import.service"),
                 "TB_IMPORT_TIMER_FILE": str(tmp / "legacy-import.timer"),
@@ -82,6 +84,10 @@ class StartupContractTest(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            proxy_unit = proxy_service.read_text(encoding="utf-8")
+            self.assertIn(
+                f'--db "{tmp / "data" / "token-board.db"}"', proxy_unit,
+            )
             unit = dashboard_service.read_text(encoding="utf-8")
             self.assertIn("Dashboard and Agent Usage Importer", unit)
             self.assertIn(
@@ -125,6 +131,8 @@ class StartupContractTest(unittest.TestCase):
             user_dir.mkdir(parents=True)
             dashboard_service = user_dir / "token-dashboard.service"
             dashboard_service.write_text("old-dashboard\n", encoding="utf-8")
+            proxy_service = user_dir / "token-proxy.service"
+            proxy_service.write_text("old-proxy\n", encoding="utf-8")
             legacy_service = user_dir / "token-agent-import.service"
             legacy_timer = user_dir / "token-agent-import.timer"
             legacy_service.write_text("old-import-service\n", encoding="utf-8")
@@ -145,6 +153,8 @@ class StartupContractTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(dashboard_service.read_text(encoding="utf-8"),
                              "old-dashboard\n")
+            self.assertEqual(proxy_service.read_text(encoding="utf-8"),
+                             "old-proxy\n")
             self.assertEqual(legacy_service.read_text(encoding="utf-8"),
                              "old-import-service\n")
             self.assertEqual(legacy_timer.read_text(encoding="utf-8"),

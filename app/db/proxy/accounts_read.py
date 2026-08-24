@@ -16,47 +16,33 @@ class ProxyAccountReadMixin:
                     "WHERE contract_id=bc.id ORDER BY effective_at DESC,id DESC LIMIT 1),0) recurring_price,"
                     "bc.charge_type,"
                     "COALESCE(bc.currency,'CNY') currency,"
-                    "COALESCE(i.importer_kind,'') importer_kind,"
                     "COALESCE(a.valid_from,'') valid_from,u.max_concurrency,a.created_at,a.deleted_at,"
-                    "(SELECT count(*) FROM upstream_credentials c "
+                    "(SELECT count(DISTINCT c.key_masked) FROM upstream_credentials c "
                     "LEFT JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
                     "WHERE c.upstream_id=u.id "
                     "AND (c.deleted_at IS NULL OR c.deleted_at>"
                     "strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
-                    "AND s.secret_value IS NOT NULL "
+                    "AND (bc.charge_type='recurring' OR s.secret_value IS NOT NULL) "
                     "AND (c.disabled_at IS NULL OR c.disabled_at>"
                     "strftime('%Y-%m-%dT%H:%M:%fZ','now'))) key_count "
                     "FROM route_sets rs JOIN accounts a ON a.id=rs.account_id "
                     "JOIN upstreams u ON u.account_id=a.id AND u.enabled=1 "
                     "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.valid_until IS NULL "
-                    "LEFT JOIN account_importers i ON i.account_id=a.id AND i.enabled=1 "
-                    "WHERE rs.enabled=1 AND a.lifecycle_state='active' "
-                    "UNION ALL "
-                    "SELECT 0 routed,a.id,a.name,'','openai','','auto',"
-                    "COALESCE((SELECT recurring_price FROM billing_rate_events "
-                    "WHERE contract_id=bc.id ORDER BY effective_at DESC,id DESC LIMIT 1),0),"
-                    "bc.charge_type,"
-                    "COALESCE(bc.currency,'CNY'),i.importer_kind,COALESCE(a.valid_from,''),"
-                    "0,a.created_at,a.deleted_at,0 "
-                    "FROM account_importers i JOIN accounts a ON a.id=i.account_id "
-                    "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.valid_until IS NULL "
-                    "WHERE i.enabled=1 AND a.lifecycle_state='active'"
+                    "WHERE rs.enabled=1 AND a.account_kind='proxy' "
+                    "AND a.lifecycle_state='active'"
                 ).fetchall()
             adapter = AccountTemplateAdapter()
             accounts = []
             for row in rows:
                 row = dict(row)
                 routed = bool(row.pop("routed"))
-                importer_kind = row.get("importer_kind") or ""
                 recurring = row.get("charge_type") == "recurring"
                 if routed:
-                    template = adapter.routed(
-                        row, recurring=recurring, importer_kind=importer_kind)
+                    template = adapter.routed(row, recurring=recurring)
                 else:
-                    template = adapter.agent_only(
-                        row, importer_kind,
-                        float(row.get("recurring_price") or 0),
-                        row.get("currency") or "CNY")
+                    # This branch is retained only for malformed historical
+                    # rows; importer-only agent data is now separate.
+                    continue
                 acc = template.to_dict()
                 route = self._v1_route_account(conn, acc["id"])
                 local_keys: list[dict] = []

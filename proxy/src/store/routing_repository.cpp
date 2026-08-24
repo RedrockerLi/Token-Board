@@ -135,7 +135,9 @@ bool Database::load_routing_config(RoutingConfig &config) {
         "rs.id,rs.name,'','openai','','auto',"
         "CASE WHEN rs.account_id IS NULL THEN 1 ELSE 0 END,0,0,0 "
         "FROM client_keys ck JOIN route_sets rs ON rs.id=ck.route_set_id "
+        "LEFT JOIN accounts a ON a.id=rs.account_id "
         "WHERE ck.enabled=1 AND rs.enabled=1 "
+        "AND (rs.account_id IS NULL OR COALESCE(a.account_kind,'proxy')='proxy') "
         "AND (ck.deleted_at IS NULL OR ck.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
         "ORDER BY ck.id";
     if (sqlite3_prepare_v2(read_db_, routes_sql.c_str(), -1, &stmt,
@@ -182,6 +184,7 @@ bool Database::load_routing_config(RoutingConfig &config) {
         "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
         "LEFT JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
         "WHERE rr.enabled=1 AND u.enabled=1 AND a.lifecycle_state='active' "
+        "AND a.account_kind='proxy' "
         "ORDER BY rr.route_set_id,rr.priority,rr.id,c.position,c.runtime_id";
     if (sqlite3_prepare_v2(read_db_, rules_sql.c_str(), -1, &stmt,
                            nullptr) != SQLITE_OK) {

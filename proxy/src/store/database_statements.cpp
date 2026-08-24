@@ -25,7 +25,9 @@ bool Database::prepare_statements() {
             "CASE WHEN rs.account_id IS NULL THEN 1 ELSE 0 END,0,"
             "COALESCE(u.max_concurrency,0),CASE WHEN rs.enabled=1 THEN 0 ELSE 1 END "
             "FROM route_sets rs LEFT JOIN upstreams u ON u.account_id=rs.account_id "
-            "AND u.enabled=1 WHERE rs.id=?1 ORDER BY u.id LIMIT 1",
+            "AND u.enabled=1 LEFT JOIN accounts a ON a.id=rs.account_id "
+            "WHERE rs.id=?1 AND (rs.account_id IS NULL OR "
+            "COALESCE(a.account_kind,'proxy')='proxy') ORDER BY u.id LIMIT 1",
             stmt_get_account_);
         PREPARE_ON(read_db_,
             "SELECT ck.id,ck.key_value,ck.route_set_id,COALESCE(ck.label,''),"
@@ -35,14 +37,17 @@ bool Database::prepare_statements() {
             "COALESCE(u.max_concurrency,0),0 "
             "FROM client_keys ck JOIN route_sets rs ON rs.id=ck.route_set_id "
             "LEFT JOIN upstreams u ON u.account_id=rs.account_id AND u.enabled=1 "
+            "LEFT JOIN accounts a ON a.id=rs.account_id "
             "WHERE ck.key_value=?1 AND ck.enabled=1 AND rs.enabled=1 "
+            "AND (rs.account_id IS NULL OR COALESCE(a.account_kind,'proxy')='proxy') "
             "AND (ck.deleted_at IS NULL OR ck.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
             "ORDER BY u.id LIMIT 1",
             stmt_lookup_route_);
         PREPARE_ON(read_db_,
             "SELECT c.runtime_id,s.secret_value,c.position FROM upstream_credentials c "
             "JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
-            "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=?1 "
+            "JOIN upstreams u ON u.id=c.upstream_id JOIN accounts a ON a.id=u.account_id "
+            "WHERE u.account_id=?1 AND a.account_kind='proxy' "
             "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
             "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
             "ORDER BY c.position,c.runtime_id",
@@ -79,6 +84,7 @@ bool Database::prepare_statements() {
         PREPARE_ON(read_db_,
             "SELECT model_pattern,u.account_id,COALESCE(target_model,model_pattern) "
             "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
+            "JOIN accounts a ON a.id=u.account_id AND a.account_kind='proxy' "
             "WHERE route_set_id=?1 AND rr.enabled=1 ORDER BY priority,rr.id",
             stmt_get_aggregate_entries_);
         PREPARE_ON(read_db_,
@@ -93,7 +99,8 @@ bool Database::prepare_statements() {
         PREPARE_ON(read_db_,
             "SELECT u.base_url,s.secret_value,u.api_format,u.auth_scheme "
             "FROM upstream_credentials c JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
-            "JOIN upstreams u ON u.id=c.upstream_id WHERE c.runtime_id=?1 "
+            "JOIN upstreams u ON u.id=c.upstream_id JOIN accounts a ON a.id=u.account_id "
+            "WHERE c.runtime_id=?1 AND a.account_kind='proxy' "
             "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
             "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
             "AND u.enabled=1",

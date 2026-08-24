@@ -10,7 +10,7 @@
 cd proxy
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-./build/token_proxy --db ../data/proxy.db --schema-dir ../schema --port 8800
+./build/token_proxy --db ../data/token-board.db --schema-dir ../schema --port 8800
 ```
 
 Release 构建额外加 `-O3 -march=native -flto`。构建产物有两个:`token_proxy`(完整代理)和 `format_conv_test`(codec 自测,见下)。
@@ -52,9 +52,9 @@ python3 scripts/mock_upstream.py --port 9100
 
 ## 数据写入
 
-用量数据来自代理转发:消费报告页点「导出数据」触发 `sync_dashboard`(见 [sync.md](sync.md)),把 `request_log`
-按 日×账户(id)×模型 增量聚合写进 `dashboard.db`(纯存档,写时固化的 `api_cost` 直接入库,改价不回溯)。
-CSV 导入已弃用,相关代码与适配器已移除。
+用量数据来自代理转发和已注册智能体软件:消费报告页点「导出数据」触发 `sync_dashboard`(见 [sync.md](sync.md)),把 `request_log`
+按 日×账户/软件(id)×模型 增量聚合写进 `dashboard.db`(纯存档,写时固化的费用直接入库,改价不回溯)。
+Codex 解析器参考 `ref/vibe-usage` 的 `token_count`、累计量去重和 live/archive 会话目录；`project`、`session_id` 只写本机 proxy 请求日志,不作为 API 字段。
 
 ## 前端
 
@@ -66,6 +66,7 @@ SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 
 - `dashboard.js`:用量仪表板(弃用模型过滤、模型别名分组)。弃用判定:全局(所有用户、全历史)token 占比 <1% **且**最新有数据月份内 0 用量(含调用失败 0 token)的模型/别名组;该集合计算一次后固定,不随月份/用户选择变化,「刷新数据」时重算。
 - `proxy_manager.js`:账户/聚合/密钥/定价管理页,含按浏览器当地时间输入的峰谷时段编辑器;档位以 UTC+0 分钟存储。
 - `proxy_billing.js`:消费报告 + 请求日志页。
+- `agent_manager.js`:智能体订阅与软件来源管理页。
 - `proxy_perf.js`:性能监控页(15s 自动刷新)。
 - `proxy_settings.js`:代理设置页(超时三档配置、WebDAV 同步设置)。
 
@@ -80,6 +81,6 @@ SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 
 - **schema 只通过迁移改。** 兼容变更追加 `schema/<库>/v<major>/<major>-<minor>_*.sql`；跨 Major 使用 transition。规则见 [database-migrations.md](database-migrations.md)。
 - **时间存 UTC,显示浏览器当地时间。** 库内 `datetime('now')` 和请求时间存 UTC;前端通过 `Date` 的本机时区显示时间戳,并把当地日期筛选转换为 UTC 范围。峰谷档位边界按 UTC+0 分钟存储,电脑时区变化只改变显示。订阅起始日是 UTC 日期锚点,前端使用可逆的当地日期映射,避免换时区后原样保存改动账期。
 - **计费写时固化。** 改价、换序不回溯 `request_log.api_cost`,见 [billing-pricing.md](billing-pricing.md)。
-- **request_log 明细不上传。** 同步进度用 `sync_state.last_exported_log_id` 单值检查点,拉取-导出-上传是完整事务(失败回滚),见 [sync.md](sync.md)。
+- **request_log 明细不上传。** 普通用户配置和本地代理密钥上传到配置云端文件；上游 API Key 明文与 WebDAV 密码只保存在本机。同步进度用 `sync_state.last_exported_log_id` 单值检查点,拉取-导出-上传是完整事务(失败回滚),见 [sync.md](sync.md)。
 - **Python 无依赖清单。** 只有 flask、requests 两个第三方包,启动脚本在缺 flask 时自动 pip 安装。
-- **数据库路径与 schema 目录的推导约定**:`data/proxy.db` / `data/dashboard.db` → `<仓库>/schema/`，runner 再选择 `proxy|dashboard/v<major>`。
+- **数据库路径与 schema 目录的推导约定**:`data/token-board.db` / `data/dashboard.db` → `<仓库>/schema/`，runner 再选择 `proxy|dashboard/v<major>`。

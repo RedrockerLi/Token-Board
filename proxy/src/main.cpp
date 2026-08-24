@@ -55,7 +55,7 @@ int main(int argc, char *argv[]) {
     // ── Open database ─────────────────────────────────────────────────
     if (cfg.schema_dir.empty()) {
         // Derive the default migration dir from the DB path:
-        // data/proxy.db → data/../schema → schema root
+        // data/token-board.db → data/../schema → schema root
         auto dbp = std::filesystem::path(cfg.db_path);
         cfg.schema_dir = (dbp.parent_path() / ".." / "schema")
                              .lexically_normal()

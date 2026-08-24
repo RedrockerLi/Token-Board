@@ -6,11 +6,11 @@
 
 ## V1 当前结构
 
-Proxy V1 将身份、转发与计费拆开：`accounts` 是稳定计费主体；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，明文只存在本机 `upstream_secrets`；`account_importers` 表示 Codex 等导入源。
+Proxy V1 将身份、转发与计费拆开：`accounts` 是稳定计费主体；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，配置的明文位于 `upstream_secrets`；智能体订阅和软件来源分别位于 `agent_subscriptions` / `agent_software`，不再作为上游账户。
 
 计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/rates/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
 
-Dashboard V1 只保留 `accounts`、`daily_usage`、`monthly_recurring_costs`。`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、equivalent cost 和 billed usage cost。
+Dashboard V1 统一使用 `accounts`、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存订阅分摊后的实际周期费用。
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
@@ -33,11 +33,10 @@ Dashboard V1 只保留 `accounts`、`daily_usage`、`monthly_recurring_costs`。
 | `is_aggregate` | 是否聚合账户(聚合的模型映射在 `aggregate_entries`) |
 | `endpoint_path` | 自定义上游路径;为空则按 `api_format` 推导(`/chat/completions`、`/responses`、`/v1/messages`) |
 | `auth_header` | `bearer` / `x-api-key` / `auto`(auto 按格式推导:anthropic 用 x-api-key,其余用 Bearer) |
-| `account_type` | `api`(按量计费)、`plan`(订阅套餐,调用免费)或 `agent`(Agent 订阅,如 Codex)。agent 与 plan 计费一致,但不绑定上游密钥、不可被路由,用量由后台导入 |
+| `account_type` | `api`(按量计费)或 `plan`(订阅套餐,调用免费)。智能体不再是上游账户类型 |
 | `currency` | 订阅价原生币种 `CNY` / `USD`,默认 CNY |
-| `agent_kind` | agent 账户的子类型,目前仅 `codex` |
 | `max_concurrency` | 并发限额,NULL=不限;达到限额的请求返回 429(聚合链内自动切下一个) |
-| `valid_from` | UTC 日期,per_account 订阅(agent)的订阅起始日;NULL 回落 `created_at` 的日期 |
+| `valid_from` | UTC 日期,plan 订阅的订阅起始日;NULL 回落 `created_at` 的日期 |
 
 `upstream_key` 列保留作为"legacy 单密钥"的退路(0007 起密钥改为存 `upstream_keys` 子表,见下)。
 
@@ -47,7 +46,7 @@ Dashboard V1 只保留 `accounts`、`daily_usage`、`monthly_recurring_costs`。
 
 ### upstream_keys — 本地上游密钥生命周期
 
-一行代表一把本机上游密钥。`valid_from` 是 UTC 日期（NULL 回落 `created_at` 的日期）；`deleted_at` 是 UTC 时间（`immediate` 删除=删除时刻，`end_of_period` 删除=本期期末，未来时间，到期前仍可路由）。移除密钥不会物理删除该行，而是写入 `deleted_at`，因此已归档账单能够稳定重算。明文 `key_value` 永远不上传。
+一行代表一把本机上游密钥。`valid_from` 是 UTC 日期（NULL 回落 `created_at` 的日期）；`deleted_at` 是 UTC 时间（`immediate` 删除=删除时刻，`end_of_period` 删除=本期期末，未来时间，到期前仍可路由）。移除密钥不会物理删除该行，而是写入 `deleted_at`，因此已归档账单能够稳定重算。上游密钥明文保留在本机，不随配置云端文件上传；云端只同步 `key_masked` 等元数据。
 
 `upstream_keys_cloud` 只保存 `key_masked`、起始日、位置、删除标记，供多机把同一物理密钥的账单归并；不含可用密钥材料。
 
@@ -55,9 +54,9 @@ Dashboard V1 只保留 `accounts`、`daily_usage`、`monthly_recurring_costs`。
 
 ### plan_billing_config 与 plan_price_history — plan 计费设置
 
-`plan_billing_config` 单行全局设置:`price_change_effective`(改价默认从本期还是下期生效)、`cancellation_mode`(删除 plan/agent 的默认操作:`immediate` 本期立即删除(本期计费) / `end_of_period` 到期立即删除(本期计费、下期不计费),默认 `immediate`)。`upstream_accounts.deferred_cleanup_mode` 记录 end_of_period 账户删除的延迟清理意图(detach/cascade)，由删除 finalizer 在 `deleted_at` 到期后执行。`plan_price_history` 记录每次月费变更:`account_id`、`monthly_price`、`changed_at`、`effective_mode`;订阅费由生命周期 + 价格历史重建,历史月份冻结、当月按当前设置刷新。
+`plan_billing_config` 单行全局设置:`price_change_effective`(改价默认从本期还是下期生效)、`cancellation_mode`(删除 plan 的默认操作:`immediate` 本期立即删除(本期计费) / `end_of_period` 到期立即删除(本期计费、下期不计费),默认 `immediate`)。`upstream_accounts.deferred_cleanup_mode` 记录 end_of_period 账户删除的延迟清理意图(detach/cascade)，由删除 finalizer 在 `deleted_at` 到期后执行。`plan_price_history` 记录每次月费变更:`account_id`、`monthly_price`、`changed_at`、`effective_mode`;订阅费由生命周期 + 价格历史重建,历史月份冻结、当月按当前设置刷新。
 
-**`plan_price_history` 是月费唯一事实源**:`upstream_accounts.monthly_price` 列已在 0019 删除,当前价由最新 `current_period` 事件派生(`get_accounts`/`get_agent_accounts` 的子查询,输出键仍叫 `monthly_price`,前端无感知)。改价写入新历史事件,不更新任何列。
+**`plan_price_history` 是月费唯一事实源**:`upstream_accounts.monthly_price` 列已在 0019 删除,当前价由最新 `current_period` 事件派生(`get_accounts` 的子查询,输出键仍叫 `monthly_price`,前端无感知)。改价写入新历史事件,不更新任何列。智能体订阅价格由 `agent_subscription_rate_events` 独立维护。
 
 ### request_log — 请求日志与计费载体
 
@@ -127,11 +126,11 @@ key/value 表,存 `last_exported_log_id`:最近一次**完整成功**的拉取-�
 
 ### sync_config — WebDAV 配置
 
-key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。凭据只在此表,导出到云端的副本会先删除该表。
+key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`url` / `folder` / `username` 可随普通配置同步，WebDAV `password` 只保存在本机。
 
 ### fx_rates 与 account_importers — 仅本机的运行时数据
 
-`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,触发器和代理快照计价按请求日期取最近一条;拉不到用最近存值,仍无则 1.0(不换算)。`account_importers.cursor_json` 是 Codex 会话导入的增量游标(`path` → `size`/`mtime`/`last_line`),保证幂等续传。两类数据都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
+`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,触发器和代理快照计价按请求日期取最近一条;拉不到用最近存值,仍无则 1.0(不换算)。`agent_software_runtime.cursor_json` 是 Codex/OpenCode 用量导入的增量游标,保证幂等续传。请求日志、导入游标和汇率缓存都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
 
 ## dashboard.db
 

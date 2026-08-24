@@ -38,11 +38,13 @@ def _merge_config_tables(remote_path: str, local_path: str) -> None:
 
 
 def _merge_v1_config(remote_path: str, local_path: str) -> None:
-    """Merge normalized V1 configuration without ever copying secrets.
+    """Merge normalized V1 configuration without importing local secrets.
 
-    Stable UUIDs are authoritative. Missing rows become disabled tombstones
-    rather than being deleted, preserving request/attempt foreign keys and
-    historical pricing. ``runtime_id`` and importer cursors remain local.
+    Stable UUIDs are authoritative. Missing proxy rows become lifecycle
+    tombstones rather than being deleted, preserving request/attempt foreign
+    keys and historical pricing; agent software rows are physically deleted by
+    the local management API and their account tombstone is only a sync
+    fallback. ``runtime_id`` and importer cursors remain local.
     """
     remote = sqlite3.connect(remote_path)
     remote.row_factory = sqlite3.Row
@@ -91,19 +93,12 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
             for row in remote.execute("SELECT * FROM upstream_credentials ORDER BY position,uuid"):
                 remote_credential_ids.add(row["uuid"])
                 existing = local.execute(
-                    "SELECT runtime_id, EXISTS(SELECT 1 FROM upstream_secrets s "
-                    "WHERE s.credential_uuid=upstream_credentials.uuid) "
-                    "FROM upstream_credentials WHERE uuid=?", (row["uuid"],)
+                    "SELECT runtime_id FROM upstream_credentials WHERE uuid=?",
+                    (row["uuid"],),
                 ).fetchone()
                 runtime_id = existing[0] if existing else next_runtime
                 if existing is None:
                     next_runtime += 1
-                # Local plaintext credentials are machine secrets: the cloud
-                # copy never carries them and must never be able to disable
-                # them.  Only cloud-only rows (no local secret) take their
-                # disabled_at from the remote artifact.
-                has_local_secret = bool(existing and existing[1])
-                disabled_value = None if has_local_secret else row["disabled_at"]
                 local.execute(
                     "INSERT INTO upstream_credentials"
                     "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,created_at,disabled_at,deleted_at) "
@@ -113,14 +108,50 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                     "disabled_at=excluded.disabled_at,deleted_at=excluded.deleted_at",
                     (row["uuid"], runtime_id, row["upstream_id"], row["position"],
                      row["key_masked"], row["valid_from"], row["created_at"],
-                     disabled_value, row["deleted_at"]),
+                     row["disabled_at"], row["deleted_at"]),
                 )
 
         merge_table("account_importers", {"cursor_json"})
         for table in ("billing_contracts", "billing_rate_events", "pricing_rules",
                       "pricing_rates", "pricing_slots", "upstream_model_catalog",
-                      "proxy_timeout_config"):
+                      "proxy_timeout_config", "agent_subscriptions", "agent_software",
+                      "agent_subscription_instances",
+                      "agent_subscription_rate_events",
+                      "agent_subscription_bindings"):
             merge_table(table)
+
+        # A migrated agent used to be represented by an upstream billing
+        # contract.  Remove that legacy contract after the cloud merge as well
+        # so an older cloud artifact cannot reintroduce the duplicate fee.
+        legacy_contract_ids = [row[0] for row in local.execute(
+            "SELECT bc.id FROM billing_contracts bc "
+            "JOIN account_importers i ON i.account_id=bc.account_id "
+            "WHERE i.enabled=0 AND i.importer_kind IS NOT NULL"
+        ).fetchall()]
+        if legacy_contract_ids:
+            placeholders = ",".join("?" for _ in legacy_contract_ids)
+            for table in ("billing_period_charges", "billing_rate_events"):
+                local.execute(
+                    f"DELETE FROM {table} WHERE contract_id IN ({placeholders})",
+                    legacy_contract_ids,
+                )
+            local.execute(
+                f"DELETE FROM billing_contracts WHERE id IN ({placeholders})",
+                legacy_contract_ids,
+            )
+
+        # WebDAV credentials are needed locally to reach the cloud and must
+        # never be copied between machines.  The non-secret connection
+        # settings may still be synchronized.
+        if _table_exists(remote, "sync_settings") and _table_exists(local, "sync_settings"):
+            for row in remote.execute(
+                    "SELECT key,value FROM sync_settings "
+                    "WHERE key NOT IN ('password','agent_migration_v1_6')"):
+                local.execute(
+                    "INSERT INTO sync_settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    tuple(row),
+                )
 
         remote_ids = {
             table: {tuple(row) for row in remote.execute(
@@ -128,15 +159,30 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                     info[1] for info in sorted(table_info(remote, table), key=lambda value: value[5])
                     if info[5]) + f" FROM {table}")}
             for table in ("accounts", "upstreams", "route_sets", "route_rules",
-                          "client_keys", "account_importers", "pricing_rules")
+                          "client_keys", "account_importers", "pricing_rules",
+                          "agent_subscriptions", "agent_software",
+                          "agent_subscription_instances", "agent_subscription_bindings")
             if _table_exists(remote, table)
         }
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         tombstones = {
-            "accounts": ("lifecycle_state='disabled',disabled_at=?", (now,)),
+            "accounts": (
+                "lifecycle_state=CASE WHEN account_kind='agent' THEN 'deleted' "
+                "ELSE 'disabled' END,"
+                "disabled_at=CASE WHEN account_kind='agent' THEN NULL ELSE ? END,"
+                "deleted_at=CASE WHEN account_kind='agent' THEN ? ELSE deleted_at END,"
+                "updated_at=?",
+                (now, now, now),
+            ),
             "upstreams": ("enabled=0", ()), "route_sets": ("enabled=0", ()),
             "route_rules": ("enabled=0", ()), "client_keys": ("enabled=0", ()),
             "account_importers": ("enabled=0", ()), "pricing_rules": ("enabled=0", ()),
+            "agent_subscriptions": ("lifecycle_state='deleted',valid_until=?", (now,)),
+            "agent_software": ("enabled=1", ()),
+            "agent_subscription_instances": (
+                "lifecycle_state='deleted',valid_until=?,updated_at=?", (now, now)),
+            "agent_subscription_bindings": (
+                "lifecycle_state='deleted',valid_until=?,updated_at=?", (now, now)),
         }
         for table, identities in remote_ids.items():
             info = table_info(local, table)
@@ -152,8 +198,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
             if row["uuid"] not in remote_credential_ids:
                 local.execute(
                     "UPDATE upstream_credentials SET disabled_at=COALESCE(disabled_at,?) "
-                    "WHERE uuid=? AND NOT EXISTS(SELECT 1 FROM upstream_secrets s "
-                    "WHERE s.credential_uuid=upstream_credentials.uuid)",
+                    "WHERE uuid=?",
                     (now, row["uuid"]))
         local.execute("UPDATE config_state SET generation=generation+1 WHERE id=1")
         violation = local.execute("PRAGMA foreign_key_check").fetchone()
@@ -168,35 +213,34 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
         local.close()
 
 
-def _strip_url_credentials(url: str) -> str:
-    """Remove embedded credentials from a URL (userinfo, query, fragment).
-
-    `https://user:token@host/path?token=…` → `https://host/path`.  The scheme
-    and path (routing config) are preserved so the cloud copy still routes;
-    only the parts that can carry a literal secret are dropped.
-    """
-    if not url:
-        return ""
-    try:
-        parts = urllib.parse.urlsplit(url)
-        hostport = parts.netloc.rsplit("@", 1)[-1]  # drop userinfo, keep host:port
-        return urllib.parse.urlunsplit(
-            (parts.scheme, hostport, parts.path, "", ""))
-    except ValueError:
-        return ""
-
-
 def _sanitize_upload_columns(dst: sqlite3.Connection) -> None:
-    """Strip URL credentials and machine-local importer cursors from V1."""
-    rows = dst.execute(
-        "SELECT id,COALESCE(auth_scheme,''),COALESCE(base_url,''),"
-        "COALESCE(endpoint_path,'') FROM upstreams"
-    ).fetchall()
-    for row_id, auth, base, endpoint in rows:
-        auth = (auth or "").strip().split()[0] if (auth or "").strip() else ""
+    """Remove machine-local runtime and sensitive credential values."""
+    if _table_exists(dst, "account_importers"):
+        dst.execute("UPDATE account_importers SET cursor_json='{}'")
+    if _table_exists(dst, "upstream_secrets"):
+        dst.execute("DELETE FROM upstream_secrets")
+    if (_table_exists(dst, "billing_contracts") and
+            _table_exists(dst, "account_importers")):
+        legacy_contract_ids = [row[0] for row in dst.execute(
+            "SELECT bc.id FROM billing_contracts bc "
+            "JOIN account_importers i ON i.account_id=bc.account_id "
+            "WHERE i.enabled=0 AND i.importer_kind IS NOT NULL"
+        ).fetchall()]
+        if legacy_contract_ids:
+            placeholders = ",".join("?" for _ in legacy_contract_ids)
+            for table in ("billing_period_charges", "billing_rate_events"):
+                if _table_exists(dst, table):
+                    dst.execute(
+                        f"DELETE FROM {table} WHERE contract_id IN ({placeholders})",
+                        legacy_contract_ids,
+                    )
+            dst.execute(
+                f"DELETE FROM billing_contracts WHERE id IN ({placeholders})",
+                legacy_contract_ids,
+            )
+    # This marker is created by the local one-time migration, not configured
+    # by the user. Do not make a machine's migration state cloud data.
+    if _table_exists(dst, "sync_settings"):
         dst.execute(
-            "UPDATE upstreams SET auth_scheme=?,base_url=?,endpoint_path=? WHERE id=?",
-            (auth, _strip_url_credentials(base),
-             (endpoint or "").split("?")[0].split("#")[0], row_id),
+            "DELETE FROM sync_settings WHERE key IN ('password','agent_migration_v1_6')"
         )
-    dst.execute("UPDATE account_importers SET cursor_json='{}'")

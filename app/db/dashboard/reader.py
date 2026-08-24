@@ -26,13 +26,18 @@ class DashboardReaderMixin:
         months_set, names, models = set(), set(), set()
         last_month, month_volume = {}, {}
         for row in conn.execute(
-            "SELECT d.*,COALESCE(a.name,'unknown') AS display_name FROM daily_usage d "
-            "LEFT JOIN accounts a ON a.account_id=d.account_id"):
+            "SELECT d.*,COALESCE(a.name,'unknown') AS display_name,"
+            "COALESCE(a.account_kind,'proxy') AS account_kind "
+            "FROM daily_usage d LEFT JOIN accounts a ON a.account_id=d.account_id "
+            "WHERE COALESCE(a.account_kind,'proxy')!='legacy'"):
             y, m = _parse_date(row["date"])
             if not y:
                 continue
             name = row["display_name"]
-            base = {"platform": "", "date": row["date"], "model": row["model"],
+            source_kind = "agent" if row["account_kind"] == "agent" else "proxy"
+            base = {"platform": "agent" if source_kind == "agent" else "",
+                    "source_kind": source_kind, "date": row["date"],
+                    "model": row["model"],
                     "api_key_name": name, "cost_group_key": name,
                     "_year": y, "_month": m}
             miss = max(row["input_tokens"] - row["cache_tokens"], 0)
@@ -58,14 +63,22 @@ class DashboardReaderMixin:
             _track_recency(last_month, month_volume, name, y, m, row["request_count"])
         for row in conn.execute(
             "SELECT p.month,p.account_id,COALESCE(a.name,'unknown') account_name,"
+            "COALESCE(a.account_kind,'proxy') account_kind,"
             "SUM(CASE WHEN p.normalized_recurring_cost IS NOT NULL "
             "THEN p.normalized_recurring_cost ELSE 0 END) subscription_cost,"
             "SUM(p.equivalent_cost) virtual_cost,"
             "SUM(CASE WHEN p.normalized_recurring_cost IS NULL THEN 1 ELSE 0 END) "
             "billing_incomplete_count FROM monthly_recurring_costs p "
             "LEFT JOIN accounts a ON a.account_id=p.account_id "
+            "WHERE COALESCE(a.account_kind,'proxy')!='legacy' "
             "GROUP BY p.month,p.account_id,a.name ORDER BY p.month,p.account_id"):
             plan_summary.append(dict(row))
+            # A subscription can be bound before the software has produced
+            # its first usage event. Keep that software/account selectable in
+            # the dashboard so its actual recurring cost is not invisible.
+            account_name = row["account_name"]
+            if account_name and account_name != "unknown":
+                names.add(account_name)
             # A recurring charge may exist in a month with no metered
             # traffic. Keep that month visible to /api/monthly instead of
             # deriving the calendar solely from daily_usage rows.

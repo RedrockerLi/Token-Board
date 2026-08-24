@@ -38,11 +38,23 @@
 
 ## 代理管理 API
 
-前缀 `/api/proxy`,仅在 `server.py --proxy-db` 传入 `proxy.db` 时启用。账户、密钥、定价等配置在**退出设置类页面**时作为一次事务上传云端(见 [sync.md](sync.md))。
+前缀 `/api/proxy`,仅在 `server.py --proxy-db` 传入 `data/token-board.db` 时启用。普通配置和本地代理密钥等在**退出配置页面**时作为一次事务上传云端；上游 API Key 明文与 WebDAV 密码不上传(见 [sync.md](sync.md))。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/proxy/agent-usage/import` | POST | 非阻塞唤醒服务器内置 Agent 用量 worker；网页每次加载时调用一次，返回 202 |
+
+### 智能体管理
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/proxy/agent-types` | GET | 当前可用的软件解析类型（`codex`、`opencode`） |
+| `/api/proxy/agent-subscriptions` | GET/POST | 查询/添加独立订阅（名称、开始时间、币种、一个或多个价格/开始日期实例） |
+| `/api/proxy/agent-subscriptions/<id>` | PUT/DELETE | 修改或删除订阅 |
+| `/api/proxy/agent-subscriptions/<id>/instances` | GET/POST | 查询或添加订阅实例（每个实例独立计费） |
+| `/api/proxy/agent-subscription-instances/<id>` | PUT/DELETE | 修改或删除订阅实例 |
+| `/api/proxy/agent-software` | GET/POST | 查询/添加软件来源（名称、类型、数据目录） |
+| `/api/proxy/agent-software/<id>` | PUT/DELETE | 修改/删除软件来源，并用 `subscription_ids` 替换订阅绑定 |
 
 ### 账户与密钥
 
@@ -90,8 +102,8 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/proxy/billing-config` | GET | plan 计费设置:`price_change_effective`(改价默认本期/下期)、`cancellation_mode`(删除默认操作:`immediate` 本期立即删除(本期计费) / `end_of_period` 到期立即删除(本期计费、下期不计费)) |
-| `/api/proxy/billing-config` | PUT | 整体保存 plan 计费设置 |
+| `/api/proxy/billing-config` | GET | Plan/智能体订阅计费设置:`price_change_effective`(改价默认本期/下期)、`cancellation_mode`(删除默认操作:`immediate` 本期立即删除(本期计费) / `end_of_period` 到期立即删除(本期计费、下期不计费)) |
+| `/api/proxy/billing-config` | PUT | 整体保存 Plan/智能体订阅计费设置 |
 
 ### 消费与日志
 
@@ -102,7 +114,7 @@
 | `/api/proxy/billing/daily-by-model` | GET | 近 `days` 天每日所有非聚合上游的输入/输出/缓存命中 Token 分解(堆叠柱状图用);`cost` 仅统计 `api` 类型实际费用 |
 | `/api/proxy/billing/recent-days` | GET | 近 `days` 天有数据的日期列表 |
 | `/api/proxy/billing/today-upstreams` | GET | 今日各真实上游的 真实/理论费用、token、请求数 |
-| `/api/proxy/logs` | GET | 分页请求日志(参数 `page`、`per_page`、`account_id`、`model`、`from`、`to`) |
+| `/api/proxy/logs` | GET | 简单分页请求日志(仅参数 `page`、`per_page`；`project` 与 `session_id` 不返回) |
 
 ### 导出与同步
 
@@ -112,8 +124,8 @@
 | `/api/proxy/sync/config` | GET | 读取 WebDAV 配置(密码脱敏) |
 | `/api/proxy/sync/config` | PUT | 保存 WebDAV 配置 |
 | `/api/proxy/sync/test` | POST | 测试 WebDAV 连接 |
-| `/api/proxy/sync/config/upload` | POST | 配置上传事务:hash 校验 → 副本剥离密钥/运行时表 → 上传 → 记录 config_hash 与本地快照(见 [sync.md](sync.md)) |
-| `/api/proxy/sync/config/discard` | POST | 丢弃未保存的设置,从本地快照 config_snapshot.db 单事务回滚(见 [sync.md](sync.md)) |
+| `/api/proxy/sync/config/upload` | POST | 配置上传事务:hash 校验 → 副本剥离运行时表及敏感凭据 → 上传 → 记录 config_hash 与本地快照(见 [sync.md](sync.md)) |
+| `/api/proxy/sync/config/discard` | POST | 丢弃未保存的设置,从本地快照 `token-board_config_snapshot.db` 单事务回滚 |
 
 ### 性能监控
 
@@ -135,7 +147,7 @@
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--db` | `data/proxy.db` | SQLite 数据库路径 |
+| `--db` | `data/token-board.db` | SQLite 数据库路径 |
 | `--schema-dir` | 由 `--db` 推导到仓库 `schema/` | Major–Minor schema 根目录；旧叶子路径仅兼容 |
 | `--port` | `8800` | 监听端口 |
 | `--host` | `127.0.0.1` | 绑定地址(默认仅本机可访问) |
@@ -148,4 +160,4 @@
 |------|------|------|
 | `--port` | 是 | 监听端口 |
 | `--host` | 否 | 绑定地址,默认 `127.0.0.1`(仅本机可访问) |
-| `--proxy-db` | 否 | 传入 `data/proxy.db` 时启用代理管理功能与云端配置拉取 |
+| `--proxy-db` | 否 | 传入 `data/token-board.db` 时启用代理管理功能与云端配置拉取 |

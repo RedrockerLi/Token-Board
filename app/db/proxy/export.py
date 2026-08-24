@@ -19,18 +19,32 @@ class ProxyExportMixin:
         price edits affect only the current month).
         """
         from app.db.dashboard_db import DashboardDatabase
-        from app.db.proxy.billing import materialize_period_charges
+        from app.db.proxy.billing import (
+            materialize_all_period_charges,
+        )
 
         # Export is also a billing read boundary. Run the idempotent
         # materializer synchronously so a first sync cannot omit the current
         # recurring period while the 60-second background worker is asleep.
-        materialize_period_charges(self.db_path)
+        materialize_all_period_charges(self.db_path)
         conn = self._connect()
         try:
             # The shadow may live outside data/ (e.g. data/tmp_dash/); use the
             # canonical schema root carried by this ProxyDatabase instance.
             dash_db = DashboardDatabase(
                 target_path, schema_dir=self.schema_dir)
+
+            # The generic daily ledger has a foreign key to the mirror, so
+            # identities must be upserted before usage rows.
+            dash_db.upsert_account_batch([
+                {"account_id": row["id"], "name": row["name"],
+                 "lifecycle_state": row["lifecycle_state"],
+                 "updated_at": row["updated_at"],
+                 "account_kind": row["account_kind"]}
+                for row in conn.execute(
+                    "SELECT id,name,lifecycle_state,updated_at,account_kind "
+                    "FROM accounts ORDER BY id")
+            ])
 
             # A) usage + frozen cost: keyed by account_id (the identity). The
             #    display name comes from the dashboard `accounts` mirror.
@@ -52,6 +66,7 @@ class ProxyExportMixin:
                 LEFT JOIN accounts a ON a.id = r.account_id
                 WHERE r.id > ? AND r.id <= ?
                   AND a.id IS NOT NULL
+                  AND a.account_kind IN ('proxy','agent')
                   AND LOWER(r.model) != 'unknown' AND r.model != ''
                   AND r.account_id IS NOT NULL
                   -- Only successful requests carry real usage; failed/aborted
@@ -75,6 +90,80 @@ class ProxyExportMixin:
                 }
                 for r in rows
             ])
+
+            # Both proxy and agent usage now share the same daily grain.  The
+            # account mirror carries the source kind, so the reader can label
+            # an agent without a second dashboard table.
+            # An active binding makes every materialized subscription period
+            # an actual cost of each present software. The denominator is the
+            # number of active bound agents, not the number of agents that
+            # happened to produce usage.
+            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            current_month = now[:7]
+            subscription_rows = conn.execute(
+                "SELECT s.id,s.uuid,c.period_start,c.recurring_charge,"
+                "c.normalized_recurring_cost,c.currency,c.base_currency,c.fx_rate_date "
+                "FROM agent_subscriptions s "
+                "JOIN agent_subscription_instances i ON i.subscription_id=s.id "
+                "JOIN agent_subscription_period_charges c ON c.instance_id=i.id "
+                "WHERE (s.lifecycle_state='active' OR "
+                "(s.lifecycle_state='deleted' AND s.valid_until>?)) "
+                "AND (i.lifecycle_state='active' OR "
+                "(i.lifecycle_state='deleted' AND i.valid_until>?)) "
+                "ORDER BY s.id,c.period_start", (now, now)
+            ).fetchall()
+            totals: dict[int, dict[str, dict]] = {}
+            subscription_units: dict[int, str] = {}
+            for row in subscription_rows:
+                month = str(row["period_start"])[:7]
+                sid = int(row["id"])
+                subscription_units[sid] = f"agent-subscription:{row['uuid']}"
+                values = totals.setdefault(sid, {}).setdefault(month, {
+                    "recurring_charge": 0.0,
+                    "normalized_recurring_cost": 0.0,
+                    "currency": row["currency"] or "CNY",
+                    "base_currency": row["base_currency"] or "CNY",
+                    "fx_rate_date": row["fx_rate_date"],
+                    "billing_incomplete_count": 0,
+                })
+                values["recurring_charge"] += float(row["recurring_charge"] or 0)
+                if row["normalized_recurring_cost"] is None:
+                    values["billing_incomplete_count"] += 1
+                    values["normalized_recurring_cost"] = None
+                elif values["normalized_recurring_cost"] is not None:
+                    values["normalized_recurring_cost"] += float(
+                        row["normalized_recurring_cost"])
+                values["fx_rate_date"] = row["fx_rate_date"] or values["fx_rate_date"]
+            allocations: dict[tuple[int, str], dict[str, dict]] = {}
+            for sid, periods in totals.items():
+                binding_rows = conn.execute(
+                    "SELECT b.software_id FROM agent_subscription_bindings b "
+                    "JOIN agent_subscriptions parent ON parent.id=b.subscription_id "
+                    "JOIN agent_software s ON s.id=b.software_id "
+                    "JOIN accounts a ON a.id=s.id "
+                    "WHERE b.subscription_id=? AND b.lifecycle_state='active' "
+                    "AND a.account_kind='agent' AND a.lifecycle_state='active' "
+                    "AND b.valid_from<=? "
+                    "AND (b.valid_until IS NULL OR b.valid_until>?) "
+                    "AND (parent.valid_until IS NULL OR parent.valid_until>?) "
+                    "ORDER BY b.software_id", (sid, now, now, now)
+                ).fetchall()
+                denominator = len(binding_rows)
+                if not denominator:
+                    continue
+                unit_id = subscription_units[sid]
+                for binding in binding_rows:
+                    allocations[(int(binding["software_id"]), unit_id)] = {
+                        month: {
+                            **values,
+                            "recurring_charge": values["recurring_charge"] / denominator,
+                            "normalized_recurring_cost": (
+                                values["normalized_recurring_cost"] / denominator
+                                if values["normalized_recurring_cost"] is not None else None),
+                        }
+                        for month, values in periods.items()
+                    }
+            dash_db.reconcile_agent_allocations(allocations, current_month)
 
             # B) Plan/agent subscriptions are derived from key lifecycles, not
             # from usage.  Reconcile every known lifecycle on every export so an
@@ -113,6 +202,7 @@ class ProxyExportMixin:
                 "SELECT r.account_id,r.upstream_key_id,r.requested_at,"
                 "r.equivalent_cost api_cost FROM request_log r "
                 "JOIN billing_contracts bc ON bc.account_id=r.account_id "
+                "JOIN accounts a ON a.id=r.account_id AND a.account_kind='proxy' "
                 "WHERE r.id>? AND r.id<=? AND r.status_code BETWEEN 200 AND 299 "
                 "AND bc.charge_type='recurring' AND bc.valid_from<=r.requested_at "
                 "AND (bc.valid_until IS NULL OR bc.valid_until>r.requested_at)",

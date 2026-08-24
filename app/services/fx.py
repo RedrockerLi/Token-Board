@@ -12,7 +12,7 @@ rate (no ?date=), while the subscription materializer requests the rate of
 each billing period's start date (?date=YYYY-MM-DD, supported by
 frankfurter from 1999-01-04 on).
 
-The table lives in proxy.db (fx_rates) and is excluded from cloud sync.
+The table lives in token-board.db (fx_rates) and is excluded from cloud sync.
 Every function is best-effort and never raises
 into the request path; missing data degrades to the nearest stored rate (the
 earliest one when the requested date precedes every row; 1.0 only when the

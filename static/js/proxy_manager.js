@@ -96,13 +96,13 @@ function accountTypeBadge(type) {
     return `<span class="badge badge--type-${esc(type) || 'api'}">${esc(s.short_label || type || 'API')}</span>`;
 }
 
-/** Native currency symbol for plan/agent subscription prices. */
+/** Native currency symbol for proxy plan subscription prices. */
 function currencySymbol(currency) {
     return currency === 'USD' ? '$' : '¥';
 }
 
 /** Accounts that can actually be *used as an upstream* (local-key binding,
- * aggregate targets).  Non-routable types (e.g. agent) never appear in these
+ * aggregate targets).  Non-routable types never appear in these
  * "use as upstream" pickers. */
 function routableAccounts(accounts) {
     return (accounts || []).filter(a => !a.is_aggregate && typeSpec(a.account_type).routable);
@@ -120,9 +120,7 @@ function keyBindingAccounts(accounts) {
 ///   billing 'subscription'  → 订阅月费 + 币种
 ///   routable                → Base URL / API 格式 / 上游路径 / 认证方式 / 并发限额
 ///   holds_keys              → 上游密钥区
-///   usage_source 'import'   → Agent 名称 (agent_kind)
 ///   subscription_unit 'per_key'     → 每把密钥行的订阅起始日（plan）
-///   subscription_unit 'per_account' → 账户级订阅起始日（agent）
 function toggleTypeFields(sel) {
     const s = sel && typeSpec(sel.value);
     const showSub = s && s.billing === 'subscription';
@@ -134,16 +132,11 @@ function toggleTypeFields(sel) {
     if (routing) routing.style.display = (s && s.routable) ? '' : 'none';
     const keySection = document.getElementById('accountKeySection');
     if (keySection) keySection.style.display = (s && s.holds_keys) ? '' : 'none';
-    const kind = document.getElementById('agentKindField');
-    if (kind) kind.style.display = (s && s.usage_source === 'import') ? '' : 'none';
-    const vf = document.getElementById('agentValidFromField');
-    if (vf) vf.style.display = (s && s.subscription_unit === 'per_account') ? '' : 'none';
     updatePlanPriceSymbol();
     applyKeyDateVisibility();
 }
 
-/// Current display value for a per-key 订阅起始日 date picker: only per_key
-/// subscription types (plan) use them; api/agent don't.
+/// Current display value for a per-key 订阅起始日 date picker.
 function keyDateDisplay() {
     const sel = document.querySelector('#accountForm [name="account_type"]');
     return sel && typeSpec(sel.value).subscription_unit === 'per_key' ? '' : 'none';
@@ -291,8 +284,8 @@ async function confirmCloudKey(accountId, masked, input, btn) {
 
 function collectKeyRows(form) {
     const type = form['account_type'] ? form['account_type'].value : 'api';
-    // 仅 per_key 订阅类型（plan）携带每把密钥的订阅起始日；api/agent 一律不带，
-    // 避免隐藏的旧日期输入值被误提交到非订阅类型。
+    // 仅 per_key 订阅类型（plan）携带每把密钥的订阅起始日，避免隐藏的旧日期
+    // 输入值被误提交到非订阅类型。
     const useKeyDates = typeSpec(type).subscription_unit === 'per_key';
     const keyInputs = [...form.querySelectorAll('#keyList input[name="upstream_keys[]"]')];
     const upstream_keys = [];
@@ -327,10 +320,15 @@ async function loadAccountsTable() {
             tbody.innerHTML = '<tr><td colspan="8" class="td-empty">暂无账户，请点击"添加账户"（聚合账户请到"上游账户聚合"管理）</td></tr>';
             return;
         }
-        tbody.innerHTML = real.map((a) => `
+        tbody.innerHTML = real.map((a) => {
+            const keyEntries = [...(a.keys || []), ...(a.cloud_keys || [])];
+            const uniqueMasks = [...new Set(keyEntries.map((key) => key.masked).filter(Boolean))];
+            const keyCount = Number(a.key_count || uniqueMasks.length || 0);
+            const firstMask = uniqueMasks[0] || '';
+            return `
             <tr>
                 <td>${esc(a.name)}${a.deleted_at ? ` <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="到期删除：${esc(fmtLocal(a.deleted_at))}">到期 ${esc(fmtLocal(a.deleted_at).slice(0, 10))}</span>` : ''}</td>
-                <td><code>${esc(maskKey(a.upstream_key))}</code>${a.key_count > 1 ? ` <span class="badge" title="${a.key_count} 把密钥（同一配置的多个并发槽位）">×${a.key_count}</span>` : ''}${!a.upstream_key && !a.key_count ? ' <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
+                <td><code>${esc(firstMask)}</code>${keyCount > 1 ? ` <span class="badge" title="${keyCount} 把密钥（同一配置的多个并发槽位）">×${keyCount}</span>` : ''}${!firstMask && !keyCount ? ' <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
                 <td>${accountTypeBadge(a.account_type)}</td>
@@ -348,7 +346,8 @@ async function loadAccountsTable() {
                         : `<button class="btn btn--sm" disabled title="该账户类型无直连上游密钥，不支持并发测试">测试并发</button>`}
                 </td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="8" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
@@ -361,8 +360,7 @@ async function saveAccount(e) {
     const type = form['account_type'].value || 'api';
     const s = typeSpec(type);
     const { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms } = collectKeyRows(form);
-    // 按类型组装 payload：非路由类型（agent）不带 Base URL 等路由字段，import 类型
-    // 带 agent_kind，per_account 类型带账户级订阅起始日。缺省字段由后端默认值兜底。
+    // 按类型组装 payload：非路由类型不带 Base URL 等路由字段。
     const common = {
         name: form['name'].value,
         account_type: type,
@@ -375,13 +373,6 @@ async function saveAccount(e) {
         common.endpoint_path = form['endpoint_path'].value || '';
         common.auth_header = form['auth_header'].value || 'auto';
         common.max_concurrency = form['max_concurrency'].value || null;
-    }
-    if (s.usage_source === 'import') {
-        common.agent_kind = form['agent_kind'] ? (form['agent_kind'].value || 'codex') : 'codex';
-    }
-    if (s.subscription_unit === 'per_account') {
-        common.valid_from = form['valid_from']
-            ? (localDateToUtcDate(form['valid_from'].value) || null) : null;
     }
     try {
         if (id) {
@@ -444,9 +435,6 @@ async function editAccount(id) {
         form['monthly_price'].value = typeSpec(acc.account_type).billing === 'subscription' ? (acc.monthly_price || 0) : '';
         if (form['currency']) form['currency'].value = acc.currency || 'CNY';
         form['max_concurrency'].value = acc.max_concurrency || '';
-        if (form['agent_kind']) form['agent_kind'].value = acc.agent_kind || 'codex';
-        if (form['valid_from']) form['valid_from'].value =
-            acc.valid_from ? utcDateToLocalDate(acc.valid_from) : '';
         toggleTypeFields(form['account_type']);
         // Existing keys → masked keep-rows; user adds new rows as needed.
         resetKeyList();
@@ -463,9 +451,8 @@ async function editAccount(id) {
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
-        // Types without upstream keys (e.g. agent) have no real upstream →
-        // hide the model / concurrency buttons (the key section itself is
-        // handled by toggleTypeFields via holds_keys).
+        // Types without upstream keys have no real upstream → hide the model /
+        // concurrency buttons (the key section is handled by type semantics).
         const holdsKeys = typeSpec(acc.account_type).holds_keys;
         document.getElementById('accountModelBtn').style.display = holdsKeys ? '' : 'none';
         document.getElementById('accountTestConcBtn').style.display = holdsKeys ? '' : 'none';
@@ -633,7 +620,7 @@ function initAccountsPage() {
                 <form id="accountForm" onsubmit="saveAccount(event)" data-edit-id="">
                     <label>名称 <input name="name" required></label>
                     <div id="accountKeySection" style="margin-bottom:10px;">
-                        <label>上游 API Key（多把密钥 = 同一配置的多个槽位；仅存本机，不上传云端）</label>
+                        <label>上游 API Key（多把密钥 = 同一配置的多个槽位；仅本机保存，不上传云端）</label>
                         <div id="keyList" style="margin:4px 0;"></div>
                         <div id="cloudKeyList" style="margin:4px 0;"></div>
                         <button type="button" class="btn btn--sm" onclick="addKeyRow()">+ 添加密钥</button>
@@ -666,11 +653,6 @@ function initAccountsPage() {
                              _populateTypeOptions() on modal open -->
                         <select name="account_type" onchange="toggleTypeFields(this)"></select>
                     </label>
-                    <label id="agentKindField" style="display:none;">Agent 名称
-                        <select name="agent_kind">
-                            <option value="codex">codex</option>
-                        </select>
-                    </label>
                     <label id="planPriceField" style="display:none;"><span>订阅月费 (<span id="planPriceSymbol">¥</span>/周期)</span>
                         <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 99">
                     </label>
@@ -679,9 +661,6 @@ function initAccountsPage() {
                             <option value="CNY">CNY</option>
                             <option value="USD">USD</option>
                         </select>
-                    </label>
-                    <label id="agentValidFromField" style="display:none;">订阅起始日
-                        <input name="valid_from" type="date">
                     </label>
                     <div style="display:flex; gap:8px;">
                         <button type="submit" class="btn btn--primary">添加账户</button>
@@ -1277,7 +1256,7 @@ async function reorderPricing(id, dir) {
 }
 
 function initPricingPage() {
-    const el = document.getElementById('page-proxy-pricing');
+    const el = document.getElementById('page-settings-pricing');
     if (!el || el.dataset.initialized) return;
     el.dataset.initialized = '1';
     el.innerHTML = `

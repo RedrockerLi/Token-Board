@@ -11,7 +11,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PROXY_BIN="$SCRIPT_DIR/proxy/build/token_proxy"
-PROXY_DB="$SCRIPT_DIR/data/proxy.db"
+PROXY_DB="$SCRIPT_DIR/data/token-board.db"
 PROXY_PORT=8800
 
 SERVICE_NAME="token-proxy"

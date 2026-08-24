@@ -56,7 +56,8 @@ def api_summary():
 
     def _non_plan(ces):
         return [ce for ce in ces
-                if ce["cost_group_key"] not in plan_account_names]
+                if ce.get("source_kind") == "agent"
+                or ce["cost_group_key"] not in plan_account_names]
 
     selected_costs = [
         ce for ce in _store().cost_entries

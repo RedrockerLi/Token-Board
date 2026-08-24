@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V1 config merge keeps node-local secrets and runtime IDs."""
+"""V1 config merge preserves machine-local secrets while syncing config."""
 
 from __future__ import annotations
 

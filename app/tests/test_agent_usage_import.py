@@ -51,11 +51,17 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         super().tearDown()
 
     def _write_session(self, name: str, lines) -> Path:
-        day = Path(self._sessions.name) / "2026" / "08" / "13"
+        day = Path(self._sessions.name) / "sessions" / "2026" / "08" / "13"
         day.mkdir(parents=True, exist_ok=True)
         path = day / name
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
+
+    def _create_software(self, database) -> int:
+        return database.create_agent_software({
+            "name": "codex-agent", "agent_kind": "codex",
+            "config": {"data_root": self._sessions.name},
+        })
 
     def _codex_rows(self) -> int:
         with sqlite3.connect(self.proxy_path) as conn:
@@ -70,10 +76,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
     def test_imports_rows_and_is_idempotent(self) -> None:
         from app.db.proxy_db import ProxyDatabase
         db = ProxyDatabase(str(self.proxy_path))
-        db.create_account({
-            "name": "codex-agent", "account_type": "agent",
-            "agent_kind": "codex", "monthly_price": 10,
-        })
+        self._create_software(db)
         self._write_session("rollout-20260813010000-{}.jsonl".format(SESSION_ID),
                             SESSION_LINES)
 
@@ -93,6 +96,52 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         self.assertEqual(tuple(row), (
             "gpt-5.1-codex", 10, 20, 5, 35, "2026-08-13T01:00:00Z"))
 
+    def test_fork_replay_history_is_not_counted_twice(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        def meta(timestamp, session_id, **extra):
+            return json.dumps({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": {"id": session_id, "timestamp": timestamp, **extra},
+            })
+
+        def token(timestamp, input_tokens, output_tokens, total_tokens):
+            usage = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                     "cached_input_tokens": 0,
+                     "total_tokens": input_tokens + output_tokens}
+            return json.dumps({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {
+                    "model": "gpt-5.2",
+                    "last_token_usage": usage,
+                    "total_token_usage": {"total_tokens": total_tokens},
+                }},
+            })
+
+        database = ProxyDatabase(str(self.proxy_path))
+        self._create_software(database)
+        self._write_session("parent.jsonl", [
+            meta("2026-08-13T01:00:00.000Z", "parent-session"),
+            token("2026-08-13T01:01:00.000Z", 10, 1, 11),
+            token("2026-08-13T01:02:00.000Z", 20, 2, 33),
+        ])
+        self._write_session("fork.jsonl", [
+            meta("2026-08-13T01:30:00.000Z", "fork-session",
+                 forked_from_id="parent-session"),
+            token("2026-08-13T01:30:00.000Z", 20, 2, 33),
+            token("2026-08-13T01:31:00.000Z", 5, 3, 41),
+        ])
+
+        self.assertEqual(self._run_import(), 3)
+        with sqlite3.connect(self.proxy_path) as conn:
+            prompt, completion = conn.execute(
+                "SELECT SUM(prompt_tokens),SUM(completion_tokens) "
+                "FROM request_log WHERE event_id LIKE 'codex:%'"
+            ).fetchone()
+        self.assertEqual((prompt, completion), (35, 6))
+
     def test_no_agent_account_returns_zero(self) -> None:
         # 无 codex agent 账户:干净返回 0,不报错
         self._write_session("rollout-20260813010000-{}.jsonl".format(SESSION_ID),
@@ -102,10 +151,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
 
     def test_no_session_files_returns_zero(self) -> None:
         from app.db.proxy_db import ProxyDatabase
-        ProxyDatabase(str(self.proxy_path)).create_account({
-            "name": "codex-agent", "account_type": "agent",
-            "agent_kind": "codex", "monthly_price": 10,
-        })
+        self._create_software(ProxyDatabase(str(self.proxy_path)))
         self.assertEqual(self._run_import(), 0)
         self.assertEqual(self._codex_rows(), 0)
 
@@ -113,10 +159,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         from app.db.proxy_db import ProxyDatabase
 
         database = ProxyDatabase(str(self.proxy_path))
-        database.create_account({
-            "name": "codex-agent", "account_type": "agent",
-            "agent_kind": "codex", "monthly_price": 10,
-        })
+        self._create_software(database)
         self._write_session("rollout-20260813010000-{}.jsonl".format(SESSION_ID),
                             SESSION_LINES)
         second_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -145,8 +188,8 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
 
         with sqlite3.connect(self.proxy_path) as conn:
             cursor = conn.execute(
-                "SELECT cursor_json FROM account_importers "
-                "WHERE importer_kind='codex'").fetchone()[0]
+                "SELECT cursor_json FROM agent_software_runtime "
+                "LIMIT 1").fetchone()[0]
         states = json.loads(cursor)
         self.assertEqual(len(states), 2)
         self.assertEqual(self._codex_rows(), 4)
@@ -198,10 +241,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         from app.services.runtime_tasks import stop_runtime_tasks
 
         database = ProxyDatabase(str(self.proxy_path))
-        database.create_account({
-            "name": "codex-agent", "account_type": "agent",
-            "agent_kind": "codex", "monthly_price": 10,
-        })
+        self._create_software(database)
         session_path = self._write_session(
             "rollout-20260813010000-{}.jsonl".format(SESSION_ID),
             SESSION_LINES,
@@ -309,7 +349,7 @@ class AgentUsageWorkerTest(unittest.TestCase):
         self.assertFalse(worker.thread.is_alive())
         self.assertEqual(state["calls"], 2)
         self.assertEqual(state["max_active"], 1)
-        self.assertEqual(health["codex-importer"]["status"], "stopped")
+        self.assertEqual(health["agent-usage-importer"]["status"], "stopped")
 
     def test_periodic_deadline_runs_another_pass(self) -> None:
         from app.services.runtime_tasks import AgentUsageImportWorker
@@ -385,20 +425,20 @@ class AgentUsageWorkerTest(unittest.TestCase):
         worker.start()
         self.assertTrue(attempted.wait(2))
         deadline = time.monotonic() + 2
-        while (health.get("codex-importer", {}).get("status") != "degraded"
+        while (health.get("agent-usage-importer", {}).get("status") != "degraded"
                and time.monotonic() < deadline):
             time.sleep(0.005)
-        self.assertEqual(health["codex-importer"]["status"], "degraded")
+        self.assertEqual(health["agent-usage-importer"]["status"], "degraded")
 
         attempted.clear()
         self.assertTrue(worker.trigger())
         self.assertTrue(attempted.wait(2))
         deadline = time.monotonic() + 2
-        while (health["codex-importer"].get("status") != "ok"
+        while (health["agent-usage-importer"].get("status") != "ok"
                and time.monotonic() < deadline):
             time.sleep(0.005)
-        self.assertEqual(health["codex-importer"]["status"], "ok")
-        self.assertEqual(health["codex-importer"]["last_inserted"], 7)
+        self.assertEqual(health["agent-usage-importer"]["status"], "ok")
+        self.assertEqual(health["agent-usage-importer"]["last_inserted"], 7)
         worker.stop()
         worker.thread.join(timeout=2)
         self.assertFalse(worker.trigger())

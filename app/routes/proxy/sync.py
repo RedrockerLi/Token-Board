@@ -110,8 +110,9 @@ def test_sync_connection():
 def upload_config():
     """Upload local config to cloud as one transaction (exit settings page).
 
-    Never uploads upstream API keys or the WebDAV credentials. Refuses
-    (conflict) if the cloud moved past this machine's last sync.
+    Uploads all configured proxy state. Request history and other generated
+    runtime state remain local. Refuses (conflict) if the cloud moved past
+    this machine's last sync.
     """
     from app.services.sync import sync_config_upload
 

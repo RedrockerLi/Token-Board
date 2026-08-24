@@ -1,40 +1,30 @@
-"""Codex session usage importer used by the dashboard server.
+"""Generic agent usage import with a Codex session adapter."""
 
-Parses Codex CLI session transcripts from ``~/.codex/sessions`` (recursively;
-date-partitioned ``YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl``, plain JSONL;
-``.jsonl.gz`` accepted for robustness) and inserts one ``request_log`` row per
-``token_count`` event (per-turn granularity, using ``last_token_usage`` deltas),
-attributed to the first ``agent_kind='codex'`` account.
-
-Idempotency: each row's ``event_id`` is deterministic
-(``codex:<session_id>:<line_no>``) and ``insert_agent_usage`` uses
-``INSERT OR IGNORE``, so re-scanning a file — including after a crash — never
-double-counts.  ``account_importers.cursor_json`` records ``(size, mtime)`` so
-unchanged files are skipped entirely on later passes.
-
-Failures propagate to the server scheduler, which records degraded health.
-Browser requests only wake that scheduler and never execute a pass inline.
-"""
+from __future__ import annotations
 
 import gzip
 import json
+import os
 import re
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-CODEX_DIR = Path.home() / ".codex" / "sessions"
+from .codex_replay import replay_skip_counts
+
+CODEX_HOME = Path.home() / ".codex"
+CODEX_DIR = CODEX_HOME / "sessions"
 
 
 def _iso_z_to_sqlite(ts: str) -> str | None:
-    """'2026-08-04T16:37:44.757Z' → '2026-08-04T16:37:44Z' (ISO UTC)."""
     if not ts:
         return None
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _token_int(value) -> int:
@@ -45,55 +35,52 @@ def _token_int(value) -> int:
 
 
 def _session_id_from_path(path: Path) -> str:
-    """Extract the session UUID from the filename, with fallbacks."""
     name = path.name
     for suffix in (".jsonl.gz", ".jsonl"):
         if name.endswith(suffix):
-            name = name[: -len(suffix)]
+            name = name[:-len(suffix)]
             break
-    # rollout-<ts>-<uuid> → keep the trailing UUID; else the full stem.
     match = re.search(
         r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
-        name,
-    )
-    if match:
-        return match.group(1)
-    return path.stem
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$", name)
+    return match.group(1) if match else path.stem
 
 
 def _open_maybe_gz(path: Path):
-    if path.name.endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")
-    return open(path, "r", encoding="utf-8")
+    return (gzip.open(path, "rt", encoding="utf-8")
+            if path.name.endswith(".gz") else
+            open(path, "r", encoding="utf-8"))
 
 
-def _iter_session_files(stop_event: threading.Event | None = None):
-    if not CODEX_DIR.is_dir():
-        return
+def _iter_session_files(roots=None, stop_event: threading.Event | None = None):
+    roots = list(roots or (CODEX_DIR,))
     seen = set()
-    for pattern in ("*.jsonl", "*.jsonl.gz"):
-        for p in CODEX_DIR.rglob(pattern):
-            if stop_event is not None and stop_event.is_set():
-                return
-            if not p.is_file():
-                continue
-            key = p.resolve()
-            if key not in seen:
-                seen.add(key)
-                yield p
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pattern in ("*.jsonl", "*.jsonl.gz"):
+            for path in root.rglob(pattern):
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if not path.is_file():
+                    continue
+                key = path.resolve()
+                if key not in seen:
+                    seen.add(key)
+                    yield path
 
 
-def _parse_session(path: Path, stop_event: threading.Event | None = None):
-    """Parse one session file → (total_line_count, [row dicts]).
-
-    Each ``token_count`` event_msg yields one row using its ``last_token_usage``
-    (per-turn delta).  Model is the last ``turn_context.payload.model`` seen.
-    """
+def _parse_session(path: Path, stop_event: threading.Event | None = None,
+                   skip_token_count: int = 0):
+    """Return ``(line_count, events)`` for one Codex transcript."""
     rows = []
     session_id = None
-    model = "codex"  # fallback when no turn_context carries a model
+    project = None
+    model = "codex"
+    previous_cumulative = None
     line_no = 0
+    raw_token_seen = 0
+    skip_token_count = max(0, int(skip_token_count or 0))
     with _open_maybe_gz(path) as source:
         for raw in source:
             if stop_event is not None and stop_event.is_set():
@@ -105,99 +92,255 @@ def _parse_session(path: Path, stop_event: threading.Event | None = None):
                 continue
             if not isinstance(obj, dict):
                 continue
-            etype = obj.get("type")
+            event_type = obj.get("type")
             payload = obj.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
-            if etype == "session_meta":
-                if payload.get("session_id"):
-                    session_id = payload["session_id"]
-            elif etype == "turn_context":
-                m = payload.get("model")
-                if isinstance(m, str) and m.strip():
-                    model = m.strip()
-            elif etype == "event_msg" and payload.get("type") == "token_count":
+            if event_type == "session_meta":
+                session_id = (payload.get("id") or payload.get("session_id")
+                              or session_id)
+                git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
+                project = (payload.get("project") or payload.get("cwd")
+                           or payload.get("workdir") or git.get("repository_url")
+                           or project)
+            elif event_type == "turn_context":
+                value = payload.get("model")
+                if isinstance(value, str) and value.strip():
+                    model = value.strip()
+                project = (payload.get("project") or payload.get("cwd")
+                           or payload.get("workdir") or project)
+            elif event_type == "event_msg" and payload.get("type") == "token_count":
+                raw_token_seen += 1
                 info = payload.get("info") or {}
-                if not isinstance(info, dict):
+                last = info.get("last_token_usage") if isinstance(info, dict) else None
+                if isinstance(info, dict):
+                    value = info.get("model") or payload.get("model")
+                    if isinstance(value, str) and value.strip():
+                        model = value.strip()
+                cumulative = (info.get("total_token_usage")
+                               if isinstance(info, dict) else None)
+                cumulative_total = (cumulative.get("total_tokens")
+                                    if isinstance(cumulative, dict) else None)
+                previous_total = (previous_cumulative.get("total_tokens")
+                                  if isinstance(previous_cumulative, dict) else None)
+                duplicate = (isinstance(cumulative_total, (int, float))
+                             and cumulative_total > 0
+                             and cumulative_total == previous_total)
+                if duplicate:
                     continue
-                last = info.get("last_token_usage") or {}
+                if not isinstance(last, dict) and isinstance(cumulative, dict):
+                    if isinstance(previous_cumulative, dict):
+                        last = {
+                            key: _token_int(cumulative.get(key))
+                            - _token_int(previous_cumulative.get(key))
+                            for key in ("input_tokens", "output_tokens",
+                                        "cached_input_tokens", "reasoning_output_tokens")
+                        }
+                    else:
+                        last = cumulative
                 if not isinstance(last, dict):
                     continue
-                ts = _iso_z_to_sqlite(obj.get("timestamp"))
-                if ts is None:
+                if isinstance(cumulative, dict):
+                    previous_cumulative = dict(cumulative)
+                if raw_token_seen <= skip_token_count:
                     continue
-                event_id = "codex:{}:{}".format(
-                    session_id or _session_id_from_path(path), line_no)
+                timestamp = _iso_z_to_sqlite(obj.get("timestamp"))
+                if timestamp is None:
+                    continue
+                current_session = session_id or _session_id_from_path(path)
+                prompt_tokens = _token_int(last.get("input_tokens"))
+                completion_tokens = _token_int(last.get("output_tokens"))
+                cache_read_tokens = _token_int(last.get("cached_input_tokens"))
+                total_tokens = _token_int(last.get("total_tokens"))
+                if total_tokens <= 0:
+                    # Some Codex versions omit last_token_usage.total_tokens.
+                    total_tokens = prompt_tokens + completion_tokens
                 rows.append({
                     "model": model,
-                    "prompt_tokens": _token_int(last.get("input_tokens")),
-                    "completion_tokens": _token_int(last.get("output_tokens")),
-                    "cache_read_tokens": _token_int(last.get("cached_input_tokens")),
-                    "total_tokens": _token_int(last.get("total_tokens")),
-                    "requested_at": ts,
-                    "event_id": event_id,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cache_read_tokens": cache_read_tokens,
+                    "total_tokens": total_tokens,
+                    "requested_at": timestamp,
+                    "event_id": f"codex:{current_session}:{line_no}",
+                    "project": project if isinstance(project, str) else None,
+                    "session_id": current_session,
                 })
     return line_no, rows
 
 
-def import_once(pdb, stop_event: threading.Event | None = None) -> int:
-    """Import one idempotent pass and return the number of inserted rows.
+def _software_roots(software: dict):
+    config = software.get("config") or {}
+    configured = config.get("data_root") or config.get("path")
+    if configured:
+        root = Path(str(configured)).expanduser()
+        if root.name in {"sessions", "archived_sessions"}:
+            return [root]
+        return [root / "sessions", root / "archived_sessions"]
+    configured_home = Path(os.environ.get("CODEX_HOME", str(CODEX_HOME))).expanduser()
+    default_live = CODEX_DIR
+    if CODEX_DIR == CODEX_HOME / "sessions":
+        default_live = configured_home / "sessions"
+    roots = [default_live]
+    archived = configured_home / "archived_sessions"
+    if archived != default_live:
+        roots.append(archived)
+    return roots
 
-    Scheduling and retry policy belong to the server lifecycle worker.  This
-    function intentionally lets failures propagate so that server health can
-    report a degraded importer instead of silently claiming success.
-    """
-    if stop_event is not None and stop_event.is_set():
-        return 0
-    agents = [a for a in pdb.get_agent_accounts() if a["agent_kind"] == "codex"]
-    if not agents:
-        return 0  # no codex agent account configured yet
-    account_id = agents[0]["id"]
 
-    files = []
-    for path in _iter_session_files(stop_event):
-        files.append(path)
+def _opencode_db_path(software: dict) -> Path:
+    config = software.get("config") or {}
+    configured = config.get("data_root") or config.get("path")
+    if configured:
+        value = Path(str(configured)).expanduser()
+        # Treat a configured path as a data directory unless it explicitly
+        # names a database.  This keeps a not-yet-created OpenCode directory
+        # usable on first setup as well as an existing direct .db path.
+        return value if value.is_file() or value.suffix.lower() == ".db" \
+            else value / "opencode.db"
+    return Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+
+
+def _opencode_timestamp(value) -> str | None:
+    if isinstance(value, (int, float)):
+        # OpenCode stores milliseconds since epoch in some releases and an ISO
+        # string in others.
+        seconds = float(value) / (1000 if value > 10_000_000_000 else 1)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+        except (OverflowError, OSError, ValueError):
+            return None
+    return _iso_z_to_sqlite(str(value)) if value else None
+
+
+def _parse_opencode(path: Path, stop_event: threading.Event | None = None,
+                    skip_token_count: int = 0):
+    """Read OpenCode's local ``message`` table into the shared UsageEvent IR."""
+    rows = []
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                               timeout=2)
+        conn.row_factory = sqlite3.Row
+        query = (
+            "SELECT rowid AS message_rowid,session_id,"
+            "json_extract(data,'$.time.created') AS created,"
+            "json_extract(data,'$.modelID') AS model_id,"
+            "json_extract(data,'$.tokens') AS tokens,"
+            "json_extract(data,'$.path.root') AS root_path "
+            "FROM message ORDER BY rowid"
+        )
+        source_rows = conn.execute(query).fetchall()
+        conn.close()
+    except (OSError, sqlite3.Error):
+        return 0, []
+    for source in source_rows:
         if stop_event is not None and stop_event.is_set():
-            return 0
+            return None
+        timestamp = _opencode_timestamp(source["created"])
+        if timestamp is None or not source["model_id"]:
+            continue
+        tokens = source["tokens"]
+        if isinstance(tokens, str):
+            try:
+                tokens = json.loads(tokens)
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(tokens, dict):
+            continue
+        prompt = _token_int(tokens.get("input"))
+        completion = _token_int(tokens.get("output"))
+        cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+        cache_read = _token_int(cache.get("read"))
+        if prompt <= 0 and completion <= 0:
+            continue
+        session_id = str(source["session_id"] or "unknown")
+        root = source["root_path"]
+        project = Path(str(root)).name if root else "unknown"
+        rows.append({
+            "model": str(source["model_id"]),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cache_read_tokens": cache_read,
+            "total_tokens": prompt + completion,
+            "requested_at": timestamp,
+            "event_id": f"opencode:{session_id}:{source['message_rowid']}",
+            "project": project,
+            "session_id": session_id,
+        })
+    return len(source_rows), rows
+
+
+def _software_sources(software: dict,
+                      stop_event: threading.Event | None = None):
+    if software.get("agent_kind") == "opencode":
+        path = _opencode_db_path(software)
+        return [path] if path.is_file() else []
+    return list(_iter_session_files(_software_roots(software), stop_event))
+
+
+AGENT_PARSERS = {
+    # Every parser returns the same UsageEvent IR consumed by the importer:
+    # model, token buckets, timestamp, project and session identity.
+    "codex": _parse_session,
+    "opencode": _parse_opencode,
+}
+
+
+def _import_software(pdb, software: dict,
+                     stop_event: threading.Event | None = None) -> int:
+    software_id = int(software["id"])
+    agent_kind = software.get("agent_kind")
+    # Resolve Codex dynamically so tests/extensions can replace the adapter,
+    # while other agent kinds continue to use the registry contract.
+    parser = (_parse_session if agent_kind == "codex"
+              else AGENT_PARSERS.get(agent_kind))
+    if parser is None:
+        return 0
+    files = list(_software_sources(software, stop_event))
     if not files:
         return 0
-    # Parse each changed file outside a write transaction, then atomically
-    # commit that file's rows and cursor.  A first scan may read many large
-    # transcripts; it must not hold SQLite's single-writer lock while doing so.
+    replay_skips = (replay_skip_counts(files, stop_event)
+                    if agent_kind == "codex" else {})
+
     conn = pdb._connect()
     inserted = 0
     try:
         cursor = conn.execute(
-            "SELECT cursor_json FROM account_importers "
-            "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
-            (account_id,),
+            "SELECT cursor_json FROM agent_software_runtime WHERE software_id=?",
+            (software_id,),
         ).fetchone()
         try:
-            raw_states = json.loads(cursor[0]) if cursor and cursor[0] else {}
+            states = json.loads(cursor[0]) if cursor and cursor[0] else {}
         except (TypeError, ValueError):
-            raw_states = {}
-        states = raw_states if isinstance(raw_states, dict) else {}
+            states = {}
+        if not isinstance(states, dict):
+            states = {}
+
         for path in files:
             if stop_event is not None and stop_event.is_set():
                 return inserted
-            spath = str(path)
+            path_key = str(path)
             try:
                 before = path.stat()
             except OSError:
                 continue
-            prev = states.get(spath)
+            previous = states.get(path_key)
             same_mtime = (
-                prev.get("mtime_ns") == int(before.st_mtime_ns)
-                if isinstance(prev, dict) and "mtime_ns" in prev
-                else isinstance(prev, dict)
-                and prev.get("mtime") == int(before.st_mtime)
+                previous.get("mtime_ns") == int(before.st_mtime_ns)
+                if isinstance(previous, dict) and "mtime_ns" in previous
+                else isinstance(previous, dict)
+                and previous.get("mtime") == int(before.st_mtime)
             )
-            if (isinstance(prev, dict)
-                    and prev.get("size") == before.st_size
+            if (isinstance(previous, dict)
+                    and previous.get("size") == before.st_size
                     and same_mtime):
-                continue  # unchanged since last pass
+                continue
 
-            parsed = _parse_session(path, stop_event)
+            skip_token_count = replay_skips.get(path_key, 0)
+            parsed = (parser(path, stop_event,
+                             skip_token_count=skip_token_count)
+                      if skip_token_count else parser(path, stop_event))
             if parsed is None:
                 return inserted
             line_count, rows = parsed
@@ -205,43 +348,21 @@ def import_once(pdb, stop_event: threading.Event | None = None) -> int:
                 after = path.stat()
             except OSError:
                 continue
-            stable_snapshot = (
-                after.st_size == before.st_size
-                and int(after.st_mtime_ns) == int(before.st_mtime_ns)
-            )
-
+            stable = (after.st_size == before.st_size and
+                      int(after.st_mtime_ns) == int(before.st_mtime_ns))
             file_inserted = 0
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                # Claim the writer only after parsing.  Re-read the cursor
-                # under that lock: during a rolling upgrade an old timer or a
-                # second server may have committed another file since this
-                # pass took its initial skip snapshot.
-                conn.execute("BEGIN IMMEDIATE")
                 for row in rows:
-                    if stop_event is not None and stop_event.is_set():
-                        conn.rollback()
-                        return inserted
                     if pdb._insert_agent_usage_row(
-                            conn, account_id, row["model"], row["prompt_tokens"],
+                            conn, software_id, row["model"], row["prompt_tokens"],
                             row["completion_tokens"], row["cache_read_tokens"],
-                            row["total_tokens"], row["requested_at"], row["event_id"]):
+                            row["total_tokens"], row["requested_at"],
+                            row["event_id"], row.get("project"),
+                            row.get("session_id")):
                         file_inserted += 1
-
-                if stable_snapshot:
-                    latest_cursor = conn.execute(
-                        "SELECT cursor_json FROM account_importers "
-                        "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
-                        (account_id,),
-                    ).fetchone()
-                    try:
-                        latest_states = (json.loads(latest_cursor[0])
-                                         if latest_cursor and latest_cursor[0]
-                                         else {})
-                    except (TypeError, ValueError):
-                        latest_states = {}
-                    if not isinstance(latest_states, dict):
-                        latest_states = {}
-                    latest_states[spath] = {
+                if stable:
+                    states[path_key] = {
                         "size": after.st_size,
                         "mtime": int(after.st_mtime),
                         "mtime_ns": int(after.st_mtime_ns),
@@ -251,20 +372,38 @@ def import_once(pdb, stop_event: threading.Event | None = None) -> int:
                             "%Y-%m-%dT%H:%M:%SZ"),
                     }
                     conn.execute(
-                        "UPDATE account_importers SET cursor_json=? "
-                        "WHERE account_id=? AND importer_kind='codex' AND enabled=1",
-                        (json.dumps(latest_states, ensure_ascii=False,
-                                    separators=(",", ":")), account_id),
+                        "UPDATE agent_software_runtime SET cursor_json=?,"
+                        "last_scan_at=?,last_error=NULL WHERE software_id=?",
+                        (json.dumps(states, ensure_ascii=False, separators=(",", ":")),
+                         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                         software_id),
                     )
-                # If the live session grew during parsing, its complete rows
-                # are still useful and safe to commit.  We deliberately leave
-                # the cursor unchanged so the next pass re-reads and dedupes
-                # the prefix before importing the appended events.
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
             inserted += file_inserted
+    except Exception as exc:
+        try:
+            conn.execute(
+                "UPDATE agent_software_runtime SET last_error=? WHERE software_id=?",
+                (str(exc)[:500], software_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        raise
     finally:
         conn.close()
+    return inserted
+
+
+def import_once(pdb, stop_event: threading.Event | None = None) -> int:
+    """Import one idempotent pass for every present registered software."""
+    if stop_event is not None and stop_event.is_set():
+        return 0
+    inserted = 0
+    for software in pdb.get_agent_software():
+        if software.get("agent_kind") in AGENT_PARSERS:
+            inserted += _import_software(pdb, software, stop_event)
     return inserted

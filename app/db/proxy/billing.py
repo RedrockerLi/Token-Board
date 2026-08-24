@@ -137,6 +137,93 @@ def _normalized_charge(conn: sqlite3.Connection, price: float,
     return price * rate, fx_date
 
 
+def _rate_from_table(conn: sqlite3.Connection, table: str, owner_column: str,
+                     owner_id: int, start: str, as_of: str) -> float:
+    """Read a Plan or agent-instance rate using the same effective rules."""
+    row = conn.execute(
+        f"SELECT recurring_price FROM {table} "
+        f"WHERE {owner_column}=? AND ((effective_rule='immediate' AND effective_at<=?) "
+        f"OR (effective_rule='next_period' AND effective_at<=?)) "
+        "ORDER BY effective_at DESC,id DESC LIMIT 1",
+        (owner_id, as_of, start),
+    ).fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def _materialize_period_stream(
+        conn: sqlite3.Connection, *, owner_id: int, anchor: date,
+        currency: str, valid_until: str | None, moment: datetime, now: str,
+        rate_table: str, rate_owner_column: str, charge_table: str,
+        charge_owner_column: str, credential_uuid: str | None,
+        attempted: set[tuple[str, str]],
+        charge_subscription_id: int | None = None) -> int:
+    """Materialize one recurring stream using the shared Plan algorithm."""
+    ended = _parse_stamp(valid_until) if valid_until else None
+    cutoff = min(moment, ended) if ended else moment
+    anchor_day = anchor.day
+    start_dt, end_dt = _period(_as_utc_datetime(anchor), anchor_day)
+    changed = 0
+    while start_dt <= cutoff:
+        start, end = _stamp(start_dt), _stamp(end_dt)
+        as_of = _stamp(min(moment, end_dt))
+        price = _rate_from_table(
+            conn, rate_table, rate_owner_column, owner_id, start, as_of)
+        normalized, fx_date = _normalized_charge(
+            conn, price, currency, start[:10], attempted)
+        has_credential = charge_table == "billing_period_charges"
+        if has_credential:
+            existing = conn.execute(
+                f"SELECT id,finalized_at FROM {charge_table} "
+                f"WHERE {charge_owner_column}=? AND credential_uuid IS ? "
+                "AND period_start=?",
+                (owner_id, credential_uuid, start),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                f"SELECT id,finalized_at FROM {charge_table} "
+                f"WHERE {charge_owner_column}=? AND period_start=?",
+                (owner_id, start),
+            ).fetchone()
+        values = (price, currency, normalized, "CNY", fx_date)
+        if existing is None:
+            if has_credential:
+                conn.execute(
+                    f"INSERT INTO {charge_table}"
+                    f"({charge_owner_column},credential_uuid,period_start,period_end,"
+                    "recurring_charge,currency,normalized_recurring_cost,base_currency,fx_rate_date) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (owner_id, credential_uuid, start, end, *values),
+                )
+            else:
+                conn.execute(
+                    f"INSERT INTO {charge_table}"
+                    f"({charge_owner_column},subscription_id,period_start,period_end,recurring_charge,currency,"
+                    "normalized_recurring_cost,base_currency,fx_rate_date) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (owner_id, charge_subscription_id, start, end, *values),
+                )
+            changed += 1
+        elif existing["finalized_at"] is None:
+            conn.execute(
+                f"UPDATE {charge_table} SET recurring_charge=?,currency=?,"
+                "normalized_recurring_cost=?,base_currency=?,fx_rate_date=? WHERE id=?",
+                (*values, existing["id"]),
+            )
+            changed += 1
+        start_dt, end_dt = _next_period(start_dt, anchor_day)
+    return changed
+
+
+def _finalize_period_stream(conn: sqlite3.Connection, table: str,
+                            now: str) -> int:
+    finalized = conn.execute(
+        f"UPDATE {table} SET finalized_at=? WHERE finalized_at IS NULL "
+        "AND normalized_recurring_cost IS NOT NULL "
+        "AND (currency='CNY' OR fx_rate_date=date(period_start)) "
+        "AND period_end<=?", (now, now)
+    )
+    return max(finalized.rowcount, 0)
+
+
 def materialize_period_charges(db_path: str,
                                at: datetime | None = None) -> int:
     """Create/update current charges idempotently and freeze closed periods."""
@@ -155,7 +242,8 @@ def materialize_period_charges(db_path: str,
             "bc.valid_from,bc.valid_until,a.valid_from account_valid_from,"
             "a.created_at account_created_at "
             "FROM billing_contracts bc JOIN accounts a ON a.id=bc.account_id "
-            "WHERE bc.charge_type='recurring' AND bc.valid_from<=?",
+            "WHERE bc.charge_type='recurring' AND bc.valid_from<=? "
+            "AND a.account_kind='proxy'",
             (now,),
         ).fetchall()
         for contract in contracts:
@@ -171,11 +259,9 @@ def materialize_period_charges(db_path: str,
                 seen_masks: set[tuple[int, str]] = set()
                 for row in conn.execute(
                     "SELECT c.uuid,c.key_masked,c.valid_from,c.created_at "
-                    "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
-                    "WHERE u.account_id=? "
-                    "AND EXISTS(SELECT 1 FROM upstream_secrets s "
-                    "WHERE s.credential_uuid=c.uuid) "
-                    "AND (c.disabled_at IS NULL OR c.disabled_at>?) "
+                        "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
+                        "WHERE u.account_id=? "
+                        "AND (c.disabled_at IS NULL OR c.disabled_at>?) "
                     "AND (c.deleted_at IS NULL OR c.deleted_at>?) "
                     "ORDER BY c.position,c.runtime_id",
                     (contract["account_id"], now, now),
@@ -193,53 +279,19 @@ def materialize_period_charges(db_path: str,
                               contract["account_created_at"]).date())
                 units.append({"credential_uuid": None, "anchor": anchor})
             for unit in units:
-                anchor_day = unit["anchor"].day
-                start_dt, end_dt = _period(
-                    _as_utc_datetime(unit["anchor"]), anchor_day)
-                # Include the current period immediately when its anchor is
-                # the unit's start.  A strict '<' would leave a newly created
-                # key without a charge until the next month.
-                while start_dt <= cutoff:
-                    start, end = _stamp(start_dt), _stamp(end_dt)
-                    as_of = _stamp(min(moment, end_dt))
-                    price = _rate(conn, contract["id"], start, as_of)
-                    normalized, fx_date = _normalized_charge(
-                        conn, price, contract["currency"], start[:10], attempted)
-                    existing = conn.execute(
-                        "SELECT id,finalized_at FROM billing_period_charges "
-                        "WHERE contract_id=? AND credential_uuid IS ? AND period_start=?",
-                        (contract["id"], unit["credential_uuid"], start),
-                    ).fetchone()
-                    values = (price, contract["currency"], normalized,
-                              "CNY", fx_date)
-                    if existing is None:
-                        conn.execute(
-                            "INSERT INTO billing_period_charges"
-                            "(contract_id,credential_uuid,period_start,period_end,"
-                            "recurring_charge,currency,normalized_recurring_cost,"
-                            "base_currency,fx_rate_date) VALUES(?,?,?,?,?,?,?,?,?)",
-                            (contract["id"], unit["credential_uuid"], start, end,
-                             *values),
-                        )
-                        changed += 1
-                    elif existing["finalized_at"] is None:
-                        conn.execute(
-                            "UPDATE billing_period_charges SET recurring_charge=?,"
-                            "currency=?,normalized_recurring_cost=?,base_currency=?,"
-                            "fx_rate_date=? WHERE id=?",
-                            (*values, existing["id"]),
-                        )
-                    start_dt, end_dt = _next_period(start_dt, anchor_day)
+                changed += _materialize_period_stream(
+                    conn, owner_id=contract["id"], anchor=unit["anchor"],
+                    currency=contract["currency"],
+                    valid_until=contract["valid_until"], moment=moment, now=now,
+                    rate_table="billing_rate_events",
+                    rate_owner_column="contract_id",
+                    charge_table="billing_period_charges",
+                    charge_owner_column="contract_id",
+                    credential_uuid=unit["credential_uuid"], attempted=attempted)
         # Only locked rows may be frozen: a USD row whose rate is still a
         # provisional (unlocked) value must keep retrying the historical
         # fetch instead of being finalized on a degraded rate.
-        finalized = conn.execute(
-            "UPDATE billing_period_charges SET finalized_at=? "
-            "WHERE finalized_at IS NULL AND normalized_recurring_cost IS NOT NULL "
-            "AND (currency='CNY' OR fx_rate_date=date(period_start)) "
-            "AND period_end<=?", (now, now)
-        )
-        changed += max(finalized.rowcount, 0)
+        changed += _finalize_period_stream(conn, "billing_period_charges", now)
         conn.commit()
         return changed
     except Exception:
@@ -247,3 +299,56 @@ def materialize_period_charges(db_path: str,
         raise
     finally:
         conn.close()
+
+
+def materialize_agent_subscription_charges(
+        db_path: str, at: datetime | None = None) -> int:
+    """Materialize agent subscription instances with Plan's exact rules."""
+    moment = _utc(at)
+    now = _stamp(moment)
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    changed = 0
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("BEGIN IMMEDIATE")
+        attempted: set[tuple[str, str]] = set()
+        instances = conn.execute(
+            "SELECT i.id,i.subscription_id,i.valid_from,i.valid_until,s.currency "
+            "FROM agent_subscription_instances i "
+            "JOIN agent_subscriptions s ON s.id=i.subscription_id "
+            "WHERE (s.lifecycle_state='active' OR "
+            "(s.lifecycle_state='deleted' AND s.valid_until>=?)) "
+            "AND (i.lifecycle_state='active' OR "
+            "(i.lifecycle_state='deleted' AND i.valid_until>=?)) "
+            "AND i.valid_from<=?",
+            (now, now, now),
+        ).fetchall()
+        for instance in instances:
+            anchor = _parse_iso_date(instance["valid_from"][:10])
+            changed += _materialize_period_stream(
+                conn, owner_id=instance["id"], anchor=anchor,
+                currency=instance["currency"], valid_until=instance["valid_until"],
+                moment=moment, now=now,
+                rate_table="agent_subscription_rate_events",
+                rate_owner_column="instance_id",
+                charge_table="agent_subscription_period_charges",
+                charge_owner_column="instance_id", credential_uuid=None,
+                charge_subscription_id=instance["subscription_id"],
+                attempted=attempted)
+        changed += _finalize_period_stream(
+            conn, "agent_subscription_period_charges", now)
+        conn.commit()
+        return changed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def materialize_all_period_charges(db_path: str,
+                                   at: datetime | None = None) -> int:
+    """Materialize proxy Plans and agent subscription instances."""
+    return (materialize_period_charges(db_path, at)
+            + materialize_agent_subscription_charges(db_path, at))

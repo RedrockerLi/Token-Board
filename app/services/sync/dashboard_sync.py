@@ -54,7 +54,7 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str,
     upload never advances the high-water mark, so nothing is ever lost.
 
     Args:
-        proxy_db_path: Path to proxy.db (WebDAV config + request_log).
+        proxy_db_path: Path to token-board.db (WebDAV config + request_log).
         dash_db_path: Path to dashboard.db (the local archive to replace).
     """
     project_root = Path(dash_db_path).resolve().parent

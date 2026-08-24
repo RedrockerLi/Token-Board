@@ -32,6 +32,28 @@ class DashboardWriterMixin:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    def upsert_account_batch(self, rows: list[dict]) -> int:
+        """Mirror proxy identities, including whether they are agents."""
+        if not rows:
+            return 0
+        conn = self._connect()
+        try:
+            conn.executemany(
+                """INSERT INTO accounts
+                   (account_id,name,lifecycle_state,updated_at,account_kind)
+                   VALUES(:account_id,:name,:lifecycle_state,:updated_at,:account_kind)
+                   ON CONFLICT(account_id) DO UPDATE SET
+                     name=excluded.name,
+                     lifecycle_state=excluded.lifecycle_state,
+                     updated_at=excluded.updated_at,
+                     account_kind=excluded.account_kind""",
+                rows,
+            )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
     def upsert_proxy_data(self, date: str, model: str,
                           account_id: int, prompt_tokens: int,
                           completion_tokens: int, cache_read_tokens: int,
@@ -98,6 +120,80 @@ class DashboardWriterMixin:
             except sqlite3.ProgrammingError:
                 # An earlier SQLite failure may already have closed it.
                 conn = None
+
+    def upsert_agent_software(self, rows: list[dict]) -> int:
+        """Compatibility adapter: agent names live in the generic mirror."""
+        return self.upsert_account_batch([
+            {"account_id": row["software_id"], "name": row["name"],
+             "lifecycle_state": "active",
+             "updated_at": row.get("updated_at"), "account_kind": "agent"}
+            for row in rows
+        ])
+
+    def upsert_agent_batch(self, rows: list[dict]) -> int:
+        """Compatibility adapter: agent usage uses the generic daily grain."""
+        return self.upsert_proxy_batch([
+            {**row, "account_id": row["software_id"]} for row in rows
+        ])
+
+    def reconcile_agent_allocations(
+            self, allocations: dict[tuple[int, str], dict[str, dict]],
+            current_month: str) -> None:
+        """Reconcile current/future actual subscription shares per agent.
+
+        ``equivalent_cost`` is intentionally untouched: it is the agent's
+        theoretical token cost from daily usage.  Only recurring/native and
+        normalized actual fields are changed here.
+        """
+        conn = self._connect()
+        try:
+            # A deleted software has no active allocation, but its already
+            # materialized share for the current month remains payable.  Keep
+            # that row until another software becomes bound to the same
+            # subscription; then the fresh allocation replaces the stale one.
+            conn.execute(
+                "UPDATE monthly_recurring_costs SET recurring_charge=0,"
+                "normalized_recurring_cost=0 "
+                "WHERE month>? AND billing_unit_id LIKE 'agent-subscription:%' "
+                "AND account_id IN (SELECT account_id FROM accounts WHERE account_kind='agent')",
+                (current_month,),
+            )
+            active_units = sorted({unit_id for (_account_id, unit_id) in allocations})
+            if active_units:
+                placeholders = ",".join("?" for _ in active_units)
+                conn.execute(
+                    "UPDATE monthly_recurring_costs SET recurring_charge=0,"
+                    "normalized_recurring_cost=0 "
+                    f"WHERE month=? AND billing_unit_id IN ({placeholders}) "
+                    "AND account_id IN (SELECT account_id FROM accounts WHERE account_kind='agent')",
+                    (current_month, *active_units),
+                )
+            for (account_id, unit_id), periods in allocations.items():
+                for month, values in periods.items():
+                    conn.execute(
+                        "INSERT INTO monthly_recurring_costs"
+                        "(month,account_id,billing_unit_id,recurring_charge,equivalent_cost,"
+                        "currency,normalized_recurring_cost,base_currency,fx_rate_date) "
+                        "VALUES(?,?,?,?,0,?,?,?,?) "
+                        "ON CONFLICT(month,account_id,billing_unit_id) DO UPDATE SET "
+                        "recurring_charge=excluded.recurring_charge,"
+                        "currency=excluded.currency,"
+                        "normalized_recurring_cost=excluded.normalized_recurring_cost,"
+                        "base_currency=excluded.base_currency,fx_rate_date=excluded.fx_rate_date",
+                        (month, account_id, unit_id,
+                         values.get("recurring_charge", 0),
+                         values.get("currency", "CNY"),
+                         values.get("normalized_recurring_cost"),
+                         values.get("base_currency", "CNY"),
+                         values.get("fx_rate_date")),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def purge_zero_agent_usage_rows(self) -> int:
+        """Compatibility no-op after agent archive unification."""
+        return 0
 
     def purge_zero_usage_rows(self) -> int:
         """Delete archive rows that carry no real usage.

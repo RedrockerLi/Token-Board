@@ -3,7 +3,7 @@
 ``account_type`` and ``is_aggregate`` are UI/template compatibility values,
 not storage-table identities.  This adapter is the single place that derives
 them from the normalized V1 records the application actually stores, so the
-four shapes (api / plan / agent / aggregate) are produced from one routine
+three upstream shapes (api / plan / aggregate) are produced from one routine
 instead of being re-derived inside SQL projections in several callers.
 
 The behavioral spec of each type stays in :data:`account_types.ACCOUNT_TYPES`;
@@ -36,7 +36,6 @@ class AccountTemplate:
     account_type: str = "api"
     monthly_price: float = 0.0
     currency: str = "CNY"
-    agent_kind: str = ""
     valid_from: str = ""
     max_concurrency: int = 0
     created_at: str = ""
@@ -57,7 +56,6 @@ class AccountTemplate:
             "account_type": self.account_type,
             "monthly_price": self.monthly_price,
             "currency": self.currency,
-            "agent_kind": self.agent_kind,
             "valid_from": self.valid_from,
             "max_concurrency": self.max_concurrency,
             "created_at": self.created_at,
@@ -69,24 +67,21 @@ class AccountTemplate:
 
 
 class AccountTemplateAdapter:
-    """Map normalized V1 rows onto the api/plan/agent/aggregate templates.
+    """Map normalized V1 rows onto the api/plan/aggregate templates.
 
     Each shape is derived from canonical records only:
 
     - ``api``      — account + metered contract + upstream + route set
     - ``plan``     — account + recurring contract + upstream + route set
-    - ``agent``    — account + recurring contract + importer (no upstream)
     - ``aggregate``— route set + route rules, not a billing entity
 
-    The derivation mirrors the historical SQL ``CASE`` exactly so the HTTP
-    contract is unchanged: recurring + importer → agent, recurring → plan,
-    otherwise api.
+    Agent software is not an upstream account and therefore has no projection
+    in this adapter.
     """
 
-    def routed(self, row: dict, *, recurring: bool, importer_kind: str) -> AccountTemplate:
-        """An account that owns an upstream (api/plan, or agent-with-upstream)."""
-        account_type = "agent" if (recurring and importer_kind) else (
-            "plan" if recurring else "api")
+    def routed(self, row: dict, *, recurring: bool) -> AccountTemplate:
+        """An account that owns an upstream (api or plan)."""
+        account_type = "plan" if recurring else "api"
         return AccountTemplate(
             id=int(row["id"]),
             name=row["name"],
@@ -98,28 +93,11 @@ class AccountTemplateAdapter:
             account_type=account_type,
             monthly_price=float(row.get("recurring_price") or 0),
             currency=row.get("currency") or "CNY",
-            agent_kind=importer_kind or "",
             valid_from=row.get("valid_from") or "",
             max_concurrency=int(row.get("max_concurrency") or 0),
             created_at=row.get("created_at"),
             deleted_at=row.get("deleted_at"),
             key_count=int(row.get("key_count") or 0),
-        )
-
-    def agent_only(self, row: dict, importer_kind: str, recurring_price: float,
-                   currency: str) -> AccountTemplate:
-        """An importer-only account with no upstream/credential."""
-        return AccountTemplate(
-            id=int(row["id"]),
-            name=row["name"],
-            is_aggregate=False,
-            account_type="agent",
-            monthly_price=float(recurring_price or 0),
-            currency=currency or "CNY",
-            agent_kind=importer_kind or "",
-            valid_from=row.get("valid_from") or "",
-            created_at=row.get("created_at"),
-            deleted_at=row.get("deleted_at"),
         )
 
     def aggregate(self, row: dict, entries: list[dict]) -> AccountTemplate:

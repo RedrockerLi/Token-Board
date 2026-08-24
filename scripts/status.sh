@@ -102,7 +102,7 @@ fi
 # ── Database ──
 echo ""
 echo "── 数据库 ──"
-DB="$DATA_DIR/proxy.db"
+DB="$DATA_DIR/token-board.db"
 if [ -f "$DB" ]; then
     SIZE=$(du -h "$DB" | cut -f1)
     REQUESTS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM request_log" 2>/dev/null || echo "?")

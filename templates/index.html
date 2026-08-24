@@ -40,6 +40,22 @@
                 </a>
             </div>
 
+            <!-- Agent Management Section -->
+            <div class="sidebar__nav-section">
+                <div class="sidebar__nav-section-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M5 21c.8-4 3.1-6 7-6s6.2 2 7 6"/><path d="M18 4v4M16 6h4"/></svg>
+                    智能体管理
+                </div>
+                <a class="sidebar__nav-item" href="#/agent/subscriptions">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h4"/></svg>
+                    <span>订阅管理</span>
+                </a>
+                <a class="sidebar__nav-item" href="#/agent/software">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8M8 11h8M8 15h5"/></svg>
+                    <span>软件管理</span>
+                </a>
+            </div>
+
             <!-- Proxy Management Section -->
             <div class="sidebar__nav-section">
                 <div class="sidebar__nav-section-title">
@@ -58,10 +74,10 @@
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7" cy="12" r="3"/><path d="M10 9v2l7 7"/><path d="M21 17l-1.5-1.5"/></svg>
                     <span>本地密钥</span>
                 </a>
-                <a class="sidebar__nav-item" href="#/proxy/pricing">
+                <!-- moved to General Settings: <a class="sidebar__nav-item" href="#/settings/pricing">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 18V6"/></svg>
                     <span>模型定价</span>
-                </a>
+                </a> -->
                 <a class="sidebar__nav-item" href="#/proxy/logs">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
                     <span>请求日志</span>
@@ -70,8 +86,23 @@
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
                     <span>性能监控</span>
                 </a>
-                <a class="sidebar__nav-item" href="#/proxy/settings">
+                <!-- moved to General Settings: <a class="sidebar__nav-item" href="#/settings/general">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                    <span>设置</span>
+                </a> -->
+            </div>
+            <!-- General Settings Section -->
+            <div class="sidebar__nav-section">
+                <div class="sidebar__nav-section-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82V9a1.65 1.65 0 0 0 1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09A1.65 1.65 0 0 0 16 4.6a1.65 1.65 0 0 0 1.82-.33l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 .33-1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15z"/></svg>
+                    通用设置
+                </div>
+                <a class="sidebar__nav-item" href="#/settings/pricing">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 18V6"/></svg>
+                    <span>模型定价</span>
+                </a>
+                <a class="sidebar__nav-item" href="#/settings/general">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82V9a1.65 1.65 0 0 0 1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09A1.65 1.65 0 0 0 16 4.6a1.65 1.65 0 0 0 1.82-.33l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 .33-1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15z"/></svg>
                     <span>设置</span>
                 </a>
             </div>
@@ -194,8 +225,8 @@
         <!-- ═══ Page: Keys ═══ -->
         <div class="page-container" id="page-proxy-keys" style="display:none;"></div>
 
-        <!-- ═══ Page: Pricing ═══ -->
-        <div class="page-container" id="page-proxy-pricing" style="display:none;"></div>
+        <!-- ═══ Page: General Settings / Pricing ═══ -->
+        <div class="page-container" id="page-settings-pricing" style="display:none;"></div>
 
         <!-- ═══ Page: Logs ═══ -->
         <div class="page-container" id="page-proxy-logs" style="display:none;"></div>
@@ -203,8 +234,14 @@
         <!-- ═══ Page: Performance Monitor ═══ -->
         <div class="page-container" id="page-proxy-perf" style="display:none;"></div>
 
-        <!-- ═══ Page: Settings (timeouts + WebDAV sync) ═══ -->
-        <div class="page-container" id="page-proxy-settings" style="display:none;"></div>
+        <!-- ═══ Page: General Settings (timeouts + WebDAV sync) ═══ -->
+        <div class="page-container" id="page-settings-general" style="display:none;"></div>
+
+        <!-- ═══ Agent: Subscriptions ═══ -->
+        <div class="page-container" id="page-agent-subscriptions" style="display:none;"></div>
+
+        <!-- ═══ Agent: Software ═══ -->
+        <div class="page-container" id="page-agent-software" style="display:none;"></div>
 
     </main>
 </div>
@@ -242,6 +279,7 @@
 <script src="/static/js/charts.js"></script>
 <script src="/static/js/dashboard.js"></script>
 <script src="/static/js/proxy_manager.js"></script>
+<script src="/static/js/agent_manager.js"></script>
 <script src="/static/js/app.js"></script>
 </body>
 </html>

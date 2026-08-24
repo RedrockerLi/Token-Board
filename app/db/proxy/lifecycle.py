@@ -41,7 +41,8 @@ class ProxyLifecycleMixin:
             account = conn.execute(
                 "SELECT a.created_at,a.valid_from,bc.charge_type "
                 "FROM accounts a LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
-                "AND bc.valid_until IS NULL WHERE a.id=? AND a.lifecycle_state='active'",
+                "AND bc.valid_until IS NULL WHERE a.id=? AND a.account_kind='proxy' "
+                "AND a.lifecycle_state='active'",
                 (real_id,),
             ).fetchone()
             if account is None:
@@ -144,7 +145,8 @@ class ProxyLifecycleMixin:
             now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             pending = conn.execute(
                 "SELECT id FROM accounts WHERE lifecycle_state='active' "
-                "AND deleted_at IS NOT NULL AND deleted_at<=?", (now,)
+                "AND account_kind='proxy' AND deleted_at IS NOT NULL AND deleted_at<=?",
+                (now,)
             ).fetchall()
             for row in pending:
                 real_id = row["id"]
@@ -232,8 +234,9 @@ class ProxyLifecycleMixin:
                     "SELECT rr.id,rr.model_pattern pattern,u.account_id upstream_account_id,"
                     "a.name upstream_account_name,COALESCE(rr.target_model,rr.model_pattern) upstream_model "
                     "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
-                    "LEFT JOIN accounts a ON a.id=u.account_id WHERE rr.route_set_id=? "
-                    "AND rr.enabled=1 ORDER BY rr.priority,rr.id", (row["id"],)
+                    "JOIN accounts a ON a.id=u.account_id AND a.account_kind='proxy' "
+                    "WHERE rr.route_set_id=? AND rr.enabled=1 "
+                    "ORDER BY rr.priority,rr.id", (row["id"],)
                 ).fetchall()
                 result.append({**dict(row), "entries": [dict(entry) for entry in entries]})
             return result

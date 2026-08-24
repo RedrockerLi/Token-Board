@@ -69,6 +69,7 @@ class ProxyBillingReadMixin:
                 SELECT
                     COALESCE(a.name, 'unknown') AS account_name,
                     r.account_id,
+                    r.agent_software_id,
                     r.model,
                     date(r.requested_at) AS date,
                     COUNT(*) AS requests,
@@ -80,13 +81,13 @@ class ProxyBillingReadMixin:
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
                 WHERE 1=1
-                  AND a.id IS NOT NULL
-                  AND NOT EXISTS(SELECT 1 FROM billing_contracts bc
+                  AND a.account_kind IN ('proxy','agent')
+                  AND (a.account_kind='agent' OR NOT EXISTS(SELECT 1 FROM billing_contracts bc
                                  WHERE bc.account_id=r.account_id
                                  AND bc.charge_type='recurring'
                                  AND bc.valid_from<=r.requested_at
                                  AND (bc.valid_until IS NULL
-                                      OR bc.valid_until>r.requested_at))
+                                      OR bc.valid_until>r.requested_at)))
             """
             params = []
             if account_id:
@@ -115,55 +116,21 @@ class ProxyBillingReadMixin:
         self,
         page: int = 1,
         per_page: int = 50,
-        account_id: int | None = None,
-        model: str | None = None,
-        date_from: str | None = None,
-        date_to: str | None = None,
-        include_attempts: bool = True,
-        before_requested_at: str | None = None,
-        before_id: int | None = None,
     ) -> dict:
-        """Paginated request log with filters."""
+        """Simple paginated request log without filter/query state."""
         page = max(1, int(page))
         per_page = max(1, min(int(per_page), 200))
         conn = self._connect()
         try:
-            # COUNT, page rows and optional attempt details must describe one
-            # WAL read snapshot while the proxy appends logs concurrently.
             conn.execute("BEGIN")
-            where = ["1=1"]
-            params = []
-
-            if account_id:
-                where.append("r.account_id = ?")
-                params.append(account_id)
-            if model:
-                where.append("r.model LIKE ?")
-                params.append(f"%{model}%")
-            if date_from:
-                where.append("r.requested_at >= ?")
-                params.append(_filter_bound(date_from))
-            if date_to:
-                where.append("r.requested_at <= ?")
-                params.append(_filter_bound(date_to, end=True))
-            if before_requested_at is not None and before_id is not None:
-                where.append("(r.requested_at < ? OR "
-                             "(r.requested_at = ? AND r.id < ?))")
-                params.extend([before_requested_at, before_requested_at, before_id])
-
-            where_clause = " AND ".join(where)
-
-            # Total count
-            total = conn.execute(
-                f"SELECT COUNT(*) FROM request_log r WHERE {where_clause}",
-                params,
-            ).fetchone()[0]
-
-            # Paginated data
-            offset = 0 if before_requested_at is not None else (page - 1) * per_page
+            total = conn.execute("SELECT COUNT(*) FROM request_log").fetchone()[0]
+            offset = (page - 1) * per_page
             rows = conn.execute(
-                f"""SELECT
-                    r.id, r.account_id, COALESCE(a.name, 'unknown') AS account_name,
+                """SELECT
+                    r.id, r.account_id, r.agent_software_id,
+                    CASE WHEN a.account_kind='agent' THEN 'agent'
+                         ELSE r.source_kind END AS source_kind,
+                    COALESCE(a.name, 'unknown') AS account_name,
                     r.model, r.prompt_tokens, r.cache_read_tokens,
                     r.completion_tokens,
                     r.total_tokens, r.equivalent_cost AS cost,
@@ -175,44 +142,18 @@ class ProxyBillingReadMixin:
                     r.requested_at
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
-                WHERE {where_clause}
                 ORDER BY r.requested_at DESC, r.id DESC
                 LIMIT ? OFFSET ?""",
-                params + [per_page, offset],
+                (per_page, offset),
             ).fetchall()
 
             items = [dict(r) for r in rows]
-            if items and include_attempts:
-                ids = [item["id"] for item in items]
-                placeholders = ",".join("?" for _ in ids)
-                attempt_rows = conn.execute(
-                    f"""SELECT t.request_log_id, t.attempt_index,
-                               t.account_id, COALESCE(a.name, 'unknown') AS account_name,
-                               t.upstream_key_id, t.status_code, t.duration_ms,
-                               t.ttft_ms, t.is_timeout, t.error,
-                               t.dns_ms,t.connect_ms,t.tls_ms,t.lease_wait_ms,
-                               t.first_byte_ms,t.connection_reused
-                        FROM request_attempts t
-                        LEFT JOIN accounts a ON a.id = t.account_id
-                        WHERE t.request_log_id IN ({placeholders})
-                        ORDER BY t.request_log_id, t.attempt_index""",
-                    ids,
-                ).fetchall()
-                by_request = {request_id: [] for request_id in ids}
-                for attempt in attempt_rows:
-                    by_request[attempt["request_log_id"]].append(dict(attempt))
-                for item in items:
-                    item["attempts"] = by_request[item["id"]]
-
             result = {
                 "total": total,
                 "page": page,
                 "per_page": per_page,
                 "total_pages": max(1, (total + per_page - 1) // per_page),
                 "items": items,
-                "next_cursor": ({"requested_at": items[-1]["requested_at"],
-                                 "id": items[-1]["id"]}
-                                if len(items) == per_page else None),
             }
             conn.commit()
             return result
@@ -229,7 +170,8 @@ class ProxyBillingReadMixin:
                     COALESCE(a.name, 'unknown') AS account_name,
                     COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost,
-                    CASE WHEN EXISTS(SELECT 1 FROM billing_contracts bc
+                    CASE WHEN a.account_kind='agent' THEN 'agent'
+                         WHEN EXISTS(SELECT 1 FROM billing_contracts bc
                          WHERE bc.account_id=r.account_id
                          AND bc.charge_type='recurring')
                          THEN 'plan' ELSE 'api' END AS account_type,
@@ -237,13 +179,13 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
-                WHERE a.id IS NOT NULL
-                  AND NOT EXISTS(SELECT 1 FROM billing_contracts bc
+                WHERE a.account_kind IN ('proxy','agent')
+                  AND (a.account_kind='agent' OR NOT EXISTS(SELECT 1 FROM billing_contracts bc
                                  WHERE bc.account_id=r.account_id
                                  AND bc.charge_type='recurring'
                                  AND bc.valid_from<=r.requested_at
                                  AND (bc.valid_until IS NULL
-                                      OR bc.valid_until>r.requested_at))
+                                      OR bc.valid_until>r.requested_at)))
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at), r.account_id
                 ORDER BY date, r.account_id
@@ -267,7 +209,8 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost
                 FROM request_log r
-                WHERE EXISTS(SELECT 1 FROM accounts a WHERE a.id=r.account_id)
+                JOIN accounts a ON a.id=r.account_id
+                WHERE a.account_kind IN ('proxy','agent')
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at)
                 ORDER BY date

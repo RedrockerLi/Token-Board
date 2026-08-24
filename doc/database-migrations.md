@@ -6,10 +6,10 @@ Proxy 与 Dashboard 共用 Major–Minor 版本协议，C++ 和 Python runner �
 schema/
 ├── proxy/
 │   ├── v0/0-1_initial.sql … 0-19_drop_monthly_price.sql
-│   └── v1/1-0_baseline.sql
+│   └── v1/1-0_baseline.sql … 1-9_stable_agent_instance_identity.sql
 ├── dashboard/
 │   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
-│   └── v1/1-0_baseline.sql
+│   └── v1/1-0_baseline.sql … 1-4_unify_agent_archive.sql
 └── transitions/0-to-1/
     ├── migrate.py
     ├── proxy_transform.sql
@@ -30,7 +30,7 @@ schema/
 
 ## 目录参数
 
-`--schema-dir` 推荐指向 `schema/` 根目录。旧式叶子目录（例如 `schema/proxy/v0`）只用于 V0 测试和 transition；程序会明确选择数据库名与 Major。项目默认路径仍由 `data/proxy.db` / `data/dashboard.db` 推导到仓库 `schema/`。
+`--schema-dir` 推荐指向 `schema/` 根目录。旧式叶子目录（例如 `schema/proxy/v0`）只用于 V0 测试和 transition；程序会明确选择数据库名与 Major。项目默认路径为 `data/token-board.db` / `data/dashboard.db`。
 
 ## 新增兼容迁移
 
@@ -44,7 +44,7 @@ SQL 文件不得包含 `BEGIN`、`COMMIT` 或 `PRAGMA user_version`。迁移必�
 
 ```bash
 python3 schema/transitions/0-to-1/migrate.py \
-  --proxy-db data/proxy.db --dashboard-db data/dashboard.db
+  --proxy-db data/token-board.db --dashboard-db data/dashboard.db
 ```
 
 默认只构建和校验影子库。确认 manifest 与统计后追加 `--apply` 才原子替换。脚本会检查服务已停止、WAL 可 checkpoint、spool 已排空，备份数据库和附属文件，转换时间/身份/路由/计费，执行总量与外键对账，再记录每个替换阶段。

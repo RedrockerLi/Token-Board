@@ -14,12 +14,20 @@ def _config_tables(conn: sqlite3.Connection) -> list[str]:
 
 
 def _config_hash_of_db(db_path: str) -> str:
-    """Hash the V1 cloud-representation for conflict detection."""
+    """Hash the sanitized V1 cloud-representation for conflict detection.
+
+    The local database and the discard snapshot may contain credentials, but
+    those values are deliberately absent from the cloud representation.  A
+    local API-key/password edit must therefore not create a false cloud
+    conflict.
+    """
     conn = sqlite3.connect(db_path)
     h = hashlib.sha256()
     try:
         for table in _config_tables(conn):
             if not _table_exists(conn, table):
+                continue
+            if table == "upstream_secrets":
                 continue
             cols = [d[0] for d in conn.execute(f"SELECT * FROM {table} LIMIT 0").description]
             if table == "upstream_credentials":
@@ -29,7 +37,13 @@ def _config_hash_of_db(db_path: str) -> str:
             if not cols:
                 continue
             h.update(table.encode())
-            rows = conn.execute(f"SELECT {','.join(cols)} FROM {table} ORDER BY 1").fetchall()
+            if table == "sync_settings":
+                rows = conn.execute(
+                    f"SELECT {','.join(cols)} FROM {table} "
+                    "WHERE key NOT IN ('password','agent_migration_v1_6') ORDER BY 1"
+                ).fetchall()
+            else:
+                rows = conn.execute(f"SELECT {','.join(cols)} FROM {table} ORDER BY 1").fetchall()
             for r in rows:
                 h.update(repr(tuple(r)).encode())
     finally:
@@ -72,7 +86,7 @@ def record_remote_metadata(db_path: str, prefix: str, sha256: str,
 
 def _snapshot_path(db_path: str) -> str:
     """Path to the local V1 configuration snapshot used by discard."""
-    return str(Path(db_path).resolve().parent / "config_snapshot.db")
+    return str(Path(db_path).resolve().parent / "token-board_config_snapshot.db")
 
 
 def snapshot_config(db_path: str) -> None:
@@ -81,7 +95,9 @@ def snapshot_config(db_path: str) -> None:
     _safe_copy_db(db_path, snap)
     snapshot = sqlite3.connect(snap)
     try:
-        for table in ("request_attempts", "request_log", "billing_period_charges", "fx_rates"):
+        for table in ("request_attempts", "request_log", "billing_period_charges",
+                      "agent_subscription_period_charges", "agent_software_runtime",
+                      "fx_rates", "sync_state"):
             if _table_exists(snapshot, table):
                 snapshot.execute(f"DELETE FROM {table}")
         snapshot.commit()
@@ -100,7 +116,7 @@ def restore_config_snapshot(db_path: str) -> bool:
     try:
         local.execute("PRAGMA foreign_keys=OFF")
         local.execute("BEGIN IMMEDIATE")
-        for table in V1_CONFIG_TABLES + ["upstream_secrets"]:
+        for table in V1_CONFIG_TABLES:
             if not _table_exists(snapshot, table) or not _table_exists(local, table):
                 continue
             info = [row[1] for row in snapshot.execute(f"PRAGMA table_info({table})")]

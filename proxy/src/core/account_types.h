@@ -24,10 +24,11 @@ inline const std::vector<std::string> &non_routable_types() {
     return v;
 }
 
-/// SQL fragment " AND COALESCE(<col>,'api') NOT IN ('agent') " — the
-/// routability filter applied by every routing statement.  Values are
+/// SQL fragment for proxy-routable account types. Agent software is not stored
+/// as an upstream account anymore. Values are
 /// compile-time constants (never user input), so concatenation is safe.
 inline std::string routable_filter_sql(const char *col) {
+    if (non_routable_types().empty()) return " ";
     std::string sql = " AND COALESCE(";
     sql += col;
     sql += ",'api') NOT IN (";

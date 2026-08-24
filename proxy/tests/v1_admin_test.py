@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normalized V1 admin CRUD and importer pricing smoke test."""
+"""Normalized V1 admin CRUD and independent agent management smoke test."""
 
 from __future__ import annotations
 
@@ -53,6 +53,7 @@ def main() -> None:
     migrations.migrate(str(db_path), str(schema_root), "proxy")
     database = proxy_module.ProxyDatabase.__new__(proxy_module.ProxyDatabase)
     database.db_path = str(db_path)
+    database.schema_dir = str(schema_root)
     pricing_id = database.create_pricing({
         "model_pattern": "gpt-*", "input_price": 2.0,
         "cache_read_price": 1.0, "output_price": 8.0, "currency": "CNY",
@@ -68,15 +69,20 @@ def main() -> None:
         "name": "all-models", "entries": [{"pattern": "*", "account_id": account_id,
                                               "upstream_model": "gpt-test"}],
     })
-    agent_id = database.create_account({
-        "name": "codex", "account_type": "agent", "agent_kind": "codex",
+    subscription_id = database.create_agent_subscription({
+        "name": "codex-subscription", "valid_from": "2026-08-01",
         "currency": "CNY", "monthly_price": 20,
     })
+    software_id = database.create_agent_software({
+        "name": "codex", "agent_kind": "codex",
+        "subscription_ids": [subscription_id],
+    })
     inserted = database.insert_agent_usage(
-        agent_id, "gpt-test", 1_000_000, 100_000, 0, 1_100_000,
+        software_id, "gpt-test", 1_000_000, 100_000, 0, 1_100_000,
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "v1-admin-import")
-    assert database.get_agent_accounts()[0]["id"] == agent_id
+    assert database.get_agent_software()[0]["id"] == software_id
+    assert database.get_agent_subscriptions()[0]["id"] == subscription_id
     assert len(database.get_timeout_config()) == 3
     assert database.update_timeout_config("openai", {
         "streaming_first_byte_timeout": 15,
@@ -113,26 +119,17 @@ def main() -> None:
     assert database.get_pricing()[0]["id"] == pricing_id
     first_materialize = billing_module.materialize_period_charges(str(db_path))
     second_materialize = billing_module.materialize_period_charges(str(db_path))
-    assert first_materialize >= 1
+    first_agent_materialize = billing_module.materialize_agent_subscription_charges(str(db_path))
+    assert first_materialize >= 0
+    assert first_agent_materialize >= 1
     assert second_materialize >= 0
     with sqlite3.connect(db_path) as conn:
         charge = conn.execute(
-            "SELECT contract_id,period_start,count(*) FROM billing_period_charges "
-            "WHERE credential_uuid IS NULL GROUP BY contract_id,period_start"
+            "SELECT subscription_id,period_start,count(*) "
+            "FROM agent_subscription_period_charges "
+            "GROUP BY subscription_id,period_start"
         ).fetchone()
-        assert charge and charge[2] == 1
-        try:
-            conn.execute(
-                "INSERT INTO billing_period_charges"
-                "(contract_id,credential_uuid,period_start,period_end,"
-                "recurring_charge,currency) "
-                "SELECT contract_id,NULL,period_start,period_end,recurring_charge,currency "
-                "FROM billing_period_charges WHERE credential_uuid IS NULL LIMIT 1"
-            )
-        except sqlite3.IntegrityError:
-            pass
-        else:
-            raise AssertionError("account-level recurring charge accepted a duplicate NULL unit")
+        assert charge and charge[0] == subscription_id and charge[2] == 1
     dashboard_path = db_path.parent / "dashboard.db"
     migrations.migrate(str(dashboard_path), str(schema_root), "dashboard")
     dashboard_module.reconcile_accounts(str(dashboard_path), str(db_path))
@@ -143,11 +140,13 @@ def main() -> None:
     dashboard = sqlite3.connect(dashboard_path)
     try:
         archived = dashboard.execute(
-            "SELECT equivalent_cost,billed_usage_cost FROM daily_usage"
+            "SELECT equivalent_cost,billed_usage_cost FROM daily_usage "
+            "WHERE account_id=?", (software_id,)
         ).fetchone()
         assert archived and abs(archived[0] - 2.8) < 1e-9 and archived[1] == 0
         assert dashboard.execute(
-            "SELECT recurring_charge FROM monthly_recurring_costs"
+            "SELECT recurring_charge FROM monthly_recurring_costs "
+            "WHERE account_id=?", (software_id,)
         ).fetchone()[0] == 20
     finally:
         dashboard.close()

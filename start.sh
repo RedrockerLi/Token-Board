@@ -28,7 +28,7 @@ SCRIPT_PATH="$SCRIPT_DIR/$(basename "$SCRIPT_PATH")"
 PROXY_BIN="${TB_PROXY_BIN:-$SCRIPT_DIR/proxy/build/token_proxy}"
 DATA_DIR="${TB_DATA_DIR:-$SCRIPT_DIR/data}"
 SCHEMA_DIR="${TB_SCHEMA_DIR:-$SCRIPT_DIR/schema}"
-PROXY_DB="$DATA_DIR/proxy.db"
+PROXY_DB="$DATA_DIR/token-board.db"
 DASHBOARD_DB="$DATA_DIR/dashboard.db"
 PROXY_PORT="${TB_PROXY_PORT:-8800}"
 DASHBOARD_PORT="${TB_DASHBOARD_PORT:-5000}"
@@ -150,6 +150,37 @@ restore_systemd_unit() {
     fi
 }
 
+write_proxy_service_unit() {
+    mkdir -p "$(dirname "$PROXY_SERVICE_FILE")"
+    PROXY_SERVICE_BACKUP=""
+    if [ -f "$PROXY_SERVICE_FILE" ]; then
+        PROXY_SERVICE_BACKUP="$PROXY_SERVICE_FILE.backup.$$"
+        cp -p "$PROXY_SERVICE_FILE" "$PROXY_SERVICE_BACKUP"
+    fi
+    PROXY_SERVICE_TMP="$PROXY_SERVICE_FILE.tmp.$$"
+    cat > "$PROXY_SERVICE_TMP" <<EOF
+[Unit]
+Description=Token Board API Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1 --port $PROXY_PORT
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+EOF
+    PROXY_SERVICE_TOUCHED=true
+    mv -f "$PROXY_SERVICE_TMP" "$PROXY_SERVICE_FILE"
+    systemctl --user daemon-reload
+    systemctl --user enable "$PROXY_SERVICE_NAME" >/dev/null 2>&1
+}
+
 cleanup() {
     trap - EXIT INT TERM
     if [ -n "${DASHBOARD_PID:-}" ] && kill -0 "$DASHBOARD_PID" 2>/dev/null; then
@@ -251,7 +282,7 @@ wait_for_importer() {
 import json, sys
 payload = json.loads(sys.argv[1])
 tasks = payload.get("background_tasks", {})
-raise SystemExit(0 if tasks.get("codex-importer", {}).get("status") == "ok" else 1)
+raise SystemExit(0 if tasks.get("agent-usage-importer", {}).get("status") == "ok" else 1)
 ' "$payload" 2>/dev/null; then
             return 0
         fi
@@ -430,10 +461,14 @@ PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
     --schema-dir "$SCHEMA_DIR" --timezone "$LEGACY_TIMEZONE"
 echo -e "${GREEN}✓ 本地数据库已准备${NC}"
 
-# A plain dashboard launch does not replace the proxy unit.  If it was running
-# before the safe migration window, resume it now.
-if $HAS_SYSTEMD && $PROXY_SERVICE_WAS_ACTIVE && ! $START_ALL; then
-    systemctl --user start "$PROXY_SERVICE_NAME"
+# Keep an existing proxy unit in sync with the configured database path during
+# a plain dashboard start.
+if $HAS_SYSTEMD && $PROXY_SERVICE_EXISTED && ! $START_ALL; then
+    echo "[proxy] 更新现有 systemd 服务的数据库路径..."
+    write_proxy_service_unit
+    if $PROXY_SERVICE_WAS_ACTIVE; then
+        systemctl --user start "$PROXY_SERVICE_NAME"
+    fi
 fi
 if ! $HAS_SYSTEMD && $FALLBACK_PROXY_WAS_ACTIVE && ! $START_ALL; then
     PROXY_PID="$(launch_fallback_proxy)"
@@ -462,34 +497,7 @@ if $START_ALL; then
 
     if $HAS_SYSTEMD; then
         echo "[proxy] 更新 systemd 服务（开机自启）..."
-        mkdir -p "$(dirname "$PROXY_SERVICE_FILE")"
-        PROXY_SERVICE_BACKUP=""
-        if [ -f "$PROXY_SERVICE_FILE" ]; then
-            PROXY_SERVICE_BACKUP="$PROXY_SERVICE_FILE.backup.$$"
-            cp -p "$PROXY_SERVICE_FILE" "$PROXY_SERVICE_BACKUP"
-        fi
-        PROXY_SERVICE_TMP="$PROXY_SERVICE_FILE.tmp.$$"
-        cat > "$PROXY_SERVICE_TMP" <<EOF
-[Unit]
-Description=Token Board API Proxy
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart="$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1 --port $PROXY_PORT
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-EOF
-        PROXY_SERVICE_TOUCHED=true
-        mv -f "$PROXY_SERVICE_TMP" "$PROXY_SERVICE_FILE"
-        systemctl --user daemon-reload
-        systemctl --user enable "$PROXY_SERVICE_NAME" >/dev/null 2>&1
+        write_proxy_service_unit
         systemctl --user restart "$PROXY_SERVICE_NAME"
         echo -e "${GREEN}✓ 代理已启动并设置开机自启${NC}"
     else

@@ -662,6 +662,9 @@ body {
     padding: 24px;
     width: 90%;
     max-width: 480px;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+    box-sizing: border-box;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
     animation: modalIn 0.2s ease;
 }
@@ -722,6 +725,9 @@ body {
 
 .modal form input,
 .modal form select {
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
     padding: 8px 12px;
     font-size: 13px;
     font-family: var(--font-family);
@@ -741,6 +747,45 @@ body {
 
 .modal form button[type="submit"] {
     margin-top: 4px;
+}
+
+.agent-instance-list,
+.agent-binding-list-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.agent-instance-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+}
+
+.agent-instance-row input,
+.agent-binding-row select {
+    min-width: 0;
+}
+
+.agent-binding-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.agent-binding-row select {
+    flex: 1;
+}
+
+@media (max-width: 560px) {
+    .agent-instance-row {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .agent-instance-row button {
+        justify-self: start;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════

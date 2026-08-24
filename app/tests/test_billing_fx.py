@@ -16,7 +16,10 @@ import sqlite3
 from datetime import datetime, timezone
 from unittest import mock
 
-from app.db.proxy.billing import materialize_period_charges
+from app.db.proxy.billing import (
+    materialize_agent_subscription_charges,
+    materialize_period_charges,
+)
 from app.services import fx
 
 from app.tests.support import AppDatabaseTestCase
@@ -50,15 +53,16 @@ def _rates(conn, period_start: str) -> tuple:
 class BillingFxLockTest(AppDatabaseTestCase):
     def _usd_plan(self, db, valid_from: str = "2026-07-15",
                   price: float = 10.0, account_type: str = "plan",
-                  name: str = "usd-plan") -> int:
+                  name: str = "usd-plan", keys: list[str] | None = None) -> int:
+        keys = keys or ["sk-usd"]
         data = {
             "name": name, "account_type": account_type, "currency": "USD",
             "monthly_price": price, "valid_from": valid_from,
         }
         if account_type == "plan":
             data.update({
-                "base_url": "http://example.test", "upstream_keys": ["sk-usd"],
-                "new_valid_froms": [valid_from],
+                "base_url": "http://example.test", "upstream_keys": keys,
+                "new_valid_froms": [valid_from] * len(keys),
             })
         account_id = db.create_account(data)
         # create_account stamps effective_at with real wall-clock now, which
@@ -96,6 +100,19 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 self.assertEqual(_rates(conn, "2026-07-15T00:00:00Z")[:3],
                                  (10.0, "USD", 70.0))
             get.assert_not_called()  # locked rows never touch the network
+
+    def test_cloud_only_plan_slots_still_accrue_subscription(self) -> None:
+        db = self.proxy_database()
+        self._usd_plan(db, keys=["sk-usd-key-1-abcdef", "sk-usd-key-2-efghij"])
+        self._seed_rate("2026-07-15", 7.0)
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute("DELETE FROM upstream_secrets")
+        materialize_period_charges(str(self.proxy_path), _at())
+        with sqlite3.connect(self.proxy_path) as conn:
+            count = conn.execute(
+                "SELECT count(*) FROM billing_period_charges "
+                "WHERE period_start='2026-07-15T00:00:00Z'").fetchone()[0]
+        self.assertEqual(count, 2)
 
     def test_price_change_reuses_locked_rate(self) -> None:
         db = self.proxy_database()
@@ -217,6 +234,9 @@ class BillingFxLockTest(AppDatabaseTestCase):
             "base_url": "http://example.test", "upstream_keys": ["sk-cny"],
             "new_valid_froms": ["2026-07-15"],
         })
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "UPDATE billing_rate_events SET effective_at='1990-01-01T00:00:00Z'")
         materialize_period_charges(str(self.proxy_path),
                                    datetime(2026, 8, 20, tzinfo=timezone.utc))
         with sqlite3.connect(self.proxy_path) as conn:
@@ -273,18 +293,21 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 self.assertEqual(row[3], "2026-08-01")
                 self.assertIsNone(row[4])
 
-    def test_agent_account_locks_like_plan(self) -> None:
+    def test_agent_subscription_locks_like_plan(self) -> None:
         db = self.proxy_database()
-        self._usd_plan(db, valid_from="2026-07-15", account_type="agent",
-                       name="codex-sub")
+        subscription_id = db.create_agent_subscription({
+            "name": "codex-sub", "valid_from": "2026-07-15",
+            "monthly_price": 10, "currency": "USD",
+        })
         self._seed_rate("2026-07-15", 7.0)
-        materialize_period_charges(str(self.proxy_path), _at())
+        materialize_agent_subscription_charges(str(self.proxy_path), _at())
         with sqlite3.connect(self.proxy_path) as conn:
             row = conn.execute(
-                "SELECT credential_uuid,recurring_charge,currency,"
-                "normalized_recurring_cost,fx_rate_date FROM billing_period_charges"
+                "SELECT subscription_id,recurring_charge,currency,"
+                "normalized_recurring_cost,fx_rate_date "
+                "FROM agent_subscription_period_charges"
             ).fetchone()
-            self.assertIsNone(row[0])  # per-account unit, no credential
+            self.assertEqual(row[0], subscription_id)
             self.assertEqual(row[1:4], (10.0, "USD", 70.0))
             self.assertEqual(row[4], "2026-07-15")
 

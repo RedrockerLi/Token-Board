@@ -8,14 +8,6 @@ def request_logs():
         _proxy_db().get_request_logs(
             page=request.args.get("page", 1, type=int),
             per_page=request.args.get("per_page", 50, type=int),
-            account_id=request.args.get("account_id", type=int),
-            model=request.args.get("model"),
-            date_from=request.args.get("from"),
-            date_to=request.args.get("to"),
-            include_attempts=request.args.get("include_attempts", "1").lower()
-            in {"1", "true", "yes"},
-            before_requested_at=request.args.get("before_requested_at"),
-            before_id=request.args.get("before_id", type=int),
         )
     )
 
