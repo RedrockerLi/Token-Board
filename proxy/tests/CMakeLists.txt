@@ -122,7 +122,6 @@ add_executable(pricing_snapshot_equiv_test
     pricing_snapshot_equiv_test.cpp
     ${CMAKE_SOURCE_DIR}/src/store/db.cpp
     ${CMAKE_SOURCE_DIR}/src/store/database_lifecycle.cpp
-    ${CMAKE_SOURCE_DIR}/src/store/schema_runner.cpp
     ${CMAKE_SOURCE_DIR}/src/store/database_statements.cpp
     ${CMAKE_SOURCE_DIR}/src/store/routing_repository.cpp
     ${CMAKE_SOURCE_DIR}/src/store/pricing_repository.cpp
@@ -144,8 +143,12 @@ target_link_libraries(pricing_snapshot_equiv_test PRIVATE
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
-add_test(NAME pricing_snapshot_equiv COMMAND pricing_snapshot_equiv_test
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME pricing_snapshot_equiv COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/run_prepared_cpp_db_test.py
+    $<TARGET_FILE:pricing_snapshot_equiv_test>
     ${CMAKE_SOURCE_DIR}/../schema
+    ${CMAKE_SOURCE_DIR}/..
 )
 
 # UsageReservation internal_abort contract: a reserved slot marked as having
@@ -155,7 +158,6 @@ add_executable(accounting_abort_test
     accounting_abort_test.cpp
     ${CMAKE_SOURCE_DIR}/src/store/db.cpp
     ${CMAKE_SOURCE_DIR}/src/store/database_lifecycle.cpp
-    ${CMAKE_SOURCE_DIR}/src/store/schema_runner.cpp
     ${CMAKE_SOURCE_DIR}/src/store/database_statements.cpp
     ${CMAKE_SOURCE_DIR}/src/store/routing_repository.cpp
     ${CMAKE_SOURCE_DIR}/src/store/pricing_repository.cpp
@@ -177,13 +179,15 @@ target_link_libraries(accounting_abort_test PRIVATE
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
-add_test(NAME accounting_abort COMMAND accounting_abort_test
+add_test(NAME accounting_abort COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/run_prepared_cpp_db_test.py
+    $<TARGET_FILE:accounting_abort_test>
     ${CMAKE_SOURCE_DIR}/../schema
+    ${CMAKE_SOURCE_DIR}/..
 )
 
 
 # ── Test registration ────────────────────────────────────────────────────
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME format_conversion COMMAND format_conv_test)
 add_test(NAME session_affinity COMMAND session_affinity_test)
 add_test(NAME responses_state_store COMMAND responses_state_store_test)
@@ -210,7 +214,7 @@ add_test(
     NAME pricing_equivalence
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/pricing_equivalence_test.py
-            ${CMAKE_SOURCE_DIR}/../schema/proxy/v0
+            ${CMAKE_SOURCE_DIR}/../schema/token-board/v0
             ${CMAKE_SOURCE_DIR}/..
 )
 add_test(

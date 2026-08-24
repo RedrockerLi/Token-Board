@@ -49,8 +49,8 @@ def main() -> None:
     proxy_module = load("app.db.proxy_db", project / "app/db/proxy_db.py")
     billing_module = load("app.db.proxy.billing", project / "app/db/proxy/billing.py")
 
-    db_path = Path(tempfile.mkdtemp()) / "proxy.db"
-    migrations.migrate(str(db_path), str(schema_root), "proxy")
+    db_path = Path(tempfile.mkdtemp()) / "token-board.db"
+    migrations.migrate(str(db_path), str(schema_root), "token-board")
     database = proxy_module.ProxyDatabase.__new__(proxy_module.ProxyDatabase)
     database.db_path = str(db_path)
     database.schema_dir = str(schema_root)
@@ -103,7 +103,7 @@ def main() -> None:
             "VALUES('USD','CNY','2026-08-09',7.2)")
         assert fx.get_rate(conn, date="2026-08-09") == 7.2
         assert conn.execute("PRAGMA user_version").fetchone()[0] == latest_version(
-            schema_root, "proxy")
+            schema_root, "token-board")
         assert conn.execute("SELECT count(*) FROM upstream_secrets").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM client_keys WHERE key_value=?",
                             (local_key,)).fetchone()[0] == 1

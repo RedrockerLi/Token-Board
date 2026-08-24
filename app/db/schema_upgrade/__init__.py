@@ -6,7 +6,9 @@ minors, runs the V0->V1 transformer and atomically publishes the result.
 """
 
 from .coordinator import (UpgradeResult, ensure_local_databases,
-                          upgrade_downloaded_artifact, upgrade_shadow)
+                          upgrade_downloaded_artifact, upgrade_shadow,
+                          verify_current_database)
 
 __all__ = ["UpgradeResult", "ensure_local_databases",
-           "upgrade_downloaded_artifact", "upgrade_shadow"]
+           "upgrade_downloaded_artifact", "upgrade_shadow",
+           "verify_current_database"]

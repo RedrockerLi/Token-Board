@@ -43,9 +43,9 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        proxy = root / "proxy.db"
+        proxy = root / "token-board.db"
         dashboard = root / "dashboard.db"
-        migrate(str(proxy), str(schema / "proxy/v0"), "proxy")
+        migrate(str(proxy), str(schema / "token-board/v0"), "token-board")
         migrate(str(dashboard), str(schema / "dashboard/v0"), "dashboard")
         with sqlite3.connect(proxy) as conn:
             conn.execute(
@@ -61,7 +61,7 @@ def main() -> None:
         command = [
             sys.executable,
             str(schema / "transitions/0-to-1/migrate.py"),
-            "--proxy-db", str(proxy),
+            "--token-board-db", str(proxy),
             "--dashboard-db", str(dashboard),
             "--schema-dir", str(schema),
             "--timezone", "Asia/Shanghai",
@@ -81,11 +81,11 @@ def main() -> None:
         }
         backed = {Path(item["source"]).name for item in manifest["backups"]
                   if item.get("existed", True)}
-        assert {"proxy.db", "dashboard.db", "config_snapshot.db",
+        assert {"token-board.db", "dashboard.db", "config_snapshot.db",
                 "sync_config.json"} <= backed
-        assert version(proxy) == latest_version(schema, "proxy")
+        assert version(proxy) == latest_version(schema, "token-board")
         assert version(dashboard) == latest_version(schema, "dashboard")
-        assert version(snapshot) == latest_version(schema, "proxy")
+        assert version(snapshot) == latest_version(schema, "token-board")
 
         subprocess.run(
             [sys.executable, str(schema / "transitions/0-to-1/migrate.py"),
@@ -118,7 +118,7 @@ def main() -> None:
              "--resume-manifest", str(pending[0])],
             check=True, capture_output=True, text=True,
         )
-        assert version(proxy) == latest_version(schema, "proxy")
+        assert version(proxy) == latest_version(schema, "token-board")
         assert version(dashboard) == latest_version(schema, "dashboard")
     print("transition apply/rollback recovery passed")
 

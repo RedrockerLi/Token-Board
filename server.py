@@ -5,7 +5,7 @@ Reads cost and amount CSV files from the data/ directory (organised
 by platform) and serves a web dashboard with token usage statistics
 and ECharts visualizations.
 
-Usage: python3 server.py --port <PORT> [--proxy-db <PATH>] [--schema-dir <PATH>]
+Usage: python3 server.py --port <PORT> [--token-board-db <PATH>] [--schema-dir <PATH>]
 """
 
 import argparse
@@ -24,10 +24,10 @@ if __name__ == "__main__":
              "serves API keys, keep it off the network)",
     )
     parser.add_argument(
-        "--proxy-db",
+        "--token-board-db",
         type=str,
         default=None,
-        help="Path to proxy SQLite database (enables proxy management UI)",
+        help="Path to token-board SQLite database (enables proxy management UI)",
     )
     parser.add_argument(
         "--schema-dir",
@@ -47,14 +47,14 @@ if __name__ == "__main__":
     app = None
     try:
         app = create_app(
-            proxy_db_path=args.proxy_db, host=args.host,
+            token_board_db_path=args.token_board_db, host=args.host,
             schema_dir=args.schema_dir,
             start_background_tasks=False,
         )
         app.config["DATA_STORE"].load()
-        if args.proxy_db:
+        if args.token_board_db:
             from app.services.runtime_tasks import start_runtime_tasks
-            start_runtime_tasks(app, app.config["PROXY_DB"], args.proxy_db)
+            start_runtime_tasks(app, app.config["TOKEN_BOARD_DB"], args.token_board_db)
 
         print(f" * Starting on http://{args.host}:{args.port}")
         app.run(host=args.host, port=args.port, debug=False)

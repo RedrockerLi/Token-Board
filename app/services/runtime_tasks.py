@@ -136,7 +136,7 @@ class AgentUsageImportWorker:
                 "agent-usage-importer", "stopped")
 
 
-def start_runtime_tasks(flask_app, proxy_db, proxy_db_path: str) -> None:
+def start_runtime_tasks(flask_app, proxy_db, token_board_db_path: str) -> None:
     """Start server-owned import, FX, lifecycle and billing workers."""
     if flask_app.config.get("BACKGROUND_TASKS_STARTED"):
         return
@@ -164,7 +164,7 @@ def start_runtime_tasks(flask_app, proxy_db, proxy_db_path: str) -> None:
         ("fx-prewarm", 86400, prewarm_fx),
         ("deletion-finalizer", 60, proxy_db.finalize_deferred_deletions),
         ("billing-materializer", 60,
-         lambda: materialize_all_period_charges(proxy_db_path)),
+         lambda: materialize_all_period_charges(token_board_db_path)),
     ]
     for name, interval, action in workers:
         stop = threading.Event()

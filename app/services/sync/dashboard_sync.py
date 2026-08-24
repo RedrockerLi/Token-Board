@@ -42,7 +42,7 @@ def _count_dashboard_rows(db_path: str) -> int:
         conn.close()
 
 
-def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str,
+def _sync_dashboard_once(token_board_db_path: str, dash_db_path: str,
                          schema_dir: str | None = None) -> dict:
     """Sync the dashboard archive via WebDAV — one atomic transaction.
 
@@ -54,14 +54,14 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str,
     upload never advances the high-water mark, so nothing is ever lost.
 
     Args:
-        proxy_db_path: Path to token-board.db (WebDAV config + request_log).
+        token_board_db_path: Path to token-board.db (WebDAV config + request_log).
         dash_db_path: Path to dashboard.db (the local archive to replace).
     """
     project_root = Path(dash_db_path).resolve().parent
     tmp_dir = project_root / "tmp_dash"
     tmp_dir.mkdir(exist_ok=True)
 
-    config = load_sync_config(proxy_db_path)
+    config = load_sync_config(token_board_db_path)
     if not config:
         return {"status": "error", "message": "未配置同步服务器"}
 
@@ -86,28 +86,28 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str,
         local_version = inspect_version(Path(dash_db_path), "dashboard")
         if (remote_version and local_version and
                 remote_version.major not in {0, local_version.major}):
-            _set_sync_state(proxy_db_path, "sync_health", "remote major mismatch")
+            _set_sync_state(token_board_db_path, "sync_health", "remote major mismatch")
             return {"status": "error", "message": "云端 dashboard 跨 Major，已暂停同步"}
         resolved_schema_dir = schema_dir or schema_dir_for(
             dash_db_path, "dashboard")
         upgrade_downloaded_artifact(
             shadow_path, "dashboard", resolved_schema_dir,
-            local_proxy_path=proxy_db_path)
+            local_token_board_path=token_board_db_path)
         upgraded_version = inspect_version(Path(shadow_path), "dashboard")
         if (upgraded_version and local_version and
                 upgraded_version.major == local_version.major and
                 upgraded_version.minor > local_version.minor):
-            _set_sync_state(proxy_db_path, "sync_health",
+            _set_sync_state(token_board_db_path, "sync_health",
                             "remote minor is newer; write paused")
             return {"status": "error", "message": "云端 dashboard minor 更高，已暂停写入"}
 
         # 2b. Reconcile the normalized V1 account mirror before exporting.
         from app.db.dashboard_db import reconcile_accounts
-        reconcile_accounts(shadow_path, proxy_db_path)
+        reconcile_accounts(shadow_path, token_board_db_path)
 
         # 3. Export: request_log rows in (mark, max_id] → shadow, additively.
         from app.db.proxy_db import ProxyDatabase
-        proxy_db = ProxyDatabase(proxy_db_path, schema_dir=resolved_schema_dir)
+        proxy_db = ProxyDatabase(token_board_db_path, schema_dir=resolved_schema_dir)
         mark = proxy_db.get_export_mark()
         max_id = proxy_db.get_max_log_id()
         export_result = proxy_db.export_to_dashboard(shadow_path, mark, max_id)
@@ -134,11 +134,11 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str,
         #    b. replace the local archive with the shadow;
         #    c. clean up archived rows older than 30 days.
         proxy_db.set_export_mark(max_id)
-        _set_sync_state(proxy_db_path, "dashboard_remote_artifact", published.name)
+        _set_sync_state(token_board_db_path, "dashboard_remote_artifact", published.name)
         if published.etag:
-            _set_sync_state(proxy_db_path, "dashboard_remote_etag", published.etag)
+            _set_sync_state(token_board_db_path, "dashboard_remote_etag", published.etag)
         record_remote_metadata(
-            proxy_db_path, "dashboard", raw_sha256,
+            token_board_db_path, "dashboard", raw_sha256,
             remote_version.major if remote_version else None,
             remote_version.minor if remote_version else None)
         _safe_copy_db(shadow_path, dash_db_path)
@@ -151,35 +151,35 @@ def _sync_dashboard_once(proxy_db_path: str, dash_db_path: str,
             f"仪表板：导出 {export_result.get('record_count', 0)} 条，"
             f"上传 {upload_count} 条至云端"
         )
-        _set_sync_state(proxy_db_path, "sync_health", "ok")
+        _set_sync_state(token_board_db_path, "sync_health", "ok")
         return {"status": "ok", "message": msg, "dashboard_records": upload_count}
 
     except WebDAVConflict:
         raise
     except WebDAVError as e:
-        _mark_sync_degraded(proxy_db_path, "dashboard sync", e)
+        _mark_sync_degraded(token_board_db_path, "dashboard sync", e)
         return {"status": "error", "message": f"WebDAV 错误: {e}"}
     except Exception as e:
         log.exception("dashboard sync failed")
-        _mark_sync_degraded(proxy_db_path, "dashboard sync", e)
+        _mark_sync_degraded(token_board_db_path, "dashboard sync", e)
         return {"status": "error", "message": f"同步失败: {type(e).__name__}: {e}"}
     finally:
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def sync_dashboard(proxy_db_path: str, dash_db_path: str,
+def sync_dashboard(token_board_db_path: str, dash_db_path: str,
                    schema_dir: str | None = None) -> dict:
     """Run the cloud archive transaction with bounded conflict retries."""
     last_error = None
     for attempt in range(3):
         try:
             return _sync_dashboard_once(
-                proxy_db_path, dash_db_path, schema_dir=schema_dir)
+                token_board_db_path, dash_db_path, schema_dir=schema_dir)
         except WebDAVConflict as exc:
             last_error = exc
             log.warning("dashboard upload raced with remote update; retry %d/3",
                         attempt + 1)
     if last_error is not None:
-        _mark_sync_degraded(proxy_db_path, "dashboard sync conflict", last_error)
+        _mark_sync_degraded(token_board_db_path, "dashboard sync conflict", last_error)
     return {"status": "conflict", "message": str(last_error)}

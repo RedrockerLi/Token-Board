@@ -24,7 +24,7 @@ def resume_transition(
 ) -> None:
     """Continue any durable manifest stage, including pre-verification stops."""
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    proxy = Path(manifest["proxy_db"])
+    proxy = Path(manifest["token_board_db"])
     dashboard = Path(manifest["dashboard_db"])
     schema_root = Path(manifest["schema_dir"])
     source_tz = ZoneInfo(manifest["timezone"])
@@ -40,8 +40,8 @@ def resume_transition(
         if stage == "started":
             raise RuntimeError("transition manifest has no durable backup stage")
         if stage == "backed_up":
-            if not Path(manifest["shadows"]["proxy"]).exists():
-                prepare_shadow(proxy, "proxy", schema_root)
+            if not Path(manifest["shadows"]["token-board"]).exists():
+                prepare_shadow(proxy, "token-board", schema_root)
             if not Path(manifest["shadows"]["dashboard"]).exists():
                 prepare_shadow(dashboard, "dashboard", schema_root)
             manifest["stage"] = "shadows_created"
@@ -52,7 +52,7 @@ def resume_transition(
             source_version(dashboard, 6)
             spool_records = read_usage_spool(proxy)
             mapping = transform_proxy(
-                proxy, Path(manifest["shadows"]["proxy"]), source_tz,
+                proxy, Path(manifest["shadows"]["token-board"]), source_tz,
                 spool_records)
             transform_dashboard(
                 dashboard, Path(manifest["shadows"]["dashboard"]), proxy, mapping,
@@ -62,8 +62,8 @@ def resume_transition(
             stage = manifest["stage"]
         if stage == "transformed":
             manifest["verification"] = {
-                "proxy": verify_proxy(
-                    proxy, Path(manifest["shadows"]["proxy"]),
+                "token-board": verify_proxy(
+                    proxy, Path(manifest["shadows"]["token-board"]),
                     spool_records=read_usage_spool(proxy)),
                 "dashboard": verify_dashboard(
                     dashboard, Path(manifest["shadows"]["dashboard"])),
@@ -72,10 +72,10 @@ def resume_transition(
             write_manifest(path, manifest)
             stage = manifest["stage"]
         if stage == "verified":
-            atomic_replace(proxy, Path(manifest["shadows"]["proxy"]),
-                           path, manifest, "proxy")
+            atomic_replace(proxy, Path(manifest["shadows"]["token-board"]),
+                           path, manifest, "token_board")
             stage = manifest["stage"]
-        if stage == "proxy_replaced":
+        if stage == "token_board_replaced":
             atomic_replace(dashboard, Path(manifest["shadows"]["dashboard"]),
                            path, manifest, "dashboard")
             stage = manifest["stage"]

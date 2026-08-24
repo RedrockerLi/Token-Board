@@ -4,7 +4,11 @@
 
 ## 生命周期
 
-启动流程:解析 CLI 参数→ 从 `schema/` 选择当前 Major 并跑迁移→ 构建首个 `RoutingSnapshot`→ 组装转发/codec/记账组件→ 建线程池并监听。收到 SIGINT/SIGTERM 后停止刷新、探测和记账线程，排空后退出。
+启动流程:服务脚本先调用 Python `app.db.schema_upgrade` 完成本地数据库升级与
+transition→解析 C++ CLI 参数→打开并校验已准备好的 V1 schema→构建首个
+`RoutingSnapshot`→组装转发/codec/记账组件→建线程池并监听。C++ 不读取
+`schema/` 中的 SQL，也不执行迁移；数据库版本不满足校验时直接退出并提示先
+运行 Python 升级边界。收到 SIGINT/SIGTERM 后停止刷新、探测和记账线程，排空后退出。
 
 后台维护包括:
 

@@ -1,6 +1,6 @@
--- 0001: Token Board proxy.db 初始 schema（基线迁移）
+-- 0001: Token Board token-board.db 初始 schema（基线迁移）
 --
--- 单一 DDL 来源：proxy.db 的全部表/索引/触发器都由此文件（及其后的 NNNN_*.sql）
+-- 单一 DDL 来源：token-board.db 的全部表/索引/触发器都由此文件（及其后的 NNNN_*.sql）
 -- 定义，C++ 代理与 Python/Flask 共用同一份。历史库（user_version=0）首次应用时：
 --   * 表/索引用 IF NOT EXISTS → 对已有库是无操作；
 --   * 触发器用 DROP+CREATE → 把计价触发器刷成当前定义；

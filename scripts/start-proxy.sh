@@ -11,8 +11,11 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PROXY_BIN="$SCRIPT_DIR/proxy/build/token_proxy"
-PROXY_DB="$SCRIPT_DIR/data/token-board.db"
+TOKEN_BOARD_DB="$SCRIPT_DIR/data/token-board.db"
+SCHEMA_DIR="${TB_SCHEMA_DIR:-$SCRIPT_DIR/schema}"
+DASHBOARD_DB="$SCRIPT_DIR/data/dashboard.db"
 PROXY_PORT=8800
+PYTHON_BIN="${TB_PYTHON_BIN:-python3}"
 
 SERVICE_NAME="token-proxy"
 SERVICE_FILE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
@@ -32,9 +35,19 @@ fi
 
 # ── Functions ──
 
+ensure_schema() {
+    mkdir -p "$(dirname "$TOKEN_BOARD_DB")"
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON_BIN" -m app.db.schema_upgrade.cli \
+        --token-board-db "$TOKEN_BOARD_DB" --dashboard-db "$DASHBOARD_DB" \
+        --schema-dir "$SCHEMA_DIR" --timezone "${TB_LEGACY_TIMEZONE:-Asia/Shanghai}"
+}
+
 do_install() {
     echo -e "${CYAN}安装 Token Board 代理为 systemd 用户服务...${NC}"
     echo ""
+
+    ensure_schema
 
     mkdir -p "$(dirname "$SERVICE_FILE")"
 
@@ -46,7 +59,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PROXY_BIN --db $PROXY_DB --schema-dir $SCRIPT_DIR/schema --host 127.0.0.1 --port $PROXY_PORT
+WorkingDirectory=$SCRIPT_DIR
+Environment=PYTHONPATH=$SCRIPT_DIR
+ExecStartPre=$PYTHON_BIN -m app.db.schema_upgrade.cli --token-board-db $TOKEN_BOARD_DB --dashboard-db $DASHBOARD_DB --schema-dir $SCHEMA_DIR --timezone ${TB_LEGACY_TIMEZONE:-Asia/Shanghai}
+ExecStart=$PROXY_BIN --db $TOKEN_BOARD_DB --schema-dir $SCHEMA_DIR --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -82,15 +98,17 @@ do_uninstall() {
 }
 
 do_start() {
+    ensure_schema
     echo -e "${CYAN}启动代理 (前台)...${NC}"
     echo "  端口: $PROXY_PORT"
-    echo "  数据库: $PROXY_DB"
+    echo "  数据库: $TOKEN_BOARD_DB"
     echo "  按 Ctrl+C 停止"
     echo ""
-    exec "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema" --host 127.0.0.1 --port "$PROXY_PORT"
+    exec "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1 --port "$PROXY_PORT"
 }
 
 do_daemon() {
+    ensure_schema
     # Kill existing proxy
     EXISTING=$(pgrep -f "token_proxy" 2>/dev/null || true)
     if [ -n "$EXISTING" ]; then
@@ -101,7 +119,7 @@ do_daemon() {
     fi
 
     echo -e "${CYAN}启动代理 (后台)...${NC}"
-    "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCRIPT_DIR/schema" --port "$PROXY_PORT" &
+    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --port "$PROXY_PORT" &
     PROXY_PID=$!
     echo -e "${GREEN}✓ 代理已启动 (PID: $PROXY_PID)${NC}"
     echo "  代理地址: http://localhost:$PROXY_PORT/v1"

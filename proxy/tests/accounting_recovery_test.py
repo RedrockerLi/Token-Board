@@ -64,8 +64,8 @@ def main() -> None:
     upstream_thread.start()
     try:
         with tempfile.TemporaryDirectory() as temp:
-            db = Path(temp) / "proxy.db"
-            migrate(str(db), str(schema), "proxy")
+            db = Path(temp) / "token-board.db"
+            migrate(str(db), str(schema), "token-board")
             conn = sqlite3.connect(db)
             try:
                 account, upstream_id, _ = add_upstream(

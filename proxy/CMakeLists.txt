@@ -35,7 +35,7 @@ set(NET_SOURCES
     src/net/upstream_client.cpp src/net/upstream_forward.cpp)
 
 set(STORE_SOURCES
-    src/store/db.cpp src/store/database_lifecycle.cpp src/store/schema_runner.cpp
+    src/store/db.cpp src/store/database_lifecycle.cpp
     src/store/database_statements.cpp src/store/routing_repository.cpp
     src/store/pricing_repository.cpp src/store/durable_spool.cpp
     src/store/usage_writer.cpp src/store/database_catalog.cpp

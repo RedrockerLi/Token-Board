@@ -6,23 +6,13 @@ from app.db.dashboard.common import *  # noqa: F401,F403
 class DashboardWriterMixin:
     def __init__(self, db_path: str, schema_dir: str | None = None):
         self.db_path = db_path
-        # Schema is owned by versioned migrations (schema/dashboard/vN/*.sql);
-        # apply once at construction. Fails fast (caller aborts) on error.
         # schema_dir may be passed explicitly when db_path is a shadow/temp
-        # copy outside the standard data/ layout (schema_dir_for would mis-derive).
-        from app.db.migrations import MigrationError, migrate, schema_dir_for
-        migrate(self.db_path, schema_dir or schema_dir_for(self.db_path, "dashboard"),
-                "dashboard")
-        conn = sqlite3.connect(self.db_path)
-        try:
-            row = conn.execute(
-                "SELECT major FROM schema_version WHERE id=1").fetchone()
-        finally:
-            conn.close()
-        if not row or int(row[0]) != 1:
-            raise MigrationError(
-                "DashboardDatabase only accepts V1; upgrade the database before "
-                "opening the application")
+        # copy outside the standard data/ layout.  This guard is read-only;
+        # Python startup is the only place allowed to mutate schema state.
+        from app.db.migrations import schema_dir_for
+        from app.db.schema_upgrade import verify_current_database
+        self.schema_dir = schema_dir or schema_dir_for(self.db_path, "dashboard")
+        verify_current_database(self.db_path, "dashboard", self.schema_dir)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=5)

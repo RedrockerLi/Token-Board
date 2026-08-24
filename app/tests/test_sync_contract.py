@@ -53,8 +53,8 @@ class SyncContractTest(unittest.TestCase):
             shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
             local = str(Path(temp) / "local.db")
             remote = str(Path(temp) / "remote.db")
-            migrate(local, str(Path(temp) / "schema"), "proxy")
-            migrate(remote, str(Path(temp) / "schema"), "proxy")
+            migrate(local, str(Path(temp) / "schema"), "token-board")
+            migrate(remote, str(Path(temp) / "schema"), "token-board")
             self._seed_credential(local, "credential-local",
                                   "sk-local-secret")
             # Remote does not know this credential at all.
@@ -125,7 +125,7 @@ class SyncContractTest(unittest.TestCase):
                    side_effect=[WebDAVConflict("race-1"),
                                 WebDAVConflict("race-2"),
                                 {"status": "ok"}]) as once:
-            result = sync_dashboard("proxy.db", "dashboard.db")
+            result = sync_dashboard("token-board.db", "dashboard.db")
         self.assertEqual(result, {"status": "ok"})
         self.assertEqual(once.call_count, 3)
 
@@ -134,7 +134,7 @@ class SyncContractTest(unittest.TestCase):
                    side_effect=[WebDAVConflict("race-1"),
                                 WebDAVConflict("race-2"),
                                 {"status": "ok"}]) as once:
-            result = sync_config_upload("proxy.db")
+            result = sync_config_upload("token-board.db")
         self.assertEqual(result, {"status": "ok"})
         self.assertEqual(once.call_count, 3)
 
@@ -144,9 +144,9 @@ class SyncContractTest(unittest.TestCase):
         temp = tempfile.mkdtemp()
         shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
         (Path(temp) / "data").mkdir()
-        proxy = str(Path(temp) / "data" / "proxy.db")
+        proxy = str(Path(temp) / "data" / "token-board.db")
         dash = str(Path(temp) / "data" / "dashboard.db")
-        migrate(proxy, str(Path(temp) / "schema"), "proxy")
+        migrate(proxy, str(Path(temp) / "schema"), "token-board")
         migrate(dash, str(Path(temp) / "schema"), "dashboard")
         save_sync_config(proxy, SyncConfig(
             "https://dav.example/remote.php/dav/files/u",
@@ -178,11 +178,11 @@ class SyncContractTest(unittest.TestCase):
             rows = dict(conn.execute(
                 "SELECT key, value FROM sync_state").fetchall())
             conn.close()
-            self.assertIn("proxy_remote_sha256", rows)
-            self.assertEqual(len(rows["proxy_remote_sha256"]), 64)
-            self.assertEqual(rows["proxy_remote_major"], "1")
-            version = inspect_version(Path(proxy), "proxy")
-            self.assertEqual(rows["proxy_remote_minor"], str(version.minor))
+            self.assertIn("token-board_remote_sha256", rows)
+            self.assertEqual(len(rows["token-board_remote_sha256"]), 64)
+            self.assertEqual(rows["token-board_remote_major"], "1")
+            version = inspect_version(Path(proxy), "token-board")
+            self.assertEqual(rows["token-board_remote_minor"], str(version.minor))
         finally:
             patch.stopall()
             shutil.rmtree(temp, ignore_errors=True)

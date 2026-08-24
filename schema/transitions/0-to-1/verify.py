@@ -131,8 +131,8 @@ def verify_dashboard(v0_path: str, v1_path: str, expected_version: int | None = 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--proxy-v0", required=True)
-    parser.add_argument("--proxy-v1", required=True)
+    parser.add_argument("--token-board-v0", required=True)
+    parser.add_argument("--token-board-v1", required=True)
     parser.add_argument("--dashboard-v0", required=True)
     parser.add_argument("--dashboard-v1", required=True)
     parser.add_argument("--schema-dir", default=str(Path(__file__).resolve().parents[2] / "schema"))
@@ -141,8 +141,8 @@ def main() -> None:
         if not Path(path).is_file():
             parser.error(f"database not found: {path}")
     root = Path(args.schema_dir).resolve()
-    print({"proxy": verify_proxy(args.proxy_v0, args.proxy_v1,
-                                  latest_user_version(root, "proxy")),
+    print({"token-board": verify_proxy(args.token_board_v0, args.token_board_v1,
+                                  latest_user_version(root, "token-board")),
            "dashboard": verify_dashboard(args.dashboard_v0, args.dashboard_v1,
                                            latest_user_version(root, "dashboard"))})
 

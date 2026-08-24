@@ -52,8 +52,8 @@ def main() -> None:
     import app.services.sync as sync
     directory = Path(tempfile.mkdtemp())
     local, remote = directory / "local.db", directory / "remote.db"
-    migrations.migrate(str(local), str(schema_root), "proxy")
-    migrations.migrate(str(remote), str(schema_root), "proxy")
+    migrations.migrate(str(local), str(schema_root), "token-board")
+    migrations.migrate(str(remote), str(schema_root), "token-board")
     seed(local, "local", 77, "sk-local-secret")
     seed(remote, "remote", 1, None)
     sync._merge_v1_config(str(remote), str(local))

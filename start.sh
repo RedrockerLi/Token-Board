@@ -28,7 +28,7 @@ SCRIPT_PATH="$SCRIPT_DIR/$(basename "$SCRIPT_PATH")"
 PROXY_BIN="${TB_PROXY_BIN:-$SCRIPT_DIR/proxy/build/token_proxy}"
 DATA_DIR="${TB_DATA_DIR:-$SCRIPT_DIR/data}"
 SCHEMA_DIR="${TB_SCHEMA_DIR:-$SCRIPT_DIR/schema}"
-PROXY_DB="$DATA_DIR/token-board.db"
+TOKEN_BOARD_DB="$DATA_DIR/token-board.db"
 DASHBOARD_DB="$DATA_DIR/dashboard.db"
 PROXY_PORT="${TB_PROXY_PORT:-8800}"
 DASHBOARD_PORT="${TB_DASHBOARD_PORT:-5000}"
@@ -166,7 +166,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart="$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1 --port $PROXY_PORT
+WorkingDirectory=$SCRIPT_DIR
+Environment="PYTHONPATH=$SCRIPT_DIR"
+ExecStartPre="$PYTHON_BIN" -m app.db.schema_upgrade.cli --token-board-db "$TOKEN_BOARD_DB" --dashboard-db "$DASHBOARD_DB" --schema-dir "$SCHEMA_DIR" --timezone "$LEGACY_TIMEZONE"
+ExecStart="$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -351,7 +354,7 @@ stop_managed_pid() {
 
 launch_fallback_dashboard() {
     "$PYTHON_BIN" "$SCRIPT_DIR/server.py" --port "$DASHBOARD_PORT" \
-        --proxy-db "$PROXY_DB" --schema-dir "$SCHEMA_DIR" \
+        --token-board-db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" \
         --host 127.0.0.1 >/dev/null 2>&1 &
     local pid=$!
     printf '%s\n' "$pid" > "$DASHBOARD_PID_FILE"
@@ -359,7 +362,7 @@ launch_fallback_dashboard() {
 }
 
 launch_fallback_proxy() {
-    "$PROXY_BIN" --db "$PROXY_DB" --schema-dir "$SCHEMA_DIR" \
+    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" \
         --host 127.0.0.1 --port "$PROXY_PORT" >/dev/null 2>&1 &
     local pid=$!
     printf '%s\n' "$pid" > "$PROXY_PID_FILE"
@@ -457,7 +460,7 @@ fi
 echo "[schema] 检查并自动升级本地数据库..."
 PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON_BIN" -m app.db.schema_upgrade.cli \
-    --proxy-db "$PROXY_DB" --dashboard-db "$DASHBOARD_DB" \
+    --token-board-db "$TOKEN_BOARD_DB" --dashboard-db "$DASHBOARD_DB" \
     --schema-dir "$SCHEMA_DIR" --timezone "$LEGACY_TIMEZONE"
 echo -e "${GREEN}✓ 本地数据库已准备${NC}"
 
@@ -580,7 +583,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$SCRIPT_DIR
 Environment="PYTHONPATH=$SCRIPT_DIR"
-ExecStart="$PYTHON_BIN" "$SCRIPT_DIR/server.py" --port $DASHBOARD_PORT --proxy-db "$PROXY_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1
+ExecStartPre="$PYTHON_BIN" -m app.db.schema_upgrade.cli --token-board-db "$TOKEN_BOARD_DB" --dashboard-db "$DASHBOARD_DB" --schema-dir "$SCHEMA_DIR" --timezone "$LEGACY_TIMEZONE"
+ExecStart="$PYTHON_BIN" "$SCRIPT_DIR/server.py" --port $DASHBOARD_PORT --token-board-db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15

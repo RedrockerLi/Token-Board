@@ -14,9 +14,9 @@ Dashboard V1 统一使用 `accounts`、`daily_usage` 和 `monthly_recurring_cost
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V0 proxy.db（历史参考）
+## V0 token-board.db（历史参考）
 
-代理的运行库,表定义在 `schema/proxy/0001_*.sql`(0001–0019),`user_version` 当前为 19。
+代理的运行库，表定义在 `schema/token-board/v0/0-*.sql`（0-1–0-19），`user_version` 当前为 19。
 
 ### upstream_accounts — 上游账户
 
@@ -158,4 +158,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 - 两进程都设 WAL、`busy_timeout=5000`、`foreign_keys=ON`。
 - C++ 用预编译语句 + 内部 mutex 串行写;Python 每方法独立连接(SQLite 支持多读单写)。
-- 迁移执行前对 `<库>.migrate.lock` 加 flock,C++ 与 Python 用同一把锁,见 [database-migrations.md](database-migrations.md)。
+- 数据库升级只在 Python `app.db.schema_upgrade` 边界执行：本地双库先获取
+  `schema-upgrade.lock`，单库 SQL 再使用 `<库>.migrate.lock`。C++ 不参与迁移，
+  只校验已准备好的 Proxy V1 schema；详见
+  [database-migrations.md](database-migrations.md)。

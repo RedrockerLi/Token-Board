@@ -38,7 +38,7 @@
 
 ## 代理管理 API
 
-前缀 `/api/proxy`,仅在 `server.py --proxy-db` 传入 `data/token-board.db` 时启用。普通配置和本地代理密钥等在**退出配置页面**时作为一次事务上传云端；上游 API Key 明文与 WebDAV 密码不上传(见 [sync.md](sync.md))。
+前缀 `/api/proxy`,仅在 `server.py --token-board-db` 传入 `data/token-board.db` 时启用。普通配置和本地代理密钥等在**退出配置页面**时作为一次事务上传云端；上游 API Key 明文与 WebDAV 密码不上传(见 [sync.md](sync.md))。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
@@ -148,7 +148,7 @@
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--db` | `data/token-board.db` | SQLite 数据库路径 |
-| `--schema-dir` | 由 `--db` 推导到仓库 `schema/` | Major–Minor schema 根目录；旧叶子路径仅兼容 |
+| `--schema-dir` | — | 已废弃，仅兼容旧启动器；C++ 不读取 SQL、不执行升级。请先通过 Python `app.db.schema_upgrade.cli` 准备数据库 |
 | `--port` | `8800` | 监听端口 |
 | `--host` | `127.0.0.1` | 绑定地址(默认仅本机可访问) |
 | `--log-level` | `info` | 日志级别(debug/info/warn/error) |
@@ -160,4 +160,4 @@
 |------|------|------|
 | `--port` | 是 | 监听端口 |
 | `--host` | 否 | 绑定地址,默认 `127.0.0.1`(仅本机可访问) |
-| `--proxy-db` | 否 | 传入 `data/token-board.db` 时启用代理管理功能与云端配置拉取 |
+| `--token-board-db` | 否 | 传入 `data/token-board.db` 时启用代理管理功能与云端配置拉取 |

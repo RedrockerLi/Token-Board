@@ -11,6 +11,7 @@ from app.db.proxy.billing_ledger import ProxyBillingLedgerMixin
 from app.db.proxy.export import ProxyExportMixin
 from app.db.proxy.performance import ProxyPerformanceMixin
 from app.db.proxy.agents import ProxyAgentMixin
+from app.db.migrations import TOKEN_BOARD_DATABASE_NAME
 
 
 class ProxyDatabase(
@@ -26,21 +27,13 @@ class ProxyDatabase(
         ProxyAgentMixin):
     def __init__(self, db_path: str, schema_dir: str | None = None):
         self.db_path = db_path
-        # Schema is owned by versioned migrations (schema/proxy/vN/*.sql); apply
-        # once at construction. Fails fast (create_app aborts) on error.
-        from app.db.migrations import MigrationError, migrate, schema_dir_for
-        self.schema_dir = schema_dir or schema_dir_for(self.db_path, "proxy")
-        migrate(self.db_path, self.schema_dir, "proxy")
-        conn = sqlite3.connect(self.db_path)
-        try:
-            row = conn.execute(
-                "SELECT major FROM schema_version WHERE id=1").fetchone()
-        finally:
-            conn.close()
-        if not row or int(row[0]) != 1:
-            raise MigrationError(
-                "ProxyDatabase only accepts V1; run the offline/local schema "
-                "upgrade coordinator before opening the application")
+        # The Python startup boundary owns all schema changes.  A runtime
+        # façade is deliberately verify-only so an arbitrary request-path
+        # construction cannot partially upgrade a database.
+        from app.db.migrations import schema_dir_for
+        from app.db.schema_upgrade import verify_current_database
+        self.schema_dir = schema_dir or schema_dir_for(self.db_path, TOKEN_BOARD_DATABASE_NAME)
+        verify_current_database(self.db_path, TOKEN_BOARD_DATABASE_NAME, self.schema_dir)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)

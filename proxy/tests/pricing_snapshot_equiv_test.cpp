@@ -7,7 +7,7 @@
 // C++ boundary ensures Database::open() and the production schema agree while
 // leaving one authoritative implementation of the billing formula.
 //
-// Usage: pricing_sql_authority_test <schema_dir>
+// Usage: pricing_sql_authority_test <schema_dir> <prepared_db>
 
 #include "store/db.h"
 
@@ -77,12 +77,9 @@ bool exec_sql(sqlite3 *db, const std::string &sql) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    assert(argc >= 2);
+    assert(argc >= 3);
     const std::string schema_dir = argv[1];
-
-    char dir_tpl[] = "/tmp/pricing-snapshot-XXXXXX";
-    assert(mkdtemp(dir_tpl));
-    const std::string db_path = std::string(dir_tpl) + "/pricing.db";
+    const std::string db_path = argv[2];
 
     Database db;
     assert(db.open(db_path, schema_dir));
@@ -172,8 +169,6 @@ int main(int argc, char **argv) {
     }
 
     sqlite3_close(seed);
-    unlink(db_path.c_str());
-    rmdir(dir_tpl);
     printf("OK: V1 SQLite pricing authority across %d pricing cases\n", n);
     return 0;
 }

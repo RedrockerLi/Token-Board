@@ -396,7 +396,7 @@ def transform_dashboard(source: Path, shadow: Path, proxy_source: Path | None,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--proxy-db", default="data/token-board.db")
+    parser.add_argument("--token-board-db", default="data/token-board.db")
     parser.add_argument("--dashboard-db", default="data/dashboard.db")
     parser.add_argument("--schema-dir", default=str(REPO / "schema"))
     parser.add_argument("--timezone", default="Asia/Shanghai")
@@ -409,7 +409,7 @@ def main() -> None:
     parser.add_argument(
         "--inject-failure",
         choices=("backed_up", "shadows_created", "transformed", "verified",
-                 "proxy_replaced", "dashboard_replaced", "snapshot_rebuilt"),
+                 "token_board_replaced", "dashboard_replaced", "snapshot_rebuilt"),
         help="test-only interruption after the named manifest stage")
     args = parser.parse_args()
     if args.apply and args.confirm_timezone != args.timezone:
@@ -423,7 +423,7 @@ def main() -> None:
     if args.rollback_manifest:
         rollback_manifest(Path(args.rollback_manifest).resolve())
         return
-    proxy = Path(args.proxy_db).resolve()
+    proxy = Path(args.token_board_db).resolve()
     dashboard = Path(args.dashboard_db).resolve()
     schema_root = Path(args.schema_dir).resolve()
     if not proxy.is_file() or not dashboard.is_file():
@@ -440,9 +440,9 @@ def main() -> None:
     manifest = {"transition": "0-to-1", "stage": "started",
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "timezone": args.timezone, "apply": args.apply,
-                "proxy_db": str(proxy), "dashboard_db": str(dashboard),
+                "token_board_db": str(proxy), "dashboard_db": str(dashboard),
                 "schema_dir": str(schema_root),
-                "shadows": {"proxy": str(shadow_path(proxy)),
+                "shadows": {"token-board": str(shadow_path(proxy)),
                             "dashboard": str(shadow_path(dashboard))},
                 "remote_v0_policy": "retain-read-only; publish V1 only after all nodes transition"}
 
@@ -471,7 +471,7 @@ def main() -> None:
         manifest["backups"] = backup_files(proxy, dashboard, backup_dir)
         manifest["stage"] = "backed_up"; write_manifest(manifest_path, manifest)
         inject("backed_up")
-        proxy_shadow = prepare_shadow(proxy, "proxy", schema_root)
+        proxy_shadow = prepare_shadow(proxy, "token-board", schema_root)
         dashboard_shadow = prepare_shadow(dashboard, "dashboard", schema_root)
         manifest["stage"] = "shadows_created"; write_manifest(manifest_path, manifest)
         inject("shadows_created")
@@ -481,7 +481,7 @@ def main() -> None:
         manifest["stage"] = "transformed"; write_manifest(manifest_path, manifest)
         inject("transformed")
         manifest["verification"] = {
-            "proxy": verify_proxy(str(proxy), str(proxy_shadow),
+            "token-board": verify_proxy(str(proxy), str(proxy_shadow),
                                    spool_records=spool_records),
             "dashboard": verify_dashboard(str(dashboard), str(dashboard_shadow)),
         }
@@ -489,8 +489,8 @@ def main() -> None:
         inject("verified")
 
         if args.apply:
-            atomic_replace(proxy, proxy_shadow, manifest_path, manifest, "proxy")
-            inject("proxy_replaced")
+            atomic_replace(proxy, proxy_shadow, manifest_path, manifest, "token_board")
+            inject("token_board_replaced")
             atomic_replace(dashboard, dashboard_shadow, manifest_path, manifest, "dashboard")
             inject("dashboard_replaced")
             manifest["config_snapshot"] = str(rebuild_config_snapshot(proxy))

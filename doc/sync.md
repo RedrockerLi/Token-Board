@@ -45,7 +45,9 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 
 配置同步采用云端权威镜像与冲突保护：
 
-1. 看板启动时列出 `token-board_config_*.db`，拉取最新文件，升级 shadow schema 后合入本机配置。
+1. 看板启动时列出 `token-board_config_*.db`，拉取最新文件，通过
+   `app.db.schema_upgrade.upgrade_downloaded_artifact` 在 shadow 中完成 SQL 和
+   transition，再合入本机配置。
 2. 管理页修改立即写入本机，代理可以立即使用；离开配置页时前端调用 `/api/proxy/sync/config/upload`。
 3. 上传前重新读取云端最新文件并比较 `config_hash`。如果其他机器已经修改，拒绝覆盖并提示重新拉取。
 4. 上传副本保留普通配置和本地代理客户端密钥，删除运行时数据、导入游标、上游 API Key 明文与 WebDAV 密码。成功后记录 hash 和 `token-board_config_snapshot.db` 本地快照。
@@ -58,7 +60,8 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 `POST /api/proxy/export` 执行以下完整事务：
 
 1. 拉取最新 `dashboard_sync_*.db` 到 shadow；首次同步则以本地 dashboard 为种子。
-2. 对 shadow 应用 dashboard 迁移，并同步账户/软件名称镜像。
+2. 通过同一个 Python schema-upgrade 边界对 shadow 应用 dashboard SQL/transition，
+   再同步账户/软件名称镜像。
 3. 取 `request_log` 的 `(last_exported_log_id, max_id]`，按日×账户/软件×模型聚合到 shadow；同时物化并归档 Plan 与智能体订阅费用。
 4. 上传 shadow 为新的 `dashboard_sync_*.db`。
 5. 只有上传成功后才推进 `sync_state.last_exported_log_id`、替换本地 dashboard，并清理已归档且超过 30 天的明细。

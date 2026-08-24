@@ -31,7 +31,10 @@ public:
     Database(Database &&) = delete;
     Database &operator=(Database &&) = delete;
 
-    bool open(const std::string &path, const std::string &schema_dir);
+    // schema_dir is retained as a source-compatible, deprecated argument for
+    // launchers from the previous release.  The C++ runtime never reads SQL
+    // or changes schema state; Python must prepare the database first.
+    bool open(const std::string &path, const std::string &schema_dir = {});
     int schema_major() const noexcept { return schema_major_; }
     int schema_minor() const noexcept { return schema_minor_; }
 
@@ -215,7 +218,6 @@ private:
         std::size_t frame_bytes = 0;
     };
 
-    bool run_migrations(const std::string &schema_dir);
     bool prepare_statements();
     void finalize_statements();
 

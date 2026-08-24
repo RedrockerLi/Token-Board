@@ -94,7 +94,7 @@ def validate_backups(manifest: dict) -> None:
 def rollback_manifest(path: Path) -> None:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     validate_backups(manifest)
-    proxy = Path(manifest["proxy_db"])
+    proxy = Path(manifest["token_board_db"])
     dashboard = Path(manifest["dashboard_db"])
     with migration_locks(proxy, dashboard):
         assert_offline_and_checkpoint(proxy)
@@ -124,17 +124,17 @@ def rollback_manifest(path: Path) -> None:
 def resume_manifest(path: Path) -> None:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     validate_backups(manifest)
-    proxy = Path(manifest["proxy_db"])
+    proxy = Path(manifest["token_board_db"])
     dashboard = Path(manifest["dashboard_db"])
     stage = manifest["stage"]
     with migration_locks(proxy, dashboard):
         assert_offline_and_checkpoint(proxy)
         assert_offline_and_checkpoint(dashboard)
         if stage in {"verified", "dry_run_complete"}:
-            atomic_replace(proxy, Path(manifest["shadows"]["proxy"]),
-                           path, manifest, "proxy")
+            atomic_replace(proxy, Path(manifest["shadows"]["token-board"]),
+                           path, manifest, "token_board")
             stage = manifest["stage"]
-        if stage == "proxy_replaced":
+        if stage == "token_board_replaced":
             atomic_replace(dashboard, Path(manifest["shadows"]["dashboard"]),
                            path, manifest, "dashboard")
             stage = manifest["stage"]

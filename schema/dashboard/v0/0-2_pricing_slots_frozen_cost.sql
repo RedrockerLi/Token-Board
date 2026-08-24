@@ -1,7 +1,7 @@
 -- 0002: 峰谷定价镜像 + cost_entry 写时固化
 --
 -- 变更目标：
---   1. 镜像新增 pricing_slots 表（与 proxy.db 结构一致，供多机同步/未来使用；
+--   1. 镜像新增 pricing_slots 表（与 token-board.db 结构一致，供多机同步/未来使用；
 --      本库的 cost 计算不再依赖档位——cost_entry 由导出聚合 request_log.cost 固化）。
 --   2. 删除 tr_mp_refresh_insert/update/delete：改价不再回溯重算 cost_entry。
 --   3. 用当前 model_pricing 基础价回填现存 cost_entry(source='proxy')

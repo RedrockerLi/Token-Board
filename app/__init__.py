@@ -5,7 +5,7 @@ from pathlib import Path
 from app.services.data_loader import DataStore
 
 
-def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
+def create_app(token_board_db_path: str | None = None, host: str = "127.0.0.1",
                *, testing: bool = False,
                start_background_tasks: bool = True,
                schema_dir: str | None = None):
@@ -16,7 +16,7 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
     keep them at the project root for clean separation.
 
     Args:
-        proxy_db_path: If provided, enables proxy management features
+        token_board_db_path: If provided, enables proxy management features
                        by attaching a ProxyDatabase instance to the app
                        config and registering the proxy blueprint.
         host: The bind address.  A non-loopback address (or a configured
@@ -37,11 +37,11 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
     )
     flask_app.config["TESTING"] = testing
     flask_app.config["SCHEMA_DIR"] = str(schema_root)
-    # Keep the dashboard archive next to an explicitly supplied proxy DB.
+    # Keep the dashboard archive next to an explicitly supplied token-board DB.
     # Embedded deployments and the App testbench must read the same
     # normalized V1 dataset, not the repository's default data/ directory.
-    data_dir = (Path(proxy_db_path).resolve().parent
-                if proxy_db_path else root / "data")
+    data_dir = (Path(token_board_db_path).resolve().parent
+                if token_board_db_path else root / "data")
     flask_app.config["DATA_STORE"] = DataStore(
         data_dir, schema_dir=str(schema_root))
 
@@ -49,7 +49,7 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
     flask_app.register_blueprint(bp)
 
     # ── Proxy management (optional) ──
-    if proxy_db_path:
+    if token_board_db_path:
         from app.db.proxy_db import ProxyDatabase  # noqa: E402
         from app.routes.proxy_routes import bp_proxy  # noqa: E402
 
@@ -57,17 +57,17 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
         # boundary as start.sh.  The C++ proxy still opens only V1; this call
         # completes the upgrade before ProxyDatabase creates its connection.
         from app.db.schema_upgrade import ensure_local_databases  # noqa: E402
-        dash_db_path = str(Path(proxy_db_path).resolve().parent / "dashboard.db")
+        dash_db_path = str(Path(token_board_db_path).resolve().parent / "dashboard.db")
         ensure_local_databases(
-            proxy_db_path, dash_db_path,
+            token_board_db_path, dash_db_path,
             str(schema_root),
             source_timezone="Asia/Shanghai",
         )
 
-        pdb = ProxyDatabase(proxy_db_path, schema_dir=str(schema_root))
-        flask_app.config["PROXY_DB"] = pdb
+        pdb = ProxyDatabase(token_board_db_path, schema_dir=str(schema_root))
+        flask_app.config["TOKEN_BOARD_DB"] = pdb
         flask_app.register_blueprint(bp_proxy)
-        print(f" * Proxy management enabled (DB: {proxy_db_path})")
+        print(f" * Proxy management enabled (DB: {token_board_db_path})")
 
         # Pull latest config from cloud on startup. Tests use isolated V1
         # fixtures and deliberately do not touch network state.
@@ -75,7 +75,7 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
             from app.services.sync import sync_config_download  # noqa: E402
             try:
                 if sync_config_download(
-                        proxy_db_path, schema_dir=str(schema_root)):
+                        token_board_db_path, schema_dir=str(schema_root)):
                     print(" * Config synced from cloud")
             except Exception:
                 flask_app.logger.exception("startup config sync failed")
@@ -87,7 +87,7 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
         try:
             from app.db.dashboard_db import reconcile_accounts  # noqa: E402
             if Path(dash_db_path).exists():
-                reconcile_accounts(dash_db_path, proxy_db_path)
+                reconcile_accounts(dash_db_path, token_board_db_path)
         except Exception:
             flask_app.logger.exception("dashboard account reconcile failed")
 
@@ -102,8 +102,8 @@ def create_app(proxy_db_path: str | None = None, host: str = "127.0.0.1",
     # Start threads only after every fallible application-construction step.
     # server.py opts out here and starts them after the initial DataStore load,
     # giving its try/finally ownership of the complete worker lifetime.
-    if proxy_db_path and start_background_tasks:
+    if token_board_db_path and start_background_tasks:
         from app.services.runtime_tasks import start_runtime_tasks  # noqa: E402
-        start_runtime_tasks(flask_app, pdb, proxy_db_path)
+        start_runtime_tasks(flask_app, pdb, token_board_db_path)
 
     return flask_app

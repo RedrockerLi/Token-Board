@@ -26,7 +26,6 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
 #include <thread>
 
 // Signal-safe flag for graceful shutdown
@@ -53,17 +52,8 @@ int main(int argc, char *argv[]) {
     printf("  Log:  %s\n\n", cfg.log_level.c_str());
 
     // ── Open database ─────────────────────────────────────────────────
-    if (cfg.schema_dir.empty()) {
-        // Derive the default migration dir from the DB path:
-        // data/token-board.db → data/../schema → schema root
-        auto dbp = std::filesystem::path(cfg.db_path);
-        cfg.schema_dir = (dbp.parent_path() / ".." / "schema")
-                             .lexically_normal()
-                             .string();
-    }
-
     Database db;
-    if (!db.open(cfg.db_path, cfg.schema_dir)) {
+    if (!db.open(cfg.db_path)) {
         TB_LOG_ERROR( "FATAL: Cannot open database\n");
         return 1;
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Proxy throughput / latency stress test against mock_upstream.
 
-Drives the REAL token_proxy binary with a temp proxy.db and an in-process mock
+Drives the REAL token_proxy binary with a temp token-board.db and an in-process mock
 upstream (scripts/mock_upstream), measures client-side latency plus the
 proxy's own request_log upstream_ttft_ms / duration_ms, and prints p50/p95/p99.
 
@@ -101,8 +101,8 @@ def main() -> None:
     upstream_thread.start()
 
     with tempfile.TemporaryDirectory() as tmp:
-        db_path = Path(tmp) / "proxy.db"
-        migrate(str(db_path), str(schema_dir), "proxy")
+        db_path = Path(tmp) / "token-board.db"
+        migrate(str(db_path), str(schema_dir), "token-board")
         conn = sqlite3.connect(db_path)
         try:
             from v1_fixture import add_plain_route, add_upstream

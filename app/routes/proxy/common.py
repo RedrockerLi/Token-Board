@@ -12,7 +12,7 @@ bp_proxy = Blueprint("proxy", __name__, url_prefix="/api/proxy")
 
 def _proxy_db():
     """Return the ProxyDatabase instance from app config."""
-    return current_app.config["PROXY_DB"]
+    return current_app.config["TOKEN_BOARD_DB"]
 
 
 

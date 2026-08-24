@@ -1,8 +1,7 @@
-"""Major-minor SQLite schema migrations shared by the proxy and dashboard.
+"""Private SQL migration primitives used by the Python upgrade engine.
 
-The canonical layout is ``schema/<database>/v<major>/<major>-<minor>_*.sql``.
-Minor upgrades are automatic and atomic.  A major mismatch is deliberately
-refused: it must be handled by a tool in ``schema/transitions``.
+Version-specific data transforms live under ``schema/transitions`` and are
+orchestrated by ``app.db.schema_upgrade``.
 """
 
 from __future__ import annotations
@@ -18,6 +17,9 @@ from pathlib import Path
 
 
 VERSION_RE = re.compile(r"^(\d+)-(\d+)_([a-z0-9][a-z0-9_]*)\.sql$")
+TOKEN_BOARD_DATABASE_NAME = "token-board"
+DASHBOARD_DATABASE_NAME = "dashboard"
+DATABASE_NAMES = frozenset({TOKEN_BOARD_DATABASE_NAME, DASHBOARD_DATABASE_NAME})
 
 
 class MigrationError(RuntimeError):
@@ -53,29 +55,41 @@ def schema_dir_for(db_path: str, name: str) -> str:
     ``db_path`` is retained in the API because callers may operate on shadow
     copies; the repository schema is still located relative to the data dir.
     """
-    if name not in {"proxy", "dashboard"}:
+    if name not in DATABASE_NAMES:
         raise MigrationError(f"unknown database name: {name}")
     return str(Path(db_path).resolve().parent.parent / "schema")
 
 
-def migrate(db_path: str, schema_dir: str, database_name: str | None = None) -> None:
-    """Apply compatible migrations, or reject a required major transition."""
+def apply_sql_migrations(db_path: str, schema_dir: str,
+                         database_name: str | None = None,
+                         target: SchemaVersion | None = None) -> None:
+    """Apply only the SQL portion of a compatible migration path."""
     database_name = database_name or _infer_database_name(db_path, schema_dir)
     fd = os.open(db_path + ".migrate.lock", os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        _run_locked(db_path, schema_dir, database_name)
+        _run_locked(db_path, schema_dir, database_name, target)
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
+def migrate(db_path: str, schema_dir: str,
+            database_name: str | None = None) -> None:
+    """Compatibility alias for fixture builders.
+
+    Production startup and database façades use the schema-upgrade
+    coordinator, not this low-level SQL-only primitive.
+    """
+    apply_sql_migrations(db_path, schema_dir, database_name)
+
+
 def _infer_database_name(db_path: str, schema_dir: str) -> str:
     parts = {part.lower() for part in Path(schema_dir).parts}
     stem = Path(db_path).stem.lower()
-    if "dashboard" in parts or "dashboard" in stem:
-        return "dashboard"
-    return "proxy"
+    if DASHBOARD_DATABASE_NAME in parts or DASHBOARD_DATABASE_NAME in stem:
+        return DASHBOARD_DATABASE_NAME
+    return TOKEN_BOARD_DATABASE_NAME
 
 
 def _resolve_schema_dir(schema_dir: str, database_name: str,
@@ -84,7 +98,7 @@ def _resolve_schema_dir(schema_dir: str, database_name: str,
     if not supplied.is_dir():
         # Compatibility for a path that disappeared while packaging.  A
         # schema/<database> path is otherwise a supported database root.
-        if supplied.name in {"proxy", "dashboard"} and supplied.parent.is_dir():
+        if supplied.name in DATABASE_NAMES and supplied.parent.is_dir():
             print(f"warning: --schema-dir {supplied} is deprecated; use "
                   f"{supplied.parent}", file=sys.stderr)
             supplied = supplied.parent
@@ -96,7 +110,7 @@ def _resolve_schema_dir(schema_dir: str, database_name: str,
         return supplied
 
     database_root = supplied
-    if supplied.name not in {"proxy", "dashboard"}:
+    if supplied.name not in DATABASE_NAMES:
         database_root = supplied / database_name
     majors: list[tuple[int, Path]] = []
     for child in database_root.glob("v*"):
@@ -174,7 +188,7 @@ def _database_version(conn: sqlite3.Connection,
     business_tables = conn.execute(
         "SELECT count(*) FROM sqlite_master WHERE type='table' "
         "AND name NOT LIKE 'sqlite_%' AND name NOT IN "
-        "('schema_version','schema_migrations')"
+        "('schema_version','schema_migrations','schema_transitions')"
     ).fetchone()[0]
     if business_tables:
         raise MigrationError("non-empty database has no schema version")
@@ -199,6 +213,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     PRIMARY KEY (major, minor),
     UNIQUE (filename)
 );
+CREATE TABLE IF NOT EXISTS schema_transitions (
+    transition_id TEXT PRIMARY KEY,
+    checksum TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+);
 """
 
 
@@ -220,7 +240,8 @@ def _verify_checksums(conn: sqlite3.Connection,
                 f"{filename}")
 
 
-def _run_locked(db_path: str, schema_dir: str, database_name: str) -> None:
+def _run_locked(db_path: str, schema_dir: str, database_name: str,
+                target: SchemaVersion | None = None) -> None:
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
         conn.execute("PRAGMA busy_timeout=5000")
@@ -239,6 +260,19 @@ def _run_locked(db_path: str, schema_dir: str, database_name: str) -> None:
                 f"files V{target_major}; use a transition tool")
         _verify_checksums(conn, steps)
         latest = steps[-1].version
+        requested = target or latest
+        if requested.major != target_major:
+            raise MigrationError(
+                f"requested target V{requested.major}.{requested.minor} "
+                f"does not belong to {database_name} V{target_major}")
+        if requested > latest:
+            raise MigrationError(
+                f"requested target V{requested.major}.{requested.minor} "
+                f"is newer than known V{latest.major}.{latest.minor}")
+        if current is not None and current > requested:
+            raise MigrationError(
+                f"database is already V{current.major}.{current.minor}, "
+                f"cannot move backwards to V{requested.major}.{requested.minor}")
         if current is not None and current.minor > latest.minor:
             print(f"warning: {database_name} V{current.major}.{current.minor} "
                   f"is newer than known V{latest.major}.{latest.minor}; "
@@ -246,6 +280,8 @@ def _run_locked(db_path: str, schema_dir: str, database_name: str) -> None:
             return
 
         for step in steps:
+            if step.version > requested:
+                break
             if current is not None and step.version <= current:
                 continue
             if step.version.major != target_major:

@@ -24,7 +24,7 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
 
     def test_downloaded_v0_artifact_is_upgraded_in_place_without_source(self) -> None:
         source = self.root / "source-v0.db"
-        migrate(str(source), str(self.root / "schema/proxy/v0"), "proxy")
+        migrate(str(source), str(self.root / "schema/token-board/v0"), "token-board")
         with sqlite3.connect(source) as conn:
             conn.execute(
                 "INSERT INTO upstream_accounts(name,base_url,account_type) "
@@ -33,7 +33,7 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         remote = self.root / "downloaded-artifact.db"
         shutil.copy2(source, remote)
-        result = upgrade_shadow(str(remote), "proxy", self.root / "schema")
+        result = upgrade_shadow(str(remote), "token-board", self.root / "schema")
         self.assertEqual(result.current.major, 1)
         self.assertEqual(sqlite3.connect(source).execute(
             "PRAGMA user_version").fetchone()[0], 19)
@@ -41,14 +41,14 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
                              max(int(path.name.split("_", 1)[0].split("-")[0]) * 10000
                                  + int(path.name.split("_", 1)[0].split("-")[1])
-                                 for path in (self.root / "schema/proxy/v1").glob("*.sql")))
+                                 for path in (self.root / "schema/token-board/v1").glob("*.sql")))
             self.assertEqual(conn.execute(
                 "SELECT name FROM accounts WHERE name='cloud-old'").fetchone()[0],
                              "cloud-old")
 
     def test_configuration_upgrade_drops_remote_runtime_state(self) -> None:
         source = self.root / "source-v0-full.db"
-        migrate(str(source), str(self.root / "schema/proxy/v0"), "proxy")
+        migrate(str(source), str(self.root / "schema/token-board/v0"), "token-board")
         with sqlite3.connect(source) as conn:
             conn.execute(
                 "INSERT INTO upstream_accounts(name,base_url,account_type) "
@@ -62,7 +62,7 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         remote = self.root / "downloaded-config.db"
         shutil.copy2(source, remote)
-        upgrade_shadow(str(remote), "proxy", self.root / "schema",
+        upgrade_shadow(str(remote), "token-board", self.root / "schema",
                        configuration_only=True)
         with sqlite3.connect(remote) as conn:
             self.assertEqual(conn.execute(

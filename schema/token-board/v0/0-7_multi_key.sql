@@ -1,7 +1,7 @@
 -- 0007: 多密钥上游 + 统一 api_cost 计价
 --
 -- DESTRUCTIVE: 重建 request_log（cost+virtual_cost 合并为 api_cost、加 upstream_key_id）—
--- 先备份 data/proxy.db
+-- 先备份 data/token-board.db
 --
 -- 变更目标：
 --   1. 新增 upstream_keys 子表：一个上游账户持有多把密钥（本地机密，不上云），

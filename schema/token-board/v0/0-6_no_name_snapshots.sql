@@ -1,7 +1,7 @@
 -- 0006: 摒弃名字快照 —— request_log 删快照列、upstream_accounts 加软删除标记
 --
 -- DESTRUCTIVE: 重建 request_log（删 account_name / account_type / is_aggregate）、
--- 删 account_renames 死表 — 先备份 data/proxy.db
+-- 删 account_renames 死表 — 先备份 data/token-board.db
 --
 -- 变更目标（账户身份统一为 id，名字只是 upstream_accounts 的属性）：
 --   1. request_log 删掉三个快照列，只留 account_id（FK）。一切按账户的统计/归档

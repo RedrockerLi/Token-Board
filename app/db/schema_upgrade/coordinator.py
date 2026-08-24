@@ -2,108 +2,67 @@
 
 from __future__ import annotations
 
-import contextlib
-import hashlib
 import importlib.util
-import json
-import os
 import shutil
 import sqlite3
 import sys
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from app.db.migrations import MigrationError, SchemaVersion, migrate
+from app.db.migrations import (
+    TOKEN_BOARD_DATABASE_NAME,
+    MigrationError,
+    SchemaVersion,
+    apply_sql_migrations,
+    migrate,
+)
 from .artifact import strip_runtime_artifact
+from .compound import apply_artifact_pair, pending_transitions, run as run_compound
+from .engine_core import (
+    UpgradeError,
+    UpgradeResult,
+    backup_files as _backup_files,
+    inspect_version,
+    latest_version as _latest_version,
+    now as _now,
+    repo_root as _repo_root,
+    recover_incomplete_manifests as _recover_incomplete_manifests,
+    rebuild_snapshot as _rebuild_snapshot,
+    replace as _replace,
+    schema_root as _schema_root,
+    table_exists as _table_exists,
+    verify as _verify,
+    write_manifest as _write_manifest,
+)
 from .sqlite_utils import copy_sqlite as _copy_sqlite
-from .agent_id_alignment import prepare_dashboard_agent_alignment
 
-class UpgradeError(RuntimeError):
-    """Raised when a database cannot be upgraded safely."""
+def verify_current_database(path: str | Path, database_name: str,
+                            schema_root: str | Path | None = None) -> SchemaVersion:
+    """Verify that a runtime database is already at the published V1 tip.
 
-
-@dataclass(frozen=True)
-class UpgradeResult:
-    path: str
-    database_name: str
-    previous: SchemaVersion | None
-    current: SchemaVersion
-    upgraded: bool
-    manifest: str | None = None
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def _schema_root(schema_root: str | Path | None) -> Path:
-    return Path(schema_root or (_repo_root() / "schema")).resolve()
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-
-
-def _checksum(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-    ).fetchone() is not None
-
-def inspect_version(path: Path, database_name: str) -> SchemaVersion | None:
-    if not path.exists() or path.stat().st_size == 0:
-        return None
-    conn = sqlite3.connect(path)
-    try:
-        row = None
-        if _table_exists(conn, "schema_version"):
-            row = conn.execute(
-                "SELECT major,minor,database_name FROM schema_version WHERE id=1"
-            ).fetchone()
-        pragma = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if row:
-            if row[2] != database_name:
-                raise UpgradeError(
-                    f"{path} is {row[2]!r}, expected {database_name!r}")
-            expected = int(row[0]) * 10_000 + int(row[1])
-            if pragma != expected:
-                raise UpgradeError(f"{path}: schema metadata disagrees with PRAGMA")
-            return SchemaVersion(int(row[0]), int(row[1]))
-        if pragma:
-            return SchemaVersion.from_user_version(pragma)
-        business = conn.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%'"
-        ).fetchone()[0]
-        if business:
-            raise UpgradeError(f"{path}: non-empty database has no schema version")
-        return None
-    finally:
-        conn.close()
-
-def _latest_version(schema_root: Path, database_name: str, major: int) -> SchemaVersion:
-    directory = schema_root / database_name / f"v{major}"
-    versions = []
-    for path in directory.glob("*.sql"):
-        stem = path.name.split("_", 1)[0]
-        try:
-            m, n = (int(value) for value in stem.split("-", 1))
-        except ValueError:
-            continue
-        versions.append(SchemaVersion(m, n))
-    if not versions:
-        raise UpgradeError(f"no schema files for {database_name} V{major}")
-    return max(versions)
+    This is intentionally read-only.  Runtime façades use it as a guard after
+    the Python startup boundary; they never create metadata or apply SQL.
+    """
+    database = Path(path).resolve()
+    root = _schema_root(schema_root)
+    current = inspect_version(database, database_name)
+    if current is None:
+        raise MigrationError(
+            f"{database_name} database is missing or empty: {database}; "
+            "run the Python schema-upgrade boundary first")
+    if current.major != 1:
+        raise MigrationError(
+            f"{database} is V{current.major}.{current.minor}; "
+            "runtime accepts only current V1 databases")
+    latest = _latest_version(root, database_name, 1)
+    if current != latest:
+        raise MigrationError(
+            f"{database} is V{current.major}.{current.minor}, expected "
+            f"V{latest.major}.{latest.minor}; run the Python schema-upgrade "
+            "boundary first")
+    return current
 
 
 def _transition_module(name: str):
@@ -126,76 +85,6 @@ def _stage_v0(source: Path, database_name: str, schema_root: Path,
     if source_version.minor < latest_v0.minor:
         migrate(str(staged), str(schema_root / database_name / "v0"), database_name)
     return staged
-def _write_manifest(path: Path, data: dict) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, path)
-def _backup_files(paths: list[Path], backup_dir: Path) -> list[dict]:
-    backup_dir.mkdir(parents=True, exist_ok=False)
-    result = []
-    for source in paths:
-        item = {"source": str(source), "existed": source.is_file()}
-        if source.is_file():
-            target = backup_dir / source.name
-            shutil.copy2(source, target)
-            item.update({"backup": str(target), "sha256": _checksum(target),
-                         "size": target.stat().st_size})
-        result.append(item)
-    return result
-def _recover_incomplete_manifests(root: Path) -> None:
-    for manifest_path in sorted(root.glob("auto-v0-to-v1-*.manifest.json")):
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if manifest.get("stage") in {"complete", "recovered_rollback"}:
-            continue
-        backups = manifest.get("backups") or []
-        if not backups:
-            # No source file was replaced; just clean stale shadows.
-            shutil.rmtree(manifest.get("work_dir", ""), ignore_errors=True)
-            manifest["stage"] = "recovered_rollback"
-            _write_manifest(manifest_path, manifest)
-            continue
-        for item in backups:
-            source = Path(item["source"])
-            backup = item.get("backup")
-            if item.get("existed"):
-                if not backup or not Path(backup).is_file():
-                    raise UpgradeError(f"incomplete transition backup missing: {source}")
-                if item.get("sha256") and _checksum(Path(backup)) != item["sha256"]:
-                    raise UpgradeError(f"incomplete transition backup checksum mismatch: {backup}")
-                shutil.copy2(backup, source)
-            else:
-                source.unlink(missing_ok=True)
-        shutil.rmtree(manifest.get("work_dir", ""), ignore_errors=True)
-        manifest["stage"] = "recovered_rollback"
-        _write_manifest(manifest_path, manifest)
-def _verify(path: Path, database_name: str, expected: SchemaVersion) -> None:
-    conn = sqlite3.connect(path)
-    try:
-        quick = conn.execute("PRAGMA quick_check").fetchone()[0]
-        if quick != "ok":
-            raise UpgradeError(f"{path}: quick_check failed: {quick}")
-        foreign = conn.execute("PRAGMA foreign_key_check").fetchone()
-        if foreign:
-            raise UpgradeError(f"{path}: foreign_key_check failed: {tuple(foreign)}")
-    finally:
-        conn.close()
-    actual = inspect_version(path, database_name)
-    if actual != expected:
-        raise UpgradeError(f"{path}: expected V{expected.major}.{expected.minor}, got {actual}")
-def _replace(source: Path, shadow: Path) -> None:
-    conn = sqlite3.connect(shadow, isolation_level=None)
-    try:
-        result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        if result and result[0] != 0:
-            raise UpgradeError(f"shadow WAL is busy: {shadow}")
-    finally:
-        conn.close()
-    os.replace(shadow, source)
-    Path(str(source) + "-wal").unlink(missing_ok=True)
-    Path(str(source) + "-shm").unlink(missing_ok=True)
 def _v1_dashboard_identity(proxy_path: Path) -> tuple[dict, dict]:
     conn = sqlite3.connect(proxy_path)
     conn.row_factory = sqlite3.Row
@@ -219,22 +108,6 @@ def _v1_dashboard_identity(proxy_path: Path) -> tuple[dict, dict]:
         conn.close()
 
 
-def _rebuild_snapshot(proxy_path: Path) -> None:
-    snapshot = proxy_path.parent / "token-board_config_snapshot.db"
-    temporary = snapshot.with_name("token-board_config_snapshot.db.upgrade-new")
-    temporary.unlink(missing_ok=True)
-    _copy_sqlite(proxy_path, temporary)
-    conn = sqlite3.connect(temporary)
-    try:
-        for table in ("request_attempts", "request_log", "billing_period_charges", "fx_rates"):
-            if _table_exists(conn, table):
-                conn.execute(f"DELETE FROM {table}")
-        conn.commit()
-    finally:
-        conn.close()
-    os.replace(temporary, snapshot)
-
-
 def _transition_pair_impl(proxy: Path, dashboard: Path, schema_root: Path,
                           timezone_name: str) -> UpgradeResult:
     transition = _transition_module("migrate")
@@ -247,7 +120,7 @@ def _transition_pair_impl(proxy: Path, dashboard: Path, schema_root: Path,
     manifest = {
         "transition": "0-to-current-v1", "stage": "started",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "timezone": timezone_name, "proxy_db": str(proxy),
+        "timezone": timezone_name, "token_board_db": str(proxy),
         "dashboard_db": str(dashboard), "schema_dir": str(schema_root),
         "work_dir": str(work_dir), "backup_dir": str(backup_dir),
     }
@@ -263,14 +136,14 @@ def _transition_pair_impl(proxy: Path, dashboard: Path, schema_root: Path,
     manifest["stage"] = "backed_up"
     _write_manifest(manifest_path, manifest)
 
-    proxy_version = inspect_version(proxy, "proxy")
+    proxy_version = inspect_version(proxy, TOKEN_BOARD_DATABASE_NAME)
     dashboard_version = inspect_version(dashboard, "dashboard")
     if proxy_version is None or proxy_version.major != 0:
         raise UpgradeError("paired transition requires a V0 proxy database")
     if dashboard_version is None or dashboard_version.major != 0:
         raise UpgradeError("paired transition requires a V0 dashboard database")
 
-    proxy_source = _stage_v0(proxy, "proxy", schema_root, work_dir, proxy_version)
+    proxy_source = _stage_v0(proxy, TOKEN_BOARD_DATABASE_NAME, schema_root, work_dir, proxy_version)
     dashboard_source = _stage_v0(dashboard, "dashboard", schema_root, work_dir, dashboard_version)
     spool_records = transition.read_usage_spool(proxy)
     manifest["spool"] = {
@@ -278,9 +151,9 @@ def _transition_pair_impl(proxy: Path, dashboard: Path, schema_root: Path,
         "records": len(spool_records),
     }
     _write_manifest(manifest_path, manifest)
-    proxy_shadow = work_dir / "proxy.v1-shadow.db"
+    proxy_shadow = work_dir / "token-board.v1-shadow.db"
     dashboard_shadow = work_dir / "dashboard.v1-shadow.db"
-    migrate(str(proxy_shadow), str(schema_root), "proxy")
+    migrate(str(proxy_shadow), str(schema_root), TOKEN_BOARD_DATABASE_NAME)
     migrate(str(dashboard_shadow), str(schema_root), "dashboard")
     manifest["stage"] = "shadows_created"
     _write_manifest(manifest_path, manifest)
@@ -292,13 +165,13 @@ def _transition_pair_impl(proxy: Path, dashboard: Path, schema_root: Path,
                                     mapping.get("credential_masks"))
     manifest["stage"] = "transformed"
     _write_manifest(manifest_path, manifest)
-    _verify(proxy_shadow, "proxy", _latest_version(schema_root, "proxy", 1))
+    _verify(proxy_shadow, TOKEN_BOARD_DATABASE_NAME, _latest_version(schema_root, TOKEN_BOARD_DATABASE_NAME, 1))
     _verify(dashboard_shadow, "dashboard", _latest_version(schema_root, "dashboard", 1))
     manifest["stage"] = "verified"
     _write_manifest(manifest_path, manifest)
 
     _replace(proxy, proxy_shadow)
-    manifest["stage"] = "proxy_replaced"
+    manifest["stage"] = "token_board_replaced"
     _write_manifest(manifest_path, manifest)
     _replace(dashboard, dashboard_shadow)
     manifest["stage"] = "dashboard_replaced"
@@ -310,9 +183,9 @@ def _transition_pair_impl(proxy: Path, dashboard: Path, schema_root: Path,
     manifest["stage"] = "complete"
     _write_manifest(manifest_path, manifest)
     shutil.rmtree(work_dir, ignore_errors=True)
-    current = inspect_version(proxy, "proxy")
+    current = inspect_version(proxy, TOKEN_BOARD_DATABASE_NAME)
     assert current is not None
-    return UpgradeResult(str(proxy), "proxy", proxy_version, current, True,
+    return UpgradeResult(str(proxy), TOKEN_BOARD_DATABASE_NAME, proxy_version, current, True,
                          str(manifest_path))
 
 
@@ -346,20 +219,20 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
         try:
             if auto_recover:
                 _recover_incomplete_manifests(proxy.parent)
-            pv = inspect_version(proxy, "proxy")
+            pv = inspect_version(proxy, TOKEN_BOARD_DATABASE_NAME)
             dv = inspect_version(dashboard, "dashboard") if dashboard.exists() else None
             if pv is None and dv is None:
-                migrate(str(proxy), str(root), "proxy")
-                migrate(str(dashboard), str(root), "dashboard")
+                apply_sql_migrations(str(proxy), str(root), TOKEN_BOARD_DATABASE_NAME)
+                apply_sql_migrations(str(dashboard), str(root), "dashboard")
                 return {
-                    "proxy": UpgradeResult(str(proxy), "proxy", None,
-                                             inspect_version(proxy, "proxy"), True),
+                    TOKEN_BOARD_DATABASE_NAME: UpgradeResult(str(proxy), TOKEN_BOARD_DATABASE_NAME, None,
+                                             inspect_version(proxy, TOKEN_BOARD_DATABASE_NAME), True),
                     "dashboard": UpgradeResult(str(dashboard), "dashboard", None,
                                                  inspect_version(dashboard, "dashboard"), True),
                 }
             if pv is not None and pv.major == 0 and dv is not None and dv.major == 0:
                 result = _transition_pair(proxy, dashboard, root, source_timezone)
-                return {"proxy": result, "dashboard": UpgradeResult(
+                return {TOKEN_BOARD_DATABASE_NAME: result, "dashboard": UpgradeResult(
                     str(dashboard), "dashboard", dv,
                     inspect_version(dashboard, "dashboard"), True,
                     result.manifest)}
@@ -367,7 +240,7 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
                 backup = proxy.with_name(proxy.name + ".v0-local-backup")
                 if not backup.exists():
                     shutil.copy2(proxy, backup)
-                result = upgrade_shadow(str(proxy), "proxy", root,
+                result = upgrade_shadow(str(proxy), TOKEN_BOARD_DATABASE_NAME, root,
                                         source_timezone)
                 _rebuild_snapshot(proxy)
                 pv = result.current
@@ -382,7 +255,7 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
                     migrate(str(shadow), str(root), "dashboard")
                     transition = _transition_module("migrate")
                     source_tz = ZoneInfo(source_timezone)
-                    if proxy.exists() and inspect_version(proxy, "proxy") is not None:
+                    if proxy.exists() and inspect_version(proxy, TOKEN_BOARD_DATABASE_NAME) is not None:
                         types, masks = _v1_dashboard_identity(proxy)
                     else:
                         types, masks = {}, {}
@@ -395,31 +268,43 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
                 finally:
                     shutil.rmtree(work, ignore_errors=True)
                 dv = inspect_version(dashboard, "dashboard")
-            if (dv is not None and dv.major == 1 and dv.minor < 4 and
-                    pv is not None and pv.major == 1):
-                prepare_dashboard_agent_alignment(dashboard, proxy, root)
             if pv is not None and pv.major != 1:
                 raise UpgradeError(f"unsupported proxy schema V{pv.major}.{pv.minor}")
             if dv is not None and dv.major != 1:
                 raise UpgradeError(f"unsupported dashboard schema V{dv.major}.{dv.minor}")
             if not proxy.exists():
-                migrate(str(proxy), str(root), "proxy")
+                apply_sql_migrations(str(proxy), str(root), TOKEN_BOARD_DATABASE_NAME)
             if not dashboard.exists():
-                migrate(str(dashboard), str(root), "dashboard")
-            migrate(str(proxy), str(root), "proxy")
-            migrate(str(dashboard), str(root), "dashboard")
+                apply_sql_migrations(str(dashboard), str(root), "dashboard")
+            pv = inspect_version(proxy, TOKEN_BOARD_DATABASE_NAME)
+            dv = inspect_version(dashboard, "dashboard")
+            if pv is None or dv is None:
+                raise UpgradeError("local database initialization did not produce both V1 databases")
+            pending = pending_transitions(proxy, dashboard, root, pv, dv)
+            if pending:
+                result = run_compound(proxy, dashboard, root, pv, dv, pending)
+            else:
+                apply_sql_migrations(str(proxy), str(root), TOKEN_BOARD_DATABASE_NAME)
+                apply_sql_migrations(str(dashboard), str(root), "dashboard")
+                result = None
             snapshot = proxy.parent / "token-board_config_snapshot.db"
             if snapshot.exists():
-                snapshot_version = inspect_version(snapshot, "proxy")
+                snapshot_version = inspect_version(snapshot, TOKEN_BOARD_DATABASE_NAME)
                 if snapshot_version is not None and snapshot_version.major == 1:
-                    migrate(str(snapshot), str(root), "proxy")
+                    apply_sql_migrations(str(snapshot), str(root), TOKEN_BOARD_DATABASE_NAME)
                 elif snapshot_version is not None and snapshot_version.major == 0:
                     _rebuild_snapshot(proxy)
+            current_proxy = inspect_version(proxy, TOKEN_BOARD_DATABASE_NAME)
+            current_dashboard = inspect_version(dashboard, "dashboard")
+            assert current_proxy is not None and current_dashboard is not None
             return {
-                "proxy": UpgradeResult(str(proxy), "proxy", pv,
-                                         inspect_version(proxy, "proxy"), pv is not None),
-                "dashboard": UpgradeResult(str(dashboard), "dashboard", dv,
-                                             inspect_version(dashboard, "dashboard"), dv is not None),
+                TOKEN_BOARD_DATABASE_NAME: (result if result is not None else UpgradeResult(
+                    str(proxy), TOKEN_BOARD_DATABASE_NAME, pv, current_proxy,
+                    current_proxy != pv)),
+                "dashboard": UpgradeResult(
+                    str(dashboard), "dashboard", dv, current_dashboard,
+                    current_dashboard != dv,
+                    result.manifest if result is not None else None),
             }
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -428,30 +313,55 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
 def upgrade_shadow(path: str, database_name: str,
                    schema_root: str | Path | None = None,
                    source_timezone: str = "Asia/Shanghai",
-                   local_proxy_path: str | None = None,
+                   local_token_board_path: str | None = None,
                    configuration_only: bool = False) -> UpgradeResult:
     """Upgrade a downloaded artifact in place, never touching its source."""
     database = Path(path).resolve()
     root = _schema_root(schema_root)
     current = inspect_version(database, database_name)
     if current is None:
-        migrate(str(database), str(root), database_name)
+        apply_sql_migrations(str(database), str(root), database_name)
         if configuration_only:
             strip_runtime_artifact(database, database_name)
         latest = inspect_version(database, database_name)
         assert latest is not None
         return UpgradeResult(str(database), database_name, None, latest, True)
     if current.major == 1:
-        if (database_name == "dashboard" and current.minor < 4 and
-                local_proxy_path):
-            prepare_dashboard_agent_alignment(database, Path(local_proxy_path), root)
-        migrate(str(database), str(root), database_name)
-        if configuration_only:
-            strip_runtime_artifact(database, database_name)
-        latest = inspect_version(database, database_name)
-        assert latest is not None
-        return UpgradeResult(str(database), database_name, current, latest,
-                             latest != current)
+        work = database.parent / f".{database.name}.v1-upgrade-{uuid.uuid4().hex}"
+        work.mkdir(mode=0o700)
+        try:
+            artifact_shadow = work / f"{database_name}.v1.db"
+            _copy_sqlite(database, artifact_shadow)
+            if database_name == "dashboard" and local_token_board_path:
+                local_proxy = Path(local_token_board_path).resolve()
+                local_version = inspect_version(local_proxy, TOKEN_BOARD_DATABASE_NAME)
+                if local_version is None or local_version.major != 1:
+                    raise UpgradeError(
+                        "dashboard V1 upgrade requires a current V1 proxy")
+                proxy_shadow = work / "local-token-board.v1-shadow.db"
+                _copy_sqlite(local_proxy, proxy_shadow)
+                pending = pending_transitions(
+                    proxy_shadow, artifact_shadow, root, local_version, current)
+                if pending:
+                    apply_artifact_pair(
+                        proxy_shadow, artifact_shadow, root, pending)
+                else:
+                    apply_sql_migrations(
+                        str(artifact_shadow), str(root), "dashboard")
+            else:
+                apply_sql_migrations(
+                    str(artifact_shadow), str(root), database_name)
+            expected = _latest_version(root, database_name, 1)
+            _verify(artifact_shadow, database_name, expected)
+            if configuration_only:
+                strip_runtime_artifact(artifact_shadow, database_name)
+            _replace(database, artifact_shadow)
+            latest = inspect_version(database, database_name)
+            assert latest is not None
+            return UpgradeResult(str(database), database_name, current, latest,
+                                 latest != current)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
     if current.major != 0:
         raise UpgradeError(f"unsupported remote {database_name} V{current.major}.{current.minor}")
     work = database.parent / f".{database.name}.upgrade-{uuid.uuid4().hex}"
@@ -462,14 +372,14 @@ def upgrade_shadow(path: str, database_name: str,
         migrate(str(shadow), str(root), database_name)
         transition = _transition_module("migrate")
         source_tz = ZoneInfo(source_timezone)
-        if database_name == "proxy":
+        if database_name == TOKEN_BOARD_DATABASE_NAME:
             spool_records = transition.read_usage_spool(database)
             transition.transform_proxy(staged, shadow, source_tz, spool_records)
         else:
-            if not local_proxy_path:
+            if not local_token_board_path:
                 raise UpgradeError("dashboard V0 upgrade requires local proxy identity")
-            local_proxy = Path(local_proxy_path)
-            local_version = inspect_version(local_proxy, "proxy")
+            local_proxy = Path(local_token_board_path)
+            local_version = inspect_version(local_proxy, TOKEN_BOARD_DATABASE_NAME)
             if local_version is None or local_version.major != 1:
                 raise UpgradeError("dashboard V0 upgrade requires a current V1 proxy")
             types, masks = _v1_dashboard_identity(local_proxy)
@@ -480,7 +390,7 @@ def upgrade_shadow(path: str, database_name: str,
         if configuration_only:
             strip_runtime_artifact(shadow, database_name)
         _replace(database, shadow)
-        if database_name == "proxy":
+        if database_name == TOKEN_BOARD_DATABASE_NAME:
             Path(str(database) + ".request-log.spool").unlink(missing_ok=True)
         return UpgradeResult(str(database), database_name, current,
                              inspect_version(database, database_name), True)
@@ -490,9 +400,9 @@ def upgrade_shadow(path: str, database_name: str,
 
 def upgrade_downloaded_artifact(path: str, database_name: str,
                                 schema_root: str | Path | None = None, *,
-                                local_proxy_path: str | None = None,
+                                local_token_board_path: str | None = None,
                                 source_timezone: str = "Asia/Shanghai",
                                 configuration_only: bool = False) -> UpgradeResult:
     """Upgrade a downloaded artifact through the checked shadow path."""
     return upgrade_shadow(path, database_name, schema_root, source_timezone,
-                          local_proxy_path, configuration_only)
+                          local_token_board_path, configuration_only)

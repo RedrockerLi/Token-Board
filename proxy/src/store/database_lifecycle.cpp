@@ -1,6 +1,62 @@
 #include "database_internal.h"
 
+namespace {
+
+// Keep this generated/reviewed with the newest proxy V1 SQL file.  It is a
+// validation floor only; the C++ runtime never discovers or executes SQL.
+constexpr int kMinimumRuntimeSchemaMinor = 10;
+
+bool validate_v1_schema(sqlite3 *db, const std::string &path,
+                        int &major, int &minor) {
+    sqlite3_stmt *version = nullptr;
+    if (sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &version, nullptr) !=
+            SQLITE_OK ||
+        sqlite3_step(version) != SQLITE_ROW) {
+        TB_LOG_ERROR("[DB] cannot read schema version from %s\n", path.c_str());
+        sqlite3_finalize(version);
+        return false;
+    }
+    const int encoded = sqlite3_column_int(version, 0);
+    sqlite3_finalize(version);
+    major = encoded / 10000;
+    minor = encoded % 10000;
+
+    sqlite3_stmt *metadata = nullptr;
+    const char *metadata_sql =
+        "SELECT major,minor,database_name FROM schema_version WHERE id=1";
+    if (sqlite3_prepare_v2(db, metadata_sql, -1, &metadata, nullptr) !=
+            SQLITE_OK ||
+        sqlite3_step(metadata) != SQLITE_ROW) {
+        TB_LOG_ERROR("[DB] %s has no complete Python schema metadata\n",
+                     path.c_str());
+        sqlite3_finalize(metadata);
+        return false;
+    }
+    const int metadata_major = sqlite3_column_int(metadata, 0);
+    const int metadata_minor = sqlite3_column_int(metadata, 1);
+    const auto *name = sqlite3_column_text(metadata, 2);
+    const bool identity_ok = name &&
+        std::string(reinterpret_cast<const char *>(name)) == "token-board";
+    sqlite3_finalize(metadata);
+    if (!identity_ok || encoded != metadata_major * 10000 + metadata_minor) {
+        TB_LOG_ERROR("[DB] %s schema metadata disagrees with PRAGMA user_version\n",
+                     path.c_str());
+        return false;
+    }
+    if (major != 1 || minor < kMinimumRuntimeSchemaMinor) {
+        TB_LOG_ERROR("[DB] %s is V%d.%d; run the Python schema-upgrade "
+                     "boundary to V1.%d or newer before starting C++\n",
+                     path.c_str(), major, minor,
+                     kMinimumRuntimeSchemaMinor);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 bool Database::open(const std::string &path, const std::string &schema_dir) {
+    (void)schema_dir;
     std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     if (write_db_ || read_db_ || pricing_db_) {
         TB_LOG_ERROR( "[DB] open called on an already-open database\n");
@@ -8,7 +64,7 @@ bool Database::open(const std::string &path, const std::string &schema_dir) {
     }
     int rc = sqlite3_open_v2(
         path.c_str(), &write_db_,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
         nullptr);
     if (rc != SQLITE_OK) {
         TB_LOG_ERROR( "[DB] Failed to open %s: %s\n", path.c_str(),
@@ -23,29 +79,8 @@ bool Database::open(const std::string &path, const std::string &schema_dir) {
     sqlite3_exec(write_db_, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr);
     sqlite3_exec(write_db_, "PRAGMA busy_timeout=5000", nullptr, nullptr, nullptr);
 
-    if (!run_migrations(schema_dir)) {
-        TB_LOG_ERROR( "[DB] Schema migration failed — see errors above\n");
-        sqlite3_close(write_db_);
-        write_db_ = nullptr;
-        return false;
-    }
-    {
-        sqlite3_stmt *version_stmt = nullptr;
-        if (sqlite3_prepare_v2(write_db_, "PRAGMA user_version", -1,
-                               &version_stmt, nullptr) == SQLITE_OK &&
-            sqlite3_step(version_stmt) == SQLITE_ROW)
-        {
-            const int encoded = sqlite3_column_int(version_stmt, 0);
-            schema_major_ = encoded / 10000;
-            schema_minor_ = encoded % 10000;
-        }
-        sqlite3_finalize(version_stmt);
-    }
-    if (schema_major_ != 1) {
-        TB_LOG_ERROR(
-                "[DB] runtime accepts only V1 databases; received V%d. "
-                "Run the offline/local upgrade coordinator first\n",
-                schema_major_);
+    if (!validate_v1_schema(write_db_, path, schema_major_, schema_minor_)) {
+        TB_LOG_ERROR("[DB] schema validation failed; Python must upgrade it first\n");
         sqlite3_close(write_db_);
         write_db_ = nullptr;
         return false;
@@ -135,8 +170,8 @@ void Database::close() {
     }
 }
 
-// ── Schema migrations ────────────────────────────────────────────────────
+// ── Schema validation ────────────────────────────────────────────────────
 //
-// The protocol is shared with app/db/migrations.py.  Files are numerically
-// ordered major-minor pairs below schema/proxy/vN.  Same-major minor upgrades
-// are automatic; a major transition is always an explicit maintenance action.
+// Python app.db.schema_upgrade owns SQL migrations and data transitions.
+// The C++ runtime only validates the prepared Proxy V1 metadata before it
+// starts serving requests; schema_dir is intentionally not consulted here.

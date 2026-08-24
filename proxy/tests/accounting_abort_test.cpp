@@ -12,7 +12,7 @@
 //   3. reserved and consumed by a normal log_request, then destroyed  ->  the
 //      normal row persists and no abort row is added.
 //
-// Usage: accounting_abort_test <schema_dir>
+// Usage: accounting_abort_test <schema_dir> <prepared_db>
 
 #include "store/db.h"
 
@@ -83,12 +83,9 @@ bool stays_absent(const std::string &db_path, const std::string &model,
 }  // namespace
 
 int main(int argc, char **argv) {
-    assert(argc >= 2);
+    assert(argc >= 3);
     const std::string schema_dir = argv[1];
-
-    char dir_tpl[] = "/tmp/accounting-abort-XXXXXX";
-    assert(mkdtemp(dir_tpl));
-    const std::string db_path = std::string(dir_tpl) + "/abort.db";
+    const std::string db_path = argv[2];
 
     Database db;
     assert(db.open(db_path, schema_dir));
@@ -145,8 +142,6 @@ int main(int argc, char **argv) {
     printf("  3 OK: consumed event persists and adds no abort row\n");
 
     db.close();  // stops and drains the writer
-    unlink(db_path.c_str());
-    rmdir(dir_tpl);
     printf("OK: UsageReservation internal_abort contract\n");
     return 0;
 }

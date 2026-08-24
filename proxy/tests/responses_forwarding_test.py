@@ -155,8 +155,8 @@ def main() -> None:
     thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
-        db = Path(directory) / "proxy.db"
-        migrate(str(db), str(schema), "proxy")
+        db = Path(directory) / "token-board.db"
+        migrate(str(db), str(schema), "token-board")
         conn = sqlite3.connect(db)
         try:
             base = f"http://127.0.0.1:{upstream_port}/v1/"

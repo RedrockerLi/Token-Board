@@ -44,8 +44,8 @@ def main():
     thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
-        db = Path(directory) / "proxy.db"
-        migrate(str(db), str(schema), "proxy")
+        db = Path(directory) / "token-board.db"
+        migrate(str(db), str(schema), "token-board")
         conn = sqlite3.connect(db)
         conn.execute("INSERT INTO accounts(id,uuid,name) VALUES(1,'account-1','v1')")
         conn.execute(

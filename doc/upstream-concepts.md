@@ -54,7 +54,7 @@
 
 ## 三、单上游多密钥
 
-一个真实上游账户（api 或 plan）可以在 `upstream_keys` 表挂多把上游 Key（迁移 `0007`，[schema/proxy/0007_multi_key.sql](schema/proxy/0007_multi_key.sql)）。按当前同步规则，Key 明文只保存在本机；云端只保存掩码元数据用于跨机账单关联，请求日志等本机生成的数据也不上云。
+一个真实上游账户（api 或 plan）可以在 `upstream_keys` 表挂多把上游 Key（迁移 `0-7`，[schema/token-board/v0/0-7_multi_key.sql](../schema/token-board/v0/0-7_multi_key.sql)）。按当前同步规则，Key 明文只保存在本机；云端只保存掩码元数据用于跨机账单关联，请求日志等本机生成的数据也不上云。
 
 ### 多密钥带来的行为
 
@@ -134,7 +134,7 @@
 
 ### request_attempts（每候选一次尝试一行）
 
-候选循环里**每一次**对真实账户的尝试都记一行（账户、Key 槽、状态码、耗时、TTFT、是否超时、错误信息），聚合回退的「失败了几次、换了几家」在这里可见（[schema/proxy/0010_request_attempts.sql](schema/proxy/0010_request_attempts.sql)）。
+候选循环里**每一次**对真实账户的尝试都记一行（账户、Key 槽、状态码、耗时、TTFT、是否超时、错误信息），聚合回退的「失败了几次、换了几家」在这里可见（[schema/token-board/v0/0-10_request_attempts.sql](../schema/token-board/v0/0-10_request_attempts.sql)）。
 
 ### 哪些不上云
 

@@ -135,7 +135,14 @@ export OPENAI_API_KEY=<本地密钥>
 cd proxy
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-./build/token_proxy --db ../data/token-board.db --schema-dir ../schema --port 8800
+cd ..
+PYTHONPATH=. python3 -m app.db.schema_upgrade.cli \
+  --token-board-db data/token-board.db \
+  --dashboard-db data/dashboard.db \
+  --schema-dir schema \
+  --timezone Asia/Shanghai
+cd proxy
+./build/token_proxy --db ../data/token-board.db --port 8800
 ```
 
 命令行参数:
@@ -143,10 +150,15 @@ cmake --build build -j$(nproc)
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--db` | `data/token-board.db` | SQLite 数据库路径 |
-| `--schema-dir` | 由 `--db` 推导 | Major–Minor 迁移根目录(`schema/`) |
+| `--schema-dir` | — | 已废弃，仅兼容旧启动器；C++ 不读取 SQL、不执行升级。请先运行 Python schema-upgrade CLI |
 | `--port` | `8800` | 监听端口 |
 | `--host` | `127.0.0.1` | 绑定地址(默认仅本机可访问) |
 | `--log-level` | `info` | 日志级别 |
+
+数据库升级由 Python 统一负责。启动脚本会在代理或看板启动前调用
+`app.db.schema_upgrade.cli`；手动启动时也必须先执行该命令。升级规则、V1 配对
+transition、shadow 发布和失败恢复见
+[doc/database-migrations.md](doc/database-migrations.md)。
 
 ### systemd 服务
 

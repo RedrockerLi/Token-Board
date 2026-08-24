@@ -38,28 +38,28 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         return max(versions)
 
     def test_empty_pair_uses_current_baselines(self) -> None:
-        proxy = self.root / "data/proxy.db"
+        proxy = self.root / "data/token-board.db"
         dashboard = self.root / "data/dashboard.db"
         ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
-        self.assertEqual(self._version(proxy), self._latest("proxy"))
+        self.assertEqual(self._version(proxy), self._latest("token-board"))
         self.assertEqual(self._version(dashboard), self._latest("dashboard"))
 
     def test_v0_pair_is_upgraded_without_manual_transition(self) -> None:
-        proxy = self.root / "data/proxy.db"
+        proxy = self.root / "data/token-board.db"
         dashboard = self.root / "data/dashboard.db"
-        migrate(str(proxy), str(self.root / "schema/proxy/v0"), "proxy")
+        migrate(str(proxy), str(self.root / "schema/token-board/v0"), "token-board")
         migrate(str(dashboard), str(self.root / "schema/dashboard/v0"), "dashboard")
         result = ensure_local_databases(
             str(proxy), str(dashboard), self.root / "schema")
-        self.assertTrue(result["proxy"].upgraded)
-        self.assertEqual(self._version(proxy), self._latest("proxy"))
+        self.assertTrue(result["token-board"].upgraded)
+        self.assertEqual(self._version(proxy), self._latest("token-board"))
         self.assertEqual(self._version(dashboard), self._latest("dashboard"))
         self.assertTrue(list((self.root / "data").glob("auto-v0-to-v1-*.manifest.json")))
 
     def test_v0_pair_imports_durable_usage_spool(self) -> None:
-        proxy = self.root / "data/proxy.db"
+        proxy = self.root / "data/token-board.db"
         dashboard = self.root / "data/dashboard.db"
-        migrate(str(proxy), str(self.root / "schema/proxy/v0"), "proxy")
+        migrate(str(proxy), str(self.root / "schema/token-board/v0"), "token-board")
         migrate(str(dashboard), str(self.root / "schema/dashboard/v0"), "dashboard")
         record = {
             "v": 1,
@@ -85,7 +85,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
             struct.pack("<II", len(payload), checksum) + payload)
         result = ensure_local_databases(
             str(proxy), str(dashboard), self.root / "schema")
-        self.assertTrue(result["proxy"].upgraded)
+        self.assertTrue(result["token-board"].upgraded)
         row = sqlite3.connect(proxy).execute(
             "SELECT event_id,total_tokens,equivalent_cost,pricing_status "
             "FROM request_log WHERE event_id=?", (record["event_id"],)).fetchone()
@@ -93,9 +93,9 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertFalse(Path(str(proxy) + ".request-log.spool").exists())
 
     def test_v0_same_mask_historical_credentials_keep_distinct_uuids(self) -> None:
-        proxy = self.root / "data/proxy.db"
+        proxy = self.root / "data/token-board.db"
         dashboard = self.root / "data/dashboard.db"
-        migrate(str(proxy), str(self.root / "schema/proxy/v0"), "proxy")
+        migrate(str(proxy), str(self.root / "schema/token-board/v0"), "token-board")
         migrate(str(dashboard), str(self.root / "schema/dashboard/v0"), "dashboard")
         with sqlite3.connect(proxy) as conn:
             account_id = conn.execute(
@@ -124,26 +124,26 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertNotEqual(rows[0][0], rows[1][0])
 
     def test_downloaded_v0_proxy_and_dashboard_artifacts_upgrade_in_shadow(self) -> None:
-        proxy = self.root / "data/proxy.db"
+        proxy = self.root / "data/token-board.db"
         dashboard = self.root / "data/dashboard.db"
-        migrate(str(proxy), str(self.root / "schema/proxy/v0"), "proxy")
+        migrate(str(proxy), str(self.root / "schema/token-board/v0"), "token-board")
         migrate(str(dashboard), str(self.root / "schema/dashboard/v0"), "dashboard")
         # A remote dashboard artifact is resolved against the already-current
         # local proxy identity; its source file is replaced only in the shadow.
-        local_proxy = self.root / "data/local-v1-proxy.db"
-        migrate(str(local_proxy), str(self.root / "schema"), "proxy")
-        remote_proxy = self.root / "data/remote-proxy.db"
+        local_proxy = self.root / "data/local-v1-token-board.db"
+        migrate(str(local_proxy), str(self.root / "schema"), "token-board")
+        remote_proxy = self.root / "data/remote-token-board.db"
         shutil.copy2(proxy, remote_proxy)
         remote_dash = self.root / "data/remote-dashboard.db"
         shutil.copy2(dashboard, remote_dash)
         proxy_result = upgrade_shadow(
-            str(remote_proxy), "proxy", self.root / "schema")
+            str(remote_proxy), "token-board", self.root / "schema")
         dashboard_result = upgrade_shadow(
             str(remote_dash), "dashboard", self.root / "schema",
-            local_proxy_path=str(local_proxy))
+            local_token_board_path=str(local_proxy))
         self.assertEqual(proxy_result.current.major, 1)
         self.assertEqual(dashboard_result.current.major, 1)
-        self.assertEqual(self._version(remote_proxy), self._latest("proxy"))
+        self.assertEqual(self._version(remote_proxy), self._latest("token-board"))
         self.assertEqual(self._version(remote_dash), self._latest("dashboard"))
         self.assertEqual(self._version(proxy), (0, 19))
 

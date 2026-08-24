@@ -91,8 +91,8 @@ def main() -> None:
     thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
-        db = Path(directory) / "proxy.db"
-        migrations.migrate(str(db), str(schema), "proxy")
+        db = Path(directory) / "token-board.db"
+        migrations.migrate(str(db), str(schema), "token-board")
         with sqlite3.connect(db) as conn:
             conn.executescript("""
                 INSERT INTO accounts(id,uuid,name) VALUES(1,'a','queue');

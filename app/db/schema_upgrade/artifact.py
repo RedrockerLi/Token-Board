@@ -5,10 +5,12 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from app.db.migrations import TOKEN_BOARD_DATABASE_NAME
+
 
 def strip_runtime_artifact(path: Path, database_name: str) -> None:
     """Remove machine-local state before a config artifact is merged."""
-    if database_name != "proxy":
+    if database_name != TOKEN_BOARD_DATABASE_NAME:
         return
     runtime_tables = (
         "request_log", "request_attempts", "billing_period_charges",

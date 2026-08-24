@@ -39,14 +39,14 @@ def main() -> None:
     assert SchemaVersion.from_user_version(10000) == SchemaVersion(1, 0)
     assert SchemaVersion(1, 10).user_version == 10010
 
-    fresh = Path(tempfile.mkdtemp()) / "proxy.db"
-    migrate(str(fresh), str(schema_root), "proxy")
+    fresh = Path(tempfile.mkdtemp()) / "token-board.db"
+    migrate(str(fresh), str(schema_root), "token-board")
     conn = sqlite3.connect(fresh)
-    latest_proxy = max(step.version for step in _sql_steps(schema_root / "proxy" / "v1"))
+    latest_proxy = max(step.version for step in _sql_steps(schema_root / "token-board" / "v1"))
     assert conn.execute("PRAGMA user_version").fetchone()[0] == latest_proxy.user_version
     assert conn.execute(
         "SELECT major,minor,database_name FROM schema_version").fetchone() == (
-            latest_proxy.major, latest_proxy.minor, "proxy")
+            latest_proxy.major, latest_proxy.minor, "token-board")
     conn.close()
 
     ordered = Path(tempfile.mkdtemp())
@@ -63,18 +63,18 @@ def main() -> None:
     expect_error(lambda: _sql_steps(invalid), "bad migration filename")
 
     checksum_dir = Path(tempfile.mkdtemp())
-    shutil.copy2(schema_root / "proxy" / "v1" / "1-0_baseline.sql",
+    shutil.copy2(schema_root / "token-board" / "v1" / "1-0_baseline.sql",
                  checksum_dir / "1-0_baseline.sql")
-    checksum_db = Path(tempfile.mkdtemp()) / "proxy.db"
-    migrate(str(checksum_db), str(checksum_dir), "proxy")
+    checksum_db = Path(tempfile.mkdtemp()) / "token-board.db"
+    migrate(str(checksum_db), str(checksum_dir), "token-board")
     with (checksum_dir / "1-0_baseline.sql").open("a", encoding="utf-8") as handle:
         handle.write("\n-- forbidden edit\n")
-    expect_error(lambda: migrate(str(checksum_db), str(checksum_dir), "proxy"),
+    expect_error(lambda: migrate(str(checksum_db), str(checksum_dir), "token-board"),
                  "checksum mismatch")
 
-    v0 = Path(tempfile.mkdtemp()) / "proxy.db"
-    migrate(str(v0), str(schema_root / "proxy" / "v0"), "proxy")
-    expect_error(lambda: migrate(str(v0), str(schema_root), "proxy"),
+    v0 = Path(tempfile.mkdtemp()) / "token-board.db"
+    migrate(str(v0), str(schema_root / "token-board" / "v0"), "token-board")
+    expect_error(lambda: migrate(str(v0), str(schema_root), "token-board"),
                  "run schema/transitions/0-to-1")
 
     print("schema version vectors passed")

@@ -11,7 +11,7 @@ def export_data():
     import os as _os
     from app.services.sync import sync_dashboard
 
-    db_path = current_app.config["PROXY_DB"].db_path
+    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
 
     result = sync_dashboard(
@@ -31,7 +31,7 @@ def export_data():
 def get_sync_config():
     from app.services.sync import load_sync_config
 
-    db_path = current_app.config["PROXY_DB"].db_path
+    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     cfg = load_sync_config(db_path)
     if cfg:
         return jsonify({
@@ -56,7 +56,7 @@ def save_sync_config():
     if "/" not in data["base_url"][8:]:
         return jsonify({"error": "服务器地址格式不正确，需包含主机名"}), 400
 
-    db_path = current_app.config["PROXY_DB"].db_path
+    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
 
     # If password is masked placeholder, preserve the existing one
     if data.get("password", "").startswith("••••"):
@@ -81,7 +81,7 @@ def test_sync_connection():
     from app.services.sync import SyncConfig, _webdav_test
 
     data = request.get_json(force=True)
-    db_path = current_app.config["PROXY_DB"].db_path
+    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
 
     # Build config from request (or fall back to saved config)
     base_url = data.get("base_url")
@@ -116,7 +116,7 @@ def upload_config():
     """
     from app.services.sync import sync_config_upload
 
-    db_path = current_app.config["PROXY_DB"].db_path
+    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     result = sync_config_upload(
         db_path, schema_dir=current_app.config.get("SCHEMA_DIR"))
     return jsonify(result)
@@ -131,7 +131,7 @@ def discard_config():
     """
     from app.services.sync import restore_config_snapshot
 
-    db_path = current_app.config["PROXY_DB"].db_path
+    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     if not restore_config_snapshot(db_path):
         return jsonify({"status": "error",
                         "message": "没有可回滚的快照(本机尚未成功同步过)"}), 400

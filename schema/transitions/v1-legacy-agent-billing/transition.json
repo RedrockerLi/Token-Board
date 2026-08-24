@@ -1,0 +1,8 @@
+{
+  "id": "v1-legacy-agent-billing",
+  "databases": ["token-board", "dashboard"],
+  "strategy": "shadow-barrier",
+  "entrypoint": "transition.py",
+  "order": 10,
+  "description": "Remove recurring charge duplication left by the V1.6 agent split"
+}

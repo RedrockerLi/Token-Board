@@ -230,7 +230,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
             start_background_tasks=False,
         )
         self.assertEqual(app.config["SCHEMA_DIR"], str(schema_root.resolve()))
-        self.assertEqual(app.config["PROXY_DB"].schema_dir,
+        self.assertEqual(app.config["TOKEN_BOARD_DB"].schema_dir,
                          str(schema_root.resolve()))
         self.assertEqual(app.config["DATA_STORE"].schema_dir,
                          str(schema_root.resolve()))

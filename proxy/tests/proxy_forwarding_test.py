@@ -121,8 +121,8 @@ def main() -> None:
     upstream_thread.start()
 
     with tempfile.TemporaryDirectory() as tmp:
-        db_path = Path(tmp) / "proxy.db"
-        migrate(str(db_path), str(schema_dir), "proxy")
+        db_path = Path(tmp) / "token-board.db"
+        migrate(str(db_path), str(schema_dir), "token-board")
         conn = sqlite3.connect(db_path)
         try:
             from v1_fixture import add_plain_route, add_upstream
@@ -167,7 +167,7 @@ def main() -> None:
                 expected_version = max(
                     int(path.name.split("_", 1)[0].split("-")[0]) * 10000
                     + int(path.name.split("_", 1)[0].split("-")[1])
-                    for path in (schema_dir / "proxy/v1").glob("*.sql"))
+                    for path in (schema_dir / "token-board/v1").glob("*.sql"))
                 assert conn.execute("PRAGMA user_version").fetchone()[0] == expected_version
                 # Logging is now asynchronous (a dedicated accounting thread);
                 # the HTTP response can complete before the row is durable, so

@@ -5,7 +5,7 @@ import logging
 from app.services.sync.common import *  # noqa: F401,F403
 from app.db.schema_upgrade import upgrade_downloaded_artifact
 from app.db.schema_upgrade.coordinator import inspect_version
-from app.db.migrations import schema_dir_for
+from app.db.migrations import TOKEN_BOARD_DATABASE_NAME, schema_dir_for
 from app.services.sync.settings import SyncConfig
 
 log = logging.getLogger(__name__)
@@ -54,8 +54,8 @@ def _sync_config_upload_once(db_path: str, schema_dir: str | None = None) -> dic
             # its row-hash differ from the stored one purely by schema, not by
             # content — causing a permanent conflict.  Upgrade it here so the
             # comparison is column-consistent.
-            remote_version = inspect_version(Path(remote_path), "proxy")
-            local_version = inspect_version(Path(db_path), "proxy")
+            remote_version = inspect_version(Path(remote_path), TOKEN_BOARD_DATABASE_NAME)
+            local_version = inspect_version(Path(db_path), TOKEN_BOARD_DATABASE_NAME)
             if (remote_version and local_version and
                     remote_version.major not in {0, local_version.major}):
                 message = (f"拒绝跨 Major 配置同步: remote=V{remote_version.major}."
@@ -64,10 +64,10 @@ def _sync_config_upload_once(db_path: str, schema_dir: str | None = None) -> dic
                 _set_sync_state(db_path, "sync_health", message)
                 return {"status": "error", "message": message, "conflict": False}
             upgrade_downloaded_artifact(
-                remote_path, "proxy",
-                schema_dir or schema_dir_for(db_path, "proxy"),
-                local_proxy_path=db_path, configuration_only=True)
-            upgraded_version = inspect_version(Path(remote_path), "proxy")
+                remote_path, TOKEN_BOARD_DATABASE_NAME,
+                schema_dir or schema_dir_for(db_path, TOKEN_BOARD_DATABASE_NAME),
+                local_token_board_path=db_path, configuration_only=True)
+            upgraded_version = inspect_version(Path(remote_path), TOKEN_BOARD_DATABASE_NAME)
             if (upgraded_version and local_version and
                     upgraded_version.major == local_version.major and
                     upgraded_version.minor > local_version.minor):
@@ -111,9 +111,9 @@ def _sync_config_upload_once(db_path: str, schema_dir: str | None = None) -> dic
         _set_sync_state(db_path, "remote_artifact", published.name)
         if published.etag:
             _set_sync_state(db_path, "remote_etag", published.etag)
-        uploaded_version = inspect_version(Path(config_path), "proxy")
+        uploaded_version = inspect_version(Path(config_path), TOKEN_BOARD_DATABASE_NAME)
         record_remote_metadata(
-            db_path, "proxy", _file_checksum(Path(config_path)),
+            db_path, TOKEN_BOARD_DATABASE_NAME, _file_checksum(Path(config_path)),
             uploaded_version.major if uploaded_version else None,
             uploaded_version.minor if uploaded_version else None)
         snapshot_config(db_path)
@@ -183,17 +183,17 @@ def _sync_config_download_once(db_path: str,
         # local schema — exactly like the local DB — before merging, so a cloud
         # file from an older release (e.g. one still carrying a now-dropped
         # column like cancellation_grace_hours) cannot fight the local schema.
-        remote_version = inspect_version(Path(remote_path), "proxy")
-        local_version = inspect_version(Path(db_path), "proxy")
+        remote_version = inspect_version(Path(remote_path), TOKEN_BOARD_DATABASE_NAME)
+        local_version = inspect_version(Path(db_path), TOKEN_BOARD_DATABASE_NAME)
         if (remote_version and local_version and
                 remote_version.major not in {0, local_version.major}):
             _set_sync_state(db_path, "sync_health", "remote major mismatch")
             return False
         upgrade_downloaded_artifact(
-            remote_path, "proxy",
-            schema_dir or schema_dir_for(db_path, "proxy"),
-            local_proxy_path=db_path, configuration_only=True)
-        upgraded_version = inspect_version(Path(remote_path), "proxy")
+            remote_path, TOKEN_BOARD_DATABASE_NAME,
+            schema_dir or schema_dir_for(db_path, TOKEN_BOARD_DATABASE_NAME),
+            local_token_board_path=db_path, configuration_only=True)
+        upgraded_version = inspect_version(Path(remote_path), TOKEN_BOARD_DATABASE_NAME)
         if (upgraded_version and local_version and
                 upgraded_version.major == local_version.major and
                 upgraded_version.minor > local_version.minor):
@@ -216,9 +216,9 @@ def _sync_config_download_once(db_path: str,
             _set_sync_state(db_path, "remote_artifact", published.name)
             if published.etag:
                 _set_sync_state(db_path, "remote_etag", published.etag)
-            published_version = inspect_version(Path(publish_path), "proxy")
+            published_version = inspect_version(Path(publish_path), TOKEN_BOARD_DATABASE_NAME)
             record_remote_metadata(
-                db_path, "proxy", _file_checksum(Path(publish_path)),
+                db_path, TOKEN_BOARD_DATABASE_NAME, _file_checksum(Path(publish_path)),
                 published_version.major if published_version else None,
                 published_version.minor if published_version else None)
         else:
@@ -228,7 +228,7 @@ def _sync_config_download_once(db_path: str,
                 if remote_artifact.etag:
                     _set_sync_state(db_path, "remote_etag", remote_artifact.etag)
             record_remote_metadata(
-                db_path, "proxy", raw_sha256,
+                db_path, TOKEN_BOARD_DATABASE_NAME, raw_sha256,
                 remote_version.major if remote_version else None,
                 remote_version.minor if remote_version else None)
         snapshot_config(db_path)

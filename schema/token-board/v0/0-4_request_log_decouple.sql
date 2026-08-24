@@ -1,6 +1,6 @@
 -- 0004: 日志与上游账户彻底解耦 + 快照列 + 高水位同步
 --
--- DESTRUCTIVE: 重建 request_log / local_keys（改可空、删 exported 列、加快照列）— 先备份 data/proxy.db
+-- DESTRUCTIVE: 重建 request_log / local_keys（改可空、删 exported 列、加快照列）— 先备份 data/token-board.db
 --
 -- 变更目标：
 --   1. request_log 删掉 exported 列（三态标记废弃），改为 sync_state.last_exported_log_id 单值提交检查点。

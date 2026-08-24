@@ -29,22 +29,6 @@ def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
             [(row["id"], row["name"], row["lifecycle_state"],
               row["updated_at"], row["account_kind"]) for row in accounts],
         )
-        # Agent accounts were archived as upstream plan rows before V1.6.
-        # Their historical virtual/equivalent cost remains useful, but the
-        # recurring portion must not be counted alongside the independent
-        # agent subscription ledger.
-        legacy_ids = [row[0] for row in proxy.execute(
-            "SELECT DISTINCT account_id FROM account_importers "
-            "WHERE enabled=0 AND importer_kind IS NOT NULL"
-        ).fetchall()]
-        if legacy_ids:
-            placeholders = ",".join("?" for _ in legacy_ids)
-            dash.execute(
-                "UPDATE monthly_recurring_costs SET recurring_charge=0,"
-                "normalized_recurring_cost=0 "
-                f"WHERE account_id IN ({placeholders})",
-                legacy_ids,
-            )
         dash.commit()
     finally:
         proxy.close()
