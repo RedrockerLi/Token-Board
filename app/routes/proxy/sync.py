@@ -27,6 +27,70 @@ def export_data():
     return jsonify(result)
 
 
+@bp_proxy.route("/dashboard/users", methods=["DELETE"])
+def delete_dashboard_user():
+    """Delete one user's dashboard archive locally; cloud upload is deferred."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    prepare = bool(data.get("prepare"))
+    if not name:
+        return jsonify({"status": "error", "message": "用户名称不能为空"}), 400
+
+    import os as _os
+    from app.services.dashboard_user import delete_dashboard_user_local as _delete_user
+
+    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
+    dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
+    result = _delete_user(
+        db_path,
+        dash_db_path,
+        name,
+        schema_dir=current_app.config.get("SCHEMA_DIR"),
+        prepare=prepare,
+    )
+
+    # The local archive changes immediately; the upload is performed by
+    # POST /dashboard/users/upload when the picker closes.
+    ds = current_app.config.get("DATA_STORE")
+    if ds:
+        ds.load()
+
+    status = result.get("status")
+    if status == "ok":
+        return jsonify(result)
+    if status == "not_found":
+        return jsonify(result), 404
+    return jsonify(result), 400
+
+
+@bp_proxy.route("/dashboard/users/upload", methods=["POST"])
+def upload_dashboard_user_deletions():
+    """Upload the local Dashboard archive after picker deletions."""
+    import os as _os
+    from app.services.dashboard_user import (
+        upload_dashboard_user_deletions as _upload_deletions,
+    )
+
+    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
+    dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
+    result = _upload_deletions(
+        db_path,
+        dash_db_path,
+        schema_dir=current_app.config.get("SCHEMA_DIR"),
+    )
+
+    ds = current_app.config.get("DATA_STORE")
+    if ds:
+        ds.load()
+
+    status = result.get("status")
+    if status == "ok":
+        return jsonify(result)
+    if status == "conflict":
+        return jsonify(result), 409
+    return jsonify(result), 502
+
+
 @bp_proxy.route("/sync/config", methods=["GET"])
 def get_sync_config():
     from app.services.sync import load_sync_config

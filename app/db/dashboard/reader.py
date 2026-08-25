@@ -4,6 +4,18 @@ from app.db.dashboard.common import *  # noqa: F401,F403
 
 
 class DashboardReaderMixin:
+    def get_account_ids_by_name(self, name: str) -> list[int]:
+        """Return every archived account identity with the exact display name."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT account_id FROM accounts WHERE name=? ORDER BY account_id",
+                (name,),
+            ).fetchall()
+            return [int(row["account_id"]) for row in rows]
+        finally:
+            conn.close()
+
     def load_rows(self):
         conn = self._connect()
         try:

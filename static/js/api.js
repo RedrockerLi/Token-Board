@@ -83,6 +83,22 @@ async function fetchRefresh() {
     return fetchJSON('/api/refresh');
 }
 
+/** Delete one user's complete usage-dashboard archive on this machine only. */
+async function deleteDashboardUserLocal(name, prepare) {
+    return proxyFetchJSON('/api/proxy/dashboard/users', {
+        method: 'DELETE',
+        body: JSON.stringify({ name: name, prepare: !!prepare }),
+    });
+}
+
+/** Upload the already-modified local Dashboard archive to the cloud. */
+async function uploadDashboardUserDeletions() {
+    return proxyFetchJSON('/api/proxy/dashboard/users/upload', {
+        method: 'POST',
+        body: JSON.stringify({}),
+    });
+}
+
 // ── Proxy management API wrappers ──
 
 async function proxyFetchJSON(url, options = {}) {
@@ -92,7 +108,7 @@ async function proxyFetchJSON(url, options = {}) {
     });
     if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
-        throw new Error(err.error || `HTTP ${resp.status}`);
+        throw new Error(err.error || err.message || `HTTP ${resp.status}`);
     }
     return resp.json();
 }

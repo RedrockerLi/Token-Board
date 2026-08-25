@@ -235,6 +235,36 @@ body {
 #keyNameSelector { width: 220px; }
 .map-row > * { min-width: 0; }
 
+.more-user-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin: 2px 0;
+    padding: 2px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+}
+
+.more-user-row--active {
+    background: rgba(0,112,243,0.12);
+    border-color: var(--color-accent, #0070F3);
+}
+
+.more-user-item {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+}
+
+.more-user-delete {
+    color: #EF4444;
+}
+
+.more-user-delete:hover {
+    border-color: #EF4444;
+    color: #DC2626;
+}
+
 .btn {
     display: inline-flex;
     align-items: center;

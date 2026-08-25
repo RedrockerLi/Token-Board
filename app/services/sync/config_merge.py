@@ -42,9 +42,9 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
 
     Stable UUIDs are authoritative. Missing proxy rows become lifecycle
     tombstones rather than being deleted, preserving request/attempt foreign
-    keys and historical pricing; agent software rows are physically deleted by
-    the local management API and their account tombstone is only a sync
-    fallback. ``runtime_id`` and importer cursors remain local.
+    keys and historical pricing; agent software rows use the same lifecycle
+    tombstone model and are retained with their account identity. ``runtime_id``
+    and importer cursors remain local.
     """
     remote = sqlite3.connect(remote_path)
     remote.row_factory = sqlite3.Row
@@ -178,7 +178,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
             "route_rules": ("enabled=0", ()), "client_keys": ("enabled=0", ()),
             "account_importers": ("enabled=0", ()), "pricing_rules": ("enabled=0", ()),
             "agent_subscriptions": ("lifecycle_state='deleted',valid_until=?", (now,)),
-            "agent_software": ("enabled=1", ()),
+            "agent_software": ("enabled=0,updated_at=?", (now,)),
             "agent_subscription_instances": (
                 "lifecycle_state='deleted',valid_until=?,updated_at=?", (now, now)),
             "agent_subscription_bindings": (

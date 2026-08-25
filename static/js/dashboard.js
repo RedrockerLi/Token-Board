@@ -76,6 +76,39 @@ function populateMonthSelector(months) {
 // used by the "更多用户" picker. The dropdown itself shows the top 5.
 let allKeyNames = [];
 const KEY_SELECTOR_TOP = 5;
+const DASHBOARD_DELETE_QUEUE_KEY = 'tokenBoard.dashboardDeleteQueue';
+
+function loadPendingDashboardUserDeletes() {
+    try {
+        var raw = window.localStorage.getItem(DASHBOARD_DELETE_QUEUE_KEY);
+        var names = JSON.parse(raw || '[]');
+        if (!Array.isArray(names)) return [];
+        return names.filter(function (name) {
+            return typeof name === 'string' && name.trim();
+        }).map(function (name) { return name.trim(); });
+    } catch (err) {
+        console.warn('Unable to load pending dashboard deletions:', err);
+        return [];
+    }
+}
+
+var pendingDashboardUserDeletes = new Set(loadPendingDashboardUserDeletes());
+var moreUsersDeleteRequests = new Set();
+var moreUsersClosePromise = null;
+var moreUsersDeleteChain = Promise.resolve();
+var moreUsersDeletePrepared = false;
+var moreUsersModalSessionOpen = false;
+
+function persistPendingDashboardUserDeletes() {
+    try {
+        window.localStorage.setItem(
+            DASHBOARD_DELETE_QUEUE_KEY,
+            JSON.stringify(Array.from(pendingDashboardUserDeletes).sort())
+        );
+    } catch (err) {
+        console.warn('Unable to persist pending dashboard deletions:', err);
+    }
+}
 
 function populateKeyNameSelector(keyNames) {
     var keySel = document.getElementById('keyNameSelector');
@@ -103,25 +136,92 @@ function populateKeyNameSelector(keyNames) {
 
 // ── "更多用户" picker ────────────────────────────────────────────────
 
-function openMoreUsersModal() {
+function renderMoreUsersList() {
     var list = document.getElementById('moreUsersList');
     if (!list) return;
     if (!allKeyNames.length) {
         list.innerHTML = '<div class="td-empty">暂无其他用户</div>';
     } else {
         list.innerHTML = allKeyNames.map(function (name) {
-            var active = (name === currentKeyName)
-                ? ' style="background:rgba(0,112,243,0.12);border-color:var(--color-accent, #0070F3);"'
-                : '';
-            return '<button type="button" class="btn btn--sm more-user-item" data-name="' +
-                esc(name) + '"' + active + ' style="display:block;width:100%;text-align:left;margin:2px 0;">' +
-                esc(name) + '</button>';
+            var active = (name === currentKeyName) ? ' more-user-row--active' : '';
+            return '<div class="more-user-row' + active + '">' +
+                '<button type="button" class="btn btn--sm more-user-item" data-name="' +
+                esc(name) + '">' + esc(name) + '</button>' +
+                '<button type="button" class="btn btn--sm more-user-delete" data-name="' +
+                esc(name) + '" title="删除该用户的全部看板数据">删除</button>' +
+                '</div>';
         }).join('');
     }
+}
+
+function openMoreUsersModal() {
+    if (!moreUsersModalSessionOpen) {
+        moreUsersModalSessionOpen = true;
+        moreUsersDeletePrepared = false;
+    }
+    renderMoreUsersList();
     openModal('moreUsersModal');
 }
 
-function selectMoreUser(name) {
+function removeMoreUserFromList(name) {
+    allKeyNames = allKeyNames.filter(function (item) { return item !== name; });
+    renderMoreUsersList();
+}
+
+async function closeMoreUsersModalImpl() {
+    var modal = document.getElementById('moreUsersModal');
+    var controls = modal ? modal.querySelectorAll('button') : [];
+    Array.from(controls).forEach(function (control) { control.disabled = true; });
+
+    try {
+        var requests = Array.from(moreUsersDeleteRequests);
+        if (requests.length) await Promise.all(requests);
+
+        var names = Array.from(pendingDashboardUserDeletes);
+        if (!names.length) {
+            closeModal('moreUsersModal');
+            moreUsersModalSessionOpen = false;
+            moreUsersDeletePrepared = false;
+            return true;
+        }
+
+        await uploadDashboardUserDeletions();
+        pendingDashboardUserDeletes.clear();
+        persistPendingDashboardUserDeletes();
+        closeModal('moreUsersModal');
+        moreUsersModalSessionOpen = false;
+        moreUsersDeletePrepared = false;
+        await refreshData();
+        if (typeof showToast === 'function') {
+            showToast('已将 ' + names.length + ' 个用户的删除统一上传到云端');
+        }
+        return true;
+    } catch (err) {
+        if (typeof showToast === 'function') {
+            showToast('删除结果上传失败：' + (err.message || '上传失败') +
+                '；删除仍保留在本机，关闭窗口可重试', 'error');
+        } else {
+            alert('删除结果上传失败：' + (err.message || '同步失败'));
+        }
+        return false;
+    } finally {
+        Array.from(controls).forEach(function (control) { control.disabled = false; });
+    }
+}
+
+async function closeMoreUsersModal() {
+    if (moreUsersClosePromise) return moreUsersClosePromise;
+    var operation = closeMoreUsersModalImpl();
+    moreUsersClosePromise = operation;
+    try {
+        return await operation;
+    } finally {
+        if (moreUsersClosePromise === operation) moreUsersClosePromise = null;
+    }
+}
+
+async function selectMoreUser(name) {
+    if (!await closeMoreUsersModal()) return;
     currentKeyName = name;
     var keySel = document.getElementById('keyNameSelector');
     if (keySel) {
@@ -134,10 +234,47 @@ function selectMoreUser(name) {
         }
         keySel.value = name;
     }
-    closeModal('moreUsersModal');
     loadSummary();
     loadModelPie();
     loadTypePie();
+}
+
+async function deleteMoreUser(name, button) {
+    if (!confirm('确定删除用户「' + name + '」的全部看板数据吗？\n\n此操作不可恢复。')) {
+        return;
+    }
+
+    var shouldPrepare = !moreUsersDeletePrepared;
+    var row = button && button.closest ? button.closest('.more-user-row') : null;
+    var controls = row ? row.querySelectorAll('button') : [];
+    Array.from(controls).forEach(function (control) { control.disabled = true; });
+
+    try {
+        await deleteDashboardUserLocal(name, shouldPrepare);
+        if (shouldPrepare) moreUsersDeletePrepared = true;
+        pendingDashboardUserDeletes.add(name);
+        persistPendingDashboardUserDeletes();
+        removeMoreUserFromList(name);
+        if (currentKeyName === name) {
+            currentKeyName = '';
+            var keySel = document.getElementById('keyNameSelector');
+            if (keySel) keySel.value = '';
+        }
+        // The first delete also refreshes the dashboard that was pulled from
+        // cloud. Later deletes only update the local picker and avoid another
+        // round trip while the user is still choosing names.
+        if (shouldPrepare) await refreshData();
+        if (typeof showToast === 'function') {
+            showToast('用户「' + name + '」已从看板移除');
+        }
+    } catch (err) {
+        Array.from(controls).forEach(function (control) { control.disabled = false; });
+        if (typeof showToast === 'function') {
+            showToast('删除失败：' + (err.message || '操作失败'), 'error');
+        } else {
+            alert('删除失败：' + (err.message || '同步失败'));
+        }
+    }
 }
 
 // ── Dynamic chart container management ──
@@ -681,6 +818,20 @@ function bindDashboardEvents() {
     if (moreList && !moreList._bound) {
         moreList._bound = true;
         moreList.addEventListener('click', function (e) {
+            var deleteBtn = e.target.closest ? e.target.closest('.more-user-delete') : null;
+            if (deleteBtn) {
+                var request = moreUsersDeleteChain.then(function () {
+                    return deleteMoreUser(deleteBtn.dataset.name, deleteBtn);
+                });
+                moreUsersDeleteChain = request.catch(function () { });
+                moreUsersDeleteRequests.add(request);
+                request.then(function () {
+                    moreUsersDeleteRequests.delete(request);
+                }, function () {
+                    moreUsersDeleteRequests.delete(request);
+                });
+                return;
+            }
             var btn = e.target.closest ? e.target.closest('.more-user-item') : null;
             if (btn) selectMoreUser(btn.dataset.name);
         });

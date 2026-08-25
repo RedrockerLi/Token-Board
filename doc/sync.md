@@ -68,6 +68,10 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 
 任一步失败都会删除 shadow，不推进高水位，不替换本地 dashboard，也不清理未确认上传的明细。多机器同时上传时仍要求避免并发，后完成的完整文件可能覆盖先完成的文件。
 
+### 删除看板用户
+
+`DELETE /api/proxy/dashboard/users` 接收 `{"name":"用户名称","prepare":true/false}`。更多用户窗口中的第一次删除带 `prepare=true`：按“下载云端 dashboard → 本机导出最新用量 → 删除目标用户”的顺序处理，但不上传；同一窗口后续删除只从本机归档移除。窗口关闭时调用 `POST /api/proxy/dashboard/users/upload`，该接口只上传已经修改过的本地 dashboard 存档，不下载、不重新导出，也不接收用户名称。上游账户配置和本机请求明细不在此操作范围内。
+
 ## 运行时同步健康
 
 `sync_state.sync_health` 记录最近一次错误，性能 API 会把它反映为 degraded。WebDAV 未配置时配置上传不会报错，只返回 `unconfigured`；Dashboard 导出则提示未配置同步服务器。

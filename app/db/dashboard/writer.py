@@ -44,6 +44,29 @@ class DashboardWriterMixin:
         finally:
             conn.close()
 
+    def purge_accounts(self, account_ids: set[int] | list[int] | tuple[int, ...]) -> int:
+        """Remove all dashboard archive rows for the given identities."""
+        ids = sorted({int(account_id) for account_id in (account_ids or [])})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        conn = self._connect()
+        try:
+            deleted = 0
+            for table in ("monthly_recurring_costs", "daily_usage"):
+                deleted += conn.execute(
+                    f"DELETE FROM {table} WHERE account_id IN ({placeholders})",
+                    ids,
+                ).rowcount
+            deleted += conn.execute(
+                f"DELETE FROM accounts WHERE account_id IN ({placeholders})",
+                ids,
+            ).rowcount
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
+
     def upsert_proxy_data(self, date: str, model: str,
                           account_id: int, prompt_tokens: int,
                           completion_tokens: int, cache_read_tokens: int,

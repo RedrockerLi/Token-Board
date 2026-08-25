@@ -406,6 +406,40 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertEqual(database.get_agent_software()[0]["id"], software_id)
         self.assertNotIn(software_id, [account["id"] for account in database.get_accounts()])
 
+    def test_agent_software_delete_is_soft(self) -> None:
+        database = self.proxy_database()
+        software_id = database.create_agent_software({
+            "name": "soft-deleted-agent", "agent_kind": "codex",
+        })
+        subscription_id = database.create_agent_subscription({
+            "name": "soft-deleted-subscription", "valid_from": "2026-08-01",
+            "monthly_price": 10, "currency": "CNY",
+        })
+        self.assertTrue(database.update_agent_software(
+            software_id, {"subscription_ids": [subscription_id]}))
+
+        self.assertTrue(database.delete_agent_software(software_id))
+        with sqlite3.connect(self.proxy_path) as conn:
+            account = conn.execute(
+                "SELECT lifecycle_state,deleted_at FROM accounts WHERE id=?",
+                (software_id,)).fetchone()
+            self.assertEqual(account[0], "deleted")
+            self.assertIsNotNone(account[1])
+            self.assertEqual(conn.execute(
+                "SELECT enabled FROM agent_software WHERE id=?",
+                (software_id,)).fetchone()[0], 0)
+            self.assertIsNotNone(conn.execute(
+                "SELECT software_id FROM agent_software_runtime WHERE software_id=?",
+                (software_id,)).fetchone())
+            binding = conn.execute(
+                "SELECT lifecycle_state,valid_until FROM agent_subscription_bindings "
+                "WHERE software_id=? AND subscription_id=?",
+                (software_id, subscription_id),
+            ).fetchone()
+            self.assertEqual(binding[0], "deleted")
+            self.assertIsNotNone(binding[1])
+        self.assertEqual(database.get_agent_software(), [])
+
     def test_aggregate_route_set_and_model_catalog(self) -> None:
         database = self.proxy_database()
         metered = database.create_account({

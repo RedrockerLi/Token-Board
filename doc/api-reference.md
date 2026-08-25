@@ -54,7 +54,7 @@
 | `/api/proxy/agent-subscriptions/<id>/instances` | GET/POST | 查询或添加订阅实例（每个实例独立计费） |
 | `/api/proxy/agent-subscription-instances/<id>` | PUT/DELETE | 修改或删除订阅实例 |
 | `/api/proxy/agent-software` | GET/POST | 查询/添加软件来源（名称、类型、数据目录） |
-| `/api/proxy/agent-software/<id>` | PUT/DELETE | 修改/删除软件来源，并用 `subscription_ids` 替换订阅绑定 |
+| `/api/proxy/agent-software/<id>` | PUT/DELETE | 修改/软删除软件来源，并用 `subscription_ids` 替换订阅绑定；删除后保留身份和历史归属 |
 
 ### 账户与密钥
 
@@ -121,6 +121,8 @@
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/api/proxy/export` | POST | 导出事务:拉取云端 → 导出本地新用量 → 上传 → 成功后推进检查点并替换本地存档(见 [sync.md](sync.md)) |
+| `/api/proxy/dashboard/users` | DELETE | body `{"name":"用户名称","prepare":true/false}`；首次删除先下载云端存档并把本机最新用量导出到本地，随后只从本机删除该用户归档；退出“更多用户”界面后上传本地存档。不改上游账户配置和本机请求日志。 |
+| `/api/proxy/dashboard/users/upload` | POST | 上传当前本地 dashboard 存档；不下载、不重新导出，也不接收用户名称。 |
 | `/api/proxy/sync/config` | GET | 读取 WebDAV 配置(密码脱敏) |
 | `/api/proxy/sync/config` | PUT | 保存 WebDAV 配置 |
 | `/api/proxy/sync/test` | POST | 测试 WebDAV 连接 |

@@ -139,35 +139,38 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             ).fetchone()
             if row is None:
                 return False
-            # Software deletion is physical.  Request history is retained, but
-            # detached from this identity so the deleted software contributes
-            # no future usage and the account FK remains valid.
+            # Agent identities are stable account identities just like proxy
+            # accounts.  Keep the software, runtime cursor, bindings and
+            # request-log foreign keys so historical usage remains attributable
+            # to the deleted software; only its live lifecycle is terminated.
+            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             conn.execute(
-                "UPDATE request_log SET account_id=NULL,agent_software_id=NULL "
-                "WHERE account_id=? OR agent_software_id=?",
-                (software_id, software_id),
+                "UPDATE accounts SET lifecycle_state='deleted',"
+                "deleted_at=?,disabled_at=NULL,updated_at=? "
+                "WHERE id=? AND account_kind='agent'",
+                (now, now, software_id),
             )
-            conn.execute("DELETE FROM agent_subscription_bindings WHERE software_id=?",
-                         (software_id,))
-            conn.execute("DELETE FROM agent_software_runtime WHERE software_id=?",
-                         (software_id,))
-            # Remove any legacy importer/billing children that may still point
-            # at an agent identity left by the pre-unification schema.
-            conn.execute("DELETE FROM account_importers WHERE account_id=?",
-                         (software_id,))
-            contract_ids = [item[0] for item in conn.execute(
-                "SELECT id FROM billing_contracts WHERE account_id=?",
-                (software_id,)).fetchall()]
-            if contract_ids:
-                placeholders = ",".join("?" for _ in contract_ids)
-                for table in ("billing_period_charges", "billing_rate_events"):
-                    conn.execute(f"DELETE FROM {table} WHERE contract_id IN ({placeholders})",
-                                 contract_ids)
-                conn.execute(f"DELETE FROM billing_contracts WHERE id IN ({placeholders})",
-                             contract_ids)
-            conn.execute("DELETE FROM agent_software WHERE id=?", (software_id,))
-            conn.execute("DELETE FROM accounts WHERE id=? AND account_kind='agent'",
-                         (software_id,))
+            conn.execute(
+                "UPDATE agent_subscription_bindings SET lifecycle_state='deleted',"
+                "valid_until=?,updated_at=? WHERE software_id=? "
+                "AND lifecycle_state='active'",
+                (now, now, software_id),
+            )
+            conn.execute(
+                "UPDATE agent_software SET enabled=0,updated_at=? WHERE id=?",
+                (now, software_id),
+            )
+            # Retain legacy children for auditability, but stop them from
+            # participating in any current import or billing calculation.
+            conn.execute(
+                "UPDATE account_importers SET enabled=0 WHERE account_id=?",
+                (software_id,),
+            )
+            conn.execute(
+                "UPDATE billing_contracts SET valid_until=? WHERE account_id=? "
+                "AND (valid_until IS NULL OR valid_until>?)",
+                (now, software_id, now),
+            )
             conn.commit()
             return True
         finally:
