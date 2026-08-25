@@ -105,8 +105,8 @@ async function loadDailyBillingChart() {
         if (typeof echarts !== 'undefined') {
             if (billingChart) billingChart.dispose();
             billingChart = echarts.init(dom);
-            billingChart.setOption({
-                tooltip: {
+            billingChart.setOption(Object.assign({
+                tooltip: Object.assign({
                     trigger: 'axis',
                     axisPointer: { type: 'shadow' },
                     formatter: function(params) {
@@ -124,8 +124,8 @@ async function loadDailyBillingChart() {
                         html += '消费: <b>¥' + (d.cost || 0).toFixed(2) + '</b>';
                         return html;
                     }
-                },
-                legend: { data: ['输入Token', '输出Token', '消费'], bottom: 0, textStyle: { fontSize: 11 } },
+                }, (typeof TOOLTIP_STYLE !== 'undefined' ? TOOLTIP_STYLE : {})),
+                legend: { data: ['输入Token', '输出Token', '消费'], bottom: 0, textStyle: { fontSize: 11, color: '#6B7194' } },
                 grid: { left: 70, right: 70, top: 20, bottom: 50 },
                 xAxis: { type: 'category', data: dates, axisLabel: { rotate: 30, fontSize: 10 } },
                 yAxis: [
@@ -136,22 +136,23 @@ async function loadDailyBillingChart() {
                     {
                         name: '输出Token', type: 'bar', stack: 'tokens',
                         data: outputTokens, barMaxWidth: 28,
-                        itemStyle: { color: '#0070F3' },
+                        itemStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('#60A5FA', '#2563EB') : '#3B82F6' },
                     },
                     {
                         name: '输入Token', type: 'bar', stack: 'tokens',
                         data: inputTokens, barMaxWidth: 28,
-                        itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
+                        itemStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('#4FD6F0', '#06B6D4') : '#06B6D4', borderRadius: [4, 4, 0, 0] },
                     },
                     {
                         name: '消费', type: 'line', yAxisIndex: 1,
                         data: costs,
                         lineStyle: { color: '#EF4444', width: 2.5 },
-                        itemStyle: { color: '#EF4444' },
+                        itemStyle: { color: '#EF4444', borderColor: '#fff', borderWidth: 1.5 },
+                        areaStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('rgba(239,68,68,0.14)', 'rgba(239,68,68,0)') : 'rgba(239,68,68,0.08)' },
                         symbol: 'circle', symbolSize: 6,
                     },
                 ],
-            });
+            }, (typeof CHART_ANIM !== 'undefined' ? CHART_ANIM : {})));
             new ResizeObserver(() => billingChart.resize()).observe(dom);
         }
     } catch (err) {
@@ -192,7 +193,7 @@ function initBillingPage() {
         <!-- Stats Cards -->
         <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr);">
             <div class="stat-card stat-card--highlight">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#0070F3;"></span> 近30天 Token</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#3B82F6;"></span> 近30天 Token</div>
                 <div class="stat-card__value number-lg" id="billTotalTokens">--</div>
                 <div class="stat-card__sub">滚动窗口</div>
             </div>

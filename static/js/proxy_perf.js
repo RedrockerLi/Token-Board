@@ -33,7 +33,7 @@ function buildPerfPageHTML() {
         <!-- Stat Cards -->
         <div class="stats-grid" style="grid-template-columns:repeat(4, 1fr);">
             <div class="stat-card stat-card--highlight">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#0070F3;"></span> 当前并发</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#3B82F6;"></span> 当前并发</div>
                 <div class="stat-card__value number-lg" id="perfConcurrent">--</div>
                 <div class="stat-card__sub">处理中的请求数</div>
             </div>
@@ -43,7 +43,7 @@ function buildPerfPageHTML() {
                 <div class="stat-card__sub">最近 1 分钟 (RPM)</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#22C55E;"></span> 成功率</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#10B981;"></span> 成功率</div>
                 <div class="stat-card__value number-lg" id="perfSuccessRate">--</div>
                 <div class="stat-card__sub">最近 15 分钟</div>
             </div>
@@ -137,7 +137,7 @@ function renderLatencyChart(domId, data) {
                 name: 'P50', type: 'line',
                 data: data.map(function(d) { return d.p50; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#0070F3', width: 2 },
+                lineStyle: { color: '#3B82F6', width: 2 },
             },
             {
                 name: 'P95', type: 'line',
@@ -190,7 +190,7 @@ function renderSpeedChart(domId, data) {
                 name: 'P50', type: 'line',
                 data: data.map(function(d) { return d.p50; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#0070F3', width: 2 },
+                lineStyle: { color: '#3B82F6', width: 2 },
             },
             {
                 name: 'P95', type: 'line',
@@ -260,9 +260,9 @@ function renderRPMChart(domId, data, minutes) {
         series: [{
             name: '请求数', type: 'line', data: vals,
             smooth: true, symbol: 'circle', symbolSize: 4,
-            lineStyle: { color: '#0070F3', width: 2 },
-            itemStyle: { color: '#0070F3' },
-            areaStyle: { color: 'rgba(0,112,243,0.08)' },
+            lineStyle: { color: '#3B82F6', width: 2 },
+            itemStyle: { color: '#3B82F6' },
+            areaStyle: { color: 'rgba(59,130,246,0.08)' },
         }],
     });
 }
@@ -282,7 +282,7 @@ function renderUpstreamSuccessRateChart(domId, data) {
     var colors = data.map(function(d) {
         var r = d.success_rate;
         if (r == null) return '#6B7280';
-        return r >= 95 ? '#22C55E' : (r >= 80 ? '#F59E0B' : '#EF4444');
+        return r >= 95 ? '#10B981' : (r >= 80 ? '#F59E0B' : '#EF4444');
     });
 
     chartUpstreamSuccess.setOption({
@@ -331,7 +331,7 @@ function renderModelLatencyChart(domId, models) {
     models.sort(function(a, b) { return b.avg_ttft_ms - a.avg_ttft_ms; });
     var names = models.map(function(m) { return m.model; });
     var latencies = models.map(function(m) { return m.avg_ttft_ms; });
-    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#0070F3','#00CEF3','#22C55E','#F59E0B','#8B5CF6','#EF4444','#EC4899','#6366F1'])[i % 8]; });
+    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#3B82F6','#06B6D4','#10B981','#F59E0B','#8B5CF6','#F43F5E','#6366F1','#14B8A6'])[i % 8]; });
 
     chartModelLatency.setOption({
         tooltip: {
@@ -367,7 +367,7 @@ function renderModelSpeedChart(domId, models) {
         return;
     }
     models.sort(function(a, b) { return b.avg_output_tps - a.avg_output_tps; });
-    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#0070F3','#00CEF3','#22C55E','#F59E0B','#8B5CF6','#EF4444','#EC4899','#6366F1'])[i % 8]; });
+    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#3B82F6','#06B6D4','#10B981','#F59E0B','#8B5CF6','#F43F5E','#6366F1','#14B8A6'])[i % 8]; });
     chartModelSpeed.setOption({
         tooltip: {
             trigger: 'axis', axisPointer: { type: 'shadow' },

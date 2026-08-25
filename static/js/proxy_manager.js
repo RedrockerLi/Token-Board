@@ -43,12 +43,7 @@ function showToast(msg, type = 'success') {
     const toast = document.createElement('div');
     toast.className = `toast toast--${type}`;
     toast.textContent = msg;
-    toast.style.cssText = `
-        position:fixed; bottom:24px; right:24px; z-index:9999;
-        padding:12px 20px; border-radius:8px; color:#fff; font-size:14px;
-        background:${type === 'error' ? '#EF4444' : '#22C55E'};
-        box-shadow:0 4px 12px rgba(0,0,0,0.15); animation:slideUp 0.3s ease;
-    `;
+    // Visuals live in dashboard.css (.toast / .toast--success / .toast--error).
     document.body.appendChild(toast);
     setTimeout(() => {
         toast.style.opacity = '0';

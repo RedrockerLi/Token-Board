@@ -5,8 +5,34 @@
  * Functions expect pre-fetched data — no HTTP calls.
  */
 
-// ── Color palette ──
-const chartColors = ['#0070F3', '#00CEF3', '#22C55E', '#F59E0B', '#8B5CF6', '#EF4444', '#EC4899', '#6366F1'];
+// ── Color palette (Tailwind 500 family — uniform lightness/chroma) ──
+const chartColors = ['#3B82F6', '#06B6D4', '#10B981', '#F59E0B', '#8B5CF6', '#F43F5E', '#6366F1', '#14B8A6'];
+
+// ── Shared visual style (purely cosmetic — no data semantics) ──
+
+function _vGrad(top, bottom) {
+    return new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+        { offset: 0, color: top },
+        { offset: 1, color: bottom }
+    ]);
+}
+
+var CHART_ANIM = {
+    animationDuration: 600,
+    animationEasing: 'cubicOut',
+    animationDurationUpdate: 400,
+    // Match the UI font instead of ECharts' default sans
+    textStyle: {
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif'
+    }
+};
+var TOOLTIP_STYLE = {
+    backgroundColor: '#fff',
+    borderColor: '#E8EBF0',
+    borderRadius: 10,
+    padding: [10, 14],
+    extraCssText: 'box-shadow: 0 4px 12px rgba(2,14,54,0.08), 0 12px 28px rgba(2,14,54,0.08);'
+};
 
 // ── Chart lifecycle ──
 
@@ -51,13 +77,10 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
     var loader = document.getElementById(loaderId);
     var chart = initChart(chartId);
 
-    chart.setOption({
-        tooltip: {
+    chart.setOption(Object.assign({
+        tooltip: Object.assign({
             trigger: 'axis',
-            backgroundColor: '#fff',
-            borderColor: '#E8EBF0',
             textStyle: { color: '#020E36', fontSize: 13 },
-            boxShadow: '0 4px 16px rgba(0,0,0,0.08)',
             formatter: function (params) {
                 var idx = params[0] && params[0].dataIndex;
                 if (idx == null) return '';
@@ -71,7 +94,7 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 html += '消费: <b>' + fmtCost(d.cost) + '</b><br/>';
                 return html;
             }
-        },
+        }, TOOLTIP_STYLE),
         legend: {
             data: ['输出Token', '输入Token', '消费'],
             bottom: 0,
@@ -108,7 +131,7 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 stack: 'tokens',
                 yAxisIndex: 0,
                 data: outputTokens,
-                itemStyle: { color: '#0070F3' },
+                itemStyle: { color: _vGrad('#60A5FA', '#2563EB') },
                 barMaxWidth: 28
             },
             {
@@ -117,7 +140,7 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 stack: 'tokens',
                 yAxisIndex: 0,
                 data: inputTokens,
-                itemStyle: { color: '#00CEF3', borderRadius: [4, 4, 0, 0] },
+                itemStyle: { color: _vGrad('#4FD6F0', '#06B6D4'), borderRadius: [4, 4, 0, 0] },
                 barMaxWidth: 28
             },
             {
@@ -126,12 +149,13 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 yAxisIndex: 1,
                 data: cost,
                 lineStyle: { color: '#EF4444', width: 2.5 },
-                itemStyle: { color: '#EF4444' },
+                itemStyle: { color: '#EF4444', borderColor: '#fff', borderWidth: 1.5 },
+                areaStyle: { color: _vGrad('rgba(239,68,68,0.14)', 'rgba(239,68,68,0)') },
                 symbol: 'circle',
                 symbolSize: 6
             }
         ]
-    });
+    }, CHART_ANIM));
 
     if (loader) loader.style.display = 'none';
     dom.style.display = 'block';
@@ -148,11 +172,9 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
  */
 function renderPieChart(domId, pieData, colors) {
     var chart = initChart(domId);
-    chart.setOption({
-        tooltip: {
+    chart.setOption(Object.assign({
+        tooltip: Object.assign({
             trigger: 'item',
-            backgroundColor: '#fff',
-            borderColor: '#E8EBF0',
             textStyle: { color: '#020E36' },
             formatter: function (p) {
                 var html = p.name + '<br/>Tokens: ' + fmtNum(p.value) +
@@ -163,25 +185,31 @@ function renderPieChart(domId, pieData, colors) {
                 }
                 return html;
             }
-        },
+        }, TOOLTIP_STYLE),
         legend: {
             orient: 'vertical',
             right: 10,
             top: 'center',
+            icon: 'circle',
+            itemWidth: 9,
+            itemHeight: 9,
             textStyle: { fontSize: 12, color: '#6B7194' }
         },
         series: [{
             type: 'pie',
-            radius: ['45%', '75%'],
+            radius: ['48%', '76%'],
             center: ['35%', '50%'],
             avoidLabelOverlap: false,
-            itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 },
+            padAngle: 2,
+            itemStyle: { borderRadius: 6, borderColor: '#fff', borderWidth: 2 },
             label: { show: false },
             emphasis: {
+                scale: true,
+                scaleSize: 5,
                 label: { show: true, fontSize: 14, fontWeight: 'bold' }
             },
             data: pieData,
             color: colors
         }]
-    });
+    }, CHART_ANIM));
 }

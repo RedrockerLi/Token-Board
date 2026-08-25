@@ -629,7 +629,7 @@ async function loadDailyChartForModel(modelName, chartId, loaderId, aliasModels)
                               requestVals, costVals, days, rotate);
     } catch (err) {
         console.error('Failed to load daily chart for ' + modelName + ':', err);
-        loader.textContent = '加载失败';
+        loader.classList.add('loading--text'); loader.textContent = '加载失败';
     }
 }
 
@@ -694,7 +694,7 @@ async function loadModelPie() {
         loader.style.display = 'none';
     } catch (err) {
         console.error('Failed to load model pie:', err);
-        loader.textContent = '加载失败';
+        loader.classList.add('loading--text'); loader.textContent = '加载失败';
     }
 }
 
@@ -704,11 +704,11 @@ async function loadTypePie() {
     try {
         var data = await fetchTokenTypes();
         var filtered = data.filter(function (d) { return d.value > 0; });
-        renderPieChart('chartTypePie', filtered, ['#0070F3', '#00CEF3', '#F59E0B']);
+        renderPieChart('chartTypePie', filtered, ['#3B82F6', '#06B6D4', '#F59E0B']);
         loader.style.display = 'none';
     } catch (err) {
         console.error('Failed to load type pie:', err);
-        loader.textContent = '加载失败';
+        loader.classList.add('loading--text'); loader.textContent = '加载失败';
     }
 }
 
@@ -758,7 +758,7 @@ async function loadMonthlyTrendForModel(modelName, chartId, loaderId, aliasModel
                               requestVals, costVals, monthlyData, 0);
     } catch (err) {
         console.error('Failed to load monthly trend for ' + modelName + ':', err);
-        loader.textContent = '加载失败';
+        loader.classList.add('loading--text'); loader.textContent = '加载失败';
     }
 }
 
@@ -785,7 +785,7 @@ function bindDashboardEvents() {
                     var dom = document.getElementById(info.chartId);
                     var loader = document.getElementById(info.loaderId);
                     if (dom) dom.style.display = 'none';
-                    if (loader) { loader.style.display = 'flex'; loader.textContent = '请选择月份'; }
+                    if (loader) { loader.style.display = 'flex'; loader.classList.add('loading--text'); loader.textContent = '请选择月份'; }
                 });
                 return;
             }
