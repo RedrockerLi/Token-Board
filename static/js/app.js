@@ -190,8 +190,22 @@ const ConfigSync = {
                 // No WebDAV server configured — nothing to sync (single-machine use).
                 return true;
             }
+            if (data.status === 'remote_updated') {
+                // The server has already replaced the local DB with the
+                // cloud-authoritative configuration.  The current page still
+                // contains the discarded values in memory, so reload before
+                // allowing the user to edit again.
+                ConfigSync.dirty = false;
+                showConfigSyncUpdatedNotice(
+                    data.message || '云端配置已更新，本机修改已丢弃，请重新设置。');
+                return true;
+            }
             if (data.status === 'conflict') {
-                showToast(data.message || '云端配置已更新，已拒绝覆盖', 'error');
+                // Automatic refresh failed. Keep the recovery choices for a
+                // genuine sync failure: retry the refresh/upload or discard
+                // local changes using the last committed snapshot.
+                showConfigSyncDialog(
+                    data.message || '云端配置已更新，但自动拉取失败。');
                 return false;
             }
             showConfigSyncDialog(data.message || '配置上传失败');
@@ -222,6 +236,25 @@ function showConfigSyncDialog(message) {
     const msg = document.getElementById('configSyncMsg');
     if (msg) msg.textContent = message;
     openModal('configSyncModal');
+}
+
+let configSyncReloadTimer = null;
+
+function showConfigSyncUpdatedNotice(message) {
+    const msg = document.getElementById('configSyncUpdatedMsg');
+    if (msg) msg.textContent = message;
+    openModal('configSyncUpdatedModal');
+    if (configSyncReloadTimer) clearTimeout(configSyncReloadTimer);
+    configSyncReloadTimer = setTimeout(reloadAfterConfigSync, 1800);
+}
+
+function reloadAfterConfigSync() {
+    if (configSyncReloadTimer) {
+        clearTimeout(configSyncReloadTimer);
+        configSyncReloadTimer = null;
+    }
+    closeModal('configSyncUpdatedModal');
+    window.location.reload();
 }
 
 function configSyncRetry() {

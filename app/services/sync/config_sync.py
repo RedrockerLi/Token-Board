@@ -140,17 +140,62 @@ def sync_config_upload(db_path: str, schema_dir: str | None = None) -> dict:
     An immutable artifact can race with another node between the PROPFIND
     check and PUT.  Re-running the complete download/merge/build transaction
     is safe because the local snapshot/hash is only advanced after PUT.
+
+    If the cloud has moved ahead of this machine, the cloud is authoritative:
+    refresh the local configuration immediately and report that the local
+    unsynchronized edits were discarded.  The caller only gets a conflict
+    response when that refresh itself fails.
     """
+
+    def refresh_after_conflict() -> bool:
+        try:
+            return sync_config_download(db_path, schema_dir=schema_dir)
+        except Exception:
+            # sync_config_download normally converts failures to False, but
+            # keep the upload endpoint recoverable if an unexpected exception
+            # escapes its retry boundary.
+            log.exception("automatic config refresh after upload conflict failed")
+            return False
+
     last_error = None
     for attempt in range(3):
         try:
-            return _sync_config_upload_once(db_path, schema_dir=schema_dir)
+            result = _sync_config_upload_once(db_path, schema_dir=schema_dir)
+            if result.get("status") != "conflict":
+                return result
+
+            # The conflict check already established that a newer immutable
+            # cloud artifact exists.  Pull it into the local DB now instead
+            # of making the user restart the dashboard manually.
+            if refresh_after_conflict():
+                return {
+                    "status": "remote_updated",
+                    "message": "云端配置已更新，本机修改已丢弃，请重新设置。",
+                    "conflict": True,
+                }
+            return {
+                **result,
+                "message": "云端配置已更新，但自动拉取失败。请重试；若仍失败可丢弃本地设置。",
+            }
         except WebDAVConflict as exc:
             last_error = exc
             log.warning("config upload raced with remote update; retry %d/3",
                         attempt + 1)
     if last_error is not None:
+        # A race can leave us with a newer remote artifact even though the
+        # upload path never reached its ordinary hash-mismatch return.
+        if refresh_after_conflict():
+            return {
+                "status": "remote_updated",
+                "message": "云端配置已更新，本机修改已丢弃，请重新设置。",
+                "conflict": True,
+            }
         _mark_sync_degraded(db_path, "config upload conflict", last_error)
+        return {
+            "status": "conflict",
+            "message": "云端配置已更新，但自动拉取失败。请重试；若仍失败可丢弃本地设置。",
+            "conflict": True,
+        }
     return {"status": "conflict", "message": str(last_error), "conflict": True}
 
 

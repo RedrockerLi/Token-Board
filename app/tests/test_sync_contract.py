@@ -138,6 +138,53 @@ class SyncContractTest(unittest.TestCase):
         self.assertEqual(result, {"status": "ok"})
         self.assertEqual(once.call_count, 3)
 
+    def test_config_upload_refreshes_cloud_on_hash_conflict(self) -> None:
+        conflict = {
+            "status": "conflict",
+            "message": "cloud changed",
+            "conflict": True,
+        }
+        with patch("app.services.sync.config_sync._sync_config_upload_once",
+                   return_value=conflict) as once, patch(
+                       "app.services.sync.config_sync.sync_config_download",
+                       return_value=True) as download:
+            result = sync_config_upload("token-board.db")
+
+        self.assertEqual(result["status"], "remote_updated")
+        self.assertEqual(result["message"],
+                         "云端配置已更新，本机修改已丢弃，请重新设置。")
+        once.assert_called_once_with("token-board.db", schema_dir=None)
+        download.assert_called_once_with("token-board.db", schema_dir=None)
+
+    def test_config_upload_keeps_recovery_conflict_when_refresh_fails(self) -> None:
+        conflict = {
+            "status": "conflict",
+            "message": "cloud changed",
+            "conflict": True,
+        }
+        with patch("app.services.sync.config_sync._sync_config_upload_once",
+                   return_value=conflict), patch(
+                       "app.services.sync.config_sync.sync_config_download",
+                       return_value=False) as download:
+            result = sync_config_upload("token-board.db")
+
+        self.assertEqual(result["status"], "conflict")
+        self.assertIn("自动拉取失败", result["message"])
+        download.assert_called_once_with("token-board.db", schema_dir=None)
+
+    def test_config_upload_refreshes_after_repeated_upload_race(self) -> None:
+        with patch("app.services.sync.config_sync._sync_config_upload_once",
+                   side_effect=[WebDAVConflict("race-1"),
+                                WebDAVConflict("race-2"),
+                                WebDAVConflict("race-3")]) as once, patch(
+                       "app.services.sync.config_sync.sync_config_download",
+                       return_value=True) as download:
+            result = sync_config_upload("token-board.db")
+
+        self.assertEqual(result["status"], "remote_updated")
+        self.assertEqual(once.call_count, 3)
+        download.assert_called_once_with("token-board.db", schema_dir=None)
+
     def _repo_layout(self) -> tuple[str, str, str]:
         """Temp dir laid out like the repo (schema/ + data/) so that
         ``schema_dir_for`` resolves to a real schema root."""

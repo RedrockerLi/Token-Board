@@ -49,7 +49,7 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
    `app.db.schema_upgrade.upgrade_downloaded_artifact` 在 shadow 中完成 SQL 和
    transition，再合入本机配置。
 2. 管理页修改立即写入本机，代理可以立即使用；离开配置页时前端调用 `/api/proxy/sync/config/upload`。
-3. 上传前重新读取云端最新文件并比较 `config_hash`。如果其他机器已经修改，拒绝覆盖并提示重新拉取。
+3. 上传前重新读取云端最新文件并比较 `config_hash`。如果其他机器已经修改，自动拉取云端配置并丢弃本机未同步的普通配置，提示用户重新设置并刷新页面；只有自动拉取失败时才显示重试/丢弃对话框。
 4. 上传副本保留普通配置和本地代理客户端密钥，删除运行时数据、导入游标、上游 API Key 明文与 WebDAV 密码。成功后记录 hash 和 `token-board_config_snapshot.db` 本地快照。
 5. 上传失败时可以重试；选择丢弃设置会从本地快照恢复配置，不需要网络。
 

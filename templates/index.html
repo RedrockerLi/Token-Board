@@ -272,6 +272,20 @@
     </div>
 </div>
 
+<!-- ═══ Modal: 云端配置已更新 ═══ -->
+<div class="modal-overlay" id="configSyncUpdatedModal" style="display:none">
+    <div class="modal" style="max-width:440px;">
+        <div class="modal__header">
+            <h3>配置已更新</h3>
+            <button class="modal__close" onclick="reloadAfterConfigSync()">&times;</button>
+        </div>
+        <div id="configSyncUpdatedMsg" style="padding:10px 0; font-size:14px; line-height:1.7; color:var(--color-text-secondary);"></div>
+        <div style="display:flex; justify-content:flex-end; margin-top:10px;">
+            <button class="btn btn--sm btn--primary" onclick="reloadAfterConfigSync()">重新设置</button>
+        </div>
+    </div>
+</div>
+
 <!-- ═══ Scripts ═══ -->
 <!-- Load order: utils → primitives → router → page modules → chart rendering -->
 <script src="/static/js/utils.js"></script>
