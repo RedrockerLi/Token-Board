@@ -1,6 +1,6 @@
 """ProxyDatabase methods for ProxyPerformanceMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.db.proxy.common import json, os, sqlite3, urllib
 
 
 class ProxyPerformanceMixin:

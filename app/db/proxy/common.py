@@ -17,6 +17,13 @@ import uuid
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 
+from app.core.time import (
+    UTC,
+    as_utc,
+    billing_period,
+    format_utc,
+)
+
 from app.domain.account_types import (
     ACCOUNT_TYPES,
     deletion_policy,
@@ -43,13 +50,6 @@ def mask_key(key: str) -> str:
     return f"{key[:6]}…{key[-4:]}"
 
 
-UTC = timezone.utc
-
-
-def _utc_now() -> datetime:
-    return datetime.now(UTC).replace(microsecond=0)
-
-
 def _parse_iso_date(value: object) -> date | None:
     """Parse a user-facing UTC calendar date, rejecting ambiguous values."""
     if value in (None, ""):
@@ -60,23 +60,6 @@ def _parse_iso_date(value: object) -> date | None:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise ValueError("订阅起始日必须是 YYYY-MM-DD") from exc
-
-
-def _parse_utc_timestamp(value: object) -> datetime | None:
-    """Parse an ISO-8601 UTC timestamp ("...Z" or explicit offset).
-
-    The V1 databases only store ISO timestamps; the legacy SQLite space
-    format ("YYYY-MM-DD HH:MM:SS") is no longer accepted at runtime.
-    """
-    if value in (None, ""):
-        return None
-    text = str(value).replace("Z", "+00:00")
-    if " " in text:
-        raise ValueError(
-            "legacy space-separated timestamps are not supported; "
-            "expected ISO format (YYYY-MM-DDTHH:MM:SSZ)")
-    parsed = datetime.fromisoformat(text)
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
 def _period_start(month: str, anchor_day: int) -> datetime:
@@ -132,4 +115,14 @@ def _cancellation_end(config: sqlite3.Row, now: datetime, anchor_day: int,
 
 
 
-__all__ = [name for name in globals() if not name.startswith('__')]
+__all__ = [
+    "json", "os", "secrets", "sqlite3", "string", "urllib", "uuid",
+    "monthrange", "date", "datetime", "timedelta", "timezone", "UTC",
+    "as_utc", "billing_period", "format_utc", "ACCOUNT_TYPES",
+    "deletion_policy", "type_holds_keys",
+    "import_types", "is_routable", "is_subscription", "spec",
+    "subscription_types", "_generate_key", "mask_key",
+    "_parse_iso_date", "_period_start",
+    "_previous_month", "_next_month", "_billing_period_month",
+    "_iter_months", "_cancellation_end",
+]

@@ -1,6 +1,8 @@
 """CRUD endpoints for independent agent subscriptions and software."""
 
-from app.routes.proxy.common import *  # noqa: F401,F403
+from app.routes.proxy.common import (
+    _proxy_db, api_error, bp_proxy, jsonify, require_json_object,
+)
 
 
 @bp_proxy.route("/agent-types")
@@ -17,26 +19,26 @@ def list_agent_subscriptions():
 def create_agent_subscription():
     try:
         return jsonify({"id": _proxy_db().create_agent_subscription(
-            request.get_json(force=True))}), 201
+            require_json_object(force=True))}), 201
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        return api_error(str(exc), 400)
 
 
 @bp_proxy.route("/agent-subscriptions/<int:subscription_id>", methods=["PUT"])
 def update_agent_subscription(subscription_id):
     try:
         if not _proxy_db().update_agent_subscription(
-                subscription_id, request.get_json(force=True)):
-            return jsonify({"error": "Subscription not found"}), 404
+                subscription_id, require_json_object(force=True)):
+            return api_error("Subscription not found", 404)
         return jsonify({"status": "ok"})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        return api_error(str(exc), 400)
 
 
 @bp_proxy.route("/agent-subscriptions/<int:subscription_id>", methods=["DELETE"])
 def delete_agent_subscription(subscription_id):
     if not _proxy_db().delete_agent_subscription(subscription_id):
-        return jsonify({"error": "Subscription not found"}), 404
+        return api_error("Subscription not found", 404)
     return jsonify({"status": "ok"})
 
 
@@ -49,26 +51,26 @@ def list_agent_subscription_instances(subscription_id):
 def create_agent_subscription_instance(subscription_id):
     try:
         return jsonify({"id": _proxy_db().create_agent_subscription_instance(
-            subscription_id, request.get_json(force=True))}), 201
+            subscription_id, require_json_object(force=True))}), 201
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        return api_error(str(exc), 400)
 
 
 @bp_proxy.route("/agent-subscription-instances/<int:instance_id>", methods=["PUT"])
 def update_agent_subscription_instance(instance_id):
     try:
         if not _proxy_db().update_agent_subscription_instance(
-                instance_id, request.get_json(force=True)):
-            return jsonify({"error": "Instance not found"}), 404
+                instance_id, require_json_object(force=True)):
+            return api_error("Instance not found", 404)
         return jsonify({"status": "ok"})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        return api_error(str(exc), 400)
 
 
 @bp_proxy.route("/agent-subscription-instances/<int:instance_id>", methods=["DELETE"])
 def delete_agent_subscription_instance(instance_id):
     if not _proxy_db().delete_agent_subscription_instance(instance_id):
-        return jsonify({"error": "Instance not found"}), 404
+        return api_error("Instance not found", 404)
     return jsonify({"status": "ok"})
 
 
@@ -81,24 +83,24 @@ def list_agent_software():
 def create_agent_software():
     try:
         return jsonify({"id": _proxy_db().create_agent_software(
-            request.get_json(force=True))}), 201
+            require_json_object(force=True))}), 201
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        return api_error(str(exc), 400)
 
 
 @bp_proxy.route("/agent-software/<int:software_id>", methods=["PUT"])
 def update_agent_software(software_id):
     try:
         if not _proxy_db().update_agent_software(
-                software_id, request.get_json(force=True)):
-            return jsonify({"error": "Software not found"}), 404
+                software_id, require_json_object(force=True)):
+            return api_error("Software not found", 404)
         return jsonify({"status": "ok"})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        return api_error(str(exc), 400)
 
 
 @bp_proxy.route("/agent-software/<int:software_id>", methods=["DELETE"])
 def delete_agent_software(software_id):
     if not _proxy_db().delete_agent_software(software_id):
-        return jsonify({"error": "Software not found"}), 404
+        return api_error("Software not found", 404)
     return jsonify({"status": "ok"})

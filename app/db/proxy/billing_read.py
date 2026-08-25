@@ -1,6 +1,6 @@
 """ProxyDatabase methods for ProxyBillingReadMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.db.proxy.common import datetime
 
 
 def _filter_bound(value: str | None, *, end: bool = False) -> str | None:

@@ -12,13 +12,13 @@ void ProxyServer::mark_accounting_upstream_started(
 }
 
 void ProxyServer::enqueue_log(
-    int account_id, int local_key_id, const UsageTracker::UsageInfo &usage,
+    int account_id, int local_key_id, const UsageAccounting &usage,
     bool is_streaming, int status_code, int duration_ms, int upstream_key_id,
     int ttft_ms, int generation_ms, double output_tps, int upstream_ttft_ms,
     int upstream_duration_ms, int attempt_count,
     const std::vector<Database::AttemptInfo> &attempts) {
     double cost = 0.0;
-    const bool accepted = tracker_.log_request(
+    const bool accepted = recorder_.log_request(
             account_id, local_key_id, usage, is_streaming, status_code,
             duration_ms, upstream_key_id, ttft_ms, generation_ms, output_tps,
             upstream_ttft_ms, upstream_duration_ms, attempt_count, attempts,
@@ -50,7 +50,7 @@ void ProxyServer::enqueue_zero_usage(
     bool is_streaming, int status_code, int duration_ms, int upstream_key_id,
     int attempt_count, const std::vector<Database::AttemptInfo> &attempts,
     int upstream_duration_ms) {
-    UsageTracker::UsageInfo zero;
+    UsageAccounting zero;
     zero.model = model;
     enqueue_log(account_id, local_key_id, zero, is_streaming, status_code,
                 duration_ms, upstream_key_id, -1, -1, -1.0, -1,

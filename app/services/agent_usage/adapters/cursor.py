@@ -7,6 +7,7 @@ dashboard has no extra dependency.
 
 import base64
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -15,6 +16,8 @@ from urllib.request import Request, urlopen
 
 from ..common import batch, config_value, csv_rows, make_event, source, sqlite_rows, safe_int, timestamp
 from ..ir import ParseBatch, UsageSource
+
+log = logging.getLogger(__name__)
 
 KIND = "cursor"
 LABEL = "Cursor"
@@ -75,7 +78,7 @@ def _cookie_values(token: str) -> list[str]:
         if "|" in sub:
             values.append(f"{sub.rsplit('|', 1)[-1]}%3A%3A{token}")
     except (IndexError, ValueError, TypeError, json.JSONDecodeError):
-        pass
+        log.debug("Cursor token payload did not contain a project", exc_info=True)
     values.append(token)
     return list(dict.fromkeys(values))
 

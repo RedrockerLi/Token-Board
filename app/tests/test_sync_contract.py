@@ -11,14 +11,16 @@ from app.db.migrations import migrate
 from app.db.schema_upgrade.coordinator import inspect_version
 from app.services.sync.settings import SyncConfig, save_sync_config
 from app.services.sync.webdav import (
+    ArtifactTransaction,
     RemoteArtifact,
     WebDAVConflict,
-    _upload_versioned_artifact,
+    WebDAVClient,
+    publish_versioned_artifact,
 )
-from app.services.sync.config_merge import _merge_config_tables
+from app.services.sync.config_merge import merge_config_tables
 from app.services.sync.config_sync import sync_config_upload
 from app.services.sync.dashboard_sync import sync_dashboard
-from app.services.sync.snapshot import _config_hash_of_db
+from app.services.sync.state import config_hash_of_db
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -58,7 +60,7 @@ class SyncContractTest(unittest.TestCase):
             self._seed_credential(local, "credential-local",
                                   "sk-local-secret")
             # Remote does not know this credential at all.
-            _merge_config_tables(remote, local)
+            merge_config_tables(remote, local)
             conn = sqlite3.connect(local)
             row = conn.execute(
                 "SELECT disabled_at FROM upstream_credentials "
@@ -74,7 +76,7 @@ class SyncContractTest(unittest.TestCase):
             # authoritative in the new sync contract.
             self._seed_credential(remote, "credential-local", None,
                                   "2026-08-10T04:01:36Z")
-            _merge_config_tables(remote, local)
+            merge_config_tables(remote, local)
             conn = sqlite3.connect(local)
             row = conn.execute(
                 "SELECT disabled_at FROM upstream_credentials "
@@ -92,7 +94,7 @@ class SyncContractTest(unittest.TestCase):
         temp, proxy, _ = self._repo_layout()
         try:
             self._seed_credential(proxy, "credential-local", "sk-local-secret")
-            before = _config_hash_of_db(proxy)
+            before = config_hash_of_db(proxy)
             conn = sqlite3.connect(proxy)
             conn.execute(
                 "UPDATE upstream_secrets SET secret_value='sk-changed' "
@@ -101,7 +103,7 @@ class SyncContractTest(unittest.TestCase):
                 "UPDATE sync_settings SET value='another-password' WHERE key='password'")
             conn.commit()
             conn.close()
-            self.assertEqual(before, _config_hash_of_db(proxy))
+            self.assertEqual(before, config_hash_of_db(proxy))
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
@@ -112,13 +114,20 @@ class SyncContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "config.db"
             source.write_bytes(b"fixture")
-            with patch("app.services.sync.webdav._latest_artifact",
-                       return_value=current), patch(
-                           "app.services.sync.webdav._webdav_upload") as upload:
-                with self.assertRaises(WebDAVConflict):
-                    _upload_versioned_artifact(config, str(source), "token-board_config",
-                                               expected)
-                upload.assert_not_called()
+            class FakeClient(WebDAVClient):
+                def __init__(self):
+                    super().__init__(config)
+
+                def list_artifacts(self, prefix):
+                    return [current] if current.name.startswith(prefix) else []
+
+                def upload_artifact(self, source, name, **kwargs):
+                    raise AssertionError(
+                        "stale artifact must be rejected before PUT")
+
+            with self.assertRaises(WebDAVConflict):
+                ArtifactTransaction(FakeClient()).publish_versioned_artifact(
+                    str(source), "token-board_config", expected)
 
     def test_dashboard_retries_complete_transaction_after_upload_race(self) -> None:
         with patch("app.services.sync.dashboard_sync._sync_dashboard_once",
@@ -203,17 +212,19 @@ class SyncContractTest(unittest.TestCase):
     def _webdav_mocks(self):
         """Disable the network for a full local sync transaction.
 
-        The sync package's ``__init__`` copies shared helpers into every
-        module namespace, so a function like ``_latest_artifact`` must be
-        patched both where the caller looks it up (config_sync /
-        dashboard_sync) and where webdav's own helpers look it up.
+        Patch the public transport boundary at each workflow's lookup site.
+        Uploads return a confirmed artifact so the rest of the workflow can
+        exercise its local commit behavior without network I/O.
         """
-        for module in ("app.services.sync.webdav",
-                       "app.services.sync.config_sync",
+        for module in ("app.services.sync.config_sync",
                        "app.services.sync.dashboard_sync"):
-            patch(module + "._latest_artifact", return_value=None).start()
-            patch(module + "._webdav_download", return_value=False).start()
-            patch(module + "._webdav_upload", return_value=None).start()
+            patch(module + ".latest_artifact", return_value=None).start()
+            patch(module + ".download_artifact", return_value=False).start()
+            patch(module + ".publish_versioned_artifact",
+                  return_value=RemoteArtifact(
+                      "token-board_config_20260824_120000.db",
+                      etag='"etag"')).start()
+            patch(module + ".publish_schema_manifest").start()
 
     def test_config_upload_records_remote_metadata(self) -> None:
         temp, proxy, _ = self._repo_layout()
@@ -263,7 +274,7 @@ class SyncContractTest(unittest.TestCase):
                 return RemoteArtifact("token-board_config_20260824_120000.db",
                                       etag='"etag"')
 
-            with patch("app.services.sync.config_sync._upload_versioned_artifact",
+            with patch("app.services.sync.config_sync.publish_versioned_artifact",
                        side_effect=capture):
                 result = sync_config_upload(proxy)
             self.assertEqual(result["status"], "ok", result)

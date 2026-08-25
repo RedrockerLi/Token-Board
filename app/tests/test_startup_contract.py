@@ -40,7 +40,7 @@ class StartupContractTest(unittest.TestCase):
 
         app_js = (root / "static" / "js" / "app.js").read_text(
             encoding="utf-8")
-        self.assertIn("fetch('/api/proxy/agent-usage/import'", app_js)
+        self.assertIn("proxyApi('/api/proxy/agent-usage/import'", app_js)
 
     def test_default_start_generates_boot_service_with_integrated_server(self) -> None:
         root = Path(__file__).resolve().parents[2]

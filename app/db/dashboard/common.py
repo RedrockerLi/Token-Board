@@ -3,9 +3,6 @@
 Stores daily-aggregated usage records with indexes for fast queries.
 """
 
-import sqlite3
-
-
 # Model display order — lower number = first.  Models not listed default to 99.
 MODEL_ORDER = {
     "deepseek-v4-flash": 1,
@@ -44,4 +41,4 @@ def _track_recency(last_month: dict, month_vol: dict,
 
 
 
-__all__ = [name for name in globals() if not name.startswith('__')]
+__all__ = ["MODEL_ORDER", "_sort_models", "_parse_date", "_track_recency"]

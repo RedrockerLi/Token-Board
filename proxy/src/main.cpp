@@ -20,7 +20,7 @@
 #include "router.h"
 #include "semaphore_pool.h"
 #include "upstream_client.h"
-#include "usage_tracker.h"
+#include "usage_recorder.h"
 
 #include <chrono>
 #include <csignal>
@@ -68,12 +68,12 @@ int main(int argc, char *argv[]) {
     // ── Create components ─────────────────────────────────────────────
     Router router(db);
     UpstreamClient upstream;
-    UsageTracker tracker(db);
+    UsageRecorder recorder(db);
     CodecRegistry codecs;
     codecs.add(make_openai_codec());
     codecs.add(make_anthropic_codec());
     codecs.add(make_responses_codec());
-    ProxyServer proxy_server(db, router, upstream, tracker, codecs);
+    ProxyServer proxy_server(db, router, upstream, recorder, codecs);
 
     // ── Configure httplib server ──────────────────────────────────────
     httplib::Server server;

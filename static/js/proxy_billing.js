@@ -9,7 +9,7 @@
 
 async function loadBillingStats() {
     try {
-        const stats = await proxyFetch('/api/proxy/stats');
+        const stats = await proxyApi('/api/proxy/stats');
         document.getElementById('billTotalRequests').textContent = fmtNum(stats.total_requests);
         document.getElementById('billTodayRequests').textContent = fmtNum(stats.today_requests);
         document.getElementById('billTotalCost').textContent = '¥' + (stats.total_cost || 0).toFixed(2);
@@ -26,7 +26,7 @@ async function loadTodayUpstreamTable() {
     if (!tbody) return;
     tbody.innerHTML = '<tr><td colspan="5" class="td-loading">加载中...</td></tr>';
     try {
-        const rows = await proxyFetch('/api/proxy/billing/today-upstreams');
+        const rows = await proxyApi('/api/proxy/billing/today-upstreams');
         if (!rows.length) {
             tbody.innerHTML = '<tr><td colspan="5" class="td-empty">今日暂无活跃上游</td></tr>';
             return;
@@ -92,7 +92,7 @@ async function loadDailyBillingChart() {
 
     try {
         // Rolling 30-day window (no month selection).
-        const raw = await proxyFetch('/api/proxy/billing/daily-by-model?days=30');
+        const raw = await proxyApi('/api/proxy/billing/daily-by-model?days=30');
 
         // Fill the full 30-day window — days without usage show 0.
         const data = buildDailySeries(raw, 30);
@@ -164,7 +164,7 @@ async function exportData() {
     btn.disabled = true;
     btn.textContent = '导出中...';
     try {
-        const result = await proxyFetch('/api/proxy/export', { method: 'POST' });
+        const result = await proxyApi('/api/proxy/export', { method: 'POST' });
         showToast('导出成功');
         try { await fetchRefresh(); } catch (e) { /* ignore */ }
     } catch (err) {
@@ -253,7 +253,7 @@ async function loadLogsTable() {
     });
 
     try {
-        const data = await proxyFetch(`/api/proxy/logs?${params}`);
+        const data = await proxyApi(`/api/proxy/logs?${params}`);
         document.getElementById('logsPagination').textContent =
             `第 ${data.page} 页 / 共 ${data.total_pages} 页（${data.total} 条记录）`;
 

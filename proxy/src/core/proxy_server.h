@@ -8,7 +8,7 @@
 #include "key_cost_ledger.h"
 #include "router.h"
 #include "session_affinity.h"
-#include "usage_tracker.h"
+#include "usage_recorder.h"
 #include "responses_state_store.h"
 
 #include <atomic>
@@ -31,8 +31,6 @@
 class Database;
 class Router;
 class UpstreamClient;
-class UsageTracker;
-
 using CandidateRequestBody = std::shared_ptr<const std::string>;
 
 namespace httplib {
@@ -66,8 +64,8 @@ public:
     };
 
     ProxyServer(Database &db, Router &router, UpstreamClient &upstream,
-                UsageTracker &tracker, CodecRegistry &codecs)
-        : db_(db), router_(router), upstream_(upstream), tracker_(tracker),
+                UsageRecorder &recorder, CodecRegistry &codecs)
+        : db_(db), router_(router), upstream_(upstream), recorder_(recorder),
           codecs_(codecs), affinity_(&cost_ledger_) {
         db_.set_cost_observer([this](int key_slot_id, double cost) {
             cost_ledger_.add(key_slot_id, cost);
@@ -162,9 +160,9 @@ public:
 
 private:
     /// Enqueue a request-log record; the response thread pays only an
-    /// in-memory move.  Same signature/defaults as UsageTracker::log_request.
+    /// in-memory move. Same signature/defaults as UsageRecorder::log_request.
     void enqueue_log(int account_id, int local_key_id,
-                     const UsageTracker::UsageInfo &usage, bool is_streaming,
+                     const UsageAccounting &usage, bool is_streaming,
                      int status_code, int duration_ms, int upstream_key_id,
                      int ttft_ms, int generation_ms, double output_tps,
                      int upstream_ttft_ms, int upstream_duration_ms,
@@ -219,7 +217,7 @@ private:
     Database &db_;
     Router &router_;
     UpstreamClient &upstream_;
-    UsageTracker &tracker_;
+    UsageRecorder &recorder_;
     CodecRegistry &codecs_;
     AccountGate gate_;           // per-key-slot concurrency + plan cooldown
     KeyCostLedger cost_ledger_;  // accrued cost per key slot (cold-start bias)

@@ -13,7 +13,7 @@ async function loadAgentSubscriptions() {
     if (!tbody) return;
     tbody.innerHTML = '<tr><td colspan="5" class="td-loading">加载中...</td></tr>';
     try {
-        agentSubscriptions = await proxyFetch('/api/proxy/agent-subscriptions');
+        agentSubscriptions = await proxyApi('/api/proxy/agent-subscriptions');
         if (!agentSubscriptions.length) {
             tbody.innerHTML = '<tr><td colspan="5" class="td-empty">暂无订阅，请点击“添加订阅”</td></tr>';
             return;
@@ -101,7 +101,7 @@ async function saveAgentSubscription(event) {
             instances: collectAgentInstances(form),
         };
         const id = form.dataset.editId;
-        await proxyFetch(id ? `/api/proxy/agent-subscriptions/${id}` : '/api/proxy/agent-subscriptions', {
+        await proxyApi(id ? `/api/proxy/agent-subscriptions/${id}` : '/api/proxy/agent-subscriptions', {
             method: id ? 'PUT' : 'POST',
             body: JSON.stringify(payload),
         });
@@ -117,7 +117,7 @@ async function saveAgentSubscription(event) {
 async function deleteAgentSubscription(id, name) {
     if (!confirm(`确定删除订阅“${name}”？`)) return;
     try {
-        await proxyFetch(`/api/proxy/agent-subscriptions/${id}`, { method: 'DELETE' });
+        await proxyApi(`/api/proxy/agent-subscriptions/${id}`, { method: 'DELETE' });
         ConfigSync.markDirty();
         showToast('订阅已删除');
         loadAgentSubscriptions();
@@ -132,9 +132,9 @@ async function loadAgentSoftware() {
     tbody.innerHTML = '<tr><td colspan="5" class="td-loading">加载中...</td></tr>';
     try {
         [agentSoftware, agentTypes, agentSubscriptions] = await Promise.all([
-            proxyFetch('/api/proxy/agent-software'),
-            proxyFetch('/api/proxy/agent-types'),
-            proxyFetch('/api/proxy/agent-subscriptions'),
+            proxyApi('/api/proxy/agent-software'),
+            proxyApi('/api/proxy/agent-types'),
+            proxyApi('/api/proxy/agent-subscriptions'),
         ]);
         if (!agentSoftware.length) {
             tbody.innerHTML = '<tr><td colspan="5" class="td-empty">暂无软件，请点击“添加软件”</td></tr>';
@@ -231,7 +231,7 @@ async function saveAgentSoftware(event) {
     };
     try {
         const id = form.dataset.editId;
-        await proxyFetch(id ? `/api/proxy/agent-software/${id}` : '/api/proxy/agent-software', {
+        await proxyApi(id ? `/api/proxy/agent-software/${id}` : '/api/proxy/agent-software', {
             method: id ? 'PUT' : 'POST',
             body: JSON.stringify(payload),
         });
@@ -247,7 +247,7 @@ async function saveAgentSoftware(event) {
 async function deleteAgentSoftware(id, name) {
     if (!confirm(`确定删除软件“${name}”？`)) return;
     try {
-        await proxyFetch(`/api/proxy/agent-software/${id}`, { method: 'DELETE' });
+        await proxyApi(`/api/proxy/agent-software/${id}`, { method: 'DELETE' });
         ConfigSync.markDirty();
         showToast('软件已删除');
         loadAgentSoftware();

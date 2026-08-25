@@ -1,6 +1,7 @@
 """Kimi Code current and legacy wire-format adapter."""
 
 import hashlib
+import logging
 import os
 import re
 from pathlib import Path
@@ -11,6 +12,7 @@ from ..ir import ParseBatch, UsageSource
 KIND = "kimi-code"
 LABEL = "Kimi Code"
 DEFAULT_PATH = Path.home() / ".kimi-code"
+log = logging.getLogger(__name__)
 
 
 def _roots(software: dict) -> tuple[Path, Path]:
@@ -44,7 +46,7 @@ def _load_index(root: Path) -> dict[str, str]:
             try:
                 out[str(Path(value).expanduser().resolve())] = project_name(row["workDir"])
             except OSError:
-                pass
+                log.debug("Kimi Code project path is unavailable", exc_info=True)
     return out
 
 

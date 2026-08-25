@@ -2,7 +2,7 @@
  * dashboard.js — Application orchestration layer.
  *
  * Global state, data-loading functions, DOM event handlers, and initialisation.
- * Depends on: api.js (fmtNum, fmtCost, fetchJSON, buildParams, fetch* wrappers)
+ * Depends on: api.js (fmtNum, fmtCost, requestJSON, buildParams, fetch* wrappers)
  *             charts.js (initChart, renderTimeSeriesChart, renderPieChart, chartColors)
  *
  * Exports: initDashboard() — called by the SPA router when #/dashboard is active.

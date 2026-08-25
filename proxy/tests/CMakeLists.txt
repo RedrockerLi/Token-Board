@@ -74,12 +74,35 @@ add_executable(endpoint_policy_test
 target_include_directories(endpoint_policy_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(endpoint_policy_test PRIVATE cxx_std_17)
 
+# Wire/IR -> database accounting projection.  Cache creation remains an
+# explicit wire field while the existing DB prompt bucket retains its frozen
+# Anthropic compatibility fold.
+add_executable(usage_accounting_test usage_accounting_test.cpp)
+target_include_directories(usage_accounting_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(usage_accounting_test PRIVATE cxx_std_17)
+
+# Protocol JSON/SSE extraction is a format concern. The store test above only
+# covers the database-compatible projection, while this fixture freezes the
+# relocated parser behavior and the single Anthropic cache fold.
+add_executable(usage_parser_test usage_parser_test.cpp)
+target_include_directories(usage_parser_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(usage_parser_test PRIVATE cxx_std_17)
+target_link_libraries(usage_parser_test PRIVATE token_proxy_format)
+
+# Frozen durable-spool framing: every truncation boundary, checksum/length
+# guard and the exact-I/O EINTR retry path are covered without opening a
+# network socket or depending on a running proxy.
+add_executable(spool_codec_test spool_codec_test.cpp)
+target_include_directories(spool_codec_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(spool_codec_test PRIVATE cxx_std_17)
+
 # Upstream forwarding regression: fast responses must not wait for a watchdog
 # polling interval, and invalid targets must normalize to a retryable 502.
 add_executable(upstream_client_test
     upstream_client_test.cpp
     ${CMAKE_SOURCE_DIR}/src/net/upstream_client.cpp
     ${CMAKE_SOURCE_DIR}/src/net/upstream_forward.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/upstream_metrics.cpp
 )
 target_include_directories(upstream_client_test PRIVATE
     ${TEST_INCLUDE_DIRS}
@@ -100,6 +123,7 @@ add_executable(upstream_client_perf
     upstream_client_perf.cpp
     ${CMAKE_SOURCE_DIR}/src/net/upstream_client.cpp
     ${CMAKE_SOURCE_DIR}/src/net/upstream_forward.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/upstream_metrics.cpp
 )
 target_include_directories(upstream_client_perf PRIVATE
     ${TEST_INCLUDE_DIRS}
@@ -193,6 +217,9 @@ add_test(NAME session_affinity COMMAND session_affinity_test)
 add_test(NAME responses_state_store COMMAND responses_state_store_test)
 add_test(NAME responses_semantics COMMAND responses_semantics_test)
 add_test(NAME endpoint_policy COMMAND endpoint_policy_test)
+add_test(NAME usage_accounting COMMAND usage_accounting_test)
+add_test(NAME usage_parser COMMAND usage_parser_test)
+add_test(NAME spool_codec COMMAND spool_codec_test)
 add_test(
     NAME schema_version
     COMMAND ${Python3_EXECUTABLE}
@@ -204,6 +231,12 @@ add_test(
     NAME source_size
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_SOURCE_DIR}/../scripts/check_source_size.py
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME refactor_boundaries
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/../scripts/check_refactor_boundaries.py
             ${CMAKE_SOURCE_DIR}/..
 )
 add_test(NAME upstream_client COMMAND upstream_client_test)
@@ -368,7 +401,8 @@ set_tests_properties(
     PROPERTIES LABELS "schema;unit"
 )
 set_tests_properties(format_conversion session_affinity endpoint_policy source_size
-    accounting_abort
+    refactor_boundaries
+    accounting_abort usage_accounting usage_parser
     PROPERTIES LABELS "unit")
 set_tests_properties(upstream_client PROPERTIES LABELS "integration")
 set_tests_properties(
@@ -384,3 +418,14 @@ set_tests_properties(queue_saturation perf_stress perf_gate_1000_64
     PROPERTIES LABELS "performance")
 set_tests_properties(stream_rss_100 accounting_soak_60s
     PROPERTIES LABELS "performance;soak")
+
+# Python tests load the application as a package.  CTest's working directory
+# is the build tree, so make the repository root explicit instead of relying
+# on whichever interpreter happens to be launched from the source tree.
+set_tests_properties(
+    schema_version source_size refactor_boundaries pricing_equivalence
+    proxy_forwarding v1_routing responses_forwarding v1_admin v1_sync
+    transition_recovery queue_saturation accounting_recovery stream_rss_100
+    accounting_soak_60s perf_stress perf_gate_1000_64 cooldown_discrimination
+    fallback_matrix cooldown_probe error_shape
+    PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/..")

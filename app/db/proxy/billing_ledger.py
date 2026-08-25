@@ -1,6 +1,8 @@
 """ProxyDatabase methods for ProxyBillingLedgerMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.core.time import utc_now
+from app.db.proxy.common import sqlite3
+from app.services.billing_units import BillingUnitResolver
 
 
 class ProxyBillingLedgerMixin:
@@ -22,7 +24,7 @@ class ProxyBillingLedgerMixin:
         """Per proxy account or agent software used today."""
         conn = self._connect()
         try:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            today = utc_now().strftime("%Y-%m-%d")
             rows = conn.execute("""
                 SELECT COALESCE(a.name, 'unknown') AS account_name,
                        CASE WHEN a.account_kind='agent' THEN 'agent'
@@ -52,69 +54,16 @@ class ProxyBillingLedgerMixin:
         secret is entered. Duplicate local+cloud rows with the same masked
         identity are collapsed to the local slot.
         """
-        now = _utc_now()
-        result = []
-        contracts = conn.execute(
-                "SELECT bc.*,a.created_at,a.valid_from account_valid_from,a.deleted_at account_deleted_at,"
-                "bc.valid_until contract_valid_until "
-                "FROM billing_contracts bc JOIN accounts a ON a.id=bc.account_id "
-                "WHERE bc.charge_type='recurring' "
-                "AND a.account_kind='proxy' "
-                "AND bc.valid_from<=?",
-                (now.isoformat(timespec="seconds").replace("+00:00", "Z"),)
-            ).fetchall()
-        for contract in contracts:
-            if contract["billing_scope"] == "credential":
-                credentials = conn.execute(
-                        "SELECT c.runtime_id,c.uuid,c.key_masked,c.created_at,c.valid_from,c.deleted_at "
-                        "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
-                        "WHERE u.account_id=? "
-                        "AND (c.disabled_at IS NULL OR c.disabled_at>?) "
-                        "AND (c.deleted_at IS NULL OR c.deleted_at>?) "
-                        "ORDER BY c.position,c.runtime_id",
-                        (contract["account_id"], now.isoformat(
-                            timespec="seconds").replace("+00:00", "Z"),
-                         now.isoformat(timespec="seconds").replace("+00:00", "Z")),
-                    ).fetchall()
-                seen_masks: set[tuple[int, str]] = set()
-                for credential in credentials:
-                    identity = (contract["account_id"], credential["key_masked"])
-                    if identity in seen_masks:
-                        continue
-                    seen_masks.add(identity)
-                    anchor = (_parse_iso_date(credential["valid_from"])
-                              or _parse_utc_timestamp(credential["created_at"]).date())
-                    end = min((value for value in (
-                        _parse_utc_timestamp(credential["deleted_at"]),
-                        _parse_utc_timestamp(contract["contract_valid_until"]),
-                        _parse_utc_timestamp(contract["account_deleted_at"]))
-                               if value is not None), default=None)
-                    result.append({
-                            "account_id": contract["account_id"],
-                            "contract_id": contract["id"],
-                            "credential_uuid": credential["uuid"],
-                            "key_id": credential["runtime_id"],
-                            "key_masked": credential["key_masked"],
-                            "billing_unit_id": credential["uuid"],
-                            "anchor": anchor, "end": end, "now": now,
-                            "currency": contract["currency"],
-                    })
-            else:
-                anchor = (_parse_iso_date(contract["account_valid_from"])
-                          or _parse_utc_timestamp(contract["created_at"]).date())
-                result.append({
-                        "account_id": contract["account_id"],
-                        "contract_id": contract["id"],
-                        "credential_uuid": None, "key_id": None,
-                        "key_masked": "subscription",
-                        "billing_unit_id": f"contract:{contract['uuid']}",
-                        "anchor": anchor,
-                        "end": min((value for value in (
-                            _parse_utc_timestamp(contract["contract_valid_until"]),
-                            _parse_utc_timestamp(contract["account_deleted_at"]))
-                            if value is not None), default=None),
-                        "now": now, "currency": contract["currency"],
-                    })
-        for meta in result:
-            meta["now"] = now
-        return result
+        now = utc_now()
+        return [{
+            "account_id": unit.account_id,
+            "contract_id": unit.contract_id,
+            "credential_uuid": unit.credential_uuid,
+            "key_id": unit.credential_runtime_id,
+            "key_masked": unit.key_masked or "subscription",
+            "billing_unit_id": unit.billing_unit_id.removeprefix("credential:"),
+            "anchor": unit.valid_from,
+            "end": unit.valid_until,
+            "now": now,
+            "currency": unit.currency,
+        } for unit in BillingUnitResolver.proxy_units(conn, at=now)]

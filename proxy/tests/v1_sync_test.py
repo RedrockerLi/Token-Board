@@ -49,14 +49,14 @@ def main() -> None:
         module = types.ModuleType(package)
         module.__path__ = [str(package_path)]
         sys.modules[package] = module
-    import app.services.sync as sync
+    from app.services.sync.config_merge import merge_config_tables
     directory = Path(tempfile.mkdtemp())
     local, remote = directory / "local.db", directory / "remote.db"
     migrations.migrate(str(local), str(schema_root), "token-board")
     migrations.migrate(str(remote), str(schema_root), "token-board")
     seed(local, "local", 77, "sk-local-secret")
     seed(remote, "remote", 1, None)
-    sync._merge_v1_config(str(remote), str(local))
+    merge_config_tables(str(remote), str(local))
     conn = sqlite3.connect(local)
     try:
         assert conn.execute("SELECT name FROM accounts WHERE id=1").fetchone()[0] == "remote"

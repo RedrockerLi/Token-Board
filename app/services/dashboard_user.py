@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from app.db.dashboard_db import DashboardDatabase
-from app.services.sync import (
+from app.services.sync.dashboard_sync import (
     download_dashboard_from_cloud,
     export_dashboard_to_local,
-    load_sync_config,
     upload_dashboard_to_cloud,
 )
+from app.services.sync.settings import load_sync_config
 
 
 def prepare_dashboard_user_delete(db_path: str, dash_db_path: str,

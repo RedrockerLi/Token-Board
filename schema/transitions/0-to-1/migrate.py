@@ -28,8 +28,6 @@ from transition_runtime import (  # noqa: E402
 from transition_resume import resume_transition  # noqa: E402
 from spool_transform import append_spool_attempts, append_spool_requests  # noqa: E402
 from verify import verify_dashboard, verify_proxy  # noqa: E402
-
-
 def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
                     spool_records: list[dict] | None = None) -> dict:
     old = sqlite3.connect(source)
@@ -62,7 +60,6 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
             (legacy_account_id, stable_uuid("account", "legacy-unattributed"),
              "legacy-unattributed", "1970-01-01T00:00:00Z", "1970-01-01T00:00:00Z"),
         )
-
         routable_ids: set[int] = set()
         for row in real_accounts:
             if row["account_type"] == "agent":
@@ -88,13 +85,11 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
                  utc_timestamp(row["created_at"], source_tz),
                  utc_timestamp(row["created_at"], source_tz)),
             )
-
         legacy_upstream_id = max(routable_ids, default=0) + 1
         new.execute(
             "INSERT INTO upstreams(id,account_id,name,base_url,enabled) VALUES(?,?,?,?,0)",
             (legacy_upstream_id, legacy_account_id, "legacy-unattributed", "http://invalid"),
         )
-
         route_ids: set[int] = set()
         for row in accounts:
             if row["account_type"] == "agent":
@@ -192,7 +187,6 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
              "legacy-unattributed",
              "1970-01-01T00:00:00Z", "1970-01-01T00:00:00Z"),
         )
-
         billing_config = old.execute(
             "SELECT price_change_effective,cancellation_mode FROM plan_billing_config WHERE id=1"
         ).fetchone()
@@ -293,7 +287,6 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
                 )
         for row in old.execute("SELECT key,value FROM sync_state"):
             new.execute("INSERT INTO sync_state(key,value) VALUES(?,?)", tuple(row))
-
         new.execute("UPDATE config_state SET generation=generation+1")
         new.commit()
         return {"credential_map": credential_map,
@@ -306,8 +299,6 @@ def transform_proxy(source: Path, shadow: Path, source_tz: ZoneInfo,
     finally:
         old.close()
         new.close()
-
-
 def transform_dashboard(source: Path, shadow: Path, proxy_source: Path | None,
                         proxy_mapping: dict, credential_mask_lookup=None) -> None:
     old = sqlite3.connect(source)

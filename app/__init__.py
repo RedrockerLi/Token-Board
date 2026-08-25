@@ -72,7 +72,7 @@ def create_app(token_board_db_path: str | None = None, host: str = "127.0.0.1",
         # Pull latest config from cloud on startup. Tests use isolated V1
         # fixtures and deliberately do not touch network state.
         if not testing:
-            from app.services.sync import sync_config_download  # noqa: E402
+            from app.services.sync.config_sync import sync_config_download  # noqa: E402
             try:
                 if sync_config_download(
                         token_board_db_path, schema_dir=str(schema_root)):

@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Callable, Mapping
 
+from app.core.time import format_utc, utc_now
 from .ir import ParseBatch, UsageEvent, UsageSource
-from .registry import get_adapter
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+from .registry import get_adapter, get_adapter_spec
 
 
 def _same_stat(previous: dict, stat) -> bool:
@@ -27,8 +23,10 @@ def _coerce_batch(raw, *, kind: str, source_item: UsageSource) -> ParseBatch | N
         return None
     if isinstance(raw, ParseBatch):
         return raw
-    # Compatibility for the pre-IR Codex adapter contract: (line_count, rows)
-    # where rows are request_log-shaped dictionaries.
+    # Compatibility for the pre-IR adapter container shape: (line_count, rows).
+    # The adapter still owns identity. The importer must never manufacture an
+    # ordinal event id because skipped or reordered lines would change the
+    # deduplication key.
     if isinstance(raw, tuple) and len(raw) == 2:
         record_count, rows = raw
         events = []
@@ -38,6 +36,11 @@ def _coerce_batch(raw, *, kind: str, source_item: UsageSource) -> ParseBatch | N
                 continue
             if not isinstance(row, dict):
                 continue
+            if not row.get("event_id"):
+                # Stable identity is an adapter output contract.  A source
+                # row without it is invalid rather than something the
+                # importer may repair from its current ordinal.
+                continue
             try:
                 events.append(UsageEvent(
                     model=row.get("model", "unknown"),
@@ -46,10 +49,10 @@ def _coerce_batch(raw, *, kind: str, source_item: UsageSource) -> ParseBatch | N
                     cache_read_tokens=row.get("cache_read_tokens", 0),
                     total_tokens=row.get("total_tokens", 0),
                     requested_at=row.get("requested_at") or "",
-                    event_id=row.get("event_id") or f"{kind}:{source_item.state_key}:{len(events)}",
+                    event_id=row.get("event_id"),
                     project=row.get("project"), session_id=row.get("session_id"),
                 ))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, KeyError):
                 continue
         return ParseBatch.from_events(events, int(record_count or 0))
     raise TypeError(f"agent adapter {kind} returned an invalid ParseBatch")
@@ -76,13 +79,14 @@ def _import_software(pdb, software: dict, stop_event=None,
     software_id = int(software["id"])
     kind = str(software.get("agent_kind") or "").strip().lower()
     adapter = get_adapter(kind)
-    if adapter is None:
+    spec = get_adapter_spec(kind)
+    if adapter is None or spec is None:
         return 0
-    sources = list(adapter.discover(software, stop_event))
+    sources = list(spec.discover(software, stop_event))
     if not sources:
         return 0
     replay_skips = {}
-    prepare = getattr(adapter, "replay_skips", None)
+    prepare = spec.replay_skips
     if prepare is not None:
         replay_skips = prepare(sources, stop_event)
 
@@ -109,7 +113,7 @@ def _import_software(pdb, software: dict, stop_event=None,
                 continue
             state_key = source_item.state_key
             previous = states.get(state_key)
-            always_scan = bool(getattr(adapter, "ALWAYS_SCAN", False))
+            always_scan = spec.always_scan
             if (not always_scan and isinstance(previous, dict)
                     and previous.get("size") == before.st_size
                     and _same_stat(previous, before)):
@@ -141,11 +145,11 @@ def _import_software(pdb, software: dict, stop_event=None,
                         "mtime": int(after.st_mtime),
                         "mtime_ns": int(after.st_mtime_ns),
                         "record_count": parsed.record_count,
-                        "parsed_at": _utc_now(),
+                        "parsed_at": format_utc(utc_now()),
                     }
                     conn.execute(
                         "UPDATE agent_software_runtime SET cursor_json=?,last_scan_at=?,last_error=NULL WHERE software_id=?",
-                        (json.dumps(states, ensure_ascii=False, separators=(",", ":")), _utc_now(), software_id),
+                        (json.dumps(states, ensure_ascii=False, separators=(",", ":")), format_utc(utc_now()), software_id),
                     )
                 conn.commit()
             except Exception:

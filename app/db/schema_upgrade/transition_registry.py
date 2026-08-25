@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.core import sqlite_runtime
 from app.db.migrations import DATABASE_NAMES, MigrationError
 
 
@@ -95,10 +96,9 @@ def _table_exists(conn, name: str) -> bool:
 
 
 def transition_record(path: Path, transition: Transition) -> tuple[str, str] | None:
-    import sqlite3
     if not path.exists():
         return None
-    conn = sqlite3.connect(path)
+    conn = sqlite_runtime.connect(path, "schema_upgrade")
     try:
         if not _table_exists(conn, "schema_transitions"):
             return None
@@ -116,8 +116,7 @@ def transition_record(path: Path, transition: Transition) -> tuple[str, str] | N
 
 def record_transition(path: Path, transition: Transition,
                       generation_id: str) -> None:
-    import sqlite3
-    conn = sqlite3.connect(path)
+    conn = sqlite_runtime.connect(path, "schema_upgrade")
     try:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS schema_transitions(" 

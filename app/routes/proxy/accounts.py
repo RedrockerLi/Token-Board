@@ -1,6 +1,10 @@
 """Functional proxy API route group."""
 
-from app.routes.proxy.common import *  # noqa: F401,F403
+from app.routes.proxy.common import (
+    _proxy_db, api_error, bp_proxy, current_app, jsonify, request,
+    require_json_object,
+)
+from app.routes.contract import status_for
 
 @bp_proxy.route("/stats")
 def stats():
@@ -23,22 +27,23 @@ def list_accounts():
 
 @bp_proxy.route("/accounts", methods=["POST"])
 def create_account():
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     if not data.get("name"):
-        return jsonify({"error": "name is required"}), 400
+        return api_error("name is required", 400)
     try:
         account_id = _proxy_db().create_account(data)
-        return jsonify({"id": account_id}), 201
+        return jsonify({"id": account_id}), status_for(
+            "resource_create", {"status": "ok"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return api_error(str(e), 400)
 
 
 @bp_proxy.route("/accounts/<int:account_id>", methods=["PUT"])
 def update_account(account_id):
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     ok = _proxy_db().update_account(account_id, data)
     if not ok:
-        return jsonify({"error": "No fields to update or account not found"}), 400
+        return api_error("No fields to update or account not found", 400)
     return jsonify({"status": "ok"})
 
 
@@ -47,10 +52,10 @@ def delete_account(account_id):
     # mode: "detach" (default) = unbind keys (account_id → NULL); "cascade" = delete keys too.
     mode = request.args.get("mode", "detach")
     if mode not in ("detach", "cascade"):
-        return jsonify({"error": "mode must be 'detach' or 'cascade'"}), 400
+        return api_error("mode must be 'detach' or 'cascade'", 400)
     result = _proxy_db().delete_account(account_id, mode=mode)
     if not result["ok"]:
-        return jsonify({"error": result["error"] or "Account not found"}), 400
+        return api_error(result["error"] or "Account not found", 400)
     return jsonify({"status": "ok",
                     "cancellation_mode": result.get("cancellation_mode"),
                     "cancelled_at": result.get("cancelled_at"),
@@ -64,7 +69,7 @@ def confirm_cloud_key(account_id):
 
     body: ``{"masked": "sk-abc…wxyz", "key_value": "sk-...真实明文"}``
     """
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     try:
         ok = _proxy_db().confirm_cloud_key(
             account_id,
@@ -72,10 +77,10 @@ def confirm_cloud_key(account_id):
             (data.get("key_value") or "").strip(),
         )
         if not ok:
-            return jsonify({"error": "云端没有该密钥记录"}), 404
+            return api_error("云端没有该密钥记录", 404)
         return jsonify({"status": "ok"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return api_error(str(e), 400)
 
 
 @bp_proxy.route("/accounts/<int:account_id>/models", methods=["POST"])
@@ -84,7 +89,7 @@ def update_account_models(account_id):
     db = _proxy_db()
     acc = next((a for a in db.get_accounts() if a["id"] == account_id), None)
     if not acc:
-        return jsonify({"error": "Account not found"}), 404
+        return api_error("Account not found", 404)
     keys = db.get_plain_keys(account_id)
     key = keys[0] if keys else ""
 
@@ -92,13 +97,14 @@ def update_account_models(account_id):
         from app.services.upstream_probe import model_probe
         resp = model_probe(acc, key)
         if not resp.ok:
-            return jsonify({"error": f"Upstream HTTP {resp.status_code}: {resp.text[:200]}"}), 400
+            return api_error(
+                f"Upstream HTTP {resp.status_code}: {resp.text[:200]}", 400)
         data = resp.json()
         models = [m["id"] for m in data.get("data", [])]
         count = db.update_account_models(account_id, models)
         return jsonify({"status": "ok", "count": count, "models": models})
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return api_error(str(e), 400)
 
 
 @bp_proxy.route("/accounts/<int:account_id>/models", methods=["GET"])
@@ -121,17 +127,17 @@ def test_account_concurrency(account_id):
     db = _proxy_db()
     acc = next((a for a in db.get_accounts() if a["id"] == account_id), None)
     if not acc:
-        return jsonify({"error": "Account not found"}), 404
+        return api_error("Account not found", 404)
     if acc.get("is_aggregate"):
-        return jsonify({"error": "聚合账户不支持并发测试"}), 400
+        return api_error("聚合账户不支持并发测试", 400)
     from app.domain.account_types import spec as _type_spec
     type_spec = _type_spec(acc.get("account_type") or "api")
     if not type_spec.holds_keys:
-        return jsonify({"error": "该账户类型不持有上游密钥，不支持并发测试"}), 400
+        return api_error("该账户类型不持有上游密钥，不支持并发测试", 400)
     keys = db.get_plain_keys(account_id)
     key = keys[0] if keys else ""
     if not key:
-        return jsonify({"error": "该账户未配置上游 Key，请先在账户编辑中填写 Key"}), 400
+        return api_error("该账户未配置上游 Key，请先在账户编辑中填写 Key", 400)
 
     # 并发数：请求体可覆盖（弹窗里测未保存的值），否则用已保存的限额。
     data = request.get_json(silent=True) or {}
@@ -139,7 +145,7 @@ def test_account_concurrency(account_id):
     try:
         concurrency = int(concurrency)
     except (TypeError, ValueError):
-        return jsonify({"error": "缺少并发数：该账户未设置并发限额，无法测试"}), 400
+        return api_error("缺少并发数：该账户未设置并发限额，无法测试", 400)
     concurrency = max(1, min(concurrency, 50))
 
     # ── 选最便宜的模型：定价 (input+output 总价) 升序，GLOB 匹配该账户可用模型 ──
@@ -157,7 +163,7 @@ def test_account_concurrency(account_id):
                 account_id, exc,
             )
     if not models:
-        return jsonify({"error": "该账户暂无模型，请先点击「更新模型」获取模型列表"}), 400
+        return api_error("该账户暂无模型，请先点击「更新模型」获取模型列表", 400)
 
     pricing = sorted(
         db.get_pricing(),
@@ -169,7 +175,10 @@ def test_account_concurrency(account_id):
         None,
     )
     if not model_id:
-        return jsonify({"error": f"没有匹配的定价条目（账户模型如: {models[0]}），请先在「模型定价」配置匹配模式"}), 400
+        return api_error(
+            f"没有匹配的定价条目（账户模型如: {models[0]}），请先在「模型定价」配置匹配模式",
+            400,
+        )
 
     # ── 按账户格式生成请求体；URL/auth 由共享 probe helper 解析 ──
     fmt = acc.get("api_format") or "openai"

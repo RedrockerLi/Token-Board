@@ -1,6 +1,11 @@
 """ProxyDatabase methods for ProxyAccountReadMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.core.time import parse_runtime_timestamp, utc_now
+from app.db.proxy.common import (
+    ACCOUNT_TYPES, UTC, _billing_period_month, _cancellation_end,
+    _parse_iso_date, _period_start,
+    billing_period, datetime, json, mask_key, sqlite3, uuid,
+)
 from app.domain.account_template import AccountTemplate, AccountTemplateAdapter
 
 
@@ -128,8 +133,7 @@ class ProxyAccountReadMixin:
         """V1 credential metadata is already safe for cloud synchronization."""
         return
 
-    @staticmethod
-    def _set_upstream_keys(conn: sqlite3.Connection, account_id: int,
+    def _set_upstream_keys(self, conn: sqlite3.Connection, account_id: int,
                            keep_ids: list[int], new_keys: list[str],
                            keep_valid_froms: dict[str, object] | None = None,
                            new_valid_froms: list[object] | None = None,
@@ -148,7 +152,7 @@ class ProxyAccountReadMixin:
         """
         keep_valid_froms = keep_valid_froms or {}
         new_valid_froms = new_valid_froms or []
-        route = ProxyDatabase._v1_route_account(conn, account_id)
+        route = self._v1_route_account(conn, account_id)
         if route is None or route["upstream_id"] is None:
             raise ValueError("账户没有可写入密钥的上游")
         upstream_id = int(route["upstream_id"])
@@ -160,12 +164,12 @@ class ProxyAccountReadMixin:
                 "AND c.deleted_at IS NULL", (upstream_id,))
         }
         retained = [key_id for key_id in keep_ids if key_id in active]
-        config = ProxyDatabase._billing_config_conn(conn)
-        now = _utc_now()
+        config = self._billing_config_conn(conn)
+        now = utc_now()
         for key_id, row in active.items():
             if key_id not in retained:
                 anchor = (_parse_iso_date(row["valid_from"])
-                          or _parse_utc_timestamp(row["created_at"]).date())
+                          or parse_runtime_timestamp(row["created_at"]).date())
                 end = _cancellation_end(config, now, anchor.day, account_type)
                 conn.execute(
                     "UPDATE upstream_credentials SET deleted_at=? WHERE runtime_id=?",

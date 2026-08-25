@@ -2,6 +2,7 @@
 
 #include "origin_limiter.h"
 #include "upstream_client.h"
+#include "upstream_metrics_internal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -55,4 +56,3 @@ constexpr size_t DNS_WORKER_COUNT = 4;
 #include "connection_pool_internal.h"
 #include "forward_watchdog_internal.h"
 #include "watchdog_service_internal.h"
-

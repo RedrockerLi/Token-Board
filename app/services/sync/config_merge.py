@@ -1,7 +1,10 @@
-"""Functional WebDAV synchronization module."""
+"""Cloud-authoritative configuration merge for synchronized V1 tables."""
 
-from app.services.sync.common import *  # noqa: F401,F403
-from app.services.sync.settings import SyncConfig
+import sqlite3
+
+from app.core import sqlite_runtime
+from app.core.time import format_utc, utc_now
+from app.services.sync.state import table_exists
 
 import logging
 
@@ -12,15 +15,15 @@ def _schema_major(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT major FROM schema_version WHERE id=1").fetchone()
     return int(row[0]) if row else 0
 
-def _merge_config_tables(remote_path: str, local_path: str) -> None:
+def merge_config_tables(remote_path: str, local_path: str) -> None:
     """Merge a downloaded, already-upgraded V1 artifact into local V1.
 
     V0 artifacts are upgraded by :mod:`app.db.schema_upgrade` before this
     function is called.  Keeping that boundary explicit prevents the running
     sync path from accidentally writing legacy tables or secrets.
     """
-    probe_remote = sqlite3.connect(remote_path)
-    probe_local = sqlite3.connect(local_path)
+    probe_remote = sqlite_runtime.connect(remote_path, "shadow_copy")
+    probe_local = sqlite_runtime.connect(local_path, "proxy_runtime")
     try:
         remote_major = _schema_major(probe_remote)
         local_major = _schema_major(probe_local)
@@ -46,13 +49,9 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
     tombstone model and are retained with their account identity. ``runtime_id``
     and importer cursors remain local.
     """
-    remote = sqlite3.connect(remote_path)
-    remote.row_factory = sqlite3.Row
-    local = sqlite3.connect(local_path, timeout=10)
-    local.row_factory = sqlite3.Row
+    remote = sqlite_runtime.connect(remote_path, "shadow_copy")
+    local = sqlite_runtime.connect(local_path, "proxy_runtime")
     try:
-        local.execute("PRAGMA busy_timeout=5000")
-        local.execute("PRAGMA foreign_keys=ON")
         local.execute("BEGIN IMMEDIATE")
 
         def table_info(conn, table):
@@ -60,7 +59,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
 
         def merge_table(table: str, excluded: set[str] | None = None) -> None:
             excluded = excluded or set()
-            if not _table_exists(remote, table) or not _table_exists(local, table):
+            if not table_exists(remote, table) or not table_exists(local, table):
                 return
             r_info = table_info(remote, table)
             local_columns = {row[1] for row in table_info(local, table)}
@@ -86,7 +85,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
             merge_table(table)
 
         remote_credential_ids: set[str] = set()
-        if _table_exists(remote, "upstream_credentials"):
+        if table_exists(remote, "upstream_credentials"):
             next_runtime = int(local.execute(
                 "SELECT COALESCE(max(runtime_id),0)+1 FROM upstream_credentials"
             ).fetchone()[0])
@@ -143,7 +142,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
         # WebDAV credentials are needed locally to reach the cloud and must
         # never be copied between machines.  The non-secret connection
         # settings may still be synchronized.
-        if _table_exists(remote, "sync_settings") and _table_exists(local, "sync_settings"):
+        if table_exists(remote, "sync_settings") and table_exists(local, "sync_settings"):
             for row in remote.execute(
                     "SELECT key,value FROM sync_settings "
                     "WHERE key NOT IN ('password','agent_migration_v1_6')"):
@@ -162,9 +161,9 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                           "client_keys", "account_importers", "pricing_rules",
                           "agent_subscriptions", "agent_software",
                           "agent_subscription_instances", "agent_subscription_bindings")
-            if _table_exists(remote, table)
+            if table_exists(remote, table)
         }
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = format_utc(utc_now())
         tombstones = {
             "accounts": (
                 "lifecycle_state=CASE WHEN account_kind='agent' THEN 'deleted' "
@@ -213,14 +212,14 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
         local.close()
 
 
-def _sanitize_upload_columns(dst: sqlite3.Connection) -> None:
+def sanitize_upload_columns(dst: sqlite3.Connection) -> None:
     """Remove machine-local runtime and sensitive credential values."""
-    if _table_exists(dst, "account_importers"):
+    if table_exists(dst, "account_importers"):
         dst.execute("UPDATE account_importers SET cursor_json='{}'")
-    if _table_exists(dst, "upstream_secrets"):
+    if table_exists(dst, "upstream_secrets"):
         dst.execute("DELETE FROM upstream_secrets")
-    if (_table_exists(dst, "billing_contracts") and
-            _table_exists(dst, "account_importers")):
+    if (table_exists(dst, "billing_contracts") and
+            table_exists(dst, "account_importers")):
         legacy_contract_ids = [row[0] for row in dst.execute(
             "SELECT bc.id FROM billing_contracts bc "
             "JOIN account_importers i ON i.account_id=bc.account_id "
@@ -229,7 +228,7 @@ def _sanitize_upload_columns(dst: sqlite3.Connection) -> None:
         if legacy_contract_ids:
             placeholders = ",".join("?" for _ in legacy_contract_ids)
             for table in ("billing_period_charges", "billing_rate_events"):
-                if _table_exists(dst, table):
+                if table_exists(dst, table):
                     dst.execute(
                         f"DELETE FROM {table} WHERE contract_id IN ({placeholders})",
                         legacy_contract_ids,
@@ -240,7 +239,7 @@ def _sanitize_upload_columns(dst: sqlite3.Connection) -> None:
             )
     # This marker is created by the local one-time migration, not configured
     # by the user. Do not make a machine's migration state cloud data.
-    if _table_exists(dst, "sync_settings"):
+    if table_exists(dst, "sync_settings"):
         dst.execute(
             "DELETE FROM sync_settings WHERE key IN ('password','agent_migration_v1_6')"
         )

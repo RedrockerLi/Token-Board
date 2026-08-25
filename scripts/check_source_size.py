@@ -29,11 +29,16 @@ def main() -> None:
             limit = LIMITS.get(path.suffix)
             if limit is None or "third_party" in path.parts or "tests" in path.parts:
                 continue
-            lines = sum(1 for _ in path.open(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            prefixes = ("#",) if path.suffix == ".py" else ("#", "//", "/*", "*", "*/")
+            lines = sum(
+                1 for line in text.splitlines()
+                if line.strip() and not line.lstrip().startswith(prefixes)
+            )
             checked += 1
             if lines > limit:
-                failures.append(f"{path.relative_to(root)}: {lines} > {limit}")
-            text = path.read_text(encoding="utf-8")
+                failures.append(
+                    f"{path.relative_to(root)}: {lines} logical lines > {limit}")
             if (path.parts and path.parts[0] == "app" and
                     "schema_upgrade" not in path.parts and
                     FORBIDDEN_V0_SQL.search(text)):

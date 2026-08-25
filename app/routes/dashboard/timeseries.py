@@ -1,6 +1,10 @@
 """Dashboard route group."""
 
-from app.routes.dashboard.common import *  # noqa: F401,F403
+from collections import defaultdict
+
+from app.routes.dashboard.common import (
+    _store, api_error, bp, current_app, jsonify, request,
+)
 
 @bp.route("/api/daily")
 def api_daily():
@@ -15,7 +19,7 @@ def api_daily():
     model_filter = request.args.get("model", "").strip() or None
     platform_filter = request.args.get("platform", "").strip() or None
     if not year or not month:
-        return jsonify({"error": "year and month query params required"}), 400
+        return api_error("year and month query params required", 400)
 
     # Daily token aggregation
     daily_tokens = defaultdict(lambda: {

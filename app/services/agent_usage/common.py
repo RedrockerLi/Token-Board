@@ -7,12 +7,25 @@ import io
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 from urllib.parse import quote
 
 from .ir import ParseBatch, UsageEvent, UsageSource
+from app.core import sqlite_runtime
+from app.core.time import format_utc, parse_external_timestamp
+
+
+def event_id_for(kind: str, source_identity: str, record_identity: object) -> str:
+    """Build an event id from kind + stable source identity + stable record identity.
+
+    ``record_identity`` is supplied by the adapter (database row id, source
+    line/record key, or a protocol-specific logical id).  The importer and
+    source skeletons must not normalize or recalculate it.
+    """
+
+    return f"{kind}:{source_identity}:{record_identity}"
 
 
 def config_value(software: dict, *names: str) -> str | None:
@@ -46,43 +59,11 @@ def safe_float(value: Any) -> float:
 
 def timestamp(value: Any, *, default_timezone: timezone = timezone.utc) -> str | None:
     """Normalize ISO, seconds, milliseconds, or microseconds to UTC Z time."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        number = float(value)
-        if number <= 0 or number != number or number in (float("inf"), float("-inf")):
-            return None
-        if number > 10_000_000_000_000:  # microseconds
-            number /= 1_000_000
-        elif number > 10_000_000_000:  # milliseconds
-            number /= 1_000
-        try:
-            dt = datetime.fromtimestamp(number, timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    text = str(value).strip()
-    if not text:
-        return None
-    # Some JSONL producers serialize epoch values as strings.  Treat those the
-    # same way as numeric JSON values before trying ISO parsing.
     try:
-        numeric = float(text)
-    except (TypeError, ValueError, OverflowError):
-        numeric = None
-    if numeric is not None:
-        return timestamp(numeric, default_timezone=default_timezone)
-    try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = parse_external_timestamp(value)
+        return format_utc(parsed) if parsed is not None else None
     except ValueError:
-        # A few SQLite stores use `YYYY-MM-DD HH:MM:SS` without a zone.
-        try:
-            dt = datetime.fromisoformat(text.replace(" ", "T"))
-        except ValueError:
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=default_timezone)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return None
 
 
 def project_name(value: Any, fallback: str = "unknown") -> str:
@@ -148,11 +129,9 @@ def source(path: Path, *, key: str | None = None, **context: Any) -> UsageSource
 def sqlite_rows(path: Path, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
     if not path.is_file():
         return []
-    uri = "file:" + quote(str(path.resolve()), safe="/\\:") + "?mode=ro"
     conn = None
     try:
-        conn = sqlite3.connect(uri, uri=True, timeout=2)
-        conn.row_factory = sqlite3.Row
+        conn = sqlite_runtime.read_only(path)
         return conn.execute(sql, params).fetchall()
     except (OSError, sqlite3.Error):
         return []
@@ -210,7 +189,7 @@ def make_event(
         cached_input_tokens=cache_count,
         reasoning_output_tokens=reasoning_count,
         requested_at=requested_at,
-        event_id=f"{kind}:{source_key}:{ordinal}",
+            event_id=event_id_for(kind, source_key, ordinal),
         project=project,
         session_id=session_id,
         input_includes_cache=input_includes_cache,

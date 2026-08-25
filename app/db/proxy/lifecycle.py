@@ -1,6 +1,10 @@
 """ProxyDatabase methods for ProxyLifecycleMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.core.time import parse_runtime_timestamp, utc_now
+from app.db.proxy.common import (
+    _billing_period_month, _cancellation_end, _next_month,
+    _parse_iso_date, _period_start, sqlite3, timedelta, uuid,
+)
 
 
 class ProxyLifecycleMixin:
@@ -47,9 +51,9 @@ class ProxyLifecycleMixin:
             ).fetchone()
             if account is None:
                 return {"ok": False, "error": "Account not found"}
-            now = _utc_now()
+            now = utc_now()
             anchor = (_parse_iso_date(account["valid_from"])
-                      or _parse_utc_timestamp(account["created_at"]).date())
+                      or parse_runtime_timestamp(account["created_at"]).date())
             # The settings page and the delete confirmation both describe the
             # current global default. Read that same setting in this transaction
             # instead of relying on a client-side preview.
@@ -81,13 +85,13 @@ class ProxyLifecycleMixin:
                     ).fetchall()
                     key_expiries = []
                     for credential in credential_rows:
-                        existing_end = _parse_utc_timestamp(credential["deleted_at"])
+                        existing_end = parse_runtime_timestamp(credential["deleted_at"])
                         if existing_end is not None and existing_end > now:
                             end = existing_end
                         else:
                             key_anchor = (
                                 _parse_iso_date(credential["valid_from"])
-                                or _parse_utc_timestamp(credential["created_at"]).date()
+                                or parse_runtime_timestamp(credential["created_at"]).date()
                             )
                             end = _cancellation_end(
                                 config, now, key_anchor.day, "plan")
@@ -142,7 +146,7 @@ class ProxyLifecycleMixin:
         """
         conn = self._connect()
         try:
-            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             pending = conn.execute(
                 "SELECT id FROM accounts WHERE lifecycle_state='active' "
                 "AND account_kind='proxy' AND deleted_at IS NOT NULL AND deleted_at<=?",

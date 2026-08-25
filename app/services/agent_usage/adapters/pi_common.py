@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+import logging
 from pathlib import Path
 
 from ..common import batch, iter_jsonl, make_event, project_name, source, timestamp, walk_files
 from ..ir import ParseBatch, UsageSource
+
+log = logging.getLogger(__name__)
 
 
 def _looks_like_omp_root(path: Path) -> bool:
@@ -44,7 +47,7 @@ def pi_roots(software: dict, kind: str) -> list[Path]:
         try:
             out.extend(p / "agent" / "sessions" for p in (root / "profiles").iterdir() if p.is_dir())
         except OSError:
-            pass
+            log.debug("Pi profile root is unavailable", exc_info=True)
         agent_override = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
         if agent_override:
             override_root = Path(agent_override).expanduser()
@@ -56,7 +59,7 @@ def pi_roots(software: dict, kind: str) -> list[Path]:
             try:
                 out.extend(p / "sessions" for p in (Path(xdg) / "omp" / "profiles").iterdir() if p.is_dir())
             except OSError:
-                pass
+                log.debug("OMP profile root is unavailable", exc_info=True)
         return out
     return [Path.home() / ".pi" / "agent" / "sessions"]
 
@@ -92,7 +95,7 @@ def _project_from_path(path: Path, sessions_root: Path) -> str:
             if index + 1 < len(path.parts):
                 return project_name(path.parts[index + 1])
         except ValueError:
-            pass
+            log.debug("Pi session path is outside its expected root", exc_info=True)
     stripped = first.strip("-")
     if first.startswith("--") and stripped:
         return project_name(stripped.split("-")[-1])

@@ -37,8 +37,7 @@ std::string prepare_anthropic_beta(const httplib::Request &request,
 
 void ProxyServer::handle_chat_request(const httplib::Request &req,
                                       httplib::Response &res) {
-    auto accounting_cleanup = make_scope_exit(
-        [this] { release_unconsumed_accounting(); });
+    EndpointRunner endpoint_runner(*this);
     add_cors_headers(res);
     auto t0 = std::chrono::steady_clock::now();
 
@@ -198,7 +197,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         // Reserve only after all request validation and lazy conversion work
         // has succeeded.  A malformed conversion must not strand accounting
         // capacity for a request that never contacts an upstream.
-        if (!try_reserve_accounting()) {
+        if (!endpoint_runner.try_reserve_accounting()) {
             res.status = 503;
             res.set_header("Retry-After", "1");
             res.set_content(json_error(
@@ -231,7 +230,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     // ── Non-streaming: candidate loop with fallback ────────────────────
     const std::string &content_type = context.content_type;
     const FormatCodec &harness_codec = codecs_.get(harness);
-    if (!try_reserve_accounting()) {
+    if (!endpoint_runner.try_reserve_accounting()) {
         res.status = 503;
         res.set_header("Retry-After", "1");
         res.set_content(json_error(
@@ -241,8 +240,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     }
     // From here the request is committed to contacting an upstream: an abnormal
     // exit below writes an internal_abort UsageEvent instead of dropping the slot.
-    mark_accounting_upstream_started(ar.route.account_id, ar.route.local_key_id,
-                                     model, false);
+    endpoint_runner.mark_accounting_upstream_started(
+        ar.route.account_id, ar.route.local_key_id, model, false);
     ir::ChatRequest cReq;
     std::string perr;
 

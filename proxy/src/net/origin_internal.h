@@ -1,13 +1,6 @@
 constexpr size_t CLIENT_POOL_MAX_IDLE = 256;
 constexpr size_t CLIENT_POOL_MAX_IDLE_PER_ORIGIN = 64;
 constexpr int64_t CLIENT_POOL_IDLE_TTL_MS = 60 * 1000;
-std::atomic<std::uint64_t> transport_dns_lookups{0};
-std::atomic<std::uint64_t> transport_dns_total_ms{0};
-std::atomic<std::uint64_t> transport_connect_total_ms{0};
-std::atomic<std::uint64_t> transport_tls_total_ms{0};
-std::atomic<std::uint64_t> transport_new_connections{0};
-std::atomic<std::uint64_t> transport_reused_connections{0};
-
 long long now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();

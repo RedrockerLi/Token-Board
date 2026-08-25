@@ -13,7 +13,7 @@
 #include "router.h"
 #include "think_filter.h"
 #include "upstream_client.h"
-#include "usage_tracker.h"
+#include "usage_recorder.h"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
@@ -70,6 +70,32 @@ template <typename F>
 ScopeExit<F> make_scope_exit(F fn) {
     return ScopeExit<F>(std::move(fn));
 }
+
+/// Endpoint-level reservation lifecycle. Every accounting endpoint owns one
+/// instance for the request handler; a deferred stream may detach the shared
+/// reservation, in which case the provider owns it until the durable writer
+/// queue accepts the event. The destructor only releases an unconsumed token.
+class EndpointRunner {
+public:
+    explicit EndpointRunner(ProxyServer &server) : server_(&server) {}
+    EndpointRunner(const EndpointRunner &) = delete;
+    EndpointRunner &operator=(const EndpointRunner &) = delete;
+    ~EndpointRunner() {
+        if (server_) server_->release_unconsumed_accounting();
+    }
+
+    bool try_reserve_accounting() { return server_->try_reserve_accounting(); }
+
+    void mark_accounting_upstream_started(
+        int account_id, int local_key_id, const std::string &model,
+        bool streaming) {
+        server_->mark_accounting_upstream_started(
+            account_id, local_key_id, model, streaming);
+    }
+
+private:
+    ProxyServer *server_;
+};
 
 struct AuthResult {
     bool success = false;
@@ -133,10 +159,10 @@ UpstreamClient::ForwardResult forward_endpoint_attempt(
 bool clamp_to_remaining_budget(
     Database::TimeoutConfig &timeouts,
     std::chrono::steady_clock::time_point deadline, bool streaming);
-std::optional<UsageTracker::UsageInfo> parse_usage_for_format(
+std::optional<UsageAccounting> parse_usage_for_format(
     const std::string &api_format, const std::string &body);
-UsageTracker::UsageInfo usage_from_ir(const ir::Usage &usage,
-                                     ir::ApiFormat upstream_format);
+UsageAccounting usage_from_ir(const ir::Usage &usage,
+                              ir::ApiFormat upstream_format);
 bool client_disconnected(const httplib::Request &request,
                          std::uint64_t inflight_id,
                          const std::string &model);

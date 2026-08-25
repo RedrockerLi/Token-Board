@@ -1,15 +1,23 @@
 """Functional WebDAV synchronization module."""
 
 import json
+import hashlib
 import logging
 import os
 import re
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import unquote
 
-from app.services.sync.common import *  # noqa: F401,F403
+import requests
+from requests.auth import HTTPBasicAuth
+
+from app.core import sqlite_runtime
+from app.core.time import utc_now
 from app.services.sync.settings import SyncConfig
 
 log = logging.getLogger(__name__)
@@ -22,7 +30,7 @@ class RemoteArtifact:
     etag: str | None = None
 
 
-def _file_checksum(path: Path) -> str:
+def file_checksum(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -30,16 +38,28 @@ def _file_checksum(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _make_timestamped_name(base: str) -> str:
+def _filename_now() -> datetime:
+    """Return the legacy local wall-clock used in artifact filenames.
+
+    Runtime timestamps use UTC, but artifact names are an existing remote
+    ordering contract.  Keep that clock independent so consolidating runtime
+    time helpers cannot silently rename a user's next upload.
+    """
+
+    return datetime.now()
+
+
+def _make_timestamped_name(base: str,
+                           clock: Callable[[], datetime] | None = None) -> str:
     """dashboard_sync.db → dashboard_sync_20260716_143025.db"""
     name, ext = base.rsplit(".", 1)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = (clock or _filename_now)().strftime("%Y%m%d_%H%M%S")
     return f"{name}_{stamp}.{ext}"
 
 
 def _schema_manifest(db_path: str, artifact_name: str) -> dict:
     """Describe the exact schema image published alongside a sync artifact."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite_runtime.connect(db_path, "shadow_copy")
     try:
         version = conn.execute(
             "SELECT major,minor,database_name FROM schema_version WHERE id=1"
@@ -55,13 +75,15 @@ def _schema_manifest(db_path: str, artifact_name: str) -> dict:
         "major": int(version[0]),
         "minor": int(version[1]),
         "user_version": pragma,
-        "sha256": _file_checksum(Path(db_path)),
-        "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "sha256": file_checksum(Path(db_path)),
+        "published_at": utc_now().isoformat(timespec="seconds"),
     }
 
 
-def _publish_schema_manifest(config: SyncConfig, db_path: str,
-                             artifact_name: str) -> None:
+def publish_schema_manifest(config: SyncConfig, db_path: str,
+                            artifact_name: str,
+                            *,
+                            filename_clock: Callable[[], datetime] | None = None) -> None:
     """Publish a separate V1 marker without replacing older remote files.
 
     Transition never mutates the remote V0 artifact.  Every normal V1 upload
@@ -74,13 +96,13 @@ def _publish_schema_manifest(config: SyncConfig, db_path: str,
                            encoding="utf-8")
     try:
         remote_name = (f"schema_manifest_{artifact_name}_v{marker['major']}-"
-                       f"{marker['minor']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-        _webdav_upload(config, str(marker_path), remote_filename=remote_name)
+                       f"{marker['minor']}_{(filename_clock or _filename_now)().strftime('%Y%m%d_%H%M%S')}.json")
+        upload_artifact(config, str(marker_path), remote_filename=remote_name)
     finally:
         marker_path.unlink(missing_ok=True)
 
 
-def _list_folder_files(config, prefix: str) -> list[RemoteArtifact]:
+def list_artifacts(config, prefix: str) -> list[RemoteArtifact]:
     """List filenames in the sync folder matching a prefix via PROPFIND.
 
     Returns sorted list of matching filenames.
@@ -140,41 +162,13 @@ def _artifact_sort_key(name: str) -> tuple[datetime, str]:
     return stamp, name
 
 
-def _latest_artifact_name(config, base: str) -> str | None:
-    artifact = _latest_artifact(config, base)
-    return artifact.name if artifact else None
-
-
-def _latest_artifact(config, base: str) -> RemoteArtifact | None:
-    files = [item for item in _list_folder_files(config, base + "_")
+def latest_artifact(config, base: str) -> RemoteArtifact | None:
+    files = [item for item in list_artifacts(config, base + "_")
              if _ARTIFACT_RE.match(item.name)]
     if not files:
         return None
     return max(files, key=lambda item: (_artifact_sort_key(item.name),
                                         item.timestamp or datetime.min))
-
-
-def _download_latest_artifact(config, dest_path: str,
-                              base: str) -> RemoteArtifact | None:
-    artifact = _latest_artifact(config, base)
-    remote_name = artifact.name if artifact else base + ".db"
-    if not _webdav_download(config, dest_path, remote_filename=remote_name):
-        return None
-    return artifact or RemoteArtifact(remote_name)
-
-
-def _download_latest(config, dest_path: str, base: str) -> bool:
-    """Find the latest timestamped file matching *base* and download it.
-
-    base = "dashboard_sync" → matches "dashboard_sync_20260716_143025.db"
-    Returns True if a file was found and downloaded, False if no files exist.
-    """
-    prefix = base + "_"
-    latest = _latest_artifact_name(config, base)
-    if latest is None:
-        # Also try the bare name for backward compatibility
-        return _webdav_download(config, dest_path, remote_filename=base + ".db")
-    return _webdav_download(config, dest_path, remote_filename=latest)
 
 
 class WebDAVError(Exception):
@@ -185,13 +179,145 @@ class WebDAVConflict(WebDAVError):
     """The remote version changed while a versioned artifact was prepared."""
 
 
+class WebDAVClient:
+    """Explicit transport boundary for one configured WebDAV endpoint.
+
+    Domain workflows use these methods instead of knowing URL, auth, PROPFIND
+    XML, or HTTP status details.
+    """
+
+    def __init__(self, config: SyncConfig):
+        self.config = config
+
+    def list_artifacts(self, prefix: str) -> list[RemoteArtifact]:
+        return list_artifacts(self.config, prefix)
+
+    def find_artifact(self, name: str) -> RemoteArtifact | None:
+        return find_artifact(self.config, name)
+
+    def download_artifact(self, name: str, destination: str) -> bool:
+        return download_artifact(self.config, destination, remote_filename=name)
+
+    def upload_artifact(self, source: str, name: str, *,
+                        if_match: str | None = None,
+                        if_none_match: bool = False) -> None:
+        upload_artifact(self.config, source, remote_filename=name,
+                        if_match=if_match, if_none_match=if_none_match)
+
+    def test_connection(self) -> str | None:
+        return test_connection(self.config)
+
+
+class ArtifactTransaction:
+    """Shared immutable-artifact publication protocol.
+
+    A successful publication is PUT followed by a confirmation PROPFIND that
+    contains the exact new filename.  The clock is called inside each publish
+    attempt; callers retrying the complete workflow therefore obtain a fresh
+    filename instead of reusing a colliding timestamp.
+    """
+
+    def __init__(self, client: WebDAVClient, *,
+                 filename_clock: Callable[[], datetime] | None = None,
+                 retry_count: int = 3, retry_interval: float = 0.0,
+                 sleeper: Callable[[float], None] = time.sleep):
+        if retry_count < 1:
+            raise ValueError("retry_count must be positive")
+        if retry_interval < 0:
+            raise ValueError("retry_interval must not be negative")
+        self.client = client
+        self.filename_clock = filename_clock or _filename_now
+        self.retry_count = retry_count
+        self.retry_interval = retry_interval
+        self.sleeper = sleeper
+
+    @staticmethod
+    def _changed(expected: RemoteArtifact | None,
+                 current: RemoteArtifact | None) -> bool:
+        if expected is None or current is None:
+            return False
+        if expected.etag and current.etag:
+            return expected.etag != current.etag
+        return expected.name != current.name
+
+    def publish_versioned_artifact(
+            self, source: str, base: str,
+            expected: RemoteArtifact | None = None,
+            *, list_latest: Callable[[], RemoteArtifact | None] | None = None,
+            upload: Callable[[str, str], None] | None = None,
+            _attempt: int = 0) -> RemoteArtifact:
+        latest = list_latest or (lambda: latest_artifact_from_client(self.client, base))
+        put = upload or (
+            lambda path, name: self.client.upload_artifact(
+                path, name, if_none_match=True))
+        current = latest()
+        if self._changed(expected, current):
+            raise WebDAVConflict("远端版本在上传前已变化")
+
+        # This call is intentionally per publication, not in __init__; a
+        # complete retry invokes this method again and gets a new clock value.
+        remote_name = _make_timestamped_name(base + ".db", self.filename_clock)
+        if _attempt:
+            stem, extension = remote_name.rsplit(".", 1)
+            remote_name = f"{stem}_{_attempt}.{extension}"
+        put(source, remote_name)
+        # Confirmation is an exact-name PROPFIND observation.  Looking only
+        # at the latest artifact would report a false failure if another
+        # writer published a newer file between our PUT and this check.
+        confirmed = next(
+            (item for item in self.client.list_artifacts(base + "_")
+             if item.name == remote_name),
+            None,
+        )
+        if confirmed is not None:
+            return confirmed
+        raise WebDAVError("上传后未能通过 PROPFIND 确认新 artifact")
+
+    def publish_with_retry(self, source: str, base: str,
+                           expected: RemoteArtifact | None = None) -> RemoteArtifact:
+        """Retry only the transport-level publication with fresh filenames."""
+
+        last_error: Exception | None = None
+        for attempt in range(self.retry_count):
+            try:
+                return self.publish_versioned_artifact(
+                    source, base, expected, _attempt=attempt)
+            except WebDAVError as exc:
+                last_error = exc
+                if attempt + 1 == self.retry_count:
+                    break
+                if self.retry_interval:
+                    self.sleeper(self.retry_interval)
+                expected = None
+        assert last_error is not None
+        raise last_error
+
+
+def latest_artifact_from_client(client: WebDAVClient,
+                                base: str) -> RemoteArtifact | None:
+    files = [item for item in client.list_artifacts(base + "_")
+             if _ARTIFACT_RE.match(item.name)]
+    return max(files, key=lambda item: (_artifact_sort_key(item.name),
+                                        item.timestamp or datetime.min),
+               default=None)
+
+
+def find_artifact(config: SyncConfig, name: str) -> RemoteArtifact | None:
+    """Return the exact remote filename observed by a fresh PROPFIND."""
+    for item in list_artifacts(config, name):
+        if item.name == name:
+            return item
+    return None
+
+
 def _build_url(config: SyncConfig, remote_filename: str | None = None) -> str:
     """Build the full WebDAV URL. Override filename if provided."""
     fn = remote_filename or config.filename
     return f"{config.base_url.rstrip('/')}/{config.folder.strip('/')}/{fn}"
 
 
-def _webdav_download(config: SyncConfig, dest_path: str, remote_filename: str | None = None) -> bool:
+def download_artifact(config: SyncConfig, dest_path: str,
+                      remote_filename: str | None = None) -> bool:
     """Download remote DB. Returns True if downloaded, False if not found (first sync)."""
     url = _build_url(config, remote_filename)
     resp = requests.get(
@@ -222,7 +348,7 @@ def _webdav_download(config: SyncConfig, dest_path: str, remote_filename: str | 
     return True
 
 
-def _webdav_ensure_folder(config: SyncConfig, remote_filename: str | None = None):
+def _ensure_folder(config: SyncConfig, remote_filename: str | None = None):
     """Ensure the target folder exists on the WebDAV server (create if needed)."""
     url = _build_url(config, remote_filename)
     folder_url = url.rsplit("/", 1)[0] + "/"
@@ -245,12 +371,12 @@ def _webdav_ensure_folder(config: SyncConfig, remote_filename: str | None = None
     raise WebDAVError(f"无法创建/访问文件夹 {folder_url}: HTTP {resp.status_code}/{resp2.status_code}")
 
 
-def _webdav_upload(config: SyncConfig, src_path: str,
-                   remote_filename: str | None = None,
-                   *, if_match: str | None = None,
-                   if_none_match: bool = False):
+def upload_artifact(config: SyncConfig, src_path: str,
+                    remote_filename: str | None = None,
+                    *, if_match: str | None = None,
+                    if_none_match: bool = False):
     """Upload a file to WebDAV from src_path."""
-    _webdav_ensure_folder(config, remote_filename)
+    _ensure_folder(config, remote_filename)
     url = _build_url(config, remote_filename)
     # Attempt PUT directly; if it fails with 404/409, folder issue already caught above
     with open(src_path, "rb") as f:
@@ -273,26 +399,20 @@ def _webdav_upload(config: SyncConfig, src_path: str,
         raise WebDAVError(f"Upload failed: HTTP {resp.status_code} — {resp.text[:200]}")
 
 
-def _upload_versioned_artifact(config: SyncConfig, src_path: str, base: str,
+def publish_versioned_artifact(config: SyncConfig, src_path: str, base: str,
                                expected: RemoteArtifact | None = None) -> RemoteArtifact:
-    """Publish a new immutable artifact only if the observed latest version is
-    still current.  A second listing closes the download/build/upload race;
-    timestamp collisions are rejected with If-None-Match.
+    """Publish one attempt with mandatory exact-name PROPFIND confirmation.
+
+    Domain workflows retry their complete transaction around this boundary.
+    ``ArtifactTransaction.publish_with_retry`` remains available for callers
+    that explicitly want transport-only retry semantics in a contract test.
     """
-    current = _latest_artifact(config, base)
-    if expected and current:
-        if expected.etag and current.etag and expected.etag != current.etag:
-            raise WebDAVConflict("远端版本在上传前已变化")
-        if expected.name != current.name and not expected.etag:
-            raise WebDAVConflict("远端版本在上传前已变化")
-    remote_name = _make_timestamped_name(base + ".db")
-    _webdav_upload(config, src_path, remote_filename=remote_name,
-                   if_none_match=True)
-    published = _latest_artifact(config, base)
-    return published or RemoteArtifact(remote_name)
+    return ArtifactTransaction(
+        WebDAVClient(config), retry_count=1).publish_versioned_artifact(
+            src_path, base, expected)
 
 
-def _webdav_test(config: SyncConfig) -> str | None:
+def test_connection(config: SyncConfig) -> str | None:
     """Test WebDAV connectivity. Returns None on success, error string on failure."""
     try:
         folder_url = config.full_url.rsplit("/", 1)[0] + "/"

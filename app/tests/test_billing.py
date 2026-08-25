@@ -270,7 +270,7 @@ class BillingTest(AppDatabaseTestCase):
             )
             conn.commit()
 
-        with patch("app.db.proxy.lifecycle._utc_now", return_value=fixed_now):
+        with patch("app.db.proxy.lifecycle.utc_now", return_value=fixed_now):
             result = db.delete_account(account_id)
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["deferred"], result)

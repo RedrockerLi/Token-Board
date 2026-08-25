@@ -4,7 +4,7 @@ Historical table repair belongs to the offline schema transition package.  The
 running application only ever sees the normalized V1 tables.
 """
 
-from app.db.dashboard.common import *  # noqa: F401,F403
+from app.core import sqlite_runtime
 
 
 def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
@@ -13,9 +13,8 @@ def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
     The operation is intentionally idempotent and preserves soft-deleted
     accounts so historical dashboard rows retain their display name.
     """
-    proxy = sqlite3.connect(proxy_path)
-    proxy.row_factory = sqlite3.Row
-    dash = sqlite3.connect(dash_path, timeout=10)
+    proxy = sqlite_runtime.connect(proxy_path, "proxy_runtime")
+    dash = sqlite_runtime.connect(dash_path, "dashboard_runtime")
     try:
         accounts = proxy.execute(
             "SELECT id,name,lifecycle_state,updated_at,account_kind "

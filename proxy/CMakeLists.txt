@@ -28,18 +28,20 @@ set(FORMAT_SOURCES
     src/format/format_responses_response.cpp
     src/format/format_responses_stream.cpp src/format/format_responses_emitter.cpp
     src/format/format_media.cpp
+    src/format/usage_parser.cpp
     src/format/reasoning_bridge.cpp
     src/format/think_filter.cpp)
 
 set(NET_SOURCES
-    src/net/upstream_client.cpp src/net/upstream_forward.cpp)
+    src/net/upstream_client.cpp src/net/upstream_forward.cpp
+    src/net/upstream_metrics.cpp)
 
 set(STORE_SOURCES
     src/store/db.cpp src/store/database_lifecycle.cpp
     src/store/database_statements.cpp src/store/routing_repository.cpp
     src/store/pricing_repository.cpp src/store/durable_spool.cpp
     src/store/usage_writer.cpp src/store/database_catalog.cpp
-    src/store/usage_tracker.cpp)
+    src/store/usage_recorder.cpp)
 
 set(RUNTIME_SOURCES
     src/core/config.cpp

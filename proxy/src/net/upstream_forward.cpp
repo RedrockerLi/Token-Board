@@ -1,5 +1,16 @@
 #include "transport_internal.h"
 
+namespace upstream_metrics_detail {
+
+// ClientPool is intentionally private to the forwarding implementation.  A
+// narrow read-only bridge lets the dedicated metrics TU aggregate pool data
+// without exposing the pool or its mutation methods as a public API.
+UpstreamClient::TransportMetrics pool_metrics() {
+    return ClientPool::instance().metrics();
+}
+
+}  // namespace upstream_metrics_detail
+
 UpstreamClient::ForwardResult
 UpstreamClient::forward(const std::string &method,
                         const std::string &base_url,
@@ -109,8 +120,8 @@ UpstreamClient::forward(const std::string &method,
     const int dns_ms = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - dns_started).count());
-    transport_dns_lookups.fetch_add(1, std::memory_order_relaxed);
-    transport_dns_total_ms.fetch_add(static_cast<std::uint64_t>(
+    upstream_metrics::dns_lookups.fetch_add(1, std::memory_order_relaxed);
+    upstream_metrics::dns_total_ms.fetch_add(static_cast<std::uint64_t>(
         std::max(0, dns_ms)), std::memory_order_relaxed);
 
     httplib::Headers headers;
@@ -437,16 +448,16 @@ UpstreamClient::forward(const std::string &method,
         result.tls_ms = timing->tls_ms;
         result.lease_wait_ms = origin_lease.wait_ms();
         result.connection_reused = connection_reused;
-        transport_connect_total_ms.fetch_add(
+        upstream_metrics::connect_total_ms.fetch_add(
             static_cast<std::uint64_t>(std::max(0, result.connect_ms)),
             std::memory_order_relaxed);
-        transport_tls_total_ms.fetch_add(
+        upstream_metrics::tls_total_ms.fetch_add(
             static_cast<std::uint64_t>(std::max(0, result.tls_ms)),
             std::memory_order_relaxed);
         if (connection_reused)
-            transport_reused_connections.fetch_add(1, std::memory_order_relaxed);
+            upstream_metrics::reused_connections.fetch_add(1, std::memory_order_relaxed);
         else
-            transport_new_connections.fetch_add(1, std::memory_order_relaxed);
+            upstream_metrics::new_connections.fetch_add(1, std::memory_order_relaxed);
         if (retry && addr_index < dns_addresses.size()) {
             const std::string &dead = lease.address();
             tried_addresses.insert(dead);
@@ -470,26 +481,6 @@ UpstreamClient::forward(const std::string &method,
                                              lease.address());
 
     return result;
-}
-
-UpstreamClient::TransportMetrics UpstreamClient::transport_metrics() {
-    auto metrics = ClientPool::instance().metrics();
-    metrics.dns_lookups =
-        transport_dns_lookups.load(std::memory_order_relaxed);
-    metrics.dns_total_ms =
-        transport_dns_total_ms.load(std::memory_order_relaxed);
-    metrics.connect_total_ms =
-        transport_connect_total_ms.load(std::memory_order_relaxed);
-    metrics.tls_total_ms =
-        transport_tls_total_ms.load(std::memory_order_relaxed);
-    metrics.new_connections =
-        transport_new_connections.load(std::memory_order_relaxed);
-    metrics.reused_connections =
-        transport_reused_connections.load(std::memory_order_relaxed);
-    metrics.lease_count = OriginLimiter::instance().lease_count();
-    metrics.lease_wait_ms = OriginLimiter::instance().lease_wait_ms();
-    metrics.active_leases = OriginLimiter::instance().active();
-    return metrics;
 }
 
 void UpstreamClient::invalidate_connections() {

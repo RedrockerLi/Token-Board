@@ -38,11 +38,20 @@ V1_CONFIG_TABLES = [
     "agent_subscription_rate_events", "agent_subscription_bindings",
     "agent_software",
 ]
+CONFIG_TABLE_ALLOWLIST = frozenset(V1_CONFIG_TABLES)
 _RUNTIME_TABLES = [
     "request_log", "request_attempts", "billing_period_charges",
     "agent_subscription_period_charges", "agent_software_runtime", "fx_rates",
     "sync_state", "sync_config", "perf_events", "in_flight_requests", "session_key_log",
 ]
+RUNTIME_TABLE_DENYLIST = frozenset(_RUNTIME_TABLES)
 
 
-__all__ = [name for name in globals() if not name.startswith('__')]
+def is_config_sync_table(name: str) -> bool:
+    """Return whether a table is explicitly allowed in a config artifact."""
+
+    return str(name) in CONFIG_TABLE_ALLOWLIST
+
+
+__all__ = ["V1_CONFIG_TABLES", "CONFIG_TABLE_ALLOWLIST",
+           "RUNTIME_TABLE_DENYLIST", "is_config_sync_table"]

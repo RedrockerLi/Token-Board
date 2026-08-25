@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.core import sqlite_runtime
 from app.db.migrations import SchemaVersion
 from .sqlite_utils import copy_sqlite
 
@@ -58,7 +59,7 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def inspect_version(path: Path, database_name: str) -> SchemaVersion | None:
     if not path.exists() or path.stat().st_size == 0:
         return None
-    conn = sqlite3.connect(path)
+    conn = sqlite_runtime.connect(path, "schema_upgrade")
     try:
         row = None
         if table_exists(conn, "schema_version"):
@@ -158,7 +159,7 @@ def recover_incomplete_manifests(root: Path) -> None:
 
 
 def verify(path: Path, database_name: str, expected: SchemaVersion) -> None:
-    conn = sqlite3.connect(path)
+    conn = sqlite_runtime.connect(path, "schema_upgrade")
     try:
         quick = conn.execute("PRAGMA quick_check").fetchone()[0]
         if quick != "ok":
@@ -175,7 +176,7 @@ def verify(path: Path, database_name: str, expected: SchemaVersion) -> None:
 
 
 def replace(source: Path, shadow: Path) -> None:
-    conn = sqlite3.connect(shadow, isolation_level=None)
+    conn = sqlite_runtime.connect(shadow, "schema_upgrade")
     try:
         result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if result and result[0] != 0:
@@ -192,7 +193,7 @@ def rebuild_snapshot(proxy_path: Path) -> None:
     temporary = snapshot.with_name("token-board_config_snapshot.db.upgrade-new")
     temporary.unlink(missing_ok=True)
     copy_sqlite(proxy_path, temporary)
-    conn = sqlite3.connect(temporary)
+    conn = sqlite_runtime.connect(temporary, "snapshot_restore")
     try:
         for table in ("request_attempts", "request_log",
                       "billing_period_charges", "fx_rates"):

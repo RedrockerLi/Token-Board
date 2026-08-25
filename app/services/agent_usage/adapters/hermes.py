@@ -1,6 +1,7 @@
 """Hermes multi-profile SQLite adapter."""
 
 import os
+import logging
 from pathlib import Path
 
 from ..common import batch, configured_root, make_event, source, sqlite_rows, timestamp
@@ -10,6 +11,7 @@ KIND = "hermes"
 LABEL = "Hermes"
 ALWAYS_SCAN = True
 DEFAULT_PATH = Path.home() / ".hermes"
+log = logging.getLogger(__name__)
 
 
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
@@ -28,7 +30,7 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
             if child.is_dir() and path.is_file():
                 out.append(source(path, profile=child.name))
     except OSError:
-        pass
+        log.debug("Hermes discovery root is unavailable", exc_info=True)
     return out
 
 

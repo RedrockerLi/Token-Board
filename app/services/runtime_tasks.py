@@ -6,12 +6,12 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
 
 from app.db.proxy.billing import (
     materialize_all_period_charges,
     materialize_period_charges,  # public compatibility hook for integrations/tests
 )
+from app.core.time import format_utc, utc_now
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ AGENT_USAGE_IMPORT_INTERVAL_SECONDS = 30 * 60
 
 def _set_health(health: dict, lock: threading.Lock, name: str,
                 status: str, error: str | None = None) -> None:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    now = format_utc(utc_now())
     with lock:
         item = health.setdefault(name, {})
         item.update({"status": status, "last_run": now})

@@ -1,13 +1,18 @@
 """Subscription parents, billable instances and software bindings."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.core.time import parse_runtime_timestamp, utc_now
+from app.db.proxy.common import (
+    _billing_period_month, _next_month, _parse_iso_date,
+    _period_start, datetime, json,
+    sqlite3, timedelta, uuid,
+)
 
 
 def _iso_start(value: object | None) -> str:
     if value in (None, ""):
-        return _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        return utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
     if isinstance(value, str) and "T" in value:
-        return _parse_utc_timestamp(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return parse_runtime_timestamp(value).strftime("%Y-%m-%dT%H:%M:%SZ")
     parsed = _parse_iso_date(value)
     return parsed.isoformat() + "T00:00:00Z"
 
@@ -44,7 +49,7 @@ class ProxySubscriptionMixin:
         if config["cancellation_mode"] == "immediate":
             return now
         if isinstance(valid_from, str) and "T" in valid_from:
-            anchor = _parse_utc_timestamp(valid_from).date()
+            anchor = parse_runtime_timestamp(valid_from).date()
         else:
             anchor = _parse_iso_date(valid_from)
         current = _billing_period_month(now, anchor.day)
@@ -177,7 +182,7 @@ class ProxySubscriptionMixin:
             raise ValueError("币种必须是 CNY 或 USD")
         parent_start = _iso_start(data.get("valid_from") or data.get("start_time"))
         instances = self._validate_instances(data, currency, parent_start)
-        now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
         conn = self._connect()
         try:
             sid = conn.execute(
@@ -235,7 +240,7 @@ class ProxySubscriptionMixin:
                 raise ValueError("订阅不存在")
             parsed = self._validate_instances(
                 {"instances": [data]}, parent["currency"], parent["valid_from"])[0]
-            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             self._insert_instances(conn, subscription_id, [parsed], now)
             conn.execute("UPDATE agent_subscriptions SET updated_at=? WHERE id=?",
                          (now, subscription_id))
@@ -262,7 +267,7 @@ class ProxySubscriptionMixin:
             ).fetchone()
             if row is None:
                 return False
-            now_dt = _utc_now()
+            now_dt = utc_now()
             now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             changed = self._update_instance_row(
                 conn, row, data, now, self._subscription_price_rule(conn, data))
@@ -280,7 +285,7 @@ class ProxySubscriptionMixin:
     def delete_agent_subscription_instance(self, instance_id: int) -> bool:
         conn = self._connect()
         try:
-            now_dt = _utc_now()
+            now_dt = utc_now()
             now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             row = conn.execute(
                 "SELECT i.*,s.valid_from subscription_valid_from "
@@ -323,7 +328,7 @@ class ProxySubscriptionMixin:
             if "valid_from" in data or "start_time" in data:
                 fields.append("valid_from=?")
                 values.append(_iso_start(data.get("valid_from") or data.get("start_time")))
-            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             if fields:
                 fields.append("updated_at=?")
                 values.extend([now, subscription_id])
@@ -368,7 +373,7 @@ class ProxySubscriptionMixin:
                         self._update_instance_row(conn, row, item, now, rule)
                     else:
                         self._insert_instances(conn, subscription_id, [item], now)
-                now_dt = _utc_now()
+                now_dt = utc_now()
                 for iid, row in existing.items():
                     if iid not in seen:
                         self._delete_instance_row(conn, row, now_dt)
@@ -385,7 +390,7 @@ class ProxySubscriptionMixin:
     def delete_agent_subscription(self, subscription_id: int) -> bool:
         conn = self._connect()
         try:
-            now_dt = _utc_now()
+            now_dt = utc_now()
             now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             row = conn.execute(
                 "SELECT * FROM agent_subscriptions "
@@ -438,7 +443,7 @@ class ProxySubscriptionMixin:
             ).fetchone()[0]
             if count != len(cleaned):
                 raise ValueError("绑定的订阅不存在")
-        now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
         active = {row[0] for row in conn.execute(
             "SELECT subscription_id FROM agent_subscription_bindings "
             "WHERE software_id=? AND lifecycle_state='active'", (software_id,))}

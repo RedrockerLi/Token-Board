@@ -177,8 +177,7 @@ const ConfigSync = {
         try {
             let data;
             try {
-                const resp = await fetch('/api/proxy/sync/config/upload', { method: 'POST' });
-                data = await resp.json().catch(() => ({ status: 'error', message: '响应解析失败' }));
+                data = await proxyApi('/api/proxy/sync/config/upload', { method: 'POST' });
             } catch (e) {
                 data = { status: 'error', message: e.message || '网络错误' };
             }
@@ -216,8 +215,7 @@ const ConfigSync = {
     },
     async discard() {
         try {
-            const resp = await fetch('/api/proxy/sync/config/discard', { method: 'POST' });
-            const d = await resp.json();
+            const d = await proxyApi('/api/proxy/sync/config/discard', { method: 'POST' });
             if (d.status === 'ok') {
                 showToast('已丢弃未同步的设置，回滚到上次同步状态');
                 // Full reload: config pages guard re-init, so re-render the
@@ -363,7 +361,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Opening the dashboard asks the server-owned importer for one extra
     // pass.  The request returns immediately; the same serialized worker also
     // handles startup and 30-minute imports, so multiple tabs are harmless.
-    fetch('/api/proxy/agent-usage/import', { method: 'POST' }).catch((error) => {
+    proxyApi('/api/proxy/agent-usage/import', { method: 'POST' }).catch((error) => {
         console.warn('Failed to schedule agent usage import:', error);
     });
 

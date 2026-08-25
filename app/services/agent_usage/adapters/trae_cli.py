@@ -1,6 +1,7 @@
 """Trae CLI trace/span adapter."""
 
 import os
+import logging
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ elif sys.platform == "win32":
 else:
     DEFAULT_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "trae-cli" / "sessions"
 PRIMARY = "model.stream.eino"
+log = logging.getLogger(__name__)
 FAILOVER = "model.generate"
 FALLBACK = ("model.real_call", "model.call")
 
@@ -33,7 +35,7 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
             if session.is_dir() and (session / "traces.jsonl").is_file():
                 out.append(source(session / "traces.jsonl", session_path=session, session_id=session.name))
     except OSError:
-        pass
+        log.debug("Trae CLI session root is unavailable", exc_info=True)
     return out
 
 

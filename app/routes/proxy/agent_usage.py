@@ -1,6 +1,6 @@
 """Agent usage import controls owned by the dashboard server."""
 
-from app.routes.proxy.common import *  # noqa: F401,F403
+from app.routes.proxy.common import bp_proxy, current_app, jsonify
 
 
 @bp_proxy.route("/agent-usage/import", methods=["POST"])

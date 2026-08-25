@@ -147,13 +147,13 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
                 ).fetchone()[0]
             return RemoteArtifact("dashboard_sync_20260825_120000.db")
 
-        with patch("app.services.sync.dashboard_sync._latest_artifact",
+        with patch("app.services.sync.dashboard_sync.latest_artifact",
                    return_value=None), patch(
-                       "app.services.sync.dashboard_sync._webdav_download",
+                       "app.services.sync.dashboard_sync.download_artifact",
                        side_effect=AssertionError("upload must not download")), patch(
-                           "app.services.sync.dashboard_sync._upload_versioned_artifact",
+                           "app.services.sync.dashboard_sync.publish_versioned_artifact",
                            side_effect=capture_upload), patch(
-                               "app.services.sync.dashboard_sync._publish_schema_manifest"):
+                               "app.services.sync.dashboard_sync.publish_schema_manifest"):
             result = upload_dashboard_to_cloud(
                 str(self.proxy_path), str(self.dashboard_path),
                 schema_dir=str(self.root / "schema"),
@@ -172,11 +172,11 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
     def test_download_dashboard_does_not_upload_or_export(self) -> None:
         save_sync_config(self.proxy_path, SyncConfig(
             "https://dav.example/remote", "token-board-sync", "user", "pass"))
-        with patch("app.services.sync.dashboard_sync._latest_artifact",
+        with patch("app.services.sync.dashboard_sync.latest_artifact",
                    return_value=None), patch(
-                       "app.services.sync.dashboard_sync._webdav_download",
+                       "app.services.sync.dashboard_sync.download_artifact",
                        return_value=False), patch(
-                           "app.services.sync.dashboard_sync._upload_versioned_artifact",
+                           "app.services.sync.dashboard_sync.publish_versioned_artifact",
                            side_effect=AssertionError("download must not upload")):
             result = download_dashboard_from_cloud(
                 str(self.proxy_path), str(self.dashboard_path),

@@ -9,6 +9,7 @@ from .adapters import copilot_cli, craft_agent, cursor, dimagent, droid, dsh
 from .adapters import gemini_cli, grok, hermes, kimi_code, kiro, mimocode
 from .adapters import omp, openclaw, opencode, pi_coding_agent, qwen_code
 from .adapters import roo_code, trae_cli, workbuddy, zcode
+from .skeleton import AdapterSpec
 
 ADAPTERS = {
     module.KIND: module for module in (
@@ -17,6 +18,12 @@ ADAPTERS = {
         kimi_code, amp, alma, droid, dsh, antigravity, trae_cli, hermes,
         kiro, mimocode, cline, roo_code, workbuddy, zcode,
     )
+}
+
+# Explicit manifest: importing a new module does not silently register it.
+ADAPTER_SPECS = {
+    kind: AdapterSpec.from_module(module)
+    for kind, module in ADAPTERS.items()
 }
 
 
@@ -43,3 +50,7 @@ AGENT_TYPES = {
 
 def get_adapter(kind: str):
     return ADAPTERS.get(str(kind or "").strip().lower())
+
+
+def get_adapter_spec(kind: str) -> AdapterSpec | None:
+    return ADAPTER_SPECS.get(str(kind or "").strip().lower())

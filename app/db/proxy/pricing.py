@@ -1,6 +1,7 @@
 """ProxyDatabase methods for ProxyPricingMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.core.time import utc_now
+from app.db.proxy.common import sqlite3
 
 
 class ProxyPricingMixin:
@@ -103,7 +104,7 @@ class ProxyPricingMixin:
                                ("input_price", "output_price", "cache_read_price",
                                 "currency", "slots"))
             if rate_changed:
-                now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+                now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
                 old_slots = [dict(row) for row in conn.execute(
                     "SELECT start_minute,end_minute,multiplier FROM pricing_slots "
                     "WHERE pricing_rate_id=? ORDER BY id", (current["id"],))]

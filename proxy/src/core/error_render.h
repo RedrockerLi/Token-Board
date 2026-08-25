@@ -38,6 +38,22 @@ struct TerminalError {
     bool close_connection = false;     // timeout → caller sends Connection: close
 };
 
+/// Internal error classification shared by terminal and streaming paths.
+/// `passthrough` means the caller already owns the original structured body;
+/// no retry hint or other user-visible field is added here.
+struct NormalizedError {
+    int status = 500;
+    std::string type = "upstream_error";
+    std::string message = "upstream error";
+    json code = nullptr;
+    bool close_connection = false;
+    bool passthrough = false;
+};
+
+json normalized_error_body(const NormalizedError &error);
+json serialize_normalized_error(const FormatCodec &client_codec,
+                                const NormalizedError &error);
+
 // Render the terminal failure response (status + body) for one request.  Shared
 // by chat (fail-all, used passthrough, used converted), embeddings and models so
 // the status decision (no_upstream_status), the error normalization
@@ -51,12 +67,6 @@ TerminalError render_terminal_error(
 
 // Streaming-tail companion: returns status + the normalized {message,type,code}
 // (no harness envelope) so the SSE path can emit it through make_stream_emitter().
-struct NormalizedError {
-    int status = 500;
-    json body;                       // normalized {message,type,code}
-    bool close_connection = false;
-};
-
 NormalizedError render_stream_error(
     const FormatCodec *upstream_codec, const UpstreamClient::ForwardResult &fwd,
     const std::vector<Database::AttemptInfo> &attempts, bool last_timeout,

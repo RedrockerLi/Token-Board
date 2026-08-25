@@ -1,4 +1,5 @@
 #include "proxy_server_internal.h"
+#include "usage_parser.h"
 
 std::vector<UpstreamCandidate> ProxyServer::resolve_candidates_cached(
     const Router::RouteResult &route, std::string &model) {
@@ -157,32 +158,18 @@ bool clamp_to_remaining_budget(Database::TimeoutConfig &tc,
 }
 
 /// Non-streaming usage parser dispatcher by upstream api_format.
-std::optional<UsageTracker::UsageInfo>
+std::optional<UsageAccounting>
 parse_usage_for_format(const std::string &api_format, const std::string &body) {
     const auto format = ir::parse_api_format(api_format);
-    if (format == ir::ApiFormat::Anthropic)
-        return UsageTracker::parse_anthropic_usage(body);
-    if (format == ir::ApiFormat::OpenAIResponses)
-        return UsageTracker::parse_responses_usage(body);
-    return UsageTracker::parse_usage(body);
+    const auto wire = fmt::parse_usage_for_format(format, body);
+    if (!wire) return std::nullopt;
+    return UsageAccounting::from_ir(wire->usage, format, wire->model);
 }
 
-/// Convert IR usage into UsageInfo. Anthropic codecs keep cache tokens
-/// separate from input_tokens, while OpenAI/Responses prompt_tokens already
-/// include cache hits — so for Anthropic upstreams the cache tokens are
-/// folded into prompt_tokens (matching parse_anthropic_usage semantics),
-/// making `prompt - cache_read` the uncached input for every path.
-UsageTracker::UsageInfo usage_from_ir(const ir::Usage &u,
-                                             ir::ApiFormat upstream_fmt) {
-    UsageTracker::UsageInfo info;
-    info.prompt_tokens = u.prompt_tokens;
-    info.completion_tokens = u.completion_tokens;
-    info.cache_read_tokens = u.cache_read_tokens;
-    info.cache_creation_tokens = u.cache_creation_tokens;
-    if (upstream_fmt == ir::ApiFormat::Anthropic)
-        info.prompt_tokens += u.cache_read_tokens + u.cache_creation_tokens;
-    info.total_tokens = u.total_tokens;
-    return info;
+/// Project the format/IR usage into the database-compatible accounting shape.
+UsageAccounting usage_from_ir(const ir::Usage &u,
+                              ir::ApiFormat upstream_fmt) {
+    return UsageAccounting::from_ir(u, upstream_fmt);
 }
 
 /// Check whether the client disconnected while we waited for upstream.

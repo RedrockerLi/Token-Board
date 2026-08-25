@@ -2,8 +2,7 @@
 
 void ProxyServer::handle_embeddings(const httplib::Request &req,
                                     httplib::Response &res) {
-    auto accounting_cleanup = make_scope_exit(
-        [this] { release_unconsumed_accounting(); });
+    EndpointRunner endpoint_runner(*this);
     add_cors_headers(res);
     const auto &policy = endpoint_policy(EndpointKind::Embeddings);
 
@@ -36,7 +35,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                         "application/json");
         return;
     }
-    if (!try_reserve_accounting()) {
+    if (!endpoint_runner.try_reserve_accounting()) {
         res.status = 503;
         res.set_header("Retry-After", "1");
         res.set_content(json_error(
@@ -46,8 +45,8 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     }
     // Committed to contacting an upstream: an abnormal exit below writes an
     // internal_abort UsageEvent instead of dropping the reserved slot.
-    mark_accounting_upstream_started(ar.route.account_id, ar.route.local_key_id,
-                                     req_model, false);
+    endpoint_runner.mark_accounting_upstream_started(
+        ar.route.account_id, ar.route.local_key_id, req_model, false);
     RequestBodyCache body_cache(req.body, context.parsed_json, context.model);
 
     // 3. Determine content type

@@ -1,15 +1,15 @@
 """ProxyDatabase methods for ProxyRoutingMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.db.proxy.common import _generate_key, json, sqlite3, uuid
 
 
 class ProxyRoutingMixin:
-    @staticmethod
-    def _replace_v1_aggregate_rules(conn: sqlite3.Connection, route_set_id: int,
+    def _replace_v1_aggregate_rules(self, conn: sqlite3.Connection,
+                                    route_set_id: int,
                                     entries: list[dict]) -> None:
         conn.execute("DELETE FROM route_rules WHERE route_set_id=?", (route_set_id,))
         for priority, entry in enumerate(entries):
-            target = ProxyDatabase._v1_route_account(conn, int(entry["account_id"]))
+            target = self._v1_route_account(conn, int(entry["account_id"]))
             if target is None or target["upstream_id"] is None:
                 raise ValueError(f"上游账户 {entry['account_id']} 不可路由")
             conn.execute(

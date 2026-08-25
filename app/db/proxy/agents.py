@@ -1,6 +1,7 @@
 """Agent software identities and parser configuration."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.core.time import utc_now
+from app.db.proxy.common import json, sqlite3, uuid
 from app.db.proxy.agent_subscriptions import ProxySubscriptionMixin, _json_object
 from app.services.agent_usage.registry import AGENT_TYPES
 
@@ -55,7 +56,7 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
         conn = self._connect()
         try:
             software_id = self._next_shared_id(conn)
-            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,lifecycle_state,valid_from,disabled_at,account_kind) "
                 "VALUES(?,?,?,?,?,?, 'agent')",
@@ -94,7 +95,7 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             if current is None:
                 return False
             fields, values = [], []
-            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             if "name" in data:
                 name = str(data.get("name") or "").strip()
                 if not name:
@@ -143,7 +144,7 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             # accounts.  Keep the software, runtime cursor, bindings and
             # request-log foreign keys so historical usage remains attributable
             # to the deleted software; only its live lifecycle is terminated.
-            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             conn.execute(
                 "UPDATE accounts SET lifecycle_state='deleted',"
                 "deleted_at=?,disabled_at=NULL,updated_at=? "

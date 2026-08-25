@@ -15,6 +15,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.core import sqlite_runtime
+
 
 VERSION_RE = re.compile(r"^(\d+)-(\d+)_([a-z0-9][a-z0-9_]*)\.sql$")
 TOKEN_BOARD_DATABASE_NAME = "token-board"
@@ -242,7 +244,7 @@ def _verify_checksums(conn: sqlite3.Connection,
 
 def _run_locked(db_path: str, schema_dir: str, database_name: str,
                 target: SchemaVersion | None = None) -> None:
-    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn = sqlite_runtime.connect(db_path, "schema_upgrade")
     try:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA journal_mode=WAL")

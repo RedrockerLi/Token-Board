@@ -1,6 +1,10 @@
 """ProxyDatabase methods for ProxyAccountWriteMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.core.time import utc_now
+from app.db.proxy.common import (
+    ACCOUNT_TYPES, _parse_iso_date, is_subscription, json,
+    spec, sqlite3, uuid,
+)
 
 
 class ProxyAccountWriteMixin:
@@ -17,7 +21,7 @@ class ProxyAccountWriteMixin:
         conn = self._connect()
         try:
             shared_id = self._next_shared_id(conn)
-            now = _utc_now()
+            now = utc_now()
             start_date = (valid_from or now.date()).isoformat()
             effective_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             contract_start = (f"{start_date}T00:00:00Z"
@@ -175,7 +179,7 @@ class ProxyAccountWriteMixin:
                 "INSERT INTO billing_rate_events"
                 "(contract_id,recurring_price,effective_at,effective_rule) VALUES(?,?,?,?)",
                 (original["contract_id"], float(data.get("monthly_price") or 0),
-                 _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"), effective_rule),
+                 utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"), effective_rule),
             )
         conn.commit()
         return conn.total_changes > 0

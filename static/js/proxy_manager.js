@@ -7,18 +7,6 @@
 
 // ── Shared Helpers (esc defined in utils.js) ──
 
-async function proxyFetch(url, options = {}) {
-    const resp = await fetch(url, {
-        headers: { 'Content-Type': 'application/json', ...options.headers },
-        ...options,
-    });
-    if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.error || `HTTP ${resp.status}`);
-    }
-    return resp.json();
-}
-
 // ── Upstream account-type spec (mirror of app/domain/account_types.py) ──
 // The backend owns the type semantics; the frontend fetches the spec table
 // once and asks it (billing / routable / holds_keys / …) instead of comparing
@@ -28,7 +16,7 @@ let TYPE_SPECS = null;
 /** Fetch the account-type spec table once; cached for the session. */
 async function ensureTypeSpecs() {
     if (TYPE_SPECS) return TYPE_SPECS;
-    TYPE_SPECS = await proxyFetch('/api/proxy/account-types');
+    TYPE_SPECS = await proxyApi('/api/proxy/account-types');
     return TYPE_SPECS;
 }
 
@@ -267,7 +255,7 @@ async function confirmCloudKey(accountId, masked, input, btn) {
     btn.disabled = true;
     btn.textContent = '保存中...';
     try {
-        await proxyFetch(`/api/proxy/accounts/${accountId}/cloud-keys`, {
+        await proxyApi(`/api/proxy/accounts/${accountId}/cloud-keys`, {
             method: 'POST',
             body: JSON.stringify({ masked, key_value: keyValue }),
         });
@@ -314,7 +302,7 @@ async function loadAccountsTable() {
     tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
     try {
         await ensureTypeSpecs();
-        const accounts = await proxyFetch('/api/proxy/accounts');
+        const accounts = await proxyApi('/api/proxy/accounts');
         const real = accounts.filter(a => !a.is_aggregate);
         if (!real.length) {
             tbody.innerHTML = '<tr><td colspan="8" class="td-empty">暂无账户，请点击"添加账户"（聚合账户请到"上游账户聚合"管理）</td></tr>';
@@ -386,14 +374,14 @@ async function saveAccount(e) {
                 payload.keep_valid_froms = keep_valid_froms;
                 payload.keys_edited = true;
             }
-            await proxyFetch(`/api/proxy/accounts/${id}`, {
+            await proxyApi(`/api/proxy/accounts/${id}`, {
                 method: 'PUT',
                 body: JSON.stringify(payload),
             });
             showToast('账户已更新');
             ConfigSync.markDirty();
         } else {
-            await proxyFetch('/api/proxy/accounts', {
+            await proxyApi('/api/proxy/accounts', {
                 method: 'POST',
                 body: JSON.stringify({
                     ...common,
@@ -421,7 +409,7 @@ async function saveAccount(e) {
 async function editAccount(id) {
     try {
         await ensureTypeSpecs();
-        const accounts = await proxyFetch('/api/proxy/accounts');
+        const accounts = await proxyApi('/api/proxy/accounts');
         const acc = accounts.find((a) => a.id === id);
         if (!acc) return;
         const form = document.querySelector('#accountForm');
@@ -473,7 +461,7 @@ let _deleteAccountPendingSub = false;
 async function _deletionOpNote(accountType) {
     if (typeSpec(accountType).deletion !== 'configurable') return '';
     try {
-        const cfg = await proxyFetch('/api/proxy/billing-config');
+        const cfg = await proxyApi('/api/proxy/billing-config');
         return cfg.cancellation_mode === 'end_of_period'
             ? '\n\n默认操作：到期立即删除 —— 可继续使用至本期最后一天（本期计费，下期不计费）。'
             : '\n\n默认操作：本期立即删除 —— 删除即刻生效，本期仍计费。';
@@ -488,7 +476,7 @@ async function deleteAccount(id, name, accountType) {
     const opNote = await _deletionOpNote(accountType);
     // Count local keys bound to this account.
     let keys = [];
-    try { keys = await proxyFetch('/api/proxy/keys'); } catch (_) {}
+    try { keys = await proxyApi('/api/proxy/keys'); } catch (_) {}
     const bound = keys.filter((k) => k.account_id === id).length;
 
     if (bound === 0) {
@@ -506,7 +494,7 @@ async function deleteAccount(id, name, accountType) {
 
 async function _doDeleteAccount(id, mode, isSubscription) {
     try {
-        const resp = await proxyFetch(`/api/proxy/accounts/${id}?mode=${mode}`, { method: 'DELETE' });
+        const resp = await proxyApi(`/api/proxy/accounts/${id}?mode=${mode}`, { method: 'DELETE' });
         if (resp && resp.deferred) {
             const until = resp.effective_deleted_at
                 ? fmtLocal(resp.effective_deleted_at).slice(0, 10) : '';
@@ -536,7 +524,7 @@ async function updateAccountModels(id, name) {
     const btns = document.querySelectorAll('#accountModelBtn, [onclick*="updateAccountModels"]');
     btns.forEach(b => { b.disabled = true; b.textContent = '获取中...'; });
     try {
-        const result = await proxyFetch(`/api/proxy/accounts/${id}/models`, { method: 'POST', body: '{}' });
+        const result = await proxyApi(`/api/proxy/accounts/${id}/models`, { method: 'POST', body: '{}' });
         showToast(`${name}: 获取到 ${result.count} 个模型`);
         ConfigSync.markDirty();
     } catch (err) {
@@ -561,7 +549,7 @@ async function testConcurrency(id, name, useFormValue) {
         body = JSON.stringify({ concurrency: val });
     }
     try {
-        const result = await proxyFetch(`/api/proxy/accounts/${id}/test-concurrency`, { method: 'POST', body });
+        const result = await proxyApi(`/api/proxy/accounts/${id}/test-concurrency`, { method: 'POST', body });
         showToast(result.message, result.succeeded === result.concurrency ? 'success' : 'error');
     } catch (err) {
         showToast(err.message, 'error');
@@ -695,7 +683,7 @@ async function loadKeysTable() {
     if (!tbody) return;
     tbody.innerHTML = '<tr><td colspan="6" class="td-loading">加载中...</td></tr>';
     try {
-        const keys = await proxyFetch('/api/proxy/keys');
+        const keys = await proxyApi('/api/proxy/keys');
         if (!keys.length) {
             tbody.innerHTML = '<tr><td colspan="6" class="td-empty">暂无密钥，请点击"生成密钥"</td></tr>';
             return;
@@ -723,7 +711,7 @@ async function generateKey(e) {
     const form = e.target;
     const data = Object.fromEntries(new FormData(form));
     try {
-        const result = await proxyFetch('/api/proxy/keys', {
+        const result = await proxyApi('/api/proxy/keys', {
             method: 'POST',
             body: JSON.stringify(data),
         });
@@ -744,7 +732,7 @@ function copyKey(text) {
 async function deleteKey(id, label) {
     if (!confirm(`确定删除密钥 "${label}"？\n\n此操作不可恢复，使用该密钥的 AI 工具将立即无法连接。`)) return;
     try {
-        await proxyFetch(`/api/proxy/keys/${id}`, { method: 'DELETE' });
+        await proxyApi(`/api/proxy/keys/${id}`, { method: 'DELETE' });
         showToast('密钥已删除');
         ConfigSync.markDirty();
         loadKeysTable();
@@ -757,8 +745,8 @@ async function openEditKeyModal(id) {
     try {
         await ensureTypeSpecs();
         const [keys, accounts] = await Promise.all([
-            proxyFetch('/api/proxy/keys'),
-            proxyFetch('/api/proxy/accounts'),
+            proxyApi('/api/proxy/keys'),
+            proxyApi('/api/proxy/accounts'),
         ]);
         const key = keys.find((k) => k.id === id);
         if (!key) return;
@@ -791,7 +779,7 @@ async function saveKeyEdit(e) {
         const data = {};
         if (label) data.label = label;
         data.account_id = accountId;
-        await proxyFetch(`/api/proxy/keys/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+        await proxyApi(`/api/proxy/keys/${id}`, { method: 'PUT', body: JSON.stringify(data) });
         showToast('密钥已更新');
         ConfigSync.markDirty();
         closeModal('editKeyModal');
@@ -804,7 +792,7 @@ async function saveKeyEdit(e) {
 async function loadAccountOptions() {
     try {
         await ensureTypeSpecs();
-        const accounts = await proxyFetch('/api/proxy/accounts');
+        const accounts = await proxyApi('/api/proxy/accounts');
         const sel = document.getElementById('keyAccountSelect');
         if (!sel) return;
         sel.innerHTML = keyBindingAccounts(accounts)
@@ -885,7 +873,7 @@ async function loadAggregatesTable() {
     if (!tbody) return;
     tbody.innerHTML = '<tr><td colspan="4" class="td-loading">加载中...</td></tr>';
     try {
-        const aggregates = await proxyFetch('/api/proxy/aggregates');
+        const aggregates = await proxyApi('/api/proxy/aggregates');
         if (!aggregates.length) {
             tbody.innerHTML = '<tr><td colspan="4" class="td-empty">暂无聚合账户，请点击"新建聚合账户"</td></tr>';
             return;
@@ -951,7 +939,7 @@ async function loadAggModels(sel) {
     const acctId = row.querySelector('.agg-acct').value;
     if (!acctId) { sel.innerHTML = '<option value="">请先选择账户</option>'; return; }
     try {
-        const models = await proxyFetch(`/api/proxy/accounts/${acctId}/models`);
+        const models = await proxyApi(`/api/proxy/accounts/${acctId}/models`);
         if (!models.length) { sel.innerHTML = '<option value="">该账户暂无模型</option>'; return; }
         const cur = sel.value;
         sel.innerHTML = models.map(m => `<option value="${esc(m)}" ${m===cur?'selected':''}>${esc(m)}</option>`).join('');
@@ -963,7 +951,7 @@ async function loadAggModels(sel) {
 async function loadAggAccountCache() {
     if (aggAccountsCache) return;
     await ensureTypeSpecs();
-    const accounts = await proxyFetch('/api/proxy/accounts');
+    const accounts = await proxyApi('/api/proxy/accounts');
     aggAccountsCache = routableAccounts(accounts);
 }
 
@@ -980,7 +968,7 @@ async function openAggregateModal(id) {
     }
 
     if (id) {
-        const aggregates = await proxyFetch('/api/proxy/aggregates');
+        const aggregates = await proxyApi('/api/proxy/aggregates');
         const agg = aggregates.find(a => a.id === id);
         if (!agg) return;
         document.getElementById('aggregateName').value = agg.name;
@@ -1019,11 +1007,11 @@ async function saveAggregate(e) {
     }
     try {
         if (id) {
-            await proxyFetch(`/api/proxy/aggregates/${id}`, { method: 'PUT', body: JSON.stringify({ name, entries }) });
+            await proxyApi(`/api/proxy/aggregates/${id}`, { method: 'PUT', body: JSON.stringify({ name, entries }) });
             showToast('聚合账户已更新');
             ConfigSync.markDirty();
         } else {
-            await proxyFetch('/api/proxy/aggregates', { method: 'POST', body: JSON.stringify({ name, entries }) });
+            await proxyApi('/api/proxy/aggregates', { method: 'POST', body: JSON.stringify({ name, entries }) });
             showToast('聚合账户已创建');
             ConfigSync.markDirty();
         }
@@ -1035,7 +1023,7 @@ async function saveAggregate(e) {
 async function deleteAggregate(id, name) {
     if (!confirm(`删除聚合账户 "${name}"？\n\n关联此聚合账户的本地密钥将失效。`)) return;
     try {
-        await proxyFetch(`/api/proxy/aggregates/${id}`, { method: 'DELETE' });
+        await proxyApi(`/api/proxy/aggregates/${id}`, { method: 'DELETE' });
         showToast('聚合账户已删除');
         ConfigSync.markDirty();
         loadAggregatesTable();
@@ -1144,7 +1132,7 @@ async function loadPricingTable() {
     if (!tbody) return;
     tbody.innerHTML = '<tr><td colspan="7" class="td-loading">加载中...</td></tr>';
     try {
-        const pricing = await proxyFetch('/api/proxy/pricing');
+        const pricing = await proxyApi('/api/proxy/pricing');
         _pricingCache = pricing;
         if (!pricing.length) {
             tbody.innerHTML = '<tr><td colspan="7" class="td-empty">暂无定价</td></tr>';
@@ -1196,11 +1184,11 @@ async function savePricing(e) {
     };
     try {
         if (id) {
-            await proxyFetch(`/api/proxy/pricing/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+            await proxyApi(`/api/proxy/pricing/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
             showToast('定价已更新');
             ConfigSync.markDirty();
         } else {
-            await proxyFetch('/api/proxy/pricing', { method: 'POST', body: JSON.stringify(payload) });
+            await proxyApi('/api/proxy/pricing', { method: 'POST', body: JSON.stringify(payload) });
             showToast('定价已添加');
             ConfigSync.markDirty();
         }
@@ -1238,7 +1226,7 @@ function editPricing(id) {
 async function deletePricing(id) {
     if (!confirm('确定删除此定价条目？')) return;
     try {
-        await proxyFetch(`/api/proxy/pricing/${id}`, { method: 'DELETE' });
+        await proxyApi(`/api/proxy/pricing/${id}`, { method: 'DELETE' });
         showToast('定价已删除');
         ConfigSync.markDirty();
         loadPricingTable();
@@ -1249,7 +1237,7 @@ async function deletePricing(id) {
 
 async function reorderPricing(id, dir) {
     try {
-        await proxyFetch('/api/proxy/pricing/reorder', { method: 'POST', body: JSON.stringify({ id, direction: dir }) });
+        await proxyApi('/api/proxy/pricing/reorder', { method: 'POST', body: JSON.stringify({ id, direction: dir }) });
         ConfigSync.markDirty();
         loadPricingTable();
     } catch (err) { showToast(err.message, 'error'); }

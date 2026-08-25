@@ -1,6 +1,9 @@
 """Functional proxy API route group."""
 
-from app.routes.proxy.common import *  # noqa: F401,F403
+from app.routes.proxy.common import (
+    _proxy_db, api_error, bp_proxy, jsonify, request, require_json_object,
+)
+from app.routes.contract import status_for
 
 @bp_proxy.route("/keys", methods=["GET"])
 def list_keys():
@@ -17,22 +20,22 @@ def list_keys():
 
 @bp_proxy.route("/keys", methods=["POST"])
 def create_key():
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     if not data.get("account_id"):
-        return jsonify({"error": "account_id is required"}), 400
+        return api_error("account_id is required", 400)
     try:
         key_value = _proxy_db().create_key(data)
         return jsonify({"key_value": key_value}), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return api_error(str(e), 400)
 
 
 @bp_proxy.route("/keys/<int:key_id>", methods=["PUT"])
 def update_key(key_id):
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     ok = _proxy_db().update_key(key_id, data)
     if not ok:
-        return jsonify({"error": "No fields to update or key not found"}), 400
+        return api_error("No fields to update or key not found", 400)
     return jsonify({"status": "ok"})
 
 
@@ -41,9 +44,11 @@ def delete_key(key_id):
     try:
         ok = _proxy_db().delete_key(key_id)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 409
+        return api_error(
+            str(e), status_for("key_delete", {"status": "error"}))
     if not ok:
-        return jsonify({"error": "Key not found"}), 404
+        return api_error(
+            "Key not found", status_for("key_delete", {"status": "not_found"}))
     return jsonify({"status": "ok"})
 
 
@@ -67,28 +72,28 @@ def list_aggregates():
 
 @bp_proxy.route("/aggregates", methods=["POST"])
 def create_aggregate():
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     if not data.get("name"):
-        return jsonify({"error": "name is required"}), 400
+        return api_error("name is required", 400)
     err = _validate_aggregate_entries(data.get("entries"))
     if err:
-        return jsonify({"error": err}), 400
+        return api_error(err, 400)
     try:
         agg_id = _proxy_db().create_aggregate(data)
         return jsonify({"id": agg_id}), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return api_error(str(e), 400)
 
 
 @bp_proxy.route("/aggregates/<int:agg_id>", methods=["PUT"])
 def update_aggregate(agg_id):
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     err = _validate_aggregate_entries(data.get("entries"))
     if err:
-        return jsonify({"error": err}), 400
+        return api_error(err, 400)
     ok = _proxy_db().update_aggregate(agg_id, data)
     if not ok:
-        return jsonify({"error": "Aggregate account not found"}), 404
+        return api_error("Aggregate account not found", 404)
     return jsonify({"status": "ok"})
 
 
@@ -96,5 +101,5 @@ def update_aggregate(agg_id):
 def delete_aggregate(agg_id):
     ok = _proxy_db().delete_aggregate(agg_id)
     if not ok:
-        return jsonify({"error": "Aggregate account not found"}), 404
+        return api_error("Aggregate account not found", 404)
     return jsonify({"status": "ok"})

@@ -6,7 +6,7 @@ import threading
 from app import create_app
 from app.db.dashboard_db import DashboardDatabase
 from app.db.proxy_db import ProxyDatabase
-from app.db.proxy.common import _parse_utc_timestamp
+from app.core.time import parse_runtime_timestamp
 
 from app.tests.support import AppDatabaseTestCase
 
@@ -288,12 +288,12 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertFalse(thread.is_alive())
 
     def test_time_conventions_are_iso_only(self) -> None:
-        parsed = _parse_utc_timestamp("2026-08-04T16:37:44Z")
+        parsed = parse_runtime_timestamp("2026-08-04T16:37:44Z")
         self.assertEqual(parsed.year, 2026)
         self.assertEqual(parsed.hour, 16)
         # The legacy SQLite space format is no longer accepted at runtime.
         with self.assertRaises(ValueError):
-            _parse_utc_timestamp("2026-08-04 16:37:44")
+            parse_runtime_timestamp("2026-08-04 16:37:44")
 
     def test_request_logs_use_simple_pagination(self) -> None:
         db = self.proxy_database()

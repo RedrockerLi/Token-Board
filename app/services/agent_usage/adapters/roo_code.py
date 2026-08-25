@@ -1,6 +1,7 @@
 """Roo Code extension task adapter."""
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ KIND = "roo-code"
 LABEL = "Roo Code"
 DEFAULT_PATH = Path.home() / ".config" / "Code" / "User" / "globalStorage" / "rooveterinaryinc.roo-cline"
 HOSTS = ("Code", "Cursor", "Windsurf", "VSCodium", "Code - Insiders", "Trae", "Trae CN")
+log = logging.getLogger(__name__)
 
 
 def _roots(software: dict) -> list[Path]:
@@ -43,7 +45,7 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
                         if isinstance(value, dict):
                             items.append(value)
             except OSError:
-                pass
+                log.debug("Roo Code task directory is unavailable", exc_info=True)
         for task in items:
             if isinstance(task, dict) and task.get("id"):
                 path = tasks / str(task["id"]) / "ui_messages.json"

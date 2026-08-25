@@ -1,6 +1,8 @@
 """Functional WebDAV synchronization module."""
 
-from app.services.sync.common import *  # noqa: F401,F403
+from app.core import sqlite_runtime
+
+from dataclasses import dataclass
 
 @dataclass
 class SyncConfig:
@@ -17,7 +19,7 @@ class SyncConfig:
 
 
 def save_sync_config(db_path: str, config: SyncConfig):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite_runtime.connect(db_path, "proxy_runtime")
     try:
         conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('url', ?)", (config.base_url,))
         conn.execute("INSERT OR REPLACE INTO sync_config VALUES ('folder', ?)", (config.folder,))
@@ -29,7 +31,7 @@ def save_sync_config(db_path: str, config: SyncConfig):
 
 
 def load_sync_config(db_path: str) -> SyncConfig | None:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite_runtime.connect(db_path, "proxy_runtime")
     try:
         rows = dict(conn.execute("SELECT key, value FROM sync_config").fetchall())
         if rows.get("url") and rows.get("username"):

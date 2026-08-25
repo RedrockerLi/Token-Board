@@ -1,6 +1,9 @@
 """Functional proxy API route group."""
 
-from app.routes.proxy.common import *  # noqa: F401,F403
+from app.routes.proxy.common import (
+    api_error, bp_proxy, current_app, jsonify, request, require_json_object,
+)
+from app.routes.contract import status_for
 
 @bp_proxy.route("/export", methods=["POST"])
 def export_data():
@@ -9,7 +12,7 @@ def export_data():
     Full pipeline: pull remote dashboard → export local → push back.
     """
     import os as _os
-    from app.services.sync import sync_dashboard
+    from app.services.sync.dashboard_sync import sync_dashboard
 
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
@@ -56,11 +59,7 @@ def delete_dashboard_user():
         ds.load()
 
     status = result.get("status")
-    if status == "ok":
-        return jsonify(result)
-    if status == "not_found":
-        return jsonify(result), 404
-    return jsonify(result), 400
+    return jsonify(result), status_for("dashboard_delete", result)
 
 
 @bp_proxy.route("/dashboard/users/upload", methods=["POST"])
@@ -84,16 +83,12 @@ def upload_dashboard_user_deletions():
         ds.load()
 
     status = result.get("status")
-    if status == "ok":
-        return jsonify(result)
-    if status == "conflict":
-        return jsonify(result), 409
-    return jsonify(result), 502
+    return jsonify(result), status_for("dashboard_upload", result)
 
 
 @bp_proxy.route("/sync/config", methods=["GET"])
 def get_sync_config():
-    from app.services.sync import load_sync_config
+    from app.services.sync.settings import load_sync_config
 
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     cfg = load_sync_config(db_path)
@@ -110,21 +105,21 @@ def get_sync_config():
 
 @bp_proxy.route("/sync/config", methods=["PUT"])
 def save_sync_config():
-    from app.services.sync import SyncConfig, save_sync_config as save_cfg
+    from app.services.sync.settings import SyncConfig, save_sync_config as save_cfg
 
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     if not data.get("base_url") or not data.get("username"):
-        return jsonify({"error": "base_url and username are required"}), 400
+        return api_error("base_url and username are required", 400)
     if not data["base_url"].startswith(("https://", "http://")):
-        return jsonify({"error": "服务器地址必须以 https:// 或 http:// 开头"}), 400
+        return api_error("服务器地址必须以 https:// 或 http:// 开头", 400)
     if "/" not in data["base_url"][8:]:
-        return jsonify({"error": "服务器地址格式不正确，需包含主机名"}), 400
+        return api_error("服务器地址格式不正确，需包含主机名", 400)
 
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
 
     # If password is masked placeholder, preserve the existing one
     if data.get("password", "").startswith("••••"):
-        from app.services.sync import load_sync_config
+        from app.services.sync.settings import load_sync_config
         existing = load_sync_config(db_path)
         password = existing.password if existing else ""
     else:
@@ -142,9 +137,10 @@ def save_sync_config():
 
 @bp_proxy.route("/sync/test", methods=["POST"])
 def test_sync_connection():
-    from app.services.sync import SyncConfig, _webdav_test
+    from app.services.sync.settings import SyncConfig
+    from app.services.sync.webdav import WebDAVClient
 
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
 
     # Build config from request (or fall back to saved config)
@@ -154,17 +150,17 @@ def test_sync_connection():
     password = data.get("password", "")
 
     if password.startswith("••••"):
-        from app.services.sync import load_sync_config
+        from app.services.sync.settings import load_sync_config
         existing = load_sync_config(db_path)
         password = existing.password if existing else ""
 
     if not base_url or not username:
-        return jsonify({"error": "base_url and username are required"}), 400
+        return api_error("base_url and username are required", 400)
     if not base_url.startswith(("https://", "http://")):
-        return jsonify({"error": "服务器地址必须以 https:// 或 http:// 开头"}), 400
+        return api_error("服务器地址必须以 https:// 或 http:// 开头", 400)
 
     cfg = SyncConfig(base_url=base_url, folder=folder, username=username, password=password)
-    err = _webdav_test(cfg)
+    err = WebDAVClient(cfg).test_connection()
     if err:
         return jsonify({"status": "error", "message": f"连接失败: {err}"}), 400
     return jsonify({"status": "ok", "message": "连接成功"})
@@ -178,7 +174,7 @@ def upload_config():
     runtime state remain local. Refuses (conflict) if the cloud moved past
     this machine's last sync.
     """
-    from app.services.sync import sync_config_upload
+    from app.services.sync.config_sync import sync_config_upload
 
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     result = sync_config_upload(
@@ -193,7 +189,7 @@ def discard_config():
     Called when the user chooses "丢弃设置" after a failed upload — local
     edits are reverted (including per-machine upstream keys) without network.
     """
-    from app.services.sync import restore_config_snapshot
+    from app.services.sync.snapshot import restore_config_snapshot
 
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     if not restore_config_snapshot(db_path):

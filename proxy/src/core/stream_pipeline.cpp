@@ -6,20 +6,14 @@ void ProxyServer::handle_streaming(
     const std::string &resolved_model, std::shared_ptr<const json> parsed_json,
     std::shared_ptr<const ir::ChatRequest> parsed_request, std::shared_ptr<const ir::ConversionContext> conversion_context,
     std::shared_ptr<const std::vector<json>> state_current_input, std::shared_ptr<UsageReservation> reservation,
-    const std::string &anthropic_beta,
-    const httplib::Request &req,
+    const std::string &anthropic_beta, const httplib::Request &req,
     httplib::Response &res, std::chrono::steady_clock::time_point t0) {
     const FormatCodec &harness_codec = codecs_.get(harness);
-    const std::string content_type = req.has_header("Content-Type")
-        ? req.get_header_value("Content-Type") : "application/json";
+    const std::string content_type = req.has_header("Content-Type") ? req.get_header_value("Content-Type") : "application/json";
     const std::string scope = affinity_scope(local_key_id, harness);
-    const auto order = candidate_order(
-        cands, start, routing_rr_.fetch_add(1, std::memory_order_relaxed));
-    const auto base_timeouts = timeout_config_cached(
-        chat_endpoint_policy(harness).kind);
-    const int budget_seconds = base_timeouts.streaming_first_byte_timeout > 0
-        ? base_timeouts.streaming_first_byte_timeout : 60;
-    const auto deadline = t0 + std::chrono::seconds(budget_seconds);
+    const auto order = candidate_order(cands, start, routing_rr_.fetch_add(1, std::memory_order_relaxed));
+    const auto base_timeouts = timeout_config_cached(chat_endpoint_policy(harness).kind);
+    const int budget_seconds = base_timeouts.streaming_first_byte_timeout > 0 ? base_timeouts.streaming_first_byte_timeout : 60; const auto deadline = t0 + std::chrono::seconds(budget_seconds);
     res.set_chunked_content_provider(
         "text/event-stream",
         [this, cands, candidate_bodies, order, session_id, scope, local_key_id,
@@ -93,7 +87,7 @@ void ProxyServer::handle_streaming(
             };
             auto outcome = attempt_executor.execute(
                 {&cands, order, deadline, budget_seconds,
-                 {}, {},  // empty inflight hooks: streaming keeps its own request_started
+                 {}, {},
                  [&](const AttemptRequest &attempt_request) {
                 const auto &candidate = attempt_request.candidate;
                 terminal_error_forwarded = false;
@@ -101,10 +95,8 @@ void ProxyServer::handle_streaming(
                     inflight_id = request_started(candidate.upstream_model(), true);
                 }
                 const auto upstream = ir::parse_api_format(candidate.account().api_format);
-                const bool responses_item_adapter =
-                    harness == ir::ApiFormat::OpenAIResponses &&
-                    parsed_request &&
-                    responses_request_needs_tool_adapter(*parsed_request);
+                const bool responses_item_adapter = harness == ir::ApiFormat::OpenAIResponses &&
+                    parsed_request && responses_request_needs_tool_adapter(*parsed_request);
                 const bool passthrough = harness == upstream &&
                     !responses_item_adapter;
                 const bool filter_thinking = passthrough && upstream == ir::ApiFormat::OpenAI;
@@ -117,8 +109,7 @@ void ProxyServer::handle_streaming(
                     result.error = "stream retry budget exhausted";
                     return result;
                 }
-                ++attempts_made;
-                const std::string *body = nullptr;
+                ++attempts_made; const std::string *body = nullptr;
                 if (passthrough) {
                     if (harness == ir::ApiFormat::OpenAIResponses && parsed_request) {
                         auto converted = *parsed_request;
@@ -495,8 +486,13 @@ void ProxyServer::handle_streaming(
                                    resolved_model, true, err.status, 0, 0,
                                    0, attempts);
             }
-            if (!committed || !terminal_error_forwarded)
-                emit_error(err.body);
+            if (!committed || !terminal_error_forwarded) {
+                const json body = err.passthrough
+                    ? (last_stream_error.is_null()
+                        ? normalized_error_body(err) : last_stream_error)
+                    : normalized_error_body(err);
+                emit_error(body);
+            }
             sink.done();
             return true;
         },

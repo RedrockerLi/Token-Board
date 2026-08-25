@@ -19,23 +19,73 @@ earliest one when the requested date precedes every row; 1.0 only when the
 pair has never been stored).
 """
 
-from datetime import datetime, timezone
+from dataclasses import dataclass
 import logging
 from collections.abc import Callable
 
 import requests
+
+from app.core.time import utc_now
 
 FRANKFURTER_URL = "https://api.frankfurter.dev/v2/rate/USD/CNY"
 _FETCH_TIMEOUT = 3  # seconds
 log = logging.getLogger(__name__)
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+@dataclass(frozen=True)
+class FxResolution:
+    """Immutable result of resolving a currency pair for a target date."""
+
+    rate: float
+    source_date: str | None
+    exact: bool
+    locked: bool
 
 
-def _utc_date() -> str:
-    return _utc_now().strftime("%Y-%m-%d")
+class FxRateResolver:
+    """Read-only FX resolution with an explicit provisional state.
+
+    ``resolve`` never fetches or writes.  ``ensure`` is the opt-in boundary
+    for historical fetches and returns the same immutable result type.  The
+    materializer may finalize only a locked result, which is equivalent to an
+    exact period-start rate under the existing billing contract.
+    """
+
+    @staticmethod
+    def resolve(conn, base: str, quote: str, target_date: str) -> FxResolution:
+        if base == quote:
+            return FxResolution(1.0, None, True, True)
+        exact = conn.execute(
+            "SELECT rate,date FROM fx_rates WHERE base_currency=? "
+            "AND quote_currency=? AND date=?", (base, quote, target_date)
+        ).fetchone()
+        if exact is not None:
+            return FxResolution(float(exact["rate"]), str(exact["date"]), True, True)
+        row = conn.execute(
+            "SELECT rate,date FROM fx_rates WHERE base_currency=? "
+            "AND quote_currency=? AND date<=? ORDER BY date DESC LIMIT 1",
+            (base, quote, target_date),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT rate,date FROM fx_rates WHERE base_currency=? "
+                "AND quote_currency=? ORDER BY date ASC LIMIT 1",
+                (base, quote),
+            ).fetchone()
+        if row is None:
+            return FxResolution(1.0, None, False, False)
+        return FxResolution(float(row["rate"]), str(row["date"]), False, False)
+
+    @classmethod
+    def ensure(cls, conn, base: str, quote: str, target_date: str) -> FxResolution:
+        ensure_rate(conn, base, quote, date=target_date)
+        return cls.resolve(conn, base, quote, target_date)
+
+    @staticmethod
+    def finalize(resolution: FxResolution) -> float:
+        if not resolution.locked:
+            raise ValueError("provisional FX resolution cannot be finalized")
+        return resolution.rate
 
 
 def get_rate(conn, base: str = "USD", quote: str = "CNY",
@@ -48,7 +98,7 @@ def get_rate(conn, base: str = "USD", quote: str = "CNY",
     not silently undervalued.  Only when the pair has never been stored does it
     return 1.0 (no failure — CNY prices are unaffected).
     """
-    date = date or _utc_date()
+    date = date or utc_now().strftime("%Y-%m-%d")
     row = conn.execute(
         "SELECT rate FROM fx_rates WHERE base_currency=? AND quote_currency=? AND date<=? "
         "ORDER BY date DESC LIMIT 1", (base, quote, date)).fetchone()
@@ -74,7 +124,7 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
     weekend request stores the requested date with the last trading day's
     rate, which is what the period-start locking rule relies on.
     """
-    date = date or _utc_date()
+    date = date or utc_now().strftime("%Y-%m-%d")
     row = conn.execute(
         "SELECT rate FROM fx_rates WHERE base_currency=? AND quote_currency=? AND date=?",
         (base, quote, date)).fetchone()
@@ -87,6 +137,7 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
         return get_rate(conn, base, quote, date)
 
     try:
+        owns_write = not conn.in_transaction
         resp = requests.get(FRANKFURTER_URL, timeout=_FETCH_TIMEOUT,
                             params={"date": date})
         resp.raise_for_status()
@@ -97,7 +148,11 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
             "INSERT INTO fx_rates(base_currency,quote_currency,date,rate) VALUES(?,?,?,?) "
             "ON CONFLICT(base_currency,quote_currency,date) DO UPDATE SET rate=excluded.rate",
             (base, quote, fetched_date, rate))
-        conn.commit()
+        # The caller may own a larger billing transaction.  Only commit when
+        # this helper opened no transaction of its own; transaction ownership
+        # must remain at the workflow boundary.
+        if owns_write:
+            conn.commit()
     except Exception as exc:
         # Offline/bad payload: use the nearest stored rate below, but keep the
         # failure visible to the billing health and application logs.

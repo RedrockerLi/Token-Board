@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from ..ir import ParseBatch, UsageSource
 KIND = "claude-code"
 LABEL = "Claude Code"
 DEFAULT_PATH = Path.home() / ".claude"
+log = logging.getLogger(__name__)
 
 
 def _roots(software: dict) -> list[Path]:
@@ -28,7 +30,7 @@ def _roots(software: dict) -> list[Path]:
     try:
         roots.extend(path for path in Path.home().glob(".claude-*") if path.is_dir())
     except OSError:
-        pass
+        log.debug("Claude Code profile roots are unavailable", exc_info=True)
     desktop_override = os.environ.get("VIBE_USAGE_CLAUDE_DESKTOP_DIRS", "").strip()
     if desktop_override:
         desktop_dirs = [Path(value).expanduser()

@@ -12,7 +12,7 @@ var _displayConfigLoaded = false;
 async function loadDisplayConfig() {
     if (_displayConfigLoaded) return;
     try {
-        displayConfig = await fetchJSON('/static/display_config.json');
+        displayConfig = await requestJSON('/static/display_config.json');
         _displayConfigLoaded = true;
     } catch (e) {
         console.warn('Failed to load display config, using defaults:', e);
@@ -33,10 +33,77 @@ function fmtCost(n) {
 
 // ── Fetch primitives ──
 
-async function fetchJSON(url) {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
-    return resp.json();
+class HttpError extends Error {
+    constructor(url, response, body) {
+        const message = body && (body.error || body.message)
+            || `HTTP ${response.status} for ${url}`;
+        super(message);
+        this.name = 'HttpError';
+        this.url = url;
+        this.status = response.status;
+        this.body = body;
+    }
+}
+
+class ResponseFormatError extends Error {
+    constructor(url, response) {
+        super(`Expected a JSON response from ${url}, got ${response.status}`);
+        this.name = 'ResponseFormatError';
+        this.url = url;
+        this.status = response.status;
+    }
+}
+
+/**
+ * @typedef {'ok'|'error'|'conflict'|'remote_updated'|'not_found'|'scheduled'} BusinessStatus
+ * A 2xx response may still carry a business failure status.  It is returned
+ * as data and is deliberately not converted into HttpError.
+ */
+
+/** @param {string} url @param {RequestInit & {headers?: object}} options */
+async function requestJSON(url, options = {}) {
+    const fetchOptions = { ...options };
+    const headers = { ...(fetchOptions.headers || {}) };
+    if (fetchOptions.body != null && !headers['Content-Type']) {
+        headers['Content-Type'] = 'application/json';
+    }
+    fetchOptions.headers = headers;
+    const resp = await fetch(url, fetchOptions);
+    if (resp.status === 204) return null;
+    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+    const text = await resp.text();
+    if (!resp.ok) {
+        let body = null;
+        if (text) {
+            try { body = JSON.parse(text); } catch (_) { /* text only */ }
+        }
+        throw new HttpError(url, resp, body);
+    }
+    if (!contentType.includes('json') || !text) {
+        throw new ResponseFormatError(url, resp);
+    }
+    try {
+        return JSON.parse(text);
+    } catch (_) {
+        throw new ResponseFormatError(url, resp);
+    }
+}
+
+/** JSON-only proxy client; business statuses remain ordinary returned data. */
+async function proxyApi(url, options = {}) {
+    return requestJSON(url, options);
+}
+
+/** Keep non-JSON downloads out of requestJSON's response parser. */
+async function requestFile(url, options = {}) {
+    const resp = await fetch(url, options);
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        let body = null;
+        try { body = text ? JSON.parse(text) : null; } catch (_) { /* text only */ }
+        throw new HttpError(url, resp, body);
+    }
+    return resp;
 }
 
 /** Build a relative URL with optional extra params, global api_key_name, and platform. */
@@ -54,38 +121,38 @@ function buildParams(baseUrl, extraParams) {
 // ── API wrappers ──
 
 async function fetchSummary() {
-    return fetchJSON(buildParams('/api/summary'));
+    return requestJSON(buildParams('/api/summary'));
 }
 
 async function fetchDaily(year, month, model) {
-    return fetchJSON(buildParams('/api/daily', { year, month, model }));
+    return requestJSON(buildParams('/api/daily', { year, month, model }));
 }
 
 async function fetchMonthly(model) {
-    return fetchJSON(buildParams('/api/monthly', { model }));
+    return requestJSON(buildParams('/api/monthly', { model }));
 }
 
 async function fetchTokenTypes() {
-    return fetchJSON(buildParams('/api/token_types'));
+    return requestJSON(buildParams('/api/token_types'));
 }
 
 // Per-model usage for a given month, across ALL users (no api_key_name) —
 // used to determine the deprecated-model set, which is a global concept.
 async function fetchModelBreakdownAllUsers(year, month) {
-    return fetchJSON('/api/model_breakdown?year=' + year + '&month=' + month);
+    return requestJSON('/api/model_breakdown?year=' + year + '&month=' + month);
 }
 
 async function fetchModels() {
-    return fetchJSON('/api/models');
+    return requestJSON('/api/models');
 }
 
 async function fetchRefresh() {
-    return fetchJSON('/api/refresh');
+    return requestJSON('/api/refresh');
 }
 
 /** Delete one user's complete usage-dashboard archive on this machine only. */
 async function deleteDashboardUserLocal(name, prepare) {
-    return proxyFetchJSON('/api/proxy/dashboard/users', {
+    return proxyApi('/api/proxy/dashboard/users', {
         method: 'DELETE',
         body: JSON.stringify({ name: name, prepare: !!prepare }),
     });
@@ -93,52 +160,38 @@ async function deleteDashboardUserLocal(name, prepare) {
 
 /** Upload the already-modified local Dashboard archive to the cloud. */
 async function uploadDashboardUserDeletions() {
-    return proxyFetchJSON('/api/proxy/dashboard/users/upload', {
+    return proxyApi('/api/proxy/dashboard/users/upload', {
         method: 'POST',
         body: JSON.stringify({}),
     });
 }
 
-// ── Proxy management API wrappers ──
-
-async function proxyFetchJSON(url, options = {}) {
-    const resp = await fetch(url, {
-        headers: { 'Content-Type': 'application/json', ...options.headers },
-        ...options,
-    });
-    if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.error || err.message || `HTTP ${resp.status}`);
-    }
-    return resp.json();
-}
-
 // ── Performance metrics API wrappers ──
 
 async function fetchPerfSummary(minutes) {
-    return fetchJSON(buildParams('/api/proxy/perf/summary', { minutes }));
+    return requestJSON(buildParams('/api/proxy/perf/summary', { minutes }));
 }
 
 async function fetchPerfLatency(minutes) {
-    return fetchJSON(buildParams('/api/proxy/perf/latency', { minutes }));
+    return requestJSON(buildParams('/api/proxy/perf/latency', { minutes }));
 }
 
 async function fetchPerfSpeed(minutes) {
-    return fetchJSON(buildParams('/api/proxy/perf/speed', { minutes }));
+    return requestJSON(buildParams('/api/proxy/perf/speed', { minutes }));
 }
 
 async function fetchPerfThroughput(minutes) {
-    return fetchJSON(buildParams('/api/proxy/perf/throughput', { minutes }));
+    return requestJSON(buildParams('/api/proxy/perf/throughput', { minutes }));
 }
 
 async function fetchPerfModels(minutes) {
-    return fetchJSON(buildParams('/api/proxy/perf/models', { minutes }));
+    return requestJSON(buildParams('/api/proxy/perf/models', { minutes }));
 }
 
 async function fetchPerfUpstreamSuccessRate(minutes) {
-    return fetchJSON(buildParams('/api/proxy/perf/upstream-success-rate', { minutes }));
+    return requestJSON(buildParams('/api/proxy/perf/upstream-success-rate', { minutes }));
 }
 
 async function fetchPerfRealtime() {
-    return fetchJSON('/api/proxy/perf/realtime');
+    return requestJSON('/api/proxy/perf/realtime');
 }

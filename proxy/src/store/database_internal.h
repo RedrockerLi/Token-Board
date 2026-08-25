@@ -33,6 +33,9 @@
 
 using json = nlohmann::json;
 
+// Disk format is frozen. Any framing/checksum change requires an explicit
+// data migration and a replacement fixture set; ordinary refactors must not
+// change these bytes.
 inline constexpr std::size_t kSpoolHeaderBytes = 8;
 
 inline std::uint32_t spool_checksum(const char *data, std::size_t size) {

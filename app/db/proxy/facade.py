@@ -1,6 +1,10 @@
 """Stable ProxyDatabase façade composed from functional query modules."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+import sqlite3
+from datetime import datetime
+
+from app.core import sqlite_runtime
+from app.core.time import utc_now
 from app.db.proxy.accounts_read import ProxyAccountReadMixin
 from app.db.proxy.accounts_write import ProxyAccountWriteMixin
 from app.db.proxy.lifecycle import ProxyLifecycleMixin
@@ -36,12 +40,7 @@ class ProxyDatabase(
         verify_current_database(self.db_path, TOKEN_BOARD_DATABASE_NAME, self.schema_dir)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+        return sqlite_runtime.connect(self.db_path, "proxy_runtime")
 
     @staticmethod
     def _next_shared_id(conn: sqlite3.Connection) -> int:
@@ -84,7 +83,7 @@ class ProxyDatabase(
         """
         conn = self._connect()
         try:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            today = utc_now().strftime("%Y-%m-%d")
             usage = conn.execute(
                 "SELECT COUNT(*) total_requests,COALESCE(SUM(total_tokens),0) total_tokens,"
                 "COALESCE(SUM(r.billed_usage_cost),0) billed_usage_cost "
@@ -212,27 +211,3 @@ class ProxyDatabase(
             }
         finally:
             conn.close()
-
-
-
-# A few legacy static helpers refer to ProxyDatabase by name.  Bind that
-# compatibility name in each implementation module after the façade exists;
-# no runtime behavior or public import changes.
-import app.db.proxy.accounts_read as _proxy_accounts_read
-_proxy_accounts_read.ProxyDatabase = ProxyDatabase
-import app.db.proxy.accounts_write as _proxy_accounts_write
-_proxy_accounts_write.ProxyDatabase = ProxyDatabase
-import app.db.proxy.lifecycle as _proxy_lifecycle
-_proxy_lifecycle.ProxyDatabase = ProxyDatabase
-import app.db.proxy.routing as _proxy_routing
-_proxy_routing.ProxyDatabase = ProxyDatabase
-import app.db.proxy.pricing as _proxy_pricing
-_proxy_pricing.ProxyDatabase = ProxyDatabase
-import app.db.proxy.billing_read as _proxy_billing_read
-_proxy_billing_read.ProxyDatabase = ProxyDatabase
-import app.db.proxy.billing_ledger as _proxy_billing_ledger
-_proxy_billing_ledger.ProxyDatabase = ProxyDatabase
-import app.db.proxy.export as _proxy_export
-_proxy_export.ProxyDatabase = ProxyDatabase
-import app.db.proxy.performance as _proxy_performance
-_proxy_performance.ProxyDatabase = ProxyDatabase

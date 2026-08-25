@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
+from app.core import sqlite_runtime
 from app.db.migrations import TOKEN_BOARD_DATABASE_NAME
 
 
@@ -17,7 +17,7 @@ def strip_runtime_artifact(path: Path, database_name: str) -> None:
         "agent_subscription_period_charges", "agent_software_runtime",
         "fx_rates", "sync_state",
     )
-    conn = sqlite3.connect(path)
+    conn = sqlite_runtime.connect(path, "snapshot_restore")
     try:
         conn.execute("PRAGMA foreign_keys=OFF")
         for table in runtime_tables:

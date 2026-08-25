@@ -1,6 +1,7 @@
 """OpenClaw profile session adapter."""
 
 import os
+import logging
 from pathlib import Path
 
 from ..common import batch, config_value, iter_jsonl, make_event, project_name, source, timestamp, walk_files
@@ -9,6 +10,7 @@ from ..ir import ParseBatch, UsageSource
 KIND = "openclaw"
 LABEL = "OpenClaw"
 DEFAULT_PATH = Path.home() / ".openclaw" / "agents"
+log = logging.getLogger(__name__)
 
 
 def _roots(software: dict) -> list[Path]:
@@ -23,7 +25,7 @@ def _roots(software: dict) -> list[Path]:
     try:
         out.extend(home / child.name for child in home.iterdir() if child.is_dir() and (child.name == ".openclaw" or child.name.startswith(".openclaw-")))
     except OSError:
-        pass
+        log.debug("OpenClaw home is unavailable", exc_info=True)
     return list(dict.fromkeys(out))
 
 
@@ -43,7 +45,7 @@ def _number(usage: dict, *keys) -> int:
             if float(value or 0) > 0:
                 return max(0, int(float(value)))
         except (TypeError, ValueError):
-            pass
+            log.debug("OpenClaw usage value is not numeric", exc_info=True)
     return 0
 
 

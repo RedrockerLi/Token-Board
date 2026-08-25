@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from app.core import sqlite_runtime
 from app.db.migrations import (
     TOKEN_BOARD_DATABASE_NAME,
     MigrationError,
@@ -86,7 +87,7 @@ def _stage_v0(source: Path, database_name: str, schema_root: Path,
         migrate(str(staged), str(schema_root / database_name / "v0"), database_name)
     return staged
 def _v1_dashboard_identity(proxy_path: Path) -> tuple[dict, dict]:
-    conn = sqlite3.connect(proxy_path)
+    conn = sqlite_runtime.connect(proxy_path, "schema_upgrade")
     conn.row_factory = sqlite3.Row
     try:
         account_types = {}

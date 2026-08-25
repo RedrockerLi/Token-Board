@@ -1,6 +1,9 @@
 """Functional proxy API route group."""
 
-from app.routes.proxy.common import *  # noqa: F401,F403
+from app.routes.proxy.common import (
+    _proxy_db, api_error, bp_proxy, current_app, jsonify, request,
+    require_json_object,
+)
 
 
 # Client wire-format groups accepted by the timeout configuration API.
@@ -14,22 +17,22 @@ def list_pricing():
 
 @bp_proxy.route("/pricing", methods=["POST"])
 def create_pricing():
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     if not data.get("model_pattern"):
-        return jsonify({"error": "model_pattern is required"}), 400
+        return api_error("model_pattern is required", 400)
     try:
         pid = _proxy_db().create_pricing(data)
         return jsonify({"id": pid}), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return api_error(str(e), 400)
 
 
 @bp_proxy.route("/pricing/<int:pricing_id>", methods=["PUT"])
 def update_pricing(pricing_id):
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     ok = _proxy_db().update_pricing(pricing_id, data)
     if not ok:
-        return jsonify({"error": "No fields to update or pricing not found"}), 400
+        return api_error("No fields to update or pricing not found", 400)
     return jsonify({"status": "ok"})
 
 
@@ -37,16 +40,16 @@ def update_pricing(pricing_id):
 def delete_pricing(pricing_id):
     ok = _proxy_db().delete_pricing(pricing_id)
     if not ok:
-        return jsonify({"error": "Pricing entry not found"}), 404
+        return api_error("Pricing entry not found", 404)
     return jsonify({"status": "ok"})
 
 
 @bp_proxy.route("/pricing/reorder", methods=["POST"])
 def reorder_pricing():
-    data = request.get_json(force=True)
+    data = require_json_object(force=True)
     ok = _proxy_db().reorder_pricing(data["id"], data["direction"])
     if not ok:
-        return jsonify({"error": "Pricing entry not found"}), 404
+        return api_error("Pricing entry not found", 404)
     return jsonify({"status": "ok"})
 
 
@@ -60,16 +63,16 @@ def get_timeout_config():
 def save_timeout_config():
     data = request.get_json(force=True)
     if not isinstance(data, dict):
-        return jsonify({"error": "请求体必须包含各分组配置"}), 400
+        return api_error("请求体必须包含各分组配置", 400)
     groups = {g: data[g] for g in _TIMEOUT_GROUPS
               if isinstance(data.get(g), dict)}
     if not groups:
-        return jsonify({"error": "缺少有效的分组配置"}), 400
+        return api_error("缺少有效的分组配置", 400)
     try:
         for app_type, group in groups.items():
             _proxy_db().update_timeout_config(app_type, group)
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return api_error(str(e), 400)
     return jsonify({"status": "ok"})
 
 
@@ -81,9 +84,9 @@ def get_billing_config():
 @bp_proxy.route("/billing-config", methods=["PUT"])
 def save_billing_config():
     try:
-        _proxy_db().update_plan_billing_config(request.get_json(force=True))
+        _proxy_db().update_plan_billing_config(require_json_object(force=True))
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return api_error(str(e), 400)
     return jsonify(_proxy_db().get_plan_billing_config())
 
 

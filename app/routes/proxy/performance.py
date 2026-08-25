@@ -1,6 +1,6 @@
 """Functional proxy API route group."""
 
-from app.routes.proxy.common import *  # noqa: F401,F403
+from app.routes.proxy.common import bp_proxy, current_app, jsonify, request, _proxy_db
 
 @bp_proxy.route("/logs")
 def request_logs():

@@ -1,6 +1,8 @@
 """Dashboard route group."""
 
-from app.routes.dashboard.common import *  # noqa: F401,F403
+from collections import defaultdict
+
+from app.routes.dashboard.common import bp, current_app, jsonify, request, _store
 
 @bp.route("/api/summary")
 def api_summary():

@@ -1,6 +1,6 @@
 """Dashboard route group."""
 
-from app.routes.dashboard.common import *  # noqa: F401,F403
+from app.routes.dashboard.common import bp, current_app, jsonify, render_template, _store
 
 @bp.route("/")
 def index():

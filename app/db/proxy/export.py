@@ -1,6 +1,7 @@
 """ProxyDatabase methods for ProxyExportMixin."""
 
-from app.db.proxy.common import *  # noqa: F401,F403
+from app.core.time import parse_runtime_timestamp, utc_now
+from app.db.proxy.common import _billing_period_month
 
 
 class ProxyExportMixin:
@@ -98,7 +99,7 @@ class ProxyExportMixin:
             # an actual cost of each present software. The denominator is the
             # number of active bound agents, not the number of agents that
             # happened to produce usage.
-            now = _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             current_month = now[:7]
             subscription_rows = conn.execute(
                 "SELECT s.id,s.uuid,c.period_start,c.recurring_charge,"
@@ -212,7 +213,7 @@ class ProxyExportMixin:
                 meta = by_key_id.get(log["upstream_key_id"]) or by_account.get(log["account_id"])
                 if meta is None or not meta.get("billing_unit_id"):
                     continue
-                requested = _parse_utc_timestamp(log["requested_at"])
+                requested = parse_runtime_timestamp(log["requested_at"])
                 month = _billing_period_month(requested, meta["anchor"].day)
                 bucket = (month, meta["account_id"],
                           meta["billing_unit_id"])

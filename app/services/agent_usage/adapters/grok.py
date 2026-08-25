@@ -1,6 +1,7 @@
 """Grok CLI session adapter."""
 
 import json
+import logging
 import os
 from pathlib import Path
 from urllib.parse import unquote
@@ -11,6 +12,7 @@ from ..ir import ParseBatch, UsageSource
 KIND = "grok"
 LABEL = "Grok"
 DEFAULT_PATH = Path.home() / ".grok" / "sessions"
+log = logging.getLogger(__name__)
 
 
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
@@ -33,7 +35,7 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
                     out.append(source(session / "updates.jsonl", session_path=session,
                                       group=group.name, group_path=group))
     except OSError:
-        pass
+        log.debug("Grok discovery root is unavailable", exc_info=True)
     return out
 
 

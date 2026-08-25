@@ -1,87 +1,13 @@
-"""Functional WebDAV synchronization module."""
+"""Configuration snapshot and restore boundary."""
 
-from app.services.sync.common import *  # noqa: F401,F403
-from app.services.sync.settings import SyncConfig
+import os
+import sqlite3
+from pathlib import Path
 
-def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-    ).fetchone() is not None
-
-
-def _config_tables(conn: sqlite3.Connection) -> list[str]:
-    return V1_CONFIG_TABLES
-
-
-def _config_hash_of_db(db_path: str) -> str:
-    """Hash the sanitized V1 cloud-representation for conflict detection.
-
-    The local database and the discard snapshot may contain credentials, but
-    those values are deliberately absent from the cloud representation.  A
-    local API-key/password edit must therefore not create a false cloud
-    conflict.
-    """
-    conn = sqlite3.connect(db_path)
-    h = hashlib.sha256()
-    try:
-        for table in _config_tables(conn):
-            if not _table_exists(conn, table):
-                continue
-            if table == "upstream_secrets":
-                continue
-            cols = [d[0] for d in conn.execute(f"SELECT * FROM {table} LIMIT 0").description]
-            if table == "upstream_credentials":
-                cols = [column for column in cols if column != "runtime_id"]
-            elif table == "account_importers":
-                cols = [column for column in cols if column != "cursor_json"]
-            if not cols:
-                continue
-            h.update(table.encode())
-            if table == "sync_settings":
-                rows = conn.execute(
-                    f"SELECT {','.join(cols)} FROM {table} "
-                    "WHERE key NOT IN ('password','agent_migration_v1_6') ORDER BY 1"
-                ).fetchall()
-            else:
-                rows = conn.execute(f"SELECT {','.join(cols)} FROM {table} ORDER BY 1").fetchall()
-            for r in rows:
-                h.update(repr(tuple(r)).encode())
-    finally:
-        conn.close()
-    return h.hexdigest()
-
-
-def _get_sync_state(db_path: str, key: str) -> str | None:
-    conn = sqlite3.connect(db_path)
-    try:
-        row = conn.execute("SELECT value FROM sync_state WHERE key=?", (key,)).fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
-
-
-def _set_sync_state(db_path: str, key: str, value: str) -> None:
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("INSERT OR REPLACE INTO sync_state (key, value) VALUES (?,?)", (key, value))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def record_remote_metadata(db_path: str, prefix: str, sha256: str,
-                           major: int | None, minor: int | None) -> None:
-    """Persist the authoritative cloud artifact's identity in sync_state.
-
-    Alongside the canonical config hash and artifact/etag, keep the raw
-    sha256 of the exact cloud file and its schema major.minor so a restarted
-    node can judge remote compatibility (e.g. a higher minor → read-compatible
-    / write-paused) without re-downloading or re-deriving it.
-    """
-    _set_sync_state(db_path, f"{prefix}_remote_sha256", sha256)
-    if major is not None:
-        _set_sync_state(db_path, f"{prefix}_remote_major", str(major))
-        _set_sync_state(db_path, f"{prefix}_remote_minor", str(minor))
+from app.core import sqlite_runtime
+from app.services.sync.common import V1_CONFIG_TABLES
+from app.services.sync.state import table_exists
+from app.services.sync.storage import safe_copy_db
 
 
 def _snapshot_path(db_path: str) -> str:
@@ -92,13 +18,13 @@ def _snapshot_path(db_path: str) -> str:
 def snapshot_config(db_path: str) -> None:
     """Copy V1 metadata and local credential secrets to the discard snapshot."""
     snap = _snapshot_path(db_path)
-    _safe_copy_db(db_path, snap)
-    snapshot = sqlite3.connect(snap)
+    safe_copy_db(db_path, snap)
+    snapshot = sqlite_runtime.connect(snap, "snapshot_restore")
     try:
         for table in ("request_attempts", "request_log", "billing_period_charges",
                       "agent_subscription_period_charges", "agent_software_runtime",
                       "fx_rates", "sync_state"):
-            if _table_exists(snapshot, table):
+            if table_exists(snapshot, table):
                 snapshot.execute(f"DELETE FROM {table}")
         snapshot.commit()
     finally:
@@ -110,14 +36,13 @@ def restore_config_snapshot(db_path: str) -> bool:
     snap_path = _snapshot_path(db_path)
     if not os.path.exists(snap_path):
         return False
-    snapshot = sqlite3.connect(snap_path)
-    snapshot.row_factory = sqlite3.Row
-    local = sqlite3.connect(db_path, timeout=10)
+    snapshot = sqlite_runtime.connect(snap_path, "snapshot_restore")
+    local = sqlite_runtime.connect(db_path, "proxy_runtime")
     try:
         local.execute("PRAGMA foreign_keys=OFF")
         local.execute("BEGIN IMMEDIATE")
         for table in V1_CONFIG_TABLES:
-            if not _table_exists(snapshot, table) or not _table_exists(local, table):
+            if not table_exists(snapshot, table) or not table_exists(local, table):
                 continue
             info = [row[1] for row in snapshot.execute(f"PRAGMA table_info({table})")]
             if not info:

@@ -33,7 +33,7 @@ function timeoutInputId(group, field) {
 
 async function loadTimeoutConfig() {
     try {
-        const cfg = await proxyFetch('/api/proxy/timeout-config');
+        const cfg = await proxyApi('/api/proxy/timeout-config');
         for (const g of TIMEOUT_GROUPS) {
             const row = cfg[g.key] || {};
             for (const field of ['streaming_first_byte_timeout',
@@ -65,7 +65,7 @@ async function saveTimeoutConfig() {
     const btn = document.getElementById('btnTimeoutSave');
     btn.disabled = true;
     try {
-        await proxyFetch('/api/proxy/timeout-config', {
+        await proxyApi('/api/proxy/timeout-config', {
             method: 'PUT',
             body: JSON.stringify(collectTimeoutConfig()),
         });
@@ -94,7 +94,7 @@ function resetTimeoutConfig() {
 
 async function loadBillingConfig() {
     try {
-        const cfg = await proxyFetch('/api/proxy/billing-config');
+        const cfg = await proxyApi('/api/proxy/billing-config');
         document.getElementById('billingPriceEffective').value = cfg.price_change_effective || 'current_period';
         document.getElementById('billingCancellationMode').value = cfg.cancellation_mode || 'immediate';
     } catch (err) {
@@ -106,7 +106,7 @@ async function saveBillingConfig() {
     const btn = document.getElementById('btnBillingConfigSave');
     btn.disabled = true;
     try {
-        await proxyFetch('/api/proxy/billing-config', {
+        await proxyApi('/api/proxy/billing-config', {
             method: 'PUT',
             body: JSON.stringify({
                 price_change_effective: document.getElementById('billingPriceEffective').value,
@@ -125,7 +125,7 @@ async function saveBillingConfig() {
 
 async function loadSyncConfig() {
     try {
-        const cfg = await proxyFetch('/api/proxy/sync/config');
+        const cfg = await proxyApi('/api/proxy/sync/config');
         document.getElementById('syncBaseUrl').value = cfg.base_url || '';
         document.getElementById('syncFolder').value = cfg.folder || 'token-board-sync';
         document.getElementById('syncUsername').value = cfg.username || '';
@@ -140,7 +140,7 @@ async function saveSyncSettings(e) {
     const form = e.target;
     const data = Object.fromEntries(new FormData(form));
     try {
-        await proxyFetch('/api/proxy/sync/config', {
+        await proxyApi('/api/proxy/sync/config', {
             method: 'PUT',
             body: JSON.stringify(data),
         });
@@ -157,7 +157,7 @@ async function testSyncConnection() {
     btn.textContent = '测试中...';
     try {
         const data = Object.fromEntries(new FormData(document.getElementById('syncConfigForm')));
-        const result = await proxyFetch('/api/proxy/sync/test', {
+        const result = await proxyApi('/api/proxy/sync/test', {
             method: 'POST',
             body: JSON.stringify(data),
         });

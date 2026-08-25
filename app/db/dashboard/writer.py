@@ -1,6 +1,11 @@
 """DashboardWriterMixin implementation."""
 
-from app.db.dashboard.common import *  # noqa: F401,F403
+import sqlite3
+
+from app.core import sqlite_runtime
+from app.db.dashboard.common import (
+    MODEL_ORDER, _parse_date, _sort_models, _track_recency,
+)
 
 
 class DashboardWriterMixin:
@@ -15,12 +20,7 @@ class DashboardWriterMixin:
         verify_current_database(self.db_path, "dashboard", self.schema_dir)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+        return sqlite_runtime.connect(self.db_path, "dashboard_runtime")
 
     def upsert_account_batch(self, rows: list[dict]) -> int:
         """Mirror proxy identities, including whether they are agents."""
