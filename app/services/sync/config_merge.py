@@ -112,7 +112,8 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
 
         merge_table("account_importers", {"cursor_json"})
         for table in ("billing_contracts", "billing_rate_events", "pricing_rules",
-                      "pricing_rates", "pricing_slots", "upstream_model_catalog",
+                      "pricing_rates", "pricing_slots", "pricing_length_tiers",
+                      "upstream_model_catalog",
                       "proxy_timeout_config", "agent_subscriptions", "agent_software",
                       "agent_subscription_instances",
                       "agent_subscription_rate_events",

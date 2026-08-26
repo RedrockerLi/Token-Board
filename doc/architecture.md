@@ -23,7 +23,7 @@ Token Board 由两个独立进程组成，共享同一份版本化数据库 sche
 ```
 
 schema 的单一来源是 `schema/` 目录下的版本化 SQL 与 transition，见
-[database-migrations.md](database-migrations.md)。当前 V1 tip 是 Proxy V1.10、
+[database-migrations.md](database-migrations.md)。当前 V1 tip 是 Proxy V1.11、
 Dashboard V1.4；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原内容归档
 在各自 `v0/`。所有生产升级由 Python 的 `app.db.schema_upgrade` 负责；C++
 只校验已准备好的 Proxy V1 数据库，不读取 SQL、不执行迁移。
@@ -69,7 +69,7 @@ manifest 和备份恢复原始文件。
 
 Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查。C++ 代理打开
 数据库时只验证 `schema_version` 与 `PRAGMA user_version` 一致，并要求当前 Proxy
-运行时最低 schema（目前为 V1.10）；不满足时直接退出并提示先运行 Python
+运行时最低 schema（目前为 V1.11）；不满足时直接退出并提示先运行 Python
 升级边界。C++ 的 `--schema-dir` 仅为旧启动器保留，不参与升级。
 
 ## 数据流

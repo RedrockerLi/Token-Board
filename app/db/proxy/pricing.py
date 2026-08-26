@@ -1,5 +1,7 @@
 """ProxyDatabase methods for ProxyPricingMixin."""
 
+import math
+
 from app.core.time import utc_now
 from app.db.proxy.common import sqlite3
 
@@ -9,6 +11,7 @@ class ProxyPricingMixin:
     _TIMEOUT_FIELDS = ("streaming_first_byte_timeout",
                        "streaming_idle_timeout",
                        "non_streaming_timeout")
+    _LENGTH_PRICE_FIELDS = ("input_price", "cache_read_price", "output_price")
 
     def get_pricing(self) -> list[dict]:
         conn = self._connect()
@@ -26,11 +29,62 @@ class ProxyPricingMixin:
                 item["slots"] = [dict(slot) for slot in conn.execute(
                     "SELECT id,start_minute,end_minute,multiplier FROM pricing_slots "
                     "WHERE pricing_rate_id=? ORDER BY id", (row["rate_id"],))]
+                item["length_tiers"] = [dict(tier) for tier in conn.execute(
+                    "SELECT threshold_tokens,input_price,cache_read_price,output_price "
+                    "FROM pricing_length_tiers WHERE pricing_rate_id=? "
+                    "ORDER BY threshold_tokens", (row["rate_id"],))]
                 item.pop("rate_id", None)
                 result.append(item)
             return result
         finally:
             conn.close()
+
+    @classmethod
+    def _validate_length_tiers(cls, tiers) -> list[dict]:
+        """Normalize and validate input-length price overrides.
+
+        The API stores canonical token counts.  Each nullable price is an
+        explicit inheritance marker; zero is a valid override and must not be
+        confused with an omitted field.
+        """
+        if not isinstance(tiers, list):
+            raise TypeError("length_tiers 必须是数组")
+
+        normalized = []
+        seen_thresholds = set()
+        for index, tier in enumerate(tiers, start=1):
+            if not isinstance(tier, dict):
+                raise TypeError(f"第 {index} 个条件档必须是对象")
+            threshold = tier.get("threshold_tokens")
+            if (isinstance(threshold, bool) or not isinstance(threshold, int)
+                    or threshold <= 0):
+                raise ValueError(f"第 {index} 个条件档的门槛必须是大于 0 的整数 token")
+            if threshold in seen_thresholds:
+                raise ValueError(f"条件档门槛不能重复: {threshold} tokens")
+            seen_thresholds.add(threshold)
+
+            values = {"threshold_tokens": threshold}
+            has_override = False
+            for field in cls._LENGTH_PRICE_FIELDS:
+                value = tier.get(field)
+                if value is None:
+                    values[field] = None
+                    continue
+                if isinstance(value, bool):
+                    raise TypeError(f"第 {index} 个条件档的 {field} 必须是数字")
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    raise ValueError(f"第 {index} 个条件档的 {field} 必须是数字")
+                if not math.isfinite(number) or number < 0:
+                    raise ValueError(f"第 {index} 个条件档的 {field} 必须是非负有限数字")
+                values[field] = number
+                has_override = True
+            if not has_override:
+                raise ValueError(f"第 {index} 个条件档至少要覆盖一个价格字段")
+            normalized.append(values)
+
+        return sorted(normalized, key=lambda tier: tier["threshold_tokens"])
 
     @staticmethod
     def _insert_pricing_slots(conn, pricing_id: int, slots) -> None:
@@ -48,7 +102,12 @@ class ProxyPricingMixin:
         ).fetchone()
         if row is None:
             raise ValueError("计价规则没有当前 rate")
-        rate_id = row[0]
+        ProxyPricingMixin._insert_pricing_slots_for_rate(conn, row[0], slots)
+
+    @staticmethod
+    def _insert_pricing_slots_for_rate(conn, rate_id: int, slots) -> None:
+        if not slots:
+            return
         for s in slots:
             conn.execute(
                 "INSERT INTO pricing_slots"
@@ -57,12 +116,31 @@ class ProxyPricingMixin:
                  float(s.get("multiplier", 1.0))),
             )
 
+    @staticmethod
+    def _insert_pricing_length_tiers(conn, rate_id: int, tiers) -> None:
+        if not tiers:
+            return
+        conn.executemany(
+            "INSERT INTO pricing_length_tiers"
+            "(pricing_rate_id,threshold_tokens,input_price,cache_read_price,output_price) "
+            "VALUES(?,?,?,?,?)",
+            [(rate_id, tier["threshold_tokens"], tier["input_price"],
+              tier["cache_read_price"], tier["output_price"])
+             for tier in tiers],
+        )
+
     def create_pricing(self, data: dict) -> int:
         conn = self._connect()
         try:
             currency = data.get("currency", "CNY")
             if currency not in ("CNY", "USD"):
                 raise ValueError("币种必须是 CNY / USD")
+            length_tiers = self._validate_length_tiers(
+                data["length_tiers"]) if "length_tiers" in data else []
+            input_price = data["input_price"]
+            cache_read_price = data.get("cache_read_price")
+            if cache_read_price is None:
+                cache_read_price = input_price
             priority = conn.execute(
                 "SELECT COALESCE(max(priority),-1)+1 FROM pricing_rules"
             ).fetchone()[0]
@@ -74,11 +152,16 @@ class ProxyPricingMixin:
                 "INSERT INTO pricing_rates"
                 "(pricing_rule_id,input_price,cache_read_price,output_price,currency,valid_from) "
                 "VALUES(?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                (pid, data["input_price"],
-                 data.get("cache_read_price", data["input_price"]),
+                (pid, input_price, cache_read_price,
                  data["output_price"], currency),
             )
-            self._insert_pricing_slots(conn, pid, data.get("slots"))
+            rate_id = conn.execute(
+                "SELECT id FROM pricing_rates WHERE pricing_rule_id=? "
+                "AND valid_until IS NULL ORDER BY valid_from DESC,id DESC LIMIT 1",
+                (pid,),
+            ).fetchone()[0]
+            self._insert_pricing_slots_for_rate(conn, rate_id, data.get("slots"))
+            self._insert_pricing_length_tiers(conn, rate_id, length_tiers)
             conn.commit()
             return pid
         finally:
@@ -97,29 +180,42 @@ class ProxyPricingMixin:
             currency = data.get("currency", current["currency"])
             if currency not in ("CNY", "USD"):
                 raise ValueError("币种必须是 CNY / USD")
+            length_tiers = None
+            if "length_tiers" in data:
+                length_tiers = self._validate_length_tiers(data["length_tiers"])
             if "model_pattern" in data:
                 conn.execute("UPDATE pricing_rules SET model_pattern=? WHERE id=?",
                              (data["model_pattern"], pricing_id))
             rate_changed = any(key in data for key in
                                ("input_price", "output_price", "cache_read_price",
-                                "currency", "slots"))
+                                "currency", "slots", "length_tiers"))
             if rate_changed:
                 now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
                 old_slots = [dict(row) for row in conn.execute(
                     "SELECT start_minute,end_minute,multiplier FROM pricing_slots "
                     "WHERE pricing_rate_id=? ORDER BY id", (current["id"],))]
+                old_length_tiers = [dict(row) for row in conn.execute(
+                    "SELECT threshold_tokens,input_price,cache_read_price,output_price "
+                    "FROM pricing_length_tiers WHERE pricing_rate_id=? "
+                    "ORDER BY threshold_tokens", (current["id"],))]
+                input_price = data.get("input_price", current["input_price"])
+                cache_read_price = data.get("cache_read_price", current["cache_read_price"])
+                if cache_read_price is None:
+                    cache_read_price = input_price
                 conn.execute("UPDATE pricing_rates SET valid_until=? WHERE id=?",
                              (now, current["id"]))
-                conn.execute(
+                new_rate_id = conn.execute(
                     "INSERT INTO pricing_rates"
                     "(pricing_rule_id,input_price,cache_read_price,output_price,currency,valid_from) "
                     "VALUES(?,?,?,?,?,?)",
-                    (pricing_id, data.get("input_price", current["input_price"]),
-                     data.get("cache_read_price", current["cache_read_price"]),
+                    (pricing_id, input_price, cache_read_price,
                      data.get("output_price", current["output_price"]), currency, now),
-                )
-                self._insert_pricing_slots(
-                    conn, pricing_id, data.get("slots", old_slots))
+                ).lastrowid
+                self._insert_pricing_slots_for_rate(
+                    conn, new_rate_id, data.get("slots", old_slots))
+                self._insert_pricing_length_tiers(
+                    conn, new_rate_id,
+                    length_tiers if length_tiers is not None else old_length_tiers)
             conn.commit()
             return conn.total_changes > 0
         finally:

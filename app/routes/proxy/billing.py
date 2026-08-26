@@ -30,7 +30,10 @@ def create_pricing():
 @bp_proxy.route("/pricing/<int:pricing_id>", methods=["PUT"])
 def update_pricing(pricing_id):
     data = require_json_object(force=True)
-    ok = _proxy_db().update_pricing(pricing_id, data)
+    try:
+        ok = _proxy_db().update_pricing(pricing_id, data)
+    except (TypeError, ValueError) as e:
+        return api_error(str(e), 400)
     if not ok:
         return api_error("No fields to update or pricing not found", 400)
     return jsonify({"status": "ok"})

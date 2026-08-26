@@ -1068,7 +1068,8 @@ function initAggregatesPage() {
 
 // ── Pricing Page ─────────────────────────────────────────────────────────
 
-// Cached pricing rows (with slots) so the edit modal can look up by id.
+// Cached pricing rows (with slots and input-length tiers) so the edit modal
+// can look up the complete current configuration by id.
 let _pricingCache = [];
 let _pricingOrderSavePromise = null;
 let _pricingDragState = null;
@@ -1127,11 +1128,97 @@ function collectSlots() {
     return slots;
 }
 
-function slotsSummary(slots) {
-    if (!slots || !slots.length) return '<span style="color:var(--color-text-tertiary);">无</span>';
-    return slots.map(function (s) {
-        return minutesToHHMM(utcMinuteToLocal(s.start_minute)) + '-' + minutesToHHMM(utcMinuteToLocal(s.end_minute)) + ' ×' + s.multiplier;
-    }).join('、');
+// ── Input-length tier helpers (decimal K/M UI ↔ integer token API) ──────
+const LENGTH_UNIT_FACTORS = { K: 1000, M: 1000000 };
+
+function lengthTierPartsFromTokens(tokens) {
+    const n = Number(tokens);
+    const unit = n >= LENGTH_UNIT_FACTORS.M ? 'M' : 'K';
+    const value = n / LENGTH_UNIT_FACTORS[unit];
+    return {
+        value: Number.isInteger(value) ? String(value) : String(Number(value.toFixed(6))),
+        unit,
+    };
+}
+
+function lengthTierTokens(value, unit) {
+    const number = Number(value);
+    const factor = LENGTH_UNIT_FACTORS[unit];
+    if (!Number.isFinite(number) || number <= 0 || !factor) {
+        throw new Error('输入长度门槛必须是大于 0 的数字');
+    }
+    const tokens = number * factor;
+    const rounded = Math.round(tokens);
+    if (!Number.isSafeInteger(rounded) || Math.abs(tokens - rounded) > 1e-6) {
+        throw new Error('输入长度门槛必须能精确换算为整数 token');
+    }
+    return rounded;
+}
+
+function addLengthTierRow(tier) {
+    const rows = document.getElementById('lengthTierRows');
+    if (!rows) return;
+    const parts = tier
+        ? lengthTierPartsFromTokens(tier.threshold_tokens)
+        : { value: '128', unit: 'K' };
+    const priceValue = function (name) {
+        return tier && tier[name] != null ? tier[name] : '';
+    };
+    const div = document.createElement('div');
+    div.className = 'length-tier-row';
+    div.style.cssText = 'display:grid;grid-template-columns:minmax(80px,1fr) 58px repeat(3,minmax(64px,1fr)) auto;gap:6px;align-items:center;margin-bottom:6px;';
+    div.innerHTML =
+        '<input type="number" class="tier-threshold-value" min="0" step="any" value="' + parts.value + '" aria-label="输入长度数值" placeholder="例如 128">' +
+        '<select class="tier-threshold-unit" aria-label="输入长度单位">' +
+            '<option value="K"' + (parts.unit === 'K' ? ' selected' : '') + '>K</option>' +
+            '<option value="M"' + (parts.unit === 'M' ? ' selected' : '') + '>M</option>' +
+        '</select>' +
+        '<input type="number" class="tier-input-price" min="0" step="0.0001" value="' + priceValue('input_price') + '" aria-label="条件输入价格" placeholder="输入价">' +
+        '<input type="number" class="tier-cache-price" min="0" step="0.0001" value="' + priceValue('cache_read_price') + '" aria-label="条件缓存价格" placeholder="缓存价">' +
+        '<input type="number" class="tier-output-price" min="0" step="0.0001" value="' + priceValue('output_price') + '" aria-label="条件输出价格" placeholder="输出价">' +
+        '<button type="button" class="btn btn--sm" onclick="removeLengthTierRow(this)">×</button>';
+    rows.appendChild(div);
+}
+
+function removeLengthTierRow(btn) {
+    const row = btn && btn.parentElement;
+    if (row) row.remove();
+}
+
+function collectLengthTiers() {
+    const rows = document.querySelectorAll('#lengthTierRows .length-tier-row');
+    const tiers = [];
+    const thresholds = new Set();
+    rows.forEach(function (row, index) {
+        const threshold = lengthTierTokens(
+            row.querySelector('.tier-threshold-value').value,
+            row.querySelector('.tier-threshold-unit').value,
+        );
+        if (thresholds.has(threshold)) {
+            throw new Error('条件档门槛不能重复');
+        }
+        thresholds.add(threshold);
+        const readPrice = function (selector, label) {
+            const raw = row.querySelector(selector).value;
+            if (raw === '') return null;
+            const value = Number(raw);
+            if (!Number.isFinite(value) || value < 0) {
+                throw new Error('第 ' + (index + 1) + ' 个条件档的' + label + '必须是非负数字');
+            }
+            return value;
+        };
+        const tier = {
+            threshold_tokens: threshold,
+            input_price: readPrice('.tier-input-price', '输入价格'),
+            cache_read_price: readPrice('.tier-cache-price', '缓存价格'),
+            output_price: readPrice('.tier-output-price', '输出价格'),
+        };
+        if (tier.input_price == null && tier.cache_read_price == null && tier.output_price == null) {
+            throw new Error('第 ' + (index + 1) + ' 个条件档至少要覆盖一个价格字段');
+        }
+        tiers.push(tier);
+    });
+    return tiers.sort(function (a, b) { return a.threshold_tokens - b.threshold_tokens; });
 }
 
 function pricingRows(tbody) {
@@ -1342,12 +1429,12 @@ function bindPricingDragHandlers(tbody) {
 async function loadPricingTable() {
     const tbody = document.querySelector('#pricingTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="td-loading">加载中...</td></tr>';
     try {
         const pricing = await proxyApi('/api/proxy/pricing');
         _pricingCache = pricing;
         if (!pricing.length) {
-            tbody.innerHTML = '<tr><td colspan="8" class="td-empty">暂无定价</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="7" class="td-empty">暂无定价</td></tr>';
             return;
         }
         tbody.innerHTML = pricing.map((p, index) => {
@@ -1364,7 +1451,6 @@ async function loadPricingTable() {
                 <td>${sym}${p.input_price.toFixed(4)} / 1M tokens</td>
                 <td>${sym}${p.output_price.toFixed(4)} / 1M tokens</td>
                 <td>${p.cache_read_price != null ? sym + p.cache_read_price.toFixed(4) + ' / 1M tokens' : '<span style="color:var(--color-text-tertiary);">同输入价</span>'}</td>
-                <td>${slotsSummary(p.slots)}</td>
                 <td><span class="badge ${p.currency === 'USD' ? 'badge--type-plan' : 'badge--type-api'}">${esc(p.currency)}</span></td>
                 <td>
                     <button class="btn btn--sm" onclick="editPricing(${p.id})">编辑</button>
@@ -1375,7 +1461,7 @@ async function loadPricingTable() {
         updatePricingOrderLabels(tbody);
         bindPricingDragHandlers(tbody);
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="8" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -1392,6 +1478,13 @@ async function savePricing(e) {
     const data = Object.fromEntries(new FormData(form));
     const id = form.dataset.editId;
     const cacheRead = data.cache_read_price !== '' ? parseFloat(data.cache_read_price) : null;
+    let lengthTiers;
+    try {
+        lengthTiers = collectLengthTiers();
+    } catch (err) {
+        showToast(err.message, 'error');
+        return;
+    }
     const payload = {
         model_pattern: data.model_pattern,
         input_price: parseFloat(data.input_price),
@@ -1399,6 +1492,7 @@ async function savePricing(e) {
         cache_read_price: cacheRead,
         currency: data.currency || 'CNY',
         slots: collectSlots(),
+        length_tiers: lengthTiers,
     };
     try {
         if (id) {
@@ -1413,7 +1507,9 @@ async function savePricing(e) {
         form.reset();
         form.dataset.editId = '';
         form.querySelector('[type=submit]').textContent = '添加';
+        updatePricingSymbols();
         document.getElementById('slotRows').innerHTML = '';
+        document.getElementById('lengthTierRows').innerHTML = '';
         closeModal('pricingModal');
         loadPricingTable();
     } catch (err) {
@@ -1430,11 +1526,17 @@ function editPricing(id) {
     form['output_price'].value = p.output_price;
     form['cache_read_price'].value = p.cache_read_price == null ? '' : p.cache_read_price;
     if (form['currency']) form['currency'].value = p.currency || 'CNY';
+    updatePricingSymbols();
     // Populate time-slot editor (empty for new rows)
     const slotRows = document.getElementById('slotRows');
     if (slotRows) {
         slotRows.innerHTML = '';
         (p.slots || []).forEach(function (s) { addSlotRow(s); });
+    }
+    const lengthTierRows = document.getElementById('lengthTierRows');
+    if (lengthTierRows) {
+        lengthTierRows.innerHTML = '';
+        (p.length_tiers || []).forEach(function (tier) { addLengthTierRow(tier); });
     }
     form.dataset.editId = id;
     form.querySelector('[type=submit]').textContent = '更新';
@@ -1460,11 +1562,11 @@ function initPricingPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">模型定价管理</h1>
-            <p class="page-subtitle">配置模型价格（百万元 token 价格，CNY 默认 / 可选 USD）· 时段倍率按本机当地时间设置</p>
+            <p class="page-subtitle">配置模型基本价格（每百万 token，CNY 默认 / 可选 USD）</p>
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
         <table class="mgmt-table pricing-table" id="pricingTable" aria-describedby="pricingOrderHelp">
-            <thead><tr><th class="pricing-order-column">顺序</th><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>时段倍率</th><th>货币</th><th>操作</th></tr></thead>
+            <thead><tr><th class="pricing-order-column">顺序</th><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>货币</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
         <p class="pricing-order-help" id="pricingOrderHelp"><span class="pricing-drag-grip" aria-hidden="true">⠿</span> 拖动左侧把手调整匹配优先级；也可聚焦把手后使用 ↑↓、Home、End 键。</p>
@@ -1487,6 +1589,16 @@ function initPricingPage() {
                     </label>
                     <div style="margin:10px 0;">
                         <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:6px;">
+                            输入长度条件价（达到门槛后生效；留空字段继承基本价）
+                        </div>
+                        <div style="display:grid;grid-template-columns:minmax(80px,1fr) 58px repeat(3,minmax(64px,1fr)) auto;gap:6px;color:var(--color-text-tertiary);font-size:12px;margin-bottom:5px;">
+                            <span>门槛</span><span>单位</span><span>输入价</span><span>缓存价</span><span>输出价</span><span></span>
+                        </div>
+                        <div id="lengthTierRows"></div>
+                        <button type="button" class="btn btn--sm" onclick="addLengthTierRow(null)">+ 添加条件档</button>
+                    </div>
+                    <div style="margin:10px 0;">
+                        <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:6px;">
                             时段倍率（每日生效，倍率作用于输入/输出/缓存三档价格）
                         </div>
                         <div id="slotRows"></div>
@@ -1498,5 +1610,6 @@ function initPricingPage() {
         </div>
     `;
     document.getElementById('slotRows').innerHTML = '';
+    document.getElementById('lengthTierRows').innerHTML = '';
     loadPricingTable();
 }
