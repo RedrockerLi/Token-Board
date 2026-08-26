@@ -953,9 +953,9 @@ async function loadAggregatesTable() {
             <tr>
                 <td>${esc(a.name)}</td>
                 <td>${a.entries ? a.entries.length : 0} 条映射</td>
-                <td>${a.entries ? a.entries.map(e =>
+                <td><div class="mapping-preview">${a.entries ? a.entries.map(e =>
                     `<code>${esc(e.pattern)} → ${esc(e.upstream_account_name || `账户${e.upstream_account_id}`)} / ${esc(e.upstream_model)}</code>`
-                ).join('<br>') : ''}</td>
+                ).join('') : ''}</div></td>
                 <td>
                     <button class="btn btn--sm" onclick="openAggregateModal(${a.id})">编辑</button>
                     <button class="btn btn--sm" onclick="deleteAggregate(${a.id}, '${esc(a.name)}')" style="color:var(--color-danger);">删除</button>
