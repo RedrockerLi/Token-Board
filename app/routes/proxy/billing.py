@@ -47,7 +47,12 @@ def delete_pricing(pricing_id):
 @bp_proxy.route("/pricing/reorder", methods=["POST"])
 def reorder_pricing():
     data = require_json_object(force=True)
-    ok = _proxy_db().reorder_pricing(data["id"], data["direction"])
+    try:
+        ok = _proxy_db().reorder_pricing_order(data["ids"])
+    except KeyError:
+        return api_error("ids is required", 400)
+    except (TypeError, ValueError) as e:
+        return api_error(str(e), 400)
     if not ok:
         return api_error("Pricing entry not found", 404)
     return jsonify({"status": "ok"})

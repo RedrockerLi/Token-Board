@@ -111,8 +111,8 @@ class BillingTest(AppDatabaseTestCase):
         # first (priority 0); the generic catch-all follows (priority 1).
         specific = db.create_pricing({"model_pattern": "model-a",
                                       "input_price": 5, "output_price": 10})
-        db.create_pricing({"model_pattern": "model-*",
-                           "input_price": 1, "output_price": 2})
+        generic = db.create_pricing({"model_pattern": "model-*",
+                                     "input_price": 1, "output_price": 2})
         rows = db.get_pricing()
         self.assertEqual([r["model_pattern"] for r in rows],
                          ["model-a", "model-*"])
@@ -133,7 +133,7 @@ class BillingTest(AppDatabaseTestCase):
             # over the generic model-* rule (which would give 3).
             self.assertAlmostEqual(row[1], 15.0)
         # Reorder moves the specific rule down (generic rule now wins).
-        self.assertTrue(db.reorder_pricing(specific, "down"))
+        self.assertTrue(db.reorder_pricing_order([generic, specific]))
         self.assertEqual([r["model_pattern"] for r in db.get_pricing()],
                          ["model-*", "model-a"])
         # Historical price change: a later update supersedes, old rate frozen.

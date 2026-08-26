@@ -87,6 +87,30 @@ class AppContractTest(AppDatabaseTestCase):
         }
         self.assertEqual(config.get_json(), expected)
 
+    def test_pricing_reorder_endpoint_accepts_complete_order(self) -> None:
+        app = create_app(str(self.proxy_path), testing=True,
+                         start_background_tasks=False)
+        client = app.test_client()
+        first = client.post("/api/proxy/pricing", json={
+            "model_pattern": "first-*", "input_price": 1,
+            "output_price": 2,
+        }).get_json()["id"]
+        second = client.post("/api/proxy/pricing", json={
+            "model_pattern": "second-*", "input_price": 3,
+            "output_price": 4,
+        }).get_json()["id"]
+
+        response = client.post("/api/proxy/pricing/reorder",
+                               json={"ids": [second, first]})
+        self.assertEqual(response.status_code, 200,
+                         response.get_data(as_text=True))
+        self.assertEqual(
+            [row["id"] for row in client.get("/api/proxy/pricing").get_json()],
+            [second, first],
+        )
+        stale = client.post("/api/proxy/pricing/reorder", json={"ids": [first]})
+        self.assertEqual(stale.status_code, 400)
+
     def test_dashboard_facade_uses_v1_grain(self) -> None:
         dashboard = DashboardDatabase(
             str(self.dashboard_path), str(self.root / "schema"))

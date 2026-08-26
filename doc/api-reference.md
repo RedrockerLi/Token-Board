@@ -85,7 +85,7 @@
 | `/api/proxy/pricing` | POST | 新建定价(model_pattern 必填,可带 slots) |
 | `/api/proxy/pricing/<id>` | PUT | 更新定价与档位(slots 整体替换) |
 | `/api/proxy/pricing/<id>` | DELETE | 删除定价(档位级联删除) |
-| `/api/proxy/pricing/reorder` | POST | 上下移调整匹配优先级(body: `{id, direction}`) |
+| `/api/proxy/pricing/reorder` | POST | 拖放调整匹配优先级(body: `{ids: [id, ...]}`，必须包含当前全部启用定价 ID) |
 
 改价不影响已固化的历史成本,见 [billing-pricing.md](billing-pricing.md)。
 

@@ -942,6 +942,94 @@ code {
     color: var(--color-danger);
 }
 
+.pricing-table {
+    min-width: 900px;
+}
+
+.pricing-order-column,
+.pricing-order-cell {
+    width: 78px;
+}
+
+.pricing-order-cell {
+    padding: 8px 12px !important;
+}
+
+.pricing-drag-handle {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 54px;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 9px;
+    color: var(--color-text-secondary);
+    background: transparent;
+    font: inherit;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    transition: background var(--transition), color var(--transition), transform var(--transition);
+}
+
+.pricing-drag-handle:hover {
+    color: var(--color-primary-strong);
+    background: rgba(180, 95, 69, 0.10);
+}
+
+.pricing-drag-handle:focus-visible {
+    outline: 3px solid rgba(180, 95, 69, 0.24);
+    outline-offset: 2px;
+}
+
+.pricing-drag-grip {
+    display: inline-block;
+    color: var(--color-text-tertiary);
+    font-size: 20px;
+    letter-spacing: -4px;
+    line-height: 0.75;
+}
+
+.pricing-row--pressing .pricing-drag-handle,
+.pricing-row--dragging .pricing-drag-handle {
+    color: var(--color-primary-strong);
+    cursor: grabbing;
+}
+
+.pricing-row--dragging {
+    background: rgba(180, 95, 69, 0.08) !important;
+}
+
+.pricing-table--dragging .pricing-row {
+    transition: none;
+}
+
+.pricing-row--drop-target td {
+    border-top: 2px solid var(--color-primary);
+}
+
+.pricing-table--saving {
+    opacity: 0.72;
+    pointer-events: none;
+}
+
+.pricing-table--saving .pricing-drag-handle {
+    cursor: wait;
+}
+
+.pricing-order-help {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 10px 2px 0;
+    color: var(--color-text-tertiary);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
 .td-subtle,
 .muted {
     color: var(--color-text-secondary);

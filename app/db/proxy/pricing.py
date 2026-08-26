@@ -135,22 +135,59 @@ class ProxyPricingMixin:
         finally:
             conn.close()
 
-    def reorder_pricing(self, pid: int, direction: str) -> bool:
+    def reorder_pricing_order(self, pricing_ids: list[int]) -> bool:
+        """Persist the complete active pricing-rule order atomically."""
+        if not isinstance(pricing_ids, list):
+            raise TypeError("ids 必须是数组")
+        if any(isinstance(pid, bool) or not isinstance(pid, int)
+               for pid in pricing_ids):
+            raise TypeError("ids 必须只包含整数")
+        if len(set(pricing_ids)) != len(pricing_ids):
+            raise ValueError("ids 不能包含重复条目")
+
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id,priority FROM pricing_rules WHERE enabled=1 ORDER BY priority,id").fetchall()
-            idx = next((i for i, row in enumerate(rows) if row["id"] == pid), None)
-            if idx is None:
-                return False
-            other = idx - 1 if direction == "up" else idx + 1
-            if other < 0 or other >= len(rows):
+                "SELECT id,priority FROM pricing_rules WHERE enabled=1 "
+                "ORDER BY priority,id"
+            ).fetchall()
+            current_ids = [row["id"] for row in rows]
+            if set(pricing_ids) != set(current_ids):
+                raise ValueError("排序列表已过期，请刷新后重试")
+            if pricing_ids == current_ids:
                 return True
-            conn.execute("UPDATE pricing_rules SET priority=-1 WHERE id=?", (pid,))
-            conn.execute("UPDATE pricing_rules SET priority=? WHERE id=?",
-                         (rows[idx]["priority"], rows[other]["id"]))
-            conn.execute("UPDATE pricing_rules SET priority=? WHERE id=?",
-                         (rows[other]["priority"], pid))
+
+            # Move every rule to a collision-free temporary range first.  The
+            # table only guarantees uniqueness per pattern, so a two-phase
+            # update is required even when the final order is a permutation.
+            all_rows = conn.execute(
+                "SELECT id FROM pricing_rules ORDER BY id"
+            ).fetchall()
+            minimum = conn.execute(
+                "SELECT COALESCE(MIN(priority),0) FROM pricing_rules"
+            ).fetchone()[0]
+            temporary_base = minimum - len(all_rows) - 1
+            for offset, row in enumerate(all_rows):
+                conn.execute(
+                    "UPDATE pricing_rules SET priority=? WHERE id=?",
+                    (temporary_base - offset, row["id"]),
+                )
+
+            # Active rules own the visible order.  Disabled rules are placed
+            # after them so a later create remains appended to active rules.
+            for priority, pricing_id in enumerate(pricing_ids):
+                conn.execute(
+                    "UPDATE pricing_rules SET priority=? WHERE id=?",
+                    (priority, pricing_id),
+                )
+            disabled_ids = [row["id"] for row in conn.execute(
+                "SELECT id FROM pricing_rules WHERE enabled=0 ORDER BY id"
+            ).fetchall()]
+            for offset, pricing_id in enumerate(disabled_ids, len(pricing_ids)):
+                conn.execute(
+                    "UPDATE pricing_rules SET priority=? WHERE id=?",
+                    (offset, pricing_id),
+                )
             conn.commit()
             return True
         finally:

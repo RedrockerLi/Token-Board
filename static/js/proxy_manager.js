@@ -1070,6 +1070,9 @@ function initAggregatesPage() {
 
 // Cached pricing rows (with slots) so the edit modal can look up by id.
 let _pricingCache = [];
+let _pricingOrderSavePromise = null;
+let _pricingDragState = null;
+const PRICING_DRAG_THRESHOLD = 6;
 
 // ── Time-slot helpers (UTC storage ↔ browser-local UI) ──────────────────
 // Slot boundaries are stored as UTC minute-of-day; the UI enters and shows
@@ -1131,21 +1134,232 @@ function slotsSummary(slots) {
     }).join('、');
 }
 
+function pricingRows(tbody) {
+    return Array.from(tbody.querySelectorAll('tr.pricing-row'));
+}
+
+function pricingRowIds(tbody) {
+    return pricingRows(tbody).map(function (row) {
+        return Number(row.dataset.pricingId);
+    });
+}
+
+function updatePricingOrderLabels(tbody) {
+    const rows = pricingRows(tbody);
+    rows.forEach(function (row, index) {
+        const indexLabel = row.querySelector('.pricing-order-index');
+        if (indexLabel) indexLabel.textContent = String(index + 1);
+        row.setAttribute('aria-posinset', String(index + 1));
+        row.setAttribute('aria-setsize', String(rows.length));
+    });
+}
+
+function clearPricingDropTarget(tbody) {
+    tbody.querySelectorAll('.pricing-row--drop-target').forEach(function (row) {
+        row.classList.remove('pricing-row--drop-target');
+    });
+}
+
+function restorePricingRowOrder(tbody, order) {
+    const rowById = new Map(pricingRows(tbody).map(function (row) {
+        return [Number(row.dataset.pricingId), row];
+    }));
+    order.forEach(function (id) {
+        const row = rowById.get(Number(id));
+        if (row) tbody.appendChild(row);
+    });
+    updatePricingOrderLabels(tbody);
+}
+
+function movePricingRowAtPointer(state, clientY) {
+    const rows = pricingRows(state.tbody).filter(function (row) {
+        return row !== state.row;
+    });
+    let before = null;
+    for (const row of rows) {
+        const rect = row.getBoundingClientRect();
+        if (clientY < rect.top + rect.height / 2) {
+            before = row;
+            break;
+        }
+    }
+    if (before) {
+        if (state.row.nextElementSibling !== before) {
+            state.tbody.insertBefore(state.row, before);
+        }
+    } else if (state.row !== state.tbody.lastElementChild) {
+        state.tbody.appendChild(state.row);
+    }
+    clearPricingDropTarget(state.tbody);
+    if (before) before.classList.add('pricing-row--drop-target');
+    updatePricingOrderLabels(state.tbody);
+}
+
+async function persistPricingOrder(order) {
+    const tbody = document.querySelector('#pricingTable tbody');
+    if (!tbody || _pricingOrderSavePromise) return;
+    const table = tbody.closest('table');
+    const request = (async function () {
+        tbody.dataset.orderSaving = '1';
+        tbody.setAttribute('aria-busy', 'true');
+        if (table) table.classList.add('pricing-table--saving');
+        try {
+            await proxyApi('/api/proxy/pricing/reorder', {
+                method: 'POST',
+                body: JSON.stringify({ ids: order }),
+            });
+            const pricingById = new Map(_pricingCache.map(function (item) {
+                return [Number(item.id), item];
+            }));
+            _pricingCache = order.map(function (id) {
+                return pricingById.get(Number(id));
+            }).filter(Boolean);
+            ConfigSync.markDirty();
+            showToast('定价优先级已更新');
+        } catch (err) {
+            showToast(err.message, 'error');
+            await loadPricingTable();
+        } finally {
+            delete tbody.dataset.orderSaving;
+            tbody.removeAttribute('aria-busy');
+            if (table) table.classList.remove('pricing-table--saving');
+        }
+    })();
+    _pricingOrderSavePromise = request;
+    try {
+        await request;
+    } finally {
+        if (_pricingOrderSavePromise === request) _pricingOrderSavePromise = null;
+    }
+}
+
+function handlePricingReorderKeydown(event) {
+    if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+    if (_pricingOrderSavePromise) return;
+    const handle = event.currentTarget;
+    const row = handle.closest('tr.pricing-row');
+    const tbody = row && row.parentElement;
+    if (!row || !tbody) return;
+    const rows = pricingRows(tbody);
+    const currentIndex = rows.indexOf(row);
+    let targetIndex = currentIndex;
+    if (event.key === 'ArrowUp') targetIndex -= 1;
+    if (event.key === 'ArrowDown') targetIndex += 1;
+    if (event.key === 'Home') targetIndex = 0;
+    if (event.key === 'End') targetIndex = rows.length - 1;
+    if (targetIndex < 0 || targetIndex >= rows.length || targetIndex === currentIndex) return;
+
+    event.preventDefault();
+    const target = rows[targetIndex];
+    if (targetIndex < currentIndex) {
+        tbody.insertBefore(row, target);
+    } else if (target.nextElementSibling) {
+        tbody.insertBefore(row, target.nextElementSibling);
+    } else {
+        tbody.appendChild(row);
+    }
+    updatePricingOrderLabels(tbody);
+    handle.focus({ preventScroll: true });
+    persistPricingOrder(pricingRowIds(tbody));
+}
+
+function beginPricingDrag(event) {
+    if ((event.button != null && event.button !== 0) || _pricingOrderSavePromise) return;
+    const handle = event.currentTarget;
+    const row = handle.closest('tr.pricing-row');
+    if (!row) return;
+    const tbody = row.parentElement;
+    handle.focus({ preventScroll: true });
+    _pricingDragState = {
+        handle,
+        row,
+        tbody,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        originalOrder: pricingRowIds(tbody),
+        active: false,
+    };
+    event.preventDefault();
+    row.classList.add('pricing-row--pressing');
+    try { handle.setPointerCapture(event.pointerId); } catch (_) { /* best effort */ }
+}
+
+function updatePricingDrag(event) {
+    const state = _pricingDragState;
+    if (!state || event.pointerId !== state.pointerId) return;
+    const distance = Math.hypot(event.clientX - state.startX, event.clientY - state.startY);
+    if (!state.active && distance < PRICING_DRAG_THRESHOLD) return;
+    if (!state.active) {
+        state.active = true;
+        state.row.classList.add('pricing-row--dragging');
+        state.tbody.classList.add('pricing-table--dragging');
+        state.row.setAttribute('aria-grabbed', 'true');
+    }
+    event.preventDefault();
+    movePricingRowAtPointer(state, event.clientY);
+}
+
+function endPricingDrag(event, cancelled) {
+    const state = _pricingDragState;
+    if (!state || event.pointerId !== state.pointerId) return;
+    if (state.active) event.preventDefault();
+    try {
+        if (state.handle.hasPointerCapture(event.pointerId)) {
+            state.handle.releasePointerCapture(event.pointerId);
+        }
+    } catch (_) { /* best effort */ }
+    state.row.classList.remove('pricing-row--pressing', 'pricing-row--dragging');
+    state.row.setAttribute('aria-grabbed', 'false');
+    state.tbody.classList.remove('pricing-table--dragging');
+    clearPricingDropTarget(state.tbody);
+    const currentOrder = pricingRowIds(state.tbody);
+    const changed = currentOrder.some(function (id, index) {
+        return id !== state.originalOrder[index];
+    });
+    if (cancelled || !changed) {
+        if (cancelled) restorePricingRowOrder(state.tbody, state.originalOrder);
+    } else {
+        persistPricingOrder(currentOrder);
+    }
+    _pricingDragState = null;
+}
+
+function bindPricingDragHandlers(tbody) {
+    tbody.querySelectorAll('.pricing-drag-handle').forEach(function (handle) {
+        handle.addEventListener('pointerdown', beginPricingDrag);
+        handle.addEventListener('pointermove', updatePricingDrag);
+        handle.addEventListener('pointerup', function (event) {
+            endPricingDrag(event, false);
+        });
+        handle.addEventListener('pointercancel', function (event) {
+            endPricingDrag(event, true);
+        });
+        handle.addEventListener('keydown', handlePricingReorderKeydown);
+    });
+}
+
 async function loadPricingTable() {
     const tbody = document.querySelector('#pricingTable tbody');
     if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="7" class="td-loading">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
     try {
         const pricing = await proxyApi('/api/proxy/pricing');
         _pricingCache = pricing;
         if (!pricing.length) {
-            tbody.innerHTML = '<tr><td colspan="7" class="td-empty">暂无定价</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="td-empty">暂无定价</td></tr>';
             return;
         }
-        tbody.innerHTML = pricing.map((p) => {
+        tbody.innerHTML = pricing.map((p, index) => {
             const sym = currencySymbol(p.currency);
             return `
-            <tr>
+            <tr class="pricing-row" data-pricing-id="${p.id}" aria-posinset="${index + 1}" aria-setsize="${pricing.length}" aria-grabbed="false">
+                <td class="pricing-order-cell">
+                    <button type="button" class="pricing-drag-handle" title="拖动调整匹配优先级" aria-label="拖动 ${esc(p.model_pattern)} 调整优先级" aria-describedby="pricingOrderHelp" aria-keyshortcuts="ArrowUp ArrowDown Home End">
+                        <span class="pricing-drag-grip" aria-hidden="true">⠿</span>
+                        <span class="pricing-order-index">${index + 1}</span>
+                    </button>
+                </td>
                 <td><code>${esc(p.model_pattern)}</code></td>
                 <td>${sym}${p.input_price.toFixed(4)} / 1M tokens</td>
                 <td>${sym}${p.output_price.toFixed(4)} / 1M tokens</td>
@@ -1153,15 +1367,15 @@ async function loadPricingTable() {
                 <td>${slotsSummary(p.slots)}</td>
                 <td><span class="badge ${p.currency === 'USD' ? 'badge--type-plan' : 'badge--type-api'}">${esc(p.currency)}</span></td>
                 <td>
-                    <button class="btn btn--sm" onclick="reorderPricing(${p.id},'up')">▲</button>
-                    <button class="btn btn--sm" onclick="reorderPricing(${p.id},'down')">▼</button>
                     <button class="btn btn--sm" onclick="editPricing(${p.id})">编辑</button>
                     <button class="btn btn--sm" onclick="deletePricing(${p.id})">删除</button>
                 </td>
             </tr>
         `;}).join('');
+        updatePricingOrderLabels(tbody);
+        bindPricingDragHandlers(tbody);
     } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="7" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
     }
 }
 
@@ -1239,14 +1453,6 @@ async function deletePricing(id) {
     }
 }
 
-async function reorderPricing(id, dir) {
-    try {
-        await proxyApi('/api/proxy/pricing/reorder', { method: 'POST', body: JSON.stringify({ id, direction: dir }) });
-        ConfigSync.markDirty();
-        loadPricingTable();
-    } catch (err) { showToast(err.message, 'error'); }
-}
-
 function initPricingPage() {
     const el = document.getElementById('page-settings-pricing');
     if (!el || el.dataset.initialized) return;
@@ -1257,10 +1463,11 @@ function initPricingPage() {
             <p class="page-subtitle">配置模型价格（百万元 token 价格，CNY 默认 / 可选 USD）· 时段倍率按本机当地时间设置</p>
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
-        <table class="mgmt-table" id="pricingTable">
-            <thead><tr><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>时段倍率</th><th>货币</th><th>操作</th></tr></thead>
+        <table class="mgmt-table pricing-table" id="pricingTable" aria-describedby="pricingOrderHelp">
+            <thead><tr><th class="pricing-order-column">顺序</th><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>时段倍率</th><th>货币</th><th>操作</th></tr></thead>
             <tbody></tbody>
         </table>
+        <p class="pricing-order-help" id="pricingOrderHelp"><span class="pricing-drag-grip" aria-hidden="true">⠿</span> 拖动左侧把手调整匹配优先级；也可聚焦把手后使用 ↑↓、Home、End 键。</p>
         <div class="modal-overlay" id="pricingModal" style="display:none">
             <div class="modal">
                 <div class="modal__header">

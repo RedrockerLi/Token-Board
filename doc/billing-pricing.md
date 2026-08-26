@@ -10,7 +10,7 @@ V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库按 `requested
 - `output_price`:输出单价
 - `cache_read_price`:缓存命中的输入单价,缺省回落 `input_price`
 
-匹配按 `priority,id`，再在请求时间点选择有效 rate。上下移只交换 priority；改价关闭旧 rate 并新建 rate，不修改主键或历史行。
+匹配按 `priority,id`，再在请求时间点选择有效 rate。模型定价页通过拖放一次提交完整优先级顺序；改价关闭旧 rate 并新建 rate，不修改主键或历史行。
 
 ## 峰谷档位
 
