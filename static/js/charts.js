@@ -5,8 +5,8 @@
  * Functions expect pre-fetched data — no HTTP calls.
  */
 
-// ── Color palette (Tailwind 500 family — uniform lightness/chroma) ──
-const chartColors = ['#3B82F6', '#06B6D4', '#10B981', '#F59E0B', '#8B5CF6', '#F43F5E', '#6366F1', '#14B8A6'];
+// ── Color palette (system-like accent colors with enough separation) ──
+const chartColors = ['#B45F45', '#6E8B77', '#6F8A5D', '#C08B42', '#927CA6', '#A75558', '#8F735B', '#A57B93'];
 
 // ── Shared visual style (purely cosmetic — no data semantics) ──
 
@@ -18,20 +18,20 @@ function _vGrad(top, bottom) {
 }
 
 var CHART_ANIM = {
-    animationDuration: 600,
+    animationDuration: 520,
     animationEasing: 'cubicOut',
-    animationDurationUpdate: 400,
+    animationDurationUpdate: 360,
     // Match the UI font instead of ECharts' default sans
     textStyle: {
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif'
+        fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif'
     }
 };
 var TOOLTIP_STYLE = {
-    backgroundColor: '#fff',
-    borderColor: '#E8EBF0',
-    borderRadius: 10,
-    padding: [10, 14],
-    extraCssText: 'box-shadow: 0 4px 12px rgba(2,14,54,0.08), 0 12px 28px rgba(2,14,54,0.08);'
+    backgroundColor: 'rgba(255,253,249,0.97)',
+    borderColor: 'rgba(59,50,44,0.14)',
+    borderRadius: 12,
+    padding: [10, 13],
+    extraCssText: 'box-shadow: 0 7px 18px rgba(61,48,39,0.12), 0 24px 50px rgba(61,48,39,0.12);'
 };
 
 // ── Chart lifecycle ──
@@ -80,7 +80,7 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
     chart.setOption(Object.assign({
         tooltip: Object.assign({
             trigger: 'axis',
-            textStyle: { color: '#020E36', fontSize: 13 },
+            textStyle: { color: '#24211F', fontSize: 13 },
             formatter: function (params) {
                 var idx = params[0] && params[0].dataIndex;
                 if (idx == null) return '';
@@ -98,13 +98,13 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
         legend: {
             data: ['输出Token', '输入Token', '消费'],
             bottom: 0,
-            textStyle: { fontSize: 12, color: '#6B7194' }
+            textStyle: { fontSize: 12, color: '#716B65' }
         },
         grid: { left: 70, right: 70, top: 16, bottom: 40 },
         xAxis: {
             type: 'category',
             data: labels,
-            axisLine: { lineStyle: { color: '#E8EBF0' } },
+            axisLine: { lineStyle: { color: '#D5CEC5' } },
             axisTick: { show: false },
             axisLabel: { show: false }
         },
@@ -112,15 +112,15 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
             {
                 type: 'value',
                 axisLabel: {
-                    color: '#9094A2',
+                    color: '#746B64',
                     fontSize: 11,
                     formatter: function (v) { return fmtNum(v); }
                 },
-                splitLine: { lineStyle: { color: '#F0F1F5', type: 'dashed' } }
+                splitLine: { lineStyle: { color: '#E7E1D9', type: 'dashed' } }
             },
             {
                 type: 'value',
-                axisLabel: { color: '#9094A2', fontSize: 11, formatter: function (v) { return fmtCost(v); } },
+                axisLabel: { color: '#746B64', fontSize: 11, formatter: function (v) { return fmtCost(v); } },
                 splitLine: { show: false }
             }
         ],
@@ -131,8 +131,8 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 stack: 'tokens',
                 yAxisIndex: 0,
                 data: outputTokens,
-                itemStyle: { color: _vGrad('#60A5FA', '#2563EB') },
-                barMaxWidth: 28
+                itemStyle: { color: _vGrad('#CF876D', '#B45F45') },
+                barMaxWidth: 26
             },
             {
                 name: '输入Token',
@@ -140,19 +140,19 @@ function renderTimeSeriesChart(chartId, loaderId, labels, outputTokens, inputTok
                 stack: 'tokens',
                 yAxisIndex: 0,
                 data: inputTokens,
-                itemStyle: { color: _vGrad('#4FD6F0', '#06B6D4'), borderRadius: [4, 4, 0, 0] },
-                barMaxWidth: 28
+                itemStyle: { color: _vGrad('#A8BF92', '#6E8B77'), borderRadius: [4, 4, 0, 0] },
+                barMaxWidth: 26
             },
             {
                 name: '消费',
                 type: 'line',
                 yAxisIndex: 1,
                 data: cost,
-                lineStyle: { color: '#EF4444', width: 2.5 },
-                itemStyle: { color: '#EF4444', borderColor: '#fff', borderWidth: 1.5 },
-                areaStyle: { color: _vGrad('rgba(239,68,68,0.14)', 'rgba(239,68,68,0)') },
+                lineStyle: { color: '#927CA6', width: 2.25 },
+                itemStyle: { color: '#927CA6', borderColor: '#fffdf9', borderWidth: 1.5 },
+                areaStyle: { color: _vGrad('rgba(146,124,166,0.16)', 'rgba(146,124,166,0)') },
                 symbol: 'circle',
-                symbolSize: 6
+                symbolSize: 5
             }
         ]
     }, CHART_ANIM));
@@ -175,7 +175,7 @@ function renderPieChart(domId, pieData, colors) {
     chart.setOption(Object.assign({
         tooltip: Object.assign({
             trigger: 'item',
-            textStyle: { color: '#020E36' },
+            textStyle: { color: '#24211F' },
             formatter: function (p) {
                 var html = p.name + '<br/>Tokens: ' + fmtNum(p.value) +
                     ' (' + p.percent + '%)';
@@ -193,7 +193,7 @@ function renderPieChart(domId, pieData, colors) {
             icon: 'circle',
             itemWidth: 9,
             itemHeight: 9,
-            textStyle: { fontSize: 12, color: '#6B7194' }
+            textStyle: { fontSize: 12, color: '#716B65' }
         },
         series: [{
             type: 'pie',
@@ -201,7 +201,7 @@ function renderPieChart(domId, pieData, colors) {
             center: ['35%', '50%'],
             avoidLabelOverlap: false,
             padAngle: 2,
-            itemStyle: { borderRadius: 6, borderColor: '#fff', borderWidth: 2 },
+            itemStyle: { borderRadius: 7, borderColor: '#F4F1EC', borderWidth: 2 },
             label: { show: false },
             emphasis: {
                 scale: true,

@@ -10,24 +10,94 @@
 // ── Sidebar ──────────────────────────────────────────────────────────────
 
 const Sidebar = {
+    sidebar: null,
+    scrim: null,
+    mobileToggle: null,
+
+    isMobile() {
+        return window.matchMedia('(max-width: 720px)').matches;
+    },
+
+    setMobileOpen(open) {
+        if (!this.sidebar) return;
+        this.sidebar.classList.toggle('sidebar--mobile-open', open);
+        if (this.scrim) {
+            this.scrim.classList.toggle('sidebar-scrim--visible', open);
+            this.scrim.setAttribute('aria-hidden', String(!open));
+        }
+        if (this.mobileToggle) {
+            this.mobileToggle.setAttribute('aria-expanded', String(open));
+            this.mobileToggle.setAttribute('aria-label', open ? '关闭导航' : '打开导航');
+        }
+        document.body.classList.toggle('nav-open', open);
+    },
+
+    closeMobile() {
+        this.setMobileOpen(false);
+    },
+
     /** Initialize sidebar state and bind events. */
     init() {
         const sidebar = document.getElementById('sidebar');
         const toggle = document.getElementById('sidebarToggle');
+        const scrim = document.getElementById('sidebarScrim');
+        const mobileToggle = document.getElementById('mobileNavToggle');
+        this.sidebar = sidebar;
+        this.scrim = scrim;
+        this.mobileToggle = mobileToggle;
 
         // Restore collapsed state
         const collapsed = localStorage.getItem('sidebarCollapsed') === 'true';
-        if (collapsed) {
+        // A desktop collapse preference should not turn the mobile drawer into
+        // an icon rail. Mobile gets a full-width, touch-friendly navigation.
+        if (collapsed && !this.isMobile()) {
             sidebar.classList.add('sidebar--collapsed');
         }
+        toggle.setAttribute(
+            'aria-expanded',
+            String(!sidebar.classList.contains('sidebar--collapsed'))
+        );
+        toggle.setAttribute(
+            'aria-label',
+            sidebar.classList.contains('sidebar--collapsed') ? '展开侧边栏' : '收缩侧边栏'
+        );
 
         // Toggle collapse
         toggle.addEventListener('click', () => {
+            if (this.isMobile()) {
+                this.closeMobile();
+                return;
+            }
             sidebar.classList.toggle('sidebar--collapsed');
             localStorage.setItem(
                 'sidebarCollapsed',
                 sidebar.classList.contains('sidebar--collapsed')
             );
+            toggle.setAttribute(
+                'aria-expanded',
+                String(!sidebar.classList.contains('sidebar--collapsed'))
+            );
+            toggle.setAttribute(
+                'aria-label',
+                sidebar.classList.contains('sidebar--collapsed') ? '展开侧边栏' : '收缩侧边栏'
+            );
+        });
+
+        if (mobileToggle) {
+            mobileToggle.addEventListener('click', () => {
+                this.setMobileOpen(!sidebar.classList.contains('sidebar--mobile-open'));
+            });
+        }
+        if (scrim) scrim.addEventListener('click', () => this.closeMobile());
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') this.closeMobile();
+        });
+        window.addEventListener('resize', () => {
+            if (this.isMobile()) {
+                sidebar.classList.remove('sidebar--collapsed');
+            } else {
+                this.closeMobile();
+            }
         });
 
         // Nav section collapse (click on section title toggles children)
@@ -46,6 +116,7 @@ const Sidebar = {
         });
         const active = document.querySelector(`[href="${hash}"]`);
         if (active) active.classList.add('sidebar__nav-item--active');
+        this.closeMobile();
     },
 };
 

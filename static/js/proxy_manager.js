@@ -59,12 +59,21 @@ function maskKey(key) {
 
 function openModal(id) {
     const modal = document.getElementById(id);
-    if (modal) modal.style.display = '';
+    if (!modal) return;
+    modal.style.display = '';
+    modal.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('modal-open');
 }
 
 function closeModal(id) {
     const modal = document.getElementById(id);
-    if (modal) modal.style.display = 'none';
+    if (modal) {
+        modal.style.display = 'none';
+        modal.setAttribute('aria-hidden', 'true');
+    }
+    if (!document.querySelector('.modal-overlay[style=""]:not([style*="display: none"])')) {
+        document.body.classList.remove('modal-open');
+    }
     if (id === 'keyModal') {
         const disp = document.getElementById('generatedKeyDisplay');
         if (disp) disp.style.display = 'none';
@@ -183,7 +192,7 @@ function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion) {
     div.className = 'existing-key';
     div.dataset.keepId = keepId;
     const span = document.createElement('span');
-    span.style.cssText = 'flex:1; font-family:monospace; background:#f3f4f6; padding:4px 8px; border-radius:4px; color:var(--color-text-secondary, #6b7280);';
+    span.style.cssText = 'flex:1; font-family:monospace; background:var(--color-surface-sunken, #eeebe5); padding:4px 8px; border-radius:4px; color:var(--color-text-secondary, #716b65);';
     span.textContent = masked + (pendingDeletion
         ? '（已安排本期期末自动删除）'
         : '（已配置，如需删除点“移除”）');
@@ -310,8 +319,8 @@ async function loadAccountsTable() {
             const firstMask = uniqueMasks[0] || '';
             return `
             <tr>
-                <td>${esc(a.name)}${a.deleted_at ? ` <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="到期删除：${esc(fmtLocal(a.deleted_at))}">到期 ${esc(fmtLocal(a.deleted_at).slice(0, 10))}</span>` : ''}</td>
-                <td><code>${esc(firstMask)}</code>${keyCount > 1 ? ` <span class="badge" title="${keyCount} 把密钥（同一配置的多个并发槽位）">×${keyCount}</span>` : ''}${!firstMask && !keyCount ? ' <span class="badge" style="color:#B45309;background:#FFFBEB;border-color:#FCD34D;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
+                <td>${esc(a.name)}${a.deleted_at ? ` <span class="badge" style="color:#8F5C2D;background:#FBF1DF;border-color:#DFBF86;" title="到期删除：${esc(fmtLocal(a.deleted_at))}">到期 ${esc(fmtLocal(a.deleted_at).slice(0, 10))}</span>` : ''}</td>
+                <td><code>${esc(firstMask)}</code>${keyCount > 1 ? ` <span class="badge" title="${keyCount} 把密钥（同一配置的多个并发槽位）">×${keyCount}</span>` : ''}${!firstMask && !keyCount ? ' <span class="badge" style="color:#8F5C2D;background:#FBF1DF;border-color:#DFBF86;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
                 <td>${accountTypeBadge(a.account_type)}</td>
@@ -649,7 +658,7 @@ function initAccountsPage() {
                         <button type="submit" class="btn btn--primary">添加账户</button>
                         <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
                         <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
-                        <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:#EF4444;">删除账户</button>
+                        <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:var(--color-danger);">删除账户</button>
                     </div>
                 </form>
             </div>
@@ -663,7 +672,7 @@ function initAccountsPage() {
                 <div id="deleteAccountMsg" style="padding:10px 0;"></div>
                 <div style="display:flex; flex-direction:column; gap:8px;">
                     <button class="btn" onclick="deleteAccountCascade()">级联删除密钥并删除账户</button>
-                    <button class="btn" style="color:#EF4444;" onclick="deleteAccountDetach()">仅解绑密钥（密钥需重新分配）</button>
+                    <button class="btn" style="color:var(--color-danger);" onclick="deleteAccountDetach()">仅解绑密钥（密钥需重新分配）</button>
                 </div>
             </div>
         </div>
@@ -687,12 +696,12 @@ async function loadKeysTable() {
             <tr>
                 <td><code class="key-display" title="${esc(k.key_value)}">${esc(k.key_masked)}</code> <button class="btn btn--sm" onclick="copyKey('${esc(k.key_value)}')">复制</button></td>
                 <td>${esc(k.label || '-')}</td>
-                <td>${k.account_id == null ? '<span style="color:#9CA3AF;">未分配</span>' : esc(k.account_name || `ID:${k.account_id}`)}</td>
+                <td>${k.account_id == null ? '<span style="color:var(--color-text-tertiary);">未分配</span>' : esc(k.account_name || `ID:${k.account_id}`)}</td>
                 <td>${k.last_used_at ? esc(fmtLocal(k.last_used_at)) : '从未使用'}</td>
                 <td>${k.created_at ? esc(fmtLocal(k.created_at)) : ''}</td>
                 <td>
                     <button class="btn btn--sm" onclick="openEditKeyModal(${k.id})">编辑</button>
-                    <button class="btn btn--sm" onclick="deleteKey(${k.id}, '${esc(k.label || k.key_masked)}')" style="color:#EF4444;">删除</button>
+                    <button class="btn btn--sm" onclick="deleteKey(${k.id}, '${esc(k.label || k.key_masked)}')" style="color:var(--color-danger);">删除</button>
                 </td>
             </tr>
         `).join('');
@@ -808,10 +817,10 @@ function initKeysPage() {
             <p class="page-subtitle">生成密钥供 AI 工具连接代理使用</p>
             <button class="btn btn--primary" onclick="openModal('keyModal')">+ 生成密钥</button>
         </div>
-        <div style="margin-bottom:16px; padding:12px 16px; background:var(--color-surface, #F8FAFC); border:1px solid var(--color-border); border-radius:8px; font-size:13px; color:var(--color-text-tertiary);">
+        <div style="margin-bottom:16px; padding:12px 16px; background:var(--color-surface, #fffdfa); border:1px solid var(--color-border); border-radius:8px; font-size:13px; color:var(--color-text-tertiary);">
             <strong style="color:var(--color-text-secondary);">配置说明</strong>
             <div style="margin-top:6px;">一把密钥同时支持三种客户端格式，代理根据请求 URL 自动识别并转换为上游格式</div>
-            <div style="margin-top:6px;"><code style="background:var(--color-bg, #F1F5F9); padding:2px 6px; border-radius:4px;">BASE_URL = http://localhost:8800/v1</code></div>
+            <div style="margin-top:6px;"><code style="background:var(--color-bg, #f1ece5); padding:2px 6px; border-radius:4px;">BASE_URL = http://localhost:8800/v1</code></div>
         </div>
         <table class="mgmt-table" id="keysTable">
             <thead><tr><th>密钥</th><th>标签</th><th>关联账户</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>
@@ -830,8 +839,8 @@ function initKeysPage() {
                     <label>关联账户 <select name="account_id" id="keyAccountSelect" required></select></label>
                     <button type="submit" class="btn btn--primary">生成密钥</button>
                 </form>
-                <div id="generatedKeyDisplay" style="display:none; margin-top:16px; padding:12px; background:#F0FDF4; border-radius:8px;">
-                    <strong style="color:#166534">新密钥（仅显示一次）：</strong>
+                <div id="generatedKeyDisplay" style="display:none; margin-top:16px; padding:12px; background:#edf5ea; border-radius:8px;">
+                    <strong style="color:#4f7b55">新密钥（仅显示一次）：</strong>
                     <code id="generatedKeyValue" style="word-break:break-all; font-size:14px;"></code>
                     <button class="btn btn--sm" onclick="copyKey(document.getElementById('generatedKeyValue').textContent)" style="margin-top:8px">复制密钥</button>
                 </div>
@@ -882,7 +891,7 @@ async function loadAggregatesTable() {
                 ).join('<br>') : ''}</td>
                 <td>
                     <button class="btn btn--sm" onclick="openAggregateModal(${a.id})">编辑</button>
-                    <button class="btn btn--sm" onclick="deleteAggregate(${a.id}, '${esc(a.name)}')" style="color:#EF4444;">删除</button>
+                    <button class="btn btn--sm" onclick="deleteAggregate(${a.id}, '${esc(a.name)}')" style="color:var(--color-danger);">删除</button>
                 </td>
             </tr>
         `).join('');
@@ -903,7 +912,7 @@ function aggRow(pattern, accountId, accountName, upstreamModel) {
         <select class="agg-model" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onfocus="loadAggModels(this)"><option value="${esc(upstreamModel||'')}">${esc(upstreamModel||'点击获取模型')}</option></select>
         <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'up')" title="上移">▲</button>
         <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'down')" title="下移">▼</button>
-        <button type="button" class="btn btn--sm" onclick="this.parentElement.remove()" style="color:#EF4444;">✕</button>
+        <button type="button" class="btn btn--sm" onclick="this.parentElement.remove()" style="color:var(--color-danger);">✕</button>
     </div>`;
 }
 

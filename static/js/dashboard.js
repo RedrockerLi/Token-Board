@@ -704,7 +704,7 @@ async function loadTypePie() {
     try {
         var data = await fetchTokenTypes();
         var filtered = data.filter(function (d) { return d.value > 0; });
-        renderPieChart('chartTypePie', filtered, ['#3B82F6', '#06B6D4', '#F59E0B']);
+        renderPieChart('chartTypePie', filtered, ['#B45F45', '#6E8B77', '#C08B42']);
         loader.style.display = 'none';
     } catch (err) {
         console.error('Failed to load type pie:', err);

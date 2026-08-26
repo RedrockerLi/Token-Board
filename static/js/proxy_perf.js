@@ -33,22 +33,22 @@ function buildPerfPageHTML() {
         <!-- Stat Cards -->
         <div class="stats-grid" style="grid-template-columns:repeat(4, 1fr);">
             <div class="stat-card stat-card--highlight">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#3B82F6;"></span> 当前并发</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#B45F45;"></span> 当前并发</div>
                 <div class="stat-card__value number-lg" id="perfConcurrent">--</div>
                 <div class="stat-card__sub">处理中的请求数</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#8B5CF6;"></span> 请求速率</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#927CA6;"></span> 请求速率</div>
                 <div class="stat-card__value number-lg" id="perfRPM">--</div>
                 <div class="stat-card__sub">最近 1 分钟 (RPM)</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#10B981;"></span> 成功率</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#6F8A5D;"></span> 成功率</div>
                 <div class="stat-card__value number-lg" id="perfSuccessRate">--</div>
                 <div class="stat-card__sub">最近 15 分钟</div>
             </div>
-            <div class="stat-card stat-card--cyan">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#F59E0B;"></span> 平均 TTFT</div>
+            <div class="stat-card stat-card--cost">
+                <div class="stat-card__label"><span class="icon-dot" style="background:#C08B42;"></span> 平均 TTFT</div>
                 <div class="stat-card__value number-lg" id="perfAvgLatency">--</div>
                 <div class="stat-card__sub">最近 15 分钟 (可观测流式成功请求)</div>
             </div>
@@ -107,7 +107,7 @@ function renderLatencyChart(domId, data) {
     if (!chartLatency) return;
     if (!data || !data.length) {
         chartLatency.setOption({
-            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#746B64', fontSize: 14 } }
         });
         return;
     }
@@ -137,19 +137,19 @@ function renderLatencyChart(domId, data) {
                 name: 'P50', type: 'line',
                 data: data.map(function(d) { return d.p50; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#3B82F6', width: 2 },
+                lineStyle: { color: '#B45F45', width: 2 },
             },
             {
                 name: 'P95', type: 'line',
                 data: data.map(function(d) { return d.p95; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#F59E0B', width: 2 },
+                lineStyle: { color: '#C08B42', width: 2 },
             },
             {
                 name: 'P99', type: 'line',
                 data: data.map(function(d) { return d.p99; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#EF4444', width: 1.5 },
+                lineStyle: { color: '#A75558', width: 1.5 },
             },
         ],
     });
@@ -160,7 +160,7 @@ function renderSpeedChart(domId, data) {
     if (!chartSpeed) return;
     if (!data || !data.length) {
         chartSpeed.setOption({
-            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#746B64', fontSize: 14 } }
         });
         return;
     }
@@ -190,19 +190,19 @@ function renderSpeedChart(domId, data) {
                 name: 'P50', type: 'line',
                 data: data.map(function(d) { return d.p50; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#3B82F6', width: 2 },
+                lineStyle: { color: '#B45F45', width: 2 },
             },
             {
                 name: 'P95', type: 'line',
                 data: data.map(function(d) { return d.p95; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#F59E0B', width: 2 },
+                lineStyle: { color: '#C08B42', width: 2 },
             },
             {
                 name: 'P99', type: 'line',
                 data: data.map(function(d) { return d.p99; }),
                 smooth: true, symbol: 'none',
-                lineStyle: { color: '#EF4444', width: 1.5 },
+                lineStyle: { color: '#A75558', width: 1.5 },
             },
         ],
     });
@@ -260,9 +260,9 @@ function renderRPMChart(domId, data, minutes) {
         series: [{
             name: '请求数', type: 'line', data: vals,
             smooth: true, symbol: 'circle', symbolSize: 4,
-            lineStyle: { color: '#3B82F6', width: 2 },
-            itemStyle: { color: '#3B82F6' },
-            areaStyle: { color: 'rgba(59,130,246,0.08)' },
+            lineStyle: { color: '#927CA6', width: 2 },
+            itemStyle: { color: '#927CA6' },
+            areaStyle: { color: 'rgba(146,124,166,0.10)' },
         }],
     });
 }
@@ -272,7 +272,7 @@ function renderUpstreamSuccessRateChart(domId, data) {
     if (!chartUpstreamSuccess) return;
     if (!data || !data.length) {
         chartUpstreamSuccess.setOption({
-            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#746B64', fontSize: 14 } }
         });
         return;
     }
@@ -281,8 +281,8 @@ function renderUpstreamSuccessRateChart(domId, data) {
     var rates = data.map(function(d) { return d.success_rate; });
     var colors = data.map(function(d) {
         var r = d.success_rate;
-        if (r == null) return '#6B7280';
-        return r >= 95 ? '#10B981' : (r >= 80 ? '#F59E0B' : '#EF4444');
+        if (r == null) return '#746B64';
+        return r >= 95 ? '#6F8A5D' : (r >= 80 ? '#C08B42' : '#A75558');
     });
 
     chartUpstreamSuccess.setOption({
@@ -316,7 +316,7 @@ function renderModelLatencyChart(domId, models) {
     if (!chartModelLatency) return;
     if (!models || !models.length) {
         chartModelLatency.setOption({
-            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+            title: { text: '暂无数据', left: 'center', top: 'center', textStyle: { color: '#746B64', fontSize: 14 } }
         });
         return;
     }
@@ -324,14 +324,14 @@ function renderModelLatencyChart(domId, models) {
     models = models.filter(function(m) { return m.avg_ttft_ms != null; });
     if (!models.length) {
         chartModelLatency.setOption({
-            title: { text: '暂无可观测流式 TTFT 数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+            title: { text: '暂无可观测流式 TTFT 数据', left: 'center', top: 'center', textStyle: { color: '#746B64', fontSize: 14 } }
         });
         return;
     }
     models.sort(function(a, b) { return b.avg_ttft_ms - a.avg_ttft_ms; });
     var names = models.map(function(m) { return m.model; });
     var latencies = models.map(function(m) { return m.avg_ttft_ms; });
-    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#3B82F6','#06B6D4','#10B981','#F59E0B','#8B5CF6','#F43F5E','#6366F1','#14B8A6'])[i % 8]; });
+    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#B45F45','#6E8B77','#6F8A5D','#C08B42','#927CA6','#A75558','#8F735B','#A57B93'])[i % 8]; });
 
     chartModelLatency.setOption({
         tooltip: {
@@ -362,12 +362,12 @@ function renderModelSpeedChart(domId, models) {
     models = (models || []).filter(function(m) { return m.avg_output_tps != null; });
     if (!models.length) {
         chartModelSpeed.setOption({
-            title: { text: '暂无可观测流式速度数据', left: 'center', top: 'center', textStyle: { color: '#999', fontSize: 14 } }
+            title: { text: '暂无可观测流式速度数据', left: 'center', top: 'center', textStyle: { color: '#746B64', fontSize: 14 } }
         });
         return;
     }
     models.sort(function(a, b) { return b.avg_output_tps - a.avg_output_tps; });
-    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#3B82F6','#06B6D4','#10B981','#F59E0B','#8B5CF6','#F43F5E','#6366F1','#14B8A6'])[i % 8]; });
+    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#B45F45','#6E8B77','#6F8A5D','#C08B42','#927CA6','#A75558','#8F735B','#A57B93'])[i % 8]; });
     chartModelSpeed.setOption({
         tooltip: {
             trigger: 'axis', axisPointer: { type: 'shadow' },

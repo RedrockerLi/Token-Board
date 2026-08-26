@@ -28,7 +28,7 @@ async function loadAgentSubscriptions() {
                 <td>${esc(fmtLocal(item.updated_at || item.created_at))}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAgentSubscription(${item.id})">编辑</button>
-                    <button class="btn btn--sm" style="color:#EF4444;" onclick="deleteAgentSubscription(${item.id}, '${esc(item.name)}')">删除</button>
+                    <button class="btn btn--sm" style="color:var(--color-danger);" onclick="deleteAgentSubscription(${item.id}, '${esc(item.name)}')">删除</button>
                 </td>
             </tr>
         `).join('');
@@ -151,7 +151,7 @@ async function loadAgentSoftware() {
                 }).join('、') || '未绑定'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAgentSoftware(${item.id})">编辑</button>
-                    <button class="btn btn--sm" style="color:#EF4444;" onclick="deleteAgentSoftware(${item.id}, '${esc(item.name)}')">删除</button>
+                    <button class="btn btn--sm" style="color:var(--color-danger);" onclick="deleteAgentSoftware(${item.id}, '${esc(item.name)}')">删除</button>
                 </td>
             </tr>
         `).join('');
@@ -206,7 +206,7 @@ function addAgentSubscriptionBindingRow(subscriptionId = '') {
             <option value="">选择订阅</option>
             ${agentSubscriptions.map((item) => `<option value="${item.id}">${esc(item.name)}</option>`).join('')}
         </select>
-        <button type="button" class="btn btn--sm" style="color:#EF4444;">删除</button>`;
+        <button type="button" class="btn btn--sm" style="color:var(--color-danger);">删除</button>`;
     row.querySelector('select').value = subscriptionId || '';
     row.querySelector('button').onclick = () => row.remove();
     target.appendChild(row);

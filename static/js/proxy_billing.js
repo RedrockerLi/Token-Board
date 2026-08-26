@@ -125,7 +125,7 @@ async function loadDailyBillingChart() {
                         return html;
                     }
                 }, (typeof TOOLTIP_STYLE !== 'undefined' ? TOOLTIP_STYLE : {})),
-                legend: { data: ['输入Token', '输出Token', '消费'], bottom: 0, textStyle: { fontSize: 11, color: '#6B7194' } },
+                legend: { data: ['输入Token', '输出Token', '消费'], bottom: 0, textStyle: { fontSize: 11, color: '#6E6E73' } },
                 grid: { left: 70, right: 70, top: 20, bottom: 50 },
                 xAxis: { type: 'category', data: dates, axisLabel: { rotate: 30, fontSize: 10 } },
                 yAxis: [
@@ -136,19 +136,19 @@ async function loadDailyBillingChart() {
                     {
                         name: '输出Token', type: 'bar', stack: 'tokens',
                         data: outputTokens, barMaxWidth: 28,
-                        itemStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('#60A5FA', '#2563EB') : '#3B82F6' },
+                        itemStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('#CF876D', '#B45F45') : '#B45F45' },
                     },
                     {
                         name: '输入Token', type: 'bar', stack: 'tokens',
                         data: inputTokens, barMaxWidth: 28,
-                        itemStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('#4FD6F0', '#06B6D4') : '#06B6D4', borderRadius: [4, 4, 0, 0] },
+                        itemStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('#A8BF92', '#6E8B77') : '#6E8B77', borderRadius: [4, 4, 0, 0] },
                     },
                     {
                         name: '消费', type: 'line', yAxisIndex: 1,
                         data: costs,
-                        lineStyle: { color: '#EF4444', width: 2.5 },
-                        itemStyle: { color: '#EF4444', borderColor: '#fff', borderWidth: 1.5 },
-                        areaStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('rgba(239,68,68,0.14)', 'rgba(239,68,68,0)') : 'rgba(239,68,68,0.08)' },
+                        lineStyle: { color: '#927CA6', width: 2.25 },
+                        itemStyle: { color: '#927CA6', borderColor: '#fffdf9', borderWidth: 1.5 },
+                        areaStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('rgba(146,124,166,0.16)', 'rgba(146,124,166,0)') : 'rgba(146,124,166,0.08)' },
                         symbol: 'circle', symbolSize: 6,
                     },
                 ],
@@ -193,17 +193,17 @@ function initBillingPage() {
         <!-- Stats Cards -->
         <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr);">
             <div class="stat-card stat-card--highlight">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#3B82F6;"></span> 近30天 Token</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#B45F45;"></span> 近30天 Token</div>
                 <div class="stat-card__value number-lg" id="billTotalTokens">--</div>
                 <div class="stat-card__sub">滚动窗口</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#8B5CF6;"></span> 近30天请求数</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#927CA6;"></span> 近30天请求数</div>
                 <div class="stat-card__value number-lg" id="billTotalRequests">--</div>
                 <div class="stat-card__sub">今日: <span id="billTodayRequests">--</span></div>
             </div>
-            <div class="stat-card stat-card--cyan">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#EF4444;"></span> 近30天消费（实际）</div>
+            <div class="stat-card stat-card--cost">
+                <div class="stat-card__label"><span class="icon-dot" style="background:#A75558;"></span> 近30天消费（实际）</div>
                 <div class="stat-card__value number-lg" id="billTotalCost">--</div>
                 <div class="stat-card__sub">今日消费（理论）: <span id="billTodayCost">--</span> · <span id="billActiveUpstreams">0</span> 个活跃上游</div>
             </div>
