@@ -266,10 +266,12 @@ function initAgentSubscriptionsPage() {
             <p class="page-subtitle">记录智能体相关订阅。订阅与软件分别维护，可在软件编辑中进行多对多绑定。</p>
             <button class="btn btn--primary" onclick="openAgentSubscriptionModal()">+ 添加订阅</button>
         </div>
-        <table class="mgmt-table" id="agentSubscriptionsTable">
-            <thead><tr><th>名称</th><th>实例与月费</th><th>开始时间</th><th>更新时间</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+            <table class="mgmt-table" id="agentSubscriptionsTable">
+                <thead><tr><th>名称</th><th>实例与月费</th><th>开始时间</th><th>更新时间</th><th>操作</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
         <div class="modal-overlay" id="agentSubscriptionModal" style="display:none">
             <div class="modal">
                 <div class="modal__header"><h3 id="agentSubscriptionModalTitle">添加订阅</h3><button class="modal__close" onclick="closeModal('agentSubscriptionModal')">&times;</button></div>
@@ -296,10 +298,12 @@ function initAgentSoftwarePage() {
             <p class="page-subtitle">配置智能体软件来源。用量类型由后端 adapter registry 提供，支持多种本地 agent。</p>
             <button class="btn btn--primary" onclick="openAgentSoftwareModal()">+ 添加软件</button>
         </div>
-        <table class="mgmt-table" id="agentSoftwareTable">
-            <thead><tr><th>名称</th><th>类型</th><th>数据目录</th><th>绑定订阅</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+            <table class="mgmt-table" id="agentSoftwareTable">
+                <thead><tr><th>名称</th><th>类型</th><th>数据目录</th><th>绑定订阅</th><th>操作</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
         <div class="modal-overlay" id="agentSoftwareModal" style="display:none">
             <div class="modal">
                 <div class="modal__header"><h3 id="agentSoftwareModalTitle">添加软件</h3><button class="modal__close" onclick="closeModal('agentSoftwareModal')">&times;</button></div>

@@ -204,17 +204,19 @@ function initSettingsPage() {
         <div class="section">
             <div class="chart-card">
                 <div class="chart-card__title" style="margin-bottom:12px;">代理超时配置</div>
-                <table class="mgmt-table">
-                    <thead>
-                        <tr>
-                            <th>客户端格式</th>
-                            <th>流式首字节超时（秒）</th>
-                            <th>流式静默超时（秒，0=禁用）</th>
-                            <th>非流式超时（秒）</th>
-                        </tr>
-                    </thead>
-                    <tbody>${timeoutRows}</tbody>
-                </table>
+                <div class="table-scroll">
+                    <table class="mgmt-table">
+                        <thead>
+                            <tr>
+                                <th>客户端格式</th>
+                                <th>流式首字节超时（秒）</th>
+                                <th>流式静默超时（秒，0=禁用）</th>
+                                <th>非流式超时（秒）</th>
+                            </tr>
+                        </thead>
+                        <tbody>${timeoutRows}</tbody>
+                    </table>
+                </div>
                 <div style="margin-top:12px; font-size:13px; color:var(--color-text-secondary);">
                     首字节：等待首个流式数据块的最大时间（1-120）· 静默：两个数据块之间的最大间隔（0-600，填 0 禁用，防止中途卡住）·
                     非流式：非流式请求的整体读取超时（60-1200）

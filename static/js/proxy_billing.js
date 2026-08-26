@@ -226,10 +226,12 @@ function initBillingPage() {
         <div class="section">
             <div class="chart-card">
                 <div class="chart-card__title">今日活跃上游用量</div>
-                <table class="mgmt-table" id="todayUpstreamTable">
-                    <thead><tr><th>上游</th><th>实际消费</th><th>理论消费</th><th>Token 数</th><th>调用次数</th></tr></thead>
-                    <tbody></tbody>
-                </table>
+                <div class="table-scroll">
+                    <table class="mgmt-table" id="todayUpstreamTable">
+                        <thead><tr><th>上游</th><th>实际消费</th><th>理论消费</th><th>Token 数</th><th>调用次数</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
             </div>
         </div>
     `;
@@ -300,10 +302,12 @@ function initLogsPage() {
         </div>
 
         <!-- Log Table -->
-        <table class="mgmt-table" id="logsTable">
-            <thead><tr><th>时间</th><th>账户</th><th>模型</th><th>Tokens (输入/命中/输出/总计)</th><th>消费</th><th>TTFT</th><th>输出速度</th><th>模式</th><th>状态</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+            <table class="mgmt-table" id="logsTable">
+                <thead><tr><th>时间</th><th>账户</th><th>模型</th><th>Tokens (输入/命中/输出/总计)</th><th>消费</th><th>TTFT</th><th>输出速度</th><th>模式</th><th>状态</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
 
         <!-- Pagination -->
         <div class="pagination" style="display:flex; justify-content:center; align-items:center; gap:16px; margin-top:16px;">

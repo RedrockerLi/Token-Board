@@ -1087,6 +1087,15 @@ textarea:focus-visible {
 }
 
 /* ── Tables & data states ───────────────────────────────────────────────── */
+.table-scroll {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+}
+
 .mgmt-table {
     width: 100%;
     min-width: 720px;
@@ -1841,20 +1850,6 @@ code {
     .section-header .controls-group .select-styled {
         flex: 1;
         width: auto;
-    }
-
-    .mgmt-table {
-        display: block;
-        overflow-x: auto;
-        -webkit-overflow-scrolling: touch;
-    }
-
-    .mgmt-table thead,
-    .mgmt-table tbody {
-        display: table;
-        width: 100%;
-        min-width: 720px;
-        table-layout: auto;
     }
 
     .modal-overlay {

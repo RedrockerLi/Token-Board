@@ -661,10 +661,12 @@ function initAccountsPage() {
             <p class="page-subtitle">支持 OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 的上游服务</p>
             <button class="btn btn--primary" onclick="openAddAccountModal()">+ 添加账户</button>
         </div>
-        <table class="mgmt-table" id="accountsTable">
-            <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>类型</th><th>订阅月费</th><th>并发限额</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+            <table class="mgmt-table" id="accountsTable">
+                <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>类型</th><th>订阅月费</th><th>并发限额</th><th>操作</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
         <div class="modal-overlay" id="accountModal" style="display:none">
             <div class="modal">
                 <div class="modal__header">
@@ -885,10 +887,12 @@ function initKeysPage() {
             <div style="margin-top:6px;">一把密钥同时支持三种客户端格式，代理根据请求 URL 自动识别并转换为上游格式</div>
             <div style="margin-top:6px;"><code style="background:var(--color-bg, #f1ece5); padding:2px 6px; border-radius:4px;">BASE_URL = http://localhost:8800/v1</code></div>
         </div>
-        <table class="mgmt-table" id="keysTable">
-            <thead><tr><th>密钥</th><th>标签</th><th>关联账户</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+            <table class="mgmt-table" id="keysTable">
+                <thead><tr><th>密钥</th><th>标签</th><th>关联账户</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
 
         <!-- Generate Key Modal -->
         <div class="modal-overlay" id="keyModal" style="display:none">
@@ -1107,10 +1111,12 @@ function initAggregatesPage() {
             <p class="page-subtitle">聚合多个上游账户为一个账户：模型列表即此聚合账户暴露给客户端的全部模型。同一模型可配置多个上游账户，请求从上到下依次使用——当前账户达到并发限额或处于冷却期时自动使用下一个</p>
             <button class="btn btn--primary" onclick="openAggregateModal()">+ 新建聚合账户</button>
         </div>
-        <table class="mgmt-table" id="aggregatesTable">
-            <thead><tr><th>名称</th><th>条目数</th><th>映射预览</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+            <table class="mgmt-table" id="aggregatesTable">
+                <thead><tr><th>名称</th><th>条目数</th><th>映射预览</th><th>操作</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
         <div class="modal-overlay" id="aggregateModal" style="display:none">
             <div class="modal" style="max-width:720px;">
                 <div class="modal__header">
@@ -1628,10 +1634,12 @@ function initPricingPage() {
             <p class="page-subtitle">配置模型基本价格（每百万 token，CNY 默认 / 可选 USD）</p>
             <button class="btn btn--primary" onclick="openModal('pricingModal')">+ 添加定价</button>
         </div>
-        <table class="mgmt-table pricing-table" id="pricingTable" aria-describedby="pricingOrderHelp">
-            <thead><tr><th class="pricing-order-column">顺序</th><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>货币</th><th>操作</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+            <table class="mgmt-table pricing-table" id="pricingTable" aria-describedby="pricingOrderHelp">
+                <thead><tr><th class="pricing-order-column">顺序</th><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>货币</th><th>操作</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
         <p class="pricing-order-help" id="pricingOrderHelp"><span class="pricing-drag-grip" aria-hidden="true">⠿</span> 拖动左侧把手调整匹配优先级；也可聚焦把手后使用 ↑↓、Home、End 键。</p>
         <div class="modal-overlay" id="pricingModal" style="display:none">
             <div class="modal">
