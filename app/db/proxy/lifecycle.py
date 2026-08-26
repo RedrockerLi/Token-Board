@@ -135,6 +135,61 @@ class ProxyLifecycleMixin:
         finally:
             conn.close()
 
+    def cancel_account_deletion(self, account_id: int) -> dict:
+        """Cancel an account deletion that has not reached its effective time.
+
+        End-of-period cancellation deliberately leaves the account and its
+        routing graph live, recording only future ``deleted_at`` timestamps.
+        Reversing that operation therefore clears the account marker and the
+        future credential markers in one transaction.  An account whose
+        deadline has passed is not recoverable here: the finalizer may already
+        have disabled its routing graph, and treating that state as pending
+        would make the result depend on a race with the background sweep.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = utc_now()
+            now_text = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            route = self._v1_route_account(conn, account_id)
+            real_id = (route["account_id"] if route and route["account_id"] is not None
+                       else account_id)
+            account = conn.execute(
+                "SELECT id,deleted_at FROM accounts "
+                "WHERE id=? AND account_kind='proxy' AND lifecycle_state='active' "
+                "AND deleted_at IS NOT NULL AND deleted_at>?",
+                (real_id, now_text),
+            ).fetchone()
+            if account is None:
+                conn.rollback()
+                return {
+                    "ok": False,
+                    "error": "Account deletion is not pending or has expired",
+                }
+
+            restored = conn.execute(
+                "UPDATE upstream_credentials SET deleted_at=NULL "
+                "WHERE upstream_id IN (SELECT id FROM upstreams WHERE account_id=?) "
+                "AND deleted_at IS NOT NULL AND deleted_at>?",
+                (real_id, now_text),
+            )
+            conn.execute(
+                "UPDATE accounts SET deleted_at=NULL,updated_at=? WHERE id=?",
+                (now_text, real_id),
+            )
+            conn.commit()
+            return {
+                "ok": True,
+                "error": "",
+                "cancelled_at": now_text,
+                "restored_credentials": restored.rowcount,
+            }
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def finalize_deferred_deletions(self) -> int:
         """Complete end-of-period account deletions whose time has come.
 

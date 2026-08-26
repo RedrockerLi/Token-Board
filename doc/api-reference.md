@@ -65,6 +65,7 @@
 | `/api/proxy/accounts` | POST | 新建账户(name + upstream_key 必填) |
 | `/api/proxy/accounts/<id>` | PUT | 更新账户字段 |
 | `/api/proxy/accounts/<id>` | DELETE | 删除账户(有关联密钥或日志时拒绝) |
+| `/api/proxy/accounts/<id>/cancel-deletion` | POST | 取消尚未到期的订阅账户删除 |
 | `/api/proxy/accounts/<id>/models` | GET | 账户模型目录 |
 | `/api/proxy/accounts/<id>/models` | POST | 从上游 `GET /models` 拉取并整体替换模型目录 |
 | `/api/proxy/accounts/<id>/test-concurrency` | POST | 并发测试:不经本机代理、直连上游并行发 N 个极小请求(body 可传 `concurrency` 覆盖已保存限额,上限 50),自动挑选定价最便宜的可用模型,返回各档成功的统计与失败原因 |

@@ -91,6 +91,56 @@ select {
     -webkit-tap-highlight-color: transparent;
 }
 
+/* Keep native select semantics while giving every dropdown the same quiet,
+   warm-surface treatment as the rest of the dashboard. */
+select:not([multiple]) {
+    min-width: 0;
+    min-height: 37px;
+    padding: 0 38px 0 12px;
+    border: 1px solid var(--color-border-strong);
+    border-radius: 10px;
+    color: var(--color-text);
+    background-color: rgba(255, 255, 255, 0.82);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239b4e3a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-position: right 11px center;
+    background-repeat: no-repeat;
+    background-size: 16px 16px;
+    appearance: none;
+    -webkit-appearance: none;
+    font-size: 13px;
+    line-height: 1.2;
+    cursor: pointer;
+    transition: border-color var(--transition), background-color var(--transition), box-shadow var(--transition);
+}
+
+select:not([multiple]):hover {
+    border-color: var(--color-border-strong);
+    background-color: var(--color-surface-solid);
+}
+
+select:not([multiple]):focus {
+    border-color: var(--color-primary);
+    outline: none;
+    box-shadow: 0 0 0 4px rgba(180, 95, 69, 0.14);
+}
+
+select:not([multiple]):disabled {
+    opacity: 0.55;
+    color: var(--color-text-secondary);
+    background-color: var(--color-surface-sunken);
+    cursor: not-allowed;
+}
+
+select option {
+    color: var(--color-text);
+    background: var(--color-surface-solid);
+}
+
+select option:checked {
+    color: #ffffff;
+    background: var(--color-primary);
+}
+
 button:focus-visible,
 a:focus-visible,
 input:focus-visible,
@@ -515,32 +565,196 @@ textarea:focus-visible {
 
 .select-styled {
     width: 170px;
+}
+
+/* The native select remains in the DOM for form submission and script
+   integration. The trigger and portaled listbox below provide a themeable
+   expanded state, which browsers do not expose for native option popovers. */
+.themed-select {
+    position: relative;
+    display: block;
     min-width: 0;
-    height: 36px;
-    appearance: none;
-    -webkit-appearance: none;
-    padding: 0 34px 0 12px;
-    border: 1px solid var(--color-border);
+    height: 37px;
+}
+
+.themed-select--key-name {
+    width: 220px;
+}
+
+.themed-select__native {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 1px !important;
+    height: 1px !important;
+    min-width: 1px !important;
+    min-height: 1px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    appearance: none !important;
+    -webkit-appearance: none !important;
+}
+
+.themed-select__trigger {
+    position: relative;
+    display: flex;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+    min-height: 37px;
+    padding: 0 38px 0 12px;
+    border: 1px solid var(--color-border-strong);
     border-radius: 10px;
     color: var(--color-text);
-    background-color: rgba(255, 255, 255, 0.90);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%236E6E73' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-    background-position: right 10px center;
-    background-repeat: no-repeat;
+    background: rgba(255, 255, 255, 0.82);
     font-size: 13px;
+    line-height: 1.2;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     cursor: pointer;
-    transition: border-color var(--transition), background-color var(--transition), box-shadow var(--transition);
+    transition: border-color var(--transition), background-color var(--transition), box-shadow var(--transition), color var(--transition);
 }
 
-.select-styled:hover {
+.themed-select__label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.themed-select__trigger::after {
+    position: absolute;
+    top: 50%;
+    right: 14px;
+    width: 7px;
+    height: 7px;
+    border-right: 1.7px solid var(--color-primary);
+    border-bottom: 1.7px solid var(--color-primary);
+    content: "";
+    transform: translateY(-68%) rotate(45deg);
+    transition: transform var(--transition);
+}
+
+.themed-select__trigger:hover {
     border-color: var(--color-border-strong);
-    background-color: var(--color-surface-solid);
+    background: var(--color-surface-solid);
 }
 
-.select-styled:focus {
+.themed-select__trigger:focus-visible {
+    outline: 3px solid rgba(180, 95, 69, 0.30);
+    outline-offset: 2px;
+}
+
+.themed-select__trigger[aria-expanded="true"] {
     border-color: var(--color-primary);
-    outline: none;
+    background: var(--color-surface-solid);
     box-shadow: 0 0 0 4px rgba(180, 95, 69, 0.14);
+}
+
+.themed-select__trigger[aria-expanded="true"]::after {
+    transform: translateY(-25%) rotate(225deg);
+}
+
+.themed-select__trigger--placeholder {
+    color: var(--color-text-tertiary);
+}
+
+.themed-select__trigger:disabled {
+    opacity: 0.55;
+    color: var(--color-text-secondary);
+    background: var(--color-surface-sunken);
+    cursor: not-allowed;
+}
+
+.themed-select--invalid .themed-select__trigger {
+    border-color: var(--color-danger);
+}
+
+.themed-select__menu {
+    position: fixed;
+    z-index: 1200;
+    max-height: 320px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.78);
+    border-radius: 14px;
+    background: rgba(255, 253, 249, 0.96);
+    box-shadow: var(--shadow-md);
+    -webkit-backdrop-filter: blur(22px) saturate(135%);
+    backdrop-filter: blur(22px) saturate(135%);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-5px) scale(0.985);
+    transform-origin: top center;
+    transition: opacity 150ms var(--ease-standard), transform 180ms var(--ease-emphasized), visibility 0s linear 180ms;
+}
+
+.themed-select__menu[data-placement="top"] {
+    transform: translateY(5px) scale(0.985);
+    transform-origin: bottom center;
+}
+
+.themed-select__menu--open {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: none;
+    transition-delay: 0s;
+}
+
+.themed-select__option {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: 34px;
+    padding: 7px 10px;
+    border-radius: 9px;
+    color: var(--color-text);
+    background: transparent;
+    font-size: 13px;
+    line-height: 1.25;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    user-select: none;
+    cursor: pointer;
+    transition: color var(--transition), background-color var(--transition);
+}
+
+.themed-select__option:hover,
+.themed-select__option[data-highlighted="true"] {
+    color: var(--color-primary);
+    background: var(--color-primary-light);
+}
+
+.themed-select__option[aria-selected="true"] {
+    color: var(--color-primary-strong);
+    background: rgba(155, 78, 58, 0.10);
+    font-weight: 650;
+}
+
+.themed-select__option[aria-selected="true"][data-highlighted="true"] {
+    color: #ffffff;
+    background: var(--color-primary);
+}
+
+.themed-select__option[aria-disabled="true"] {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.themed-select__empty {
+    padding: 9px 10px;
+    color: var(--color-text-tertiary);
+    font-size: 13px;
 }
 
 #keyNameSelector {
@@ -1113,10 +1327,8 @@ code {
 
 .filter-bar input,
 .modal form input,
-.modal form select,
 .modal form textarea,
 .chart-card input,
-.chart-card select,
 .chart-card textarea,
 .input-number,
 .slot-row input[type="time"],
@@ -1138,19 +1350,15 @@ code {
 
 .filter-bar input:hover,
 .modal form input:hover,
-.modal form select:hover,
-.chart-card input:hover,
-.chart-card select:hover {
+.chart-card input:hover {
     border-color: rgba(59, 50, 44, 0.30);
     background: #ffffff;
 }
 
 .filter-bar input:focus,
 .modal form input:focus,
-.modal form select:focus,
 .modal form textarea:focus,
 .chart-card input:focus,
-.chart-card select:focus,
 .chart-card textarea:focus,
 .input-number:focus,
 .slot-row input:focus {
@@ -1217,6 +1425,15 @@ code {
     min-width: 0;
 }
 
+.map-row select {
+    flex: 1;
+}
+
+.map-row .themed-select,
+.agent-binding-row .themed-select {
+    flex: 1;
+}
+
 #keyList,
 #cloudKeyList,
 #aggMappings,
@@ -1245,7 +1462,11 @@ code {
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 20px;
+    --modal-gutter-top: max(20px, env(safe-area-inset-top, 0px));
+    --modal-gutter-right: max(20px, env(safe-area-inset-right, 0px));
+    --modal-gutter-bottom: max(20px, env(safe-area-inset-bottom, 0px));
+    --modal-gutter-left: max(20px, env(safe-area-inset-left, 0px));
+    padding: var(--modal-gutter-top) var(--modal-gutter-right) var(--modal-gutter-bottom) var(--modal-gutter-left);
     background: rgba(52, 42, 36, 0.36);
     -webkit-backdrop-filter: blur(16px) saturate(120%);
     backdrop-filter: blur(16px) saturate(120%);
@@ -1254,8 +1475,10 @@ code {
 
 .modal {
     width: min(100%, 540px);
-    max-height: calc(100dvh - 40px);
-    overflow-y: auto;
+    max-height: calc(100dvh - var(--modal-gutter-top) - var(--modal-gutter-bottom));
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
     padding: 26px;
     border: 1px solid rgba(255, 255, 255, 0.72);
     border-radius: var(--radius-xl);
@@ -1267,11 +1490,20 @@ code {
 }
 
 .modal__header {
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 14px;
     margin-bottom: 20px;
+}
+
+.modal__body {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .modal__header h3 {
@@ -1626,13 +1858,15 @@ code {
     }
 
     .modal-overlay {
-        align-items: flex-end;
-        padding: 10px;
+        align-items: center;
+        --modal-gutter-top: max(16px, env(safe-area-inset-top, 0px));
+        --modal-gutter-right: max(16px, env(safe-area-inset-right, 0px));
+        --modal-gutter-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+        --modal-gutter-left: max(16px, env(safe-area-inset-left, 0px));
     }
 
     .modal {
         width: 100%;
-        max-height: calc(100dvh - 20px);
         padding: 22px 18px 20px;
         border-radius: 22px;
     }
@@ -1667,7 +1901,8 @@ code {
         padding: 2px 7px 0;
     }
 
-    #keyNameSelector {
+    #keyNameSelector,
+    .themed-select--key-name {
         width: calc(100% - 86px);
         flex: 1 1 auto;
     }
@@ -1734,7 +1969,9 @@ code {
     .mobile-toolbar,
     .stat-card,
     .chart-card,
-    .modal {
+    .modal,
+    .themed-select__trigger,
+    .themed-select__menu {
         background: var(--color-surface-solid);
         -webkit-backdrop-filter: none;
         backdrop-filter: none;
@@ -1756,7 +1993,10 @@ code {
     .sidebar,
     .stat-card,
     .chart-card,
-    .mgmt-table {
+    .mgmt-table,
+    .themed-select__trigger,
+    .themed-select__menu {
         background: var(--color-surface-solid);
+        border-color: var(--color-border-strong);
     }
 }

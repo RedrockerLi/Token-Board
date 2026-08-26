@@ -57,9 +57,38 @@ function maskKey(key) {
     return key.length > 12 ? key.slice(0, 6) + '...' + key.slice(-4) : key.slice(0, 4) + '...';
 }
 
+function prepareModal(modal) {
+    // Page modules render their modal markup inside .page-container. That
+    // container has a transform-based entrance animation, which changes the
+    // containing block for position: fixed descendants. Keep every modal at
+    // the document root so its overlay is always relative to the viewport.
+    if (modal.parentElement !== document.body) {
+        document.body.appendChild(modal);
+    }
+
+    const dialog = modal.querySelector('.modal');
+    if (!dialog || dialog.dataset.layoutReady === 'true') return;
+
+    const header = Array.from(dialog.children).find((child) =>
+        child.classList.contains('modal__header')
+    );
+    const body = document.createElement('div');
+    body.className = 'modal__body';
+
+    if (header) {
+        while (header.nextSibling) body.appendChild(header.nextSibling);
+    } else {
+        while (dialog.firstChild) body.appendChild(dialog.firstChild);
+    }
+
+    dialog.appendChild(body);
+    dialog.dataset.layoutReady = 'true';
+}
+
 function openModal(id) {
     const modal = document.getElementById(id);
     if (!modal) return;
+    prepareModal(modal);
     modal.style.display = '';
     modal.setAttribute('aria-hidden', 'false');
     document.body.classList.add('modal-open');
@@ -71,7 +100,7 @@ function closeModal(id) {
         modal.style.display = 'none';
         modal.setAttribute('aria-hidden', 'true');
     }
-    if (!document.querySelector('.modal-overlay[style=""]:not([style*="display: none"])')) {
+    if (!document.querySelector('.modal-overlay[aria-hidden="false"]')) {
         document.body.classList.remove('modal-open');
     }
     if (id === 'keyModal') {
@@ -317,6 +346,7 @@ async function loadAccountsTable() {
             const uniqueMasks = [...new Set(keyEntries.map((key) => key.masked).filter(Boolean))];
             const keyCount = Number(a.key_count || uniqueMasks.length || 0);
             const firstMask = uniqueMasks[0] || '';
+            const pendingDeletion = isPendingAccountDeletion(a);
             return `
             <tr>
                 <td>${esc(a.name)}${a.deleted_at ? ` <span class="badge" style="color:#8F5C2D;background:#FBF1DF;border-color:#DFBF86;" title="到期删除：${esc(fmtLocal(a.deleted_at))}">到期 ${esc(fmtLocal(a.deleted_at).slice(0, 10))}</span>` : ''}</td>
@@ -330,6 +360,7 @@ async function loadAccountsTable() {
                 <td>${a.max_concurrency ? a.max_concurrency + ' 并发' : '无限制'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
+                    ${pendingDeletion ? `<button class="btn btn--sm" onclick="cancelAccountDeletion(${a.id})" title="恢复账户及尚未到期的上游密钥">取消删除</button>` : ''}
                     <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${esc(a.name)}')">更新模型</button>
                     ${typeSpec(a.account_type).holds_keys
                         ? (a.max_concurrency
@@ -342,6 +373,25 @@ async function loadAccountsTable() {
         }).join('');
     } catch (err) {
         tbody.innerHTML = `<tr><td colspan="8" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+    }
+}
+
+function isPendingAccountDeletion(account) {
+    if (!account || !account.deleted_at) return false;
+    const deadline = Date.parse(String(account.deleted_at));
+    return Number.isFinite(deadline) && deadline > Date.now();
+}
+
+async function cancelAccountDeletion(id) {
+    if (!confirm('确定取消该账户的到期删除吗？\n\n账户及尚未到期的上游密钥将恢复使用。')) return;
+    try {
+        await proxyApi(`/api/proxy/accounts/${id}/cancel-deletion`, { method: 'POST' });
+        ConfigSync.markDirty();
+        showToast('已取消账户删除，账户将继续使用');
+        loadAccountsTable();
+    } catch (err) {
+        showToast(err.message || '取消删除失败', 'error');
+        loadAccountsTable();
     }
 }
 
@@ -400,6 +450,8 @@ async function saveAccount(e) {
         resetKeyList();
         form.dataset.editId = '';
         document.getElementById('accountDeleteBtn').style.display = 'none';
+        const cancelDelBtn = document.getElementById('accountCancelDeleteBtn');
+        if (cancelDelBtn) cancelDelBtn.style.display = 'none';
         document.getElementById('accountModelBtn').style.display = 'none';
         document.getElementById('accountTestConcBtn').style.display = 'none';
         form.querySelector('[type=submit]').textContent = '添加账户';
@@ -443,6 +495,14 @@ async function editAccount(id) {
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';
+        const cancelDelBtn = document.getElementById('accountCancelDeleteBtn');
+        if (cancelDelBtn) {
+            cancelDelBtn.style.display = isPendingAccountDeletion(acc) ? '' : 'none';
+            cancelDelBtn.onclick = () => {
+                closeModal('accountModal');
+                cancelAccountDeletion(id);
+            };
+        }
         // Types without upstream keys have no real upstream → hide the model /
         // concurrency buttons (the key section is handled by type semantics).
         const holdsKeys = typeSpec(acc.account_type).holds_keys;
@@ -579,9 +639,11 @@ async function openAddAccountModal() {
     }
     resetKeyList();
     const delBtn = document.getElementById('accountDeleteBtn');
+    const cancelDelBtn = document.getElementById('accountCancelDeleteBtn');
     const modelBtn = document.getElementById('accountModelBtn');
     const testConcBtn = document.getElementById('accountTestConcBtn');
     if (delBtn) delBtn.style.display = 'none';
+    if (cancelDelBtn) cancelDelBtn.style.display = 'none';
     if (modelBtn) modelBtn.style.display = 'none';
     if (testConcBtn) testConcBtn.style.display = 'none';
     const submit = form && form.querySelector('[type=submit]');
@@ -658,6 +720,7 @@ function initAccountsPage() {
                         <button type="submit" class="btn btn--primary">添加账户</button>
                         <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
                         <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
+                        <button type="button" class="btn btn--sm" id="accountCancelDeleteBtn" style="display:none">取消删除</button>
                         <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:var(--color-danger);">删除账户</button>
                     </div>
                 </form>
@@ -908,8 +971,8 @@ function aggRow(pattern, accountId, accountName, upstreamModel) {
     return `<div class="map-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
         <input value="${esc(pattern||'')}" placeholder="模型名称" title="精确模型名；同一模型可配多行（多上游账户），按顺序依次使用" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
         <span style="color:var(--color-text-tertiary);">→</span>
-        <select class="agg-acct" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onchange="resetAggModel(this)">${accountOpts}</select>
-        <select class="agg-model" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;" onfocus="loadAggModels(this)"><option value="${esc(upstreamModel||'')}">${esc(upstreamModel||'点击获取模型')}</option></select>
+        <select class="agg-acct" onchange="resetAggModel(this)">${accountOpts}</select>
+        <select class="agg-model" onfocus="loadAggModels(this)"><option value="${esc(upstreamModel||'')}">${esc(upstreamModel||'点击获取模型')}</option></select>
         <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'up')" title="上移">▲</button>
         <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'down')" title="下移">▼</button>
         <button type="button" class="btn btn--sm" onclick="this.parentElement.remove()" style="color:var(--color-danger);">✕</button>

@@ -63,6 +63,18 @@ def delete_account(account_id):
                     "deferred": result.get("deferred", False)})
 
 
+@bp_proxy.route("/accounts/<int:account_id>/cancel-deletion", methods=["POST"])
+def cancel_account_deletion(account_id):
+    result = _proxy_db().cancel_account_deletion(account_id)
+    if not result["ok"]:
+        return api_error(result["error"] or "Account deletion is not pending", 409)
+    return jsonify({
+        "status": "ok",
+        "cancelled_at": result.get("cancelled_at"),
+        "restored_credentials": result.get("restored_credentials", 0),
+    })
+
+
 @bp_proxy.route("/accounts/<int:account_id>/cloud-keys", methods=["POST"])
 def confirm_cloud_key(account_id):
     """补填 cloud-only 密钥的明文：云端镜像里有、本机没有 → 写入 upstream_keys。

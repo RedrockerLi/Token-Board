@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import datetime, timezone
+from unittest.mock import patch
 
 from app import create_app
 from app.db.dashboard_db import DashboardDatabase
@@ -192,6 +194,35 @@ class AppContractTest(AppDatabaseTestCase):
             ).fetchall()
             self.assertEqual(len(credentials), 2)
             self.assertEqual(len({row[0] for row in credentials}), 2)
+
+    def test_pending_account_deletion_can_be_cancelled_over_http(self) -> None:
+        database = self.proxy_database()
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_settings(key,value) VALUES(?,?)",
+                ("billing.cancellation_mode", "end_of_period"),
+            )
+            conn.commit()
+        account_id = database.create_account({
+            "name": "http-restorable-plan", "account_type": "plan",
+            "valid_from": "2026-08-01", "monthly_price": 20,
+            "base_url": "http://example.test", "upstream_keys": ["sk-http-restore"],
+            "new_valid_froms": ["2026-08-01"],
+        })
+        fixed_now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        with patch("app.db.proxy.lifecycle.utc_now", return_value=fixed_now):
+            self.assertTrue(database.delete_account(account_id)["deferred"])
+            app = create_app(str(self.proxy_path), testing=True,
+                             start_background_tasks=False)
+            response = app.test_client().post(
+                f"/api/proxy/accounts/{account_id}/cancel-deletion")
+
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertEqual(response.get_json()["status"], "ok")
+        self.assertEqual(response.get_json()["restored_credentials"], 1)
+        restored = next(row for row in database.get_accounts()
+                        if row["id"] == account_id)
+        self.assertIsNone(restored.get("deleted_at"))
 
     def test_agent_subscription_has_no_public_lifecycle_status(self) -> None:
         database = self.proxy_database()

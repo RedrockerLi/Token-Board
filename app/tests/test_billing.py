@@ -287,6 +287,71 @@ class BillingTest(AppDatabaseTestCase):
             self.assertEqual(expiries[first], "2026-08-31T23:59:59Z")
             self.assertEqual(expiries[second], "2026-09-14T23:59:59Z")
 
+    def test_pending_account_deletion_can_be_cancelled(self) -> None:
+        db = self.proxy_database()
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_settings(key,value) VALUES(?,?)",
+                ("billing.cancellation_mode", "end_of_period"),
+            )
+            conn.commit()
+        account_id = db.create_account({
+            "name": "restorable-plan", "account_type": "plan",
+            "valid_from": "2026-08-01", "monthly_price": 20,
+            "base_url": "http://example.test", "upstream_keys": ["sk-restore"],
+            "new_valid_froms": ["2026-08-01"],
+        })
+        fixed_now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        with patch("app.db.proxy.lifecycle.utc_now", return_value=fixed_now):
+            deleted = db.delete_account(account_id)
+            self.assertTrue(deleted["deferred"], deleted)
+            self.assertEqual(deleted["effective_deleted_at"],
+                             "2026-08-31T23:59:59Z")
+
+            cancelled = db.cancel_account_deletion(account_id)
+
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertEqual(cancelled["restored_credentials"], 1)
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT lifecycle_state,deleted_at FROM accounts WHERE id=?",
+                (account_id,)).fetchone(), ("active", None))
+            self.assertIsNone(conn.execute(
+                "SELECT c.deleted_at FROM upstream_credentials c "
+                "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=?",
+                (account_id,)).fetchone()[0])
+            self.assertEqual(conn.execute(
+                "SELECT enabled FROM upstreams WHERE account_id=?",
+                (account_id,)).fetchone()[0], 1)
+        self.assertIn(account_id, [row["id"] for row in db.get_accounts()])
+
+    def test_expired_account_deletion_cannot_be_cancelled(self) -> None:
+        db = self.proxy_database()
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_settings(key,value) VALUES(?,?)",
+                ("billing.cancellation_mode", "end_of_period"),
+            )
+            conn.commit()
+        account_id = db.create_account({
+            "name": "expired-plan", "account_type": "plan",
+            "valid_from": "2026-08-01", "monthly_price": 20,
+            "base_url": "http://example.test", "upstream_keys": ["sk-expired"],
+        })
+        scheduled_at = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        expired_at = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+        with patch("app.db.proxy.lifecycle.utc_now", return_value=scheduled_at):
+            self.assertTrue(db.delete_account(account_id)["deferred"])
+        with patch("app.db.proxy.lifecycle.utc_now", return_value=expired_at):
+            cancelled = db.cancel_account_deletion(account_id)
+            self.assertFalse(cancelled["ok"], cancelled)
+            self.assertEqual(db.finalize_deferred_deletions(), 1)
+
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT lifecycle_state FROM accounts WHERE id=?",
+                (account_id,)).fetchone()[0], "deleted")
+
 
 if __name__ == "__main__":
     import unittest
