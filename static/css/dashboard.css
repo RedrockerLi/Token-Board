@@ -858,8 +858,12 @@ textarea:focus-visible {
 
 /* ── Summary cards ──────────────────────────────────────────────────────── */
 .stats-grid {
+    --stats-card-min-width: 180px;
+    --stats-columns: auto-fit;
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    /* The script chooses a column count that produces complete rows. The
+       auto-fit value remains a safe fallback before the first measurement. */
+    grid-template-columns: repeat(var(--stats-columns), minmax(min(100%, var(--stats-card-min-width)), 1fr));
     gap: 14px;
     margin-bottom: 42px;
 }
@@ -933,13 +937,18 @@ textarea:focus-visible {
     align-items: center;
     gap: 8px;
     min-height: 20px;
+    min-width: 0;
     margin-bottom: 13px;
-    overflow: hidden;
     color: var(--color-text-secondary);
     font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.005em;
-    text-overflow: ellipsis;
+    line-height: 1.35;
+    white-space: nowrap;
+}
+
+.stat-card__label-text {
+    min-width: 0;
     white-space: nowrap;
 }
 
@@ -953,22 +962,21 @@ textarea:focus-visible {
 }
 
 .stat-card__value {
-    overflow: hidden;
+    min-width: 0;
     color: var(--color-text);
     font-size: clamp(23px, 2.2vw, 33px);
     font-weight: 750;
     letter-spacing: -0.045em;
     line-height: 1.08;
-    text-overflow: ellipsis;
     white-space: nowrap;
 }
 
 .stat-card__sub {
     margin-top: 9px;
-    overflow: hidden;
+    min-width: 0;
     color: var(--color-text-tertiary);
     font-size: 11px;
-    text-overflow: ellipsis;
+    line-height: 1.35;
     white-space: nowrap;
 }
 
@@ -1636,10 +1644,6 @@ code {
         padding-right: clamp(22px, 3.4vw, 48px);
         padding-left: clamp(22px, 3.4vw, 48px);
     }
-
-    .stats-grid {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
 }
 
 @media (max-width: 900px) {
@@ -1811,7 +1815,6 @@ code {
     }
 
     .stats-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
         gap: 11px;
         margin-bottom: 34px;
     }
@@ -1895,10 +1898,6 @@ code {
 }
 
 @media (max-width: 460px) {
-    .stats-grid {
-        grid-template-columns: minmax(0, 1fr) !important;
-    }
-
     .page-header--row > .controls-group {
         align-items: stretch;
         flex-wrap: wrap;

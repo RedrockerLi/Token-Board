@@ -191,19 +191,19 @@ function initBillingPage() {
         </div>
 
         <!-- Stats Cards -->
-        <div class="stats-grid" style="grid-template-columns: repeat(3, 1fr);">
+        <div class="stats-grid">
             <div class="stat-card stat-card--highlight">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#B45F45;"></span> 近30天 Token</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#B45F45;"></span><span class="stat-card__label-text">近30天 Token</span></div>
                 <div class="stat-card__value number-lg" id="billTotalTokens">--</div>
                 <div class="stat-card__sub">滚动窗口</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#927CA6;"></span> 近30天请求数</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#927CA6;"></span><span class="stat-card__label-text">近30天请求数</span></div>
                 <div class="stat-card__value number-lg" id="billTotalRequests">--</div>
                 <div class="stat-card__sub">今日: <span id="billTodayRequests">--</span></div>
             </div>
             <div class="stat-card stat-card--cost">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#A75558;"></span> 近30天消费（实际）</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#A75558;"></span><span class="stat-card__label-text">近30天消费（实际）</span></div>
                 <div class="stat-card__value number-lg" id="billTotalCost">--</div>
                 <div class="stat-card__sub">今日消费（理论）: <span id="billTodayCost">--</span> · <span id="billActiveUpstreams">0</span> 个活跃上游</div>
             </div>

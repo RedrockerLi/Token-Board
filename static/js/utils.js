@@ -96,6 +96,83 @@ function fmtNum(n) {
     return n.toLocaleString('en-US');
 }
 
+// ── Responsive stat-card layout ───────────────────────────────────────────
+
+/**
+ * Keep every stat card the same size while avoiding incomplete rows.
+ *
+ * The largest column count that fits is not always the right choice: six
+ * cards in four columns would create a 4 + 2 layout. Prefer the largest
+ * divisor of the card count that fits, so the grid can render complete rows
+ * (6 → 3 + 3 in that case) without hardcoding a list of breakpoints.
+ */
+(function installStatsGridLayout() {
+    var scheduled = false;
+    var observedGrids = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
+
+    function gridCards(grid) {
+        return Array.prototype.filter.call(grid.children, function (child) {
+            return child.classList && child.classList.contains('stat-card');
+        });
+    }
+
+    function updateGrid(grid) {
+        var cards = gridCards(grid);
+        if (!cards.length || !grid.clientWidth) return;
+
+        var style = getComputedStyle(grid);
+        var gap = parseFloat(style.columnGap) || 0;
+        var minCardWidth = parseFloat(style.getPropertyValue('--stats-card-min-width')) || 180;
+        var maxColumns = Math.floor((grid.clientWidth + gap) / (minCardWidth + gap));
+        maxColumns = Math.max(1, Math.min(cards.length, maxColumns));
+
+        // A complete row keeps all cards equal-sized and uses the full grid.
+        var columns = maxColumns;
+        while (columns > 1 && cards.length % columns !== 0) columns--;
+        grid.style.setProperty('--stats-columns', String(columns));
+    }
+
+    function observeGrid(grid) {
+        if (observedGrids && observedGrids.has(grid)) {
+            updateGrid(grid);
+            return;
+        }
+        if (observedGrids) observedGrids.add(grid);
+        updateGrid(grid);
+
+        if (typeof ResizeObserver !== 'undefined') {
+            var resizeObserver = new ResizeObserver(function () {
+                schedule();
+            });
+            resizeObserver.observe(grid);
+        }
+    }
+
+    function refresh() {
+        document.querySelectorAll('.stats-grid').forEach(observeGrid);
+    }
+
+    function schedule() {
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(function () {
+            scheduled = false;
+            refresh();
+        });
+    }
+
+    refresh();
+    window.addEventListener('resize', schedule);
+
+    // Page modules insert their stat grids after the initial page load.
+    if (typeof MutationObserver !== 'undefined' && document.body) {
+        new MutationObserver(schedule).observe(document.body, {
+            childList: true,
+            subtree: true,
+        });
+    }
+})();
+
 // ── HTML escaping ───────────────────────────────────────────────────────────
 
 function esc(s) {

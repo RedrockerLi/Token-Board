@@ -31,24 +31,24 @@ function buildPerfPageHTML() {
         </div>
 
         <!-- Stat Cards -->
-        <div class="stats-grid" style="grid-template-columns:repeat(4, 1fr);">
+        <div class="stats-grid">
             <div class="stat-card stat-card--highlight">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#B45F45;"></span> 当前并发</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#B45F45;"></span><span class="stat-card__label-text">当前并发</span></div>
                 <div class="stat-card__value number-lg" id="perfConcurrent">--</div>
                 <div class="stat-card__sub">处理中的请求数</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#927CA6;"></span> 请求速率</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#927CA6;"></span><span class="stat-card__label-text">请求速率</span></div>
                 <div class="stat-card__value number-lg" id="perfRPM">--</div>
                 <div class="stat-card__sub">最近 1 分钟 (RPM)</div>
             </div>
             <div class="stat-card">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#6F8A5D;"></span> 成功率</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#6F8A5D;"></span><span class="stat-card__label-text">成功率</span></div>
                 <div class="stat-card__value number-lg" id="perfSuccessRate">--</div>
                 <div class="stat-card__sub">最近 15 分钟</div>
             </div>
             <div class="stat-card stat-card--cost">
-                <div class="stat-card__label"><span class="icon-dot" style="background:#C08B42;"></span> 平均 TTFT</div>
+                <div class="stat-card__label"><span class="icon-dot" style="background:#C08B42;"></span><span class="stat-card__label-text">平均 TTFT</span></div>
                 <div class="stat-card__value number-lg" id="perfAvgLatency">--</div>
                 <div class="stat-card__sub">最近 15 分钟 (可观测流式成功请求)</div>
             </div>
