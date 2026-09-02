@@ -230,8 +230,7 @@ function initSettingsPage() {
         <div class="section">
             <div class="chart-card">
                 <div class="chart-card__title" style="margin-bottom:12px;">Plan/智能体订阅计费</div>
-                <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
-                    <label style="align-self:center;">月费修改固定从下一计费周期生效</label>
+                <div style="display:grid; grid-template-columns:1fr; gap:12px;">
                     <label>删除订阅类账户的默认操作
                         <select id="billingCancellationMode">
                             <option value="immediate">本期立即删除（本期计费）</option>
