@@ -19,7 +19,8 @@ class ContractAssetTest(unittest.TestCase):
     def test_route_status_matrix_is_explicit(self):
         self.assertEqual(status_for("dashboard_delete", {"status": "not_found"}), 404)
         self.assertEqual(status_for("dashboard_delete", {"status": "conflict"}), 409)
-        self.assertEqual(status_for("config_upload", {"status": "remote_updated"}), 200)
+        self.assertEqual(status_for("config_upload", {"status": "rolled_back"}), 502)
+        self.assertEqual(status_for("config_upload", {"status": "read_only"}), 423)
         self.assertTrue(ROUTE_CONTRACTS["config_test"].force_json)
         self.assertTrue(ROUTE_CONTRACTS["dashboard_delete"].silent_json)
         for contract in ROUTE_CONTRACTS.values():

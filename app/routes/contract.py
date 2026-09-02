@@ -56,14 +56,14 @@ ROUTE_CONTRACTS = {
         }, json_mode="force"),
     "config_upload": RouteContract(
         "config_upload", "/api/proxy/sync/config/upload", ("POST",),
-        {"ok": 200, "unconfigured": 200, "remote_updated": 200,
-         "conflict": 200, "error": 200},
+        {"ok": 200, "unconfigured": 200, "rolled_back": 502,
+         "error": 500, "read_only": 423},
         response_shapes={
             "ok": ("status", "message"),
-            "unconfigured": ("status", "message", "conflict"),
-            "remote_updated": ("status", "message", "conflict"),
-            "conflict": ("status", "message", "conflict"),
-            "error": ("status", "message", "conflict"),
+            "unconfigured": ("status", "message"),
+            "rolled_back": ("status", "message"),
+            "error": ("status", "message"),
+            "read_only": ("status", "state", "message"),
         }),
     "key_delete": RouteContract(
         "key_delete", "/api/proxy/keys/<int:key_id>", ("DELETE",),

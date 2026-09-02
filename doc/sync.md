@@ -43,17 +43,15 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 
 ## 配置同步
 
-配置同步采用云端权威镜像与冲突保护：
+配置同步采用“启动拉取、单编辑者、云端权威”模型：
 
-1. 看板启动时列出 `token-board_config_*.db`，拉取最新文件，通过
-   `app.db.schema_upgrade.upgrade_downloaded_artifact` 在 shadow 中完成 SQL 和
-   transition，再合入本机配置。
+1. 看板启动后立即开放用量查看，同时异步列出 `token-board_config_*.db`，拉取最新文件，通过 `app.db.schema_upgrade.upgrade_downloaded_artifact` 在 shadow 中完成 SQL 和 transition，再合入本机配置。拉取完成前配置 API 为只读。
 2. 管理页修改立即写入本机，代理可以立即使用；离开配置页时前端调用 `/api/proxy/sync/config/upload`。
-3. 上传前重新读取云端最新文件并比较 `config_hash`。如果其他机器已经修改，自动拉取云端配置并丢弃本机未同步的普通配置，提示用户重新设置并刷新页面；只有自动拉取失败时才显示重试/丢弃对话框。
-4. 上传副本保留普通配置和本地代理客户端密钥，删除运行时数据、导入游标、上游 API Key 明文与 WebDAV 密码。成功后记录 hash 和 `token-board_config_snapshot.db` 本地快照。
-5. 上传失败时可以重试；选择丢弃设置会从本地快照恢复配置，不需要网络。
+3. 配置上传只执行时间戳 artifact 的 WebDAV PUT；HTTP 2xx 即视为成功，不做 config hash/ETag 冲突检查，不做上传后 PROPFIND 确认。
+4. 上传副本保留普通配置和本地代理客户端密钥，删除运行时数据、导入游标、上游 API Key 明文与 WebDAV 密码。成功后推进 `token-board_config_snapshot.db` 本地权威快照。
+5. 上传失败立即恢复最近成功的权威快照，不创建或恢复 durable pending。旧版本遗留 pending 会在下一次拉取前清理。
 
-配置合并按稳定 UUID/upstream credential UUID 做 upsert。云端缺失的普通配置行会变成停用 tombstone；本机上游 API Key 和 WebDAV 密码始终保留，需要在每台机器本地填写。
+配置合并按稳定 UUID/upstream credential UUID 做 upsert。云端缺失的普通配置行会变成停用 tombstone；本机上游 API Key 和 WebDAV bootstrap 凭证始终保留，需要在每台机器本地填写。
 
 ## Dashboard 导出事务
 
@@ -74,4 +72,4 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 
 ## 运行时同步健康
 
-`sync_state.sync_health` 记录最近一次错误，性能 API 会把它反映为 degraded。WebDAV 未配置时配置上传不会报错，只返回 `unconfigured`；Dashboard 导出则提示未配置同步服务器。
+`sync_state.sync_health` 记录最近一次错误，性能 API 会把它反映为 degraded。配置会话状态由仪表板进程内维护，固定为 `syncing`、`writable`、`read_only`、`local_only`。WebDAV 未配置时配置上传只返回 `unconfigured`；Dashboard 导出仍按独立事务处理。Agent 导入、FX 和周期费用物化由 `token-maintenance` 服务负责。

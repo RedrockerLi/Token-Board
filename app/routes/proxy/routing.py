@@ -2,6 +2,7 @@
 
 from app.routes.proxy.common import (
     _proxy_db, api_error, bp_proxy, jsonify, request, require_json_object,
+    require_config_writable,
 )
 from app.routes.contract import status_for
 
@@ -19,6 +20,7 @@ def list_keys():
 
 
 @bp_proxy.route("/keys", methods=["POST"])
+@require_config_writable
 def create_key():
     data = require_json_object(force=True)
     if not data.get("account_id"):
@@ -31,6 +33,7 @@ def create_key():
 
 
 @bp_proxy.route("/keys/<int:key_id>", methods=["PUT"])
+@require_config_writable
 def update_key(key_id):
     data = require_json_object(force=True)
     ok = _proxy_db().update_key(key_id, data)
@@ -40,6 +43,7 @@ def update_key(key_id):
 
 
 @bp_proxy.route("/keys/<int:key_id>", methods=["DELETE"])
+@require_config_writable
 def delete_key(key_id):
     try:
         ok = _proxy_db().delete_key(key_id)
@@ -71,6 +75,7 @@ def list_aggregates():
 
 
 @bp_proxy.route("/aggregates", methods=["POST"])
+@require_config_writable
 def create_aggregate():
     data = require_json_object(force=True)
     if not data.get("name"):
@@ -86,6 +91,7 @@ def create_aggregate():
 
 
 @bp_proxy.route("/aggregates/<int:agg_id>", methods=["PUT"])
+@require_config_writable
 def update_aggregate(agg_id):
     data = require_json_object(force=True)
     err = _validate_aggregate_entries(data.get("entries"))
@@ -98,6 +104,7 @@ def update_aggregate(agg_id):
 
 
 @bp_proxy.route("/aggregates/<int:agg_id>", methods=["DELETE"])
+@require_config_writable
 def delete_aggregate(agg_id):
     ok = _proxy_db().delete_aggregate(agg_id)
     if not ok:

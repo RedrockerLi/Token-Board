@@ -2,7 +2,7 @@
 
 from app.routes.proxy.common import (
     _proxy_db, api_error, bp_proxy, current_app, jsonify, request,
-    require_json_object,
+    require_json_object, require_config_writable,
 )
 
 
@@ -16,6 +16,7 @@ def list_pricing():
 
 
 @bp_proxy.route("/pricing", methods=["POST"])
+@require_config_writable
 def create_pricing():
     data = require_json_object(force=True)
     if not data.get("model_pattern"):
@@ -28,6 +29,7 @@ def create_pricing():
 
 
 @bp_proxy.route("/pricing/<int:pricing_id>", methods=["PUT"])
+@require_config_writable
 def update_pricing(pricing_id):
     data = require_json_object(force=True)
     try:
@@ -40,6 +42,7 @@ def update_pricing(pricing_id):
 
 
 @bp_proxy.route("/pricing/<int:pricing_id>", methods=["DELETE"])
+@require_config_writable
 def delete_pricing(pricing_id):
     ok = _proxy_db().delete_pricing(pricing_id)
     if not ok:
@@ -48,6 +51,7 @@ def delete_pricing(pricing_id):
 
 
 @bp_proxy.route("/pricing/reorder", methods=["POST"])
+@require_config_writable
 def reorder_pricing():
     data = require_json_object(force=True)
     try:
@@ -68,6 +72,7 @@ def get_timeout_config():
 
 
 @bp_proxy.route("/timeout-config", methods=["PUT"])
+@require_config_writable
 def save_timeout_config():
     data = request.get_json(force=True)
     if not isinstance(data, dict):
@@ -90,6 +95,7 @@ def get_billing_config():
 
 
 @bp_proxy.route("/billing-config", methods=["PUT"])
+@require_config_writable
 def save_billing_config():
     try:
         _proxy_db().update_plan_billing_config(require_json_object(force=True))

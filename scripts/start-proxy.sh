@@ -35,19 +35,23 @@ fi
 
 # ── Functions ──
 
-ensure_schema() {
-    mkdir -p "$(dirname "$TOKEN_BOARD_DB")"
+verify_schema() {
     PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-        "$PYTHON_BIN" -m app.db.schema_upgrade.cli \
-        --token-board-db "$TOKEN_BOARD_DB" --dashboard-db "$DASHBOARD_DB" \
-        --schema-dir "$SCHEMA_DIR" --timezone "${TB_LEGACY_TIMEZONE:-Asia/Shanghai}"
+        "$PYTHON_BIN" -c '
+from app.db.schema_upgrade import verify_current_database
+import sys
+verify_current_database(sys.argv[1], "token-board", sys.argv[2])
+' "$TOKEN_BOARD_DB" "$SCHEMA_DIR" || {
+        echo "[ERROR] 数据库未处于当前 schema，请运行 bash start.sh --all" >&2
+        return 1
+    }
 }
 
 do_install() {
     echo -e "${CYAN}安装 Token Board 代理为 systemd 用户服务...${NC}"
     echo ""
 
-    ensure_schema
+    verify_schema
 
     mkdir -p "$(dirname "$SERVICE_FILE")"
 
@@ -61,7 +65,6 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$SCRIPT_DIR
 Environment=PYTHONPATH=$SCRIPT_DIR
-ExecStartPre=$PYTHON_BIN -m app.db.schema_upgrade.cli --token-board-db $TOKEN_BOARD_DB --dashboard-db $DASHBOARD_DB --schema-dir $SCHEMA_DIR --timezone ${TB_LEGACY_TIMEZONE:-Asia/Shanghai}
 ExecStart=$PROXY_BIN --db $TOKEN_BOARD_DB --schema-dir $SCHEMA_DIR --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
@@ -98,7 +101,7 @@ do_uninstall() {
 }
 
 do_start() {
-    ensure_schema
+    verify_schema
     echo -e "${CYAN}启动代理 (前台)...${NC}"
     echo "  端口: $PROXY_PORT"
     echo "  数据库: $TOKEN_BOARD_DB"
@@ -108,7 +111,7 @@ do_start() {
 }
 
 do_daemon() {
-    ensure_schema
+    verify_schema
     # Kill existing proxy
     EXISTING=$(pgrep -f "token_proxy" 2>/dev/null || true)
     if [ -n "$EXISTING" ]; then

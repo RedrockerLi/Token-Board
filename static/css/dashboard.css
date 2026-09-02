@@ -79,6 +79,23 @@ body.nav-open {
     overflow: hidden;
 }
 
+.config-sync-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 12px 24px 0;
+    padding: 10px 14px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-text-secondary);
+    background: var(--color-surface-solid);
+    font-size: 13px;
+}
+
+.config-sync-status--syncing { color: var(--color-warning); }
+.config-sync-status--read_only { color: var(--color-danger); }
+.config-sync-status--local_only { color: var(--color-text-secondary); }
+
 button,
 input,
 select,

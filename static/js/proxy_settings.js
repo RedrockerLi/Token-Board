@@ -135,17 +135,21 @@ async function loadSyncConfig() {
 
 async function saveSyncSettings(e) {
     e.preventDefault();
+    if (ConfigSync.dirty && !(await ConfigSync.flush())) return;
     const form = e.target;
     const data = Object.fromEntries(new FormData(form));
     try {
-        await proxyApi('/api/proxy/sync/config', {
+        const result = await proxyApi('/api/proxy/sync/config', {
             method: 'PUT',
             body: JSON.stringify(data),
         });
-        showToast('同步配置已保存');
+        showToast(result.message || '同步配置已保存');
+        ConfigSync.dirty = false;
         loadSyncConfig();  // re-mask the password
+        if (ConfigSync.refreshStatus) ConfigSync.refreshStatus();
     } catch (err) {
         showToast(err.message, 'error');
+        if (ConfigSync.refreshStatus) ConfigSync.refreshStatus();
     }
 }
 

@@ -5,6 +5,8 @@ and read-only billing/usage endpoints backed by the SQLite database
 shared with the C++ proxy.
 """
 
+from functools import wraps
+
 from flask import Blueprint, current_app, jsonify, request
 
 bp_proxy = Blueprint("proxy", __name__, url_prefix="/api/proxy")
@@ -34,6 +36,27 @@ def require_json_object(*, force: bool = False, silent: bool = False) -> dict:
     return data
 
 
+def config_session():
+    return current_app.config.get("CONFIG_SESSION")
+
+
+def require_config_writable(view):
+    """Reject synchronized-config mutations until the cloud baseline is ready."""
+    @wraps(view)
+    def guarded(*args, **kwargs):
+        session = config_session()
+        if session is not None and not session.is_writable():
+            status = session.status()
+            return jsonify({
+                "status": "read_only",
+                "state": status.state,
+                "message": status.message or "云端配置尚未就绪，当前设置为只读",
+            }), 423
+        return view(*args, **kwargs)
+    return guarded
+
+
 
 __all__ = ["bp_proxy", "current_app", "jsonify", "request", "_proxy_db",
-           "api_error", "require_json_object"]
+           "api_error", "require_json_object", "config_session",
+           "require_config_writable"]

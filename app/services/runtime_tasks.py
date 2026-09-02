@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -137,7 +138,12 @@ class AgentUsageImportWorker:
 
 
 def start_runtime_tasks(flask_app, proxy_db, token_board_db_path: str) -> None:
-    """Start server-owned import, FX, lifecycle and billing workers."""
+    """Compatibility helper for embedded/test apps.
+
+    Production uses ``maintenance.py`` plus ``start_dashboard_tasks``; this
+    all-in-one path is retained only for integrations that explicitly request
+    in-process background tasks.
+    """
     if flask_app.config.get("BACKGROUND_TASKS_STARTED"):
         return
     flask_app.config["BACKGROUND_TASKS_STARTED"] = True
@@ -187,8 +193,46 @@ def start_runtime_tasks(flask_app, proxy_db, token_board_db_path: str) -> None:
     importer.start()
 
 
+def start_dashboard_tasks(flask_app, proxy_db) -> None:
+    """Start only the config-mutating dashboard finalizer.
+
+    FX refresh, billing materialization, and agent import are owned by the
+    standalone token-maintenance service.  This worker is enabled by the
+    configuration session only after a cloud baseline is ready.
+    """
+    if flask_app.config.get("DASHBOARD_TASKS_STARTED"):
+        return
+    flask_app.config["DASHBOARD_TASKS_STARTED"] = True
+    health = flask_app.config.setdefault("BACKGROUND_TASK_HEALTH", {})
+    health_lock = flask_app.config.setdefault(
+        "BACKGROUND_TASK_HEALTH_LOCK", threading.Lock())
+    stop = threading.Event()
+    flask_app.config["DELETION_FINALIZER_STOP"] = stop
+    threads = flask_app.config.setdefault("DASHBOARD_TASK_THREADS", [])
+    thread = threading.Thread(
+        target=_periodic,
+        args=(stop, 60, "deletion-finalizer",
+              proxy_db.finalize_deferred_deletions, health, health_lock),
+        daemon=True,
+        name="deletion-finalizer",
+    )
+    threads.append(thread)
+    thread.start()
+
+
 def trigger_agent_usage_import(flask_app) -> bool:
-    """Wake the app-owned importer after a dashboard is opened."""
+    """Wake the standalone importer after a dashboard is opened."""
+    socket_path = flask_app.config.get("MAINTENANCE_SOCKET")
+    if socket_path:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+                client.settimeout(0.2)
+                client.sendto(b"IMPORT", socket_path)
+            return True
+        except (OSError, socket.timeout):
+            # Testing/embedded apps may intentionally retain the old worker;
+            # production has no fallback worker and returns False below.
+            pass
     worker = flask_app.config.get("AGENT_USAGE_IMPORT_WORKER")
     return bool(worker and worker.trigger())
 
@@ -211,3 +255,15 @@ def stop_runtime_tasks(flask_app, join_timeout: float = 2.0) -> None:
         thread.join(timeout=join_timeout)
         all_stopped = all_stopped and not thread.is_alive()
     flask_app.config["BACKGROUND_TASKS_STARTED"] = not all_stopped
+
+
+def stop_dashboard_tasks(flask_app, join_timeout: float = 2.0) -> None:
+    """Stop dashboard-owned workers without touching proxy maintenance."""
+    stop = flask_app.config.get("DELETION_FINALIZER_STOP")
+    if isinstance(stop, threading.Event):
+        stop.set()
+    all_stopped = True
+    for thread in flask_app.config.get("DASHBOARD_TASK_THREADS", []):
+        thread.join(timeout=join_timeout)
+        all_stopped = all_stopped and not thread.is_alive()
+    flask_app.config["DASHBOARD_TASKS_STARTED"] = not all_stopped

@@ -1,5 +1,9 @@
 """Functional proxy API route group."""
 
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
 from app.routes.proxy.common import bp_proxy, current_app, jsonify, request, _proxy_db
 
 @bp_proxy.route("/logs")
@@ -55,11 +59,31 @@ def perf_realtime():
     lock = current_app.config.get("BACKGROUND_TASK_HEALTH_LOCK")
     if lock:
         with lock:
-            payload["background_tasks"] = {
+            dashboard_tasks = {
                 name: dict(value) for name, value in health.items()
             }
     else:
-        payload["background_tasks"] = dict(health)
+        dashboard_tasks = dict(health)
+    maintenance_path = Path(_proxy_db().db_path).resolve().parent / \
+        "token-maintenance-health.json"
+    maintenance_tasks = {}
+    try:
+        document = json.loads(maintenance_path.read_text(encoding="utf-8"))
+        heartbeat = document.get("heartbeat_at")
+        stale = False
+        if heartbeat:
+            stamp = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+            stale = (datetime.now(timezone.utc) - stamp).total_seconds() > 120
+        maintenance_tasks = document.get("tasks") or {}
+        if stale:
+            for name, item in maintenance_tasks.items():
+                item = dict(item)
+                item["status"] = "degraded"
+                item.setdefault("last_error", "maintenance heartbeat stale")
+                maintenance_tasks[name] = item
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    payload["background_tasks"] = {**maintenance_tasks, **dashboard_tasks}
     payload["background_health"] = (
         "degraded" if payload.get("sync_health") not in {None, "ok", "unconfigured"}
         or any(item.get("status") == "degraded"

@@ -15,6 +15,7 @@ from app.services.sync.webdav import (
     ArtifactTransaction,
     RemoteArtifact,
     WebDAVConflict,
+    WebDAVError,
     WebDAVClient,
     publish_versioned_artifact,
 )
@@ -221,61 +222,43 @@ class SyncContractTest(unittest.TestCase):
         self.assertEqual(result, {"status": "ok"})
         self.assertEqual(once.call_count, 3)
 
-    def test_config_upload_retries_complete_transaction_after_upload_race(self) -> None:
-        with patch("app.services.sync.config_sync._sync_config_upload_once",
-                   side_effect=[WebDAVConflict("race-1"),
-                                WebDAVConflict("race-2"),
-                                {"status": "ok"}]) as once:
-            result = sync_config_upload("token-board.db")
-        self.assertEqual(result, {"status": "ok"})
-        self.assertEqual(once.call_count, 3)
+    def test_config_upload_uses_one_put_without_conflict_roundtrip(self) -> None:
+        temp, proxy, _ = self._repo_layout()
+        try:
+            self._webdav_mocks()
+            with patch("app.services.sync.config_sync.publish_config_artifact",
+                       return_value=RemoteArtifact(
+                           "token-board_config_20260824_120000.db")) as publish:
+                result = sync_config_upload(proxy)
+            self.assertEqual(result["status"], "ok", result)
+            publish.assert_called_once()
+        finally:
+            patch.stopall()
+            shutil.rmtree(temp, ignore_errors=True)
 
-    def test_config_upload_refreshes_cloud_on_hash_conflict(self) -> None:
-        conflict = {
-            "status": "conflict",
-            "message": "cloud changed",
-            "conflict": True,
-        }
-        with patch("app.services.sync.config_sync._sync_config_upload_once",
-                   return_value=conflict) as once, patch(
-                       "app.services.sync.config_sync.sync_config_download",
-                       return_value=True) as download:
-            result = sync_config_upload("token-board.db")
-
-        self.assertEqual(result["status"], "remote_updated")
-        self.assertEqual(result["message"],
-                         "云端配置已更新，本机修改已丢弃，请重新设置。")
-        once.assert_called_once_with("token-board.db", schema_dir=None)
-        download.assert_called_once_with("token-board.db", schema_dir=None)
-
-    def test_config_upload_keeps_recovery_conflict_when_refresh_fails(self) -> None:
-        conflict = {
-            "status": "conflict",
-            "message": "cloud changed",
-            "conflict": True,
-        }
-        with patch("app.services.sync.config_sync._sync_config_upload_once",
-                   return_value=conflict), patch(
-                       "app.services.sync.config_sync.sync_config_download",
-                       return_value=False) as download:
-            result = sync_config_upload("token-board.db")
-
-        self.assertEqual(result["status"], "conflict")
-        self.assertIn("自动拉取失败", result["message"])
-        download.assert_called_once_with("token-board.db", schema_dir=None)
-
-    def test_config_upload_refreshes_after_repeated_upload_race(self) -> None:
-        with patch("app.services.sync.config_sync._sync_config_upload_once",
-                   side_effect=[WebDAVConflict("race-1"),
-                                WebDAVConflict("race-2"),
-                                WebDAVConflict("race-3")]) as once, patch(
-                       "app.services.sync.config_sync.sync_config_download",
-                       return_value=True) as download:
-            result = sync_config_upload("token-board.db")
-
-        self.assertEqual(result["status"], "remote_updated")
-        self.assertEqual(once.call_count, 3)
-        download.assert_called_once_with("token-board.db", schema_dir=None)
+    def test_config_upload_failure_rolls_back_to_snapshot(self) -> None:
+        temp, proxy, _ = self._repo_layout()
+        try:
+            self._webdav_mocks()
+            from app.services.sync.snapshot import snapshot_config
+            snapshot_config(proxy)
+            with sqlite3.connect(proxy) as conn:
+                conn.execute("INSERT INTO accounts(id,uuid,name) VALUES(1,'a','base')")
+                conn.commit()
+            snapshot_config(proxy)
+            with sqlite3.connect(proxy) as conn:
+                conn.execute("UPDATE accounts SET name='changed' WHERE id=1")
+                conn.commit()
+            with patch("app.services.sync.config_sync.publish_config_artifact",
+                       side_effect=WebDAVError("put failed")):
+                result = sync_config_upload(proxy)
+            self.assertEqual(result["status"], "rolled_back", result)
+            with sqlite3.connect(proxy) as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT name FROM accounts WHERE id=1").fetchone()[0], "base")
+        finally:
+            patch.stopall()
+            shutil.rmtree(temp, ignore_errors=True)
 
     def _repo_layout(self) -> tuple[str, str, str]:
         """Temp dir laid out like the repo (schema/ + data/) so that
@@ -299,13 +282,16 @@ class SyncContractTest(unittest.TestCase):
         Uploads return a confirmed artifact so the rest of the workflow can
         exercise its local commit behavior without network I/O.
         """
-        for module in ("app.services.sync.config_sync",
-                       "app.services.sync.dashboard_sync"):
+        patch("app.services.sync.config_sync.publish_config_artifact",
+              return_value=RemoteArtifact(
+                  "token-board_config_20260824_120000.db",
+                  etag='"etag"')).start()
+        for module in ("app.services.sync.dashboard_sync",):
             patch(module + ".latest_artifact", return_value=None).start()
             patch(module + ".download_artifact", return_value=False).start()
             patch(module + ".publish_versioned_artifact",
                   return_value=RemoteArtifact(
-                      "token-board_config_20260824_120000.db",
+                      "dashboard_sync_20260824_120000.db",
                       etag='"etag"')).start()
             patch(module + ".publish_schema_manifest").start()
 
@@ -345,7 +331,7 @@ class SyncContractTest(unittest.TestCase):
 
             self._webdav_mocks()
 
-            def capture(config, path, base, remote_artifact):
+            def capture(config, path):
                 check = sqlite3.connect(path)
                 captured["secret_count"] = check.execute(
                     "SELECT count(*) FROM upstream_secrets").fetchone()[0]
@@ -357,7 +343,7 @@ class SyncContractTest(unittest.TestCase):
                 return RemoteArtifact("token-board_config_20260824_120000.db",
                                       etag='"etag"')
 
-            with patch("app.services.sync.config_sync.publish_versioned_artifact",
+            with patch("app.services.sync.config_sync.publish_config_artifact",
                        side_effect=capture):
                 result = sync_config_upload(proxy)
             self.assertEqual(result["status"], "ok", result)

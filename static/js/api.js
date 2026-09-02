@@ -55,7 +55,7 @@ class ResponseFormatError extends Error {
 }
 
 /**
- * @typedef {'ok'|'error'|'invalid'|'conflict'|'remote_updated'|'not_found'|'scheduled'} BusinessStatus
+ * @typedef {'ok'|'error'|'invalid'|'rolled_back'|'read_only'|'not_found'|'scheduled'} BusinessStatus
  * A 2xx response may still carry a business failure status.  It is returned
  * as data and is deliberately not converted into HttpError.
  */

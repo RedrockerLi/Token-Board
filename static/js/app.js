@@ -218,14 +218,15 @@ const PAGES = [
 const DEFAULT_HASH = '#/dashboard';
 
 // ── Config cloud sync (upload on leaving a settings page) ────────────────
-// Config edits apply to the local proxy DB immediately (so the proxy uses
-// them right away); the WHOLE config is pushed to the cloud as ONE
-// transaction when the user leaves a settings page. A failed upload shows a
-// retry/discard dialog — "discard" rolls the local config back to the last
-// committed snapshot (including this machine's upstream keys).
+// Config edits apply to the local proxy DB immediately. The whole config is
+// pushed once when leaving a settings page; failed PUTs are rolled back by the
+// server to the most recent cloud baseline.
 const ConfigSync = {
     dirty: false,
     uploading: false,
+    state: 'syncing',
+    message: null,
+    statusTimer: null,
     configPages: new Set([
         '#/proxy/accounts',
         '#/proxy/aggregates',
@@ -243,7 +244,38 @@ const ConfigSync = {
         this.dirty = false;
         return this.upload();
     },
+    async refreshStatus() {
+        try {
+            const data = await proxyApi('/api/proxy/sync/config/status');
+            const oldState = this.state;
+            this.state = data.state || 'read_only';
+            this.message = data.message || null;
+            applyConfigSyncState();
+            if (oldState !== this.state &&
+                (this.state === 'writable' || this.state === 'local_only')) {
+                if (this.state === 'writable') window.dispatchEvent(new Event('config-sync-ready'));
+                if (this.statusTimer) {
+                    clearInterval(this.statusTimer);
+                    this.statusTimer = null;
+                }
+            }
+            return data;
+        } catch (e) {
+            this.state = 'read_only';
+            this.message = e.message || '无法读取云端配置状态';
+            applyConfigSyncState();
+            return null;
+        }
+    },
+    startStatusPolling() {
+        this.refreshStatus();
+        if (!this.statusTimer) this.statusTimer = setInterval(() => this.refreshStatus(), 1000);
+    },
     async upload() {
+        if (this.state === 'syncing' || this.state === 'read_only') {
+            showToast(this.message || '云端配置尚未就绪', 'error');
+            return false;
+        }
         this.uploading = true;
         try {
             let data;
@@ -257,91 +289,90 @@ const ConfigSync = {
                 return true;
             }
             if (data.status === 'unconfigured') {
-                // No WebDAV server configured — nothing to sync (single-machine use).
                 return true;
             }
-            if (data.status === 'remote_updated') {
-                // The server has already replaced the local DB with the
-                // cloud-authoritative configuration.  The current page still
-                // contains the discarded values in memory, so reload before
-                // allowing the user to edit again.
-                ConfigSync.dirty = false;
-                showConfigSyncUpdatedNotice(
-                    data.message || '云端配置已更新，本机修改已丢弃，请重新设置。');
-                return true;
-            }
-            if (data.status === 'conflict') {
-                // Automatic refresh failed. Keep the recovery choices for a
-                // genuine sync failure: retry the refresh/upload or discard
-                // local changes using the last committed snapshot.
-                showConfigSyncDialog(
-                    data.message || '云端配置已更新，但自动拉取失败。');
+            if (data.status === 'rolled_back') {
+                showToast(data.message || '上传失败，已恢复云端设置', 'error');
+                window.dispatchEvent(new Event('config-sync-rolled-back'));
                 return false;
             }
-            showConfigSyncDialog(data.message || '配置上传失败');
+            if (data.status === 'read_only' || data.status === 'error') {
+                showToast(data.message || '配置上传失败', 'error');
+                this.refreshStatus();
+                return false;
+            }
+            showToast(data.message || '配置上传失败', 'error');
             return false;
         } finally {
             this.uploading = false;
         }
     },
-    async discard() {
-        try {
-            const d = await proxyApi('/api/proxy/sync/config/discard', { method: 'POST' });
-            if (d.status === 'ok') {
-                showToast('已丢弃未同步的设置，回滚到上次同步状态');
-                // Full reload: config pages guard re-init, so re-render the
-                // whole app to reflect the rolled-back config.
-                setTimeout(() => location.reload(), 400);
-            } else {
-                showToast(d.message || '回滚失败', 'error');
-            }
-        } catch (e) {
-            showToast('回滚失败: ' + e.message, 'error');
-        }
-    },
 };
 
-function showConfigSyncDialog(message) {
-    const msg = document.getElementById('configSyncMsg');
-    if (msg) msg.textContent = message;
-    openModal('configSyncModal');
-}
-
-let configSyncReloadTimer = null;
-
-function showConfigSyncUpdatedNotice(message) {
-    const msg = document.getElementById('configSyncUpdatedMsg');
-    if (msg) msg.textContent = message;
-    openModal('configSyncUpdatedModal');
-    if (configSyncReloadTimer) clearTimeout(configSyncReloadTimer);
-    configSyncReloadTimer = setTimeout(reloadAfterConfigSync, 1800);
-}
-
-function reloadAfterConfigSync() {
-    if (configSyncReloadTimer) {
-        clearTimeout(configSyncReloadTimer);
-        configSyncReloadTimer = null;
+function applyConfigSyncState() {
+    const banner = document.getElementById('configSyncStatusBar');
+    if (banner) {
+        const labels = {
+            syncing: '正在拉取云端配置，设置暂时只读…',
+            read_only: ConfigSync.message || '云端配置拉取失败，设置暂时只读。',
+            local_only: '未配置云端同步，当前使用本机设置。',
+            writable: '',
+        };
+        banner.textContent = labels[ConfigSync.state] || labels.read_only;
+        banner.querySelectorAll('button').forEach((button) => button.remove());
+        banner.style.display = ConfigSync.state === 'writable' ? 'none' : '';
+        banner.className = `config-sync-status config-sync-status--${ConfigSync.state}`;
+        if (ConfigSync.state === 'read_only') {
+            const retry = document.createElement('button');
+            retry.className = 'btn btn--sm';
+            retry.textContent = '重新拉取';
+            retry.onclick = () => {
+                proxyApi('/api/proxy/sync/config/pull', { method: 'POST' })
+                    .then(() => ConfigSync.startStatusPolling())
+                    .catch((e) => showToast(e.message, 'error'));
+            };
+            banner.appendChild(retry);
+        }
     }
-    closeModal('configSyncUpdatedModal');
-    window.location.reload();
+    const editable = ConfigSync.state === 'writable' || ConfigSync.state === 'local_only';
+    const containers = [
+        'page-proxy-accounts', 'page-proxy-aggregates', 'page-proxy-keys',
+        'page-settings-pricing', 'page-settings-general',
+        'page-agent-subscriptions', 'page-agent-software',
+    ];
+    containers.forEach((id) => {
+        const container = document.getElementById(id);
+        if (!container) return;
+        container.querySelectorAll('input,select,textarea,button').forEach((el) => {
+            const connectionControl = id === 'page-settings-general' &&
+                (el.id === 'btnTestSync' || el.id === 'btnSaveSync' ||
+                 el.closest('#syncConfigForm'));
+            el.disabled = connectionControl ? ConfigSync.state === 'syncing' : !editable;
+        });
+    });
 }
 
-function configSyncRetry() {
-    closeModal('configSyncModal');
-    ConfigSync.upload();
-}
-
-function configSyncDiscard() {
-    closeModal('configSyncModal');
-    ConfigSync.discard();
+function reloadCurrentConfigPage() {
+    if (!Router.currentPage || !ConfigSync.isConfigPage(Router.currentPage.hash)) return;
+    const container = document.getElementById(Router.currentPage.container);
+    if (container) delete container.dataset.initialized;
+    const hash = Router.currentPage.hash;
+    Router.currentPage = null;
+    Router.navigate(hash);
 }
 
 const Router = {
     currentPage: null,
     loadedModules: {},
+    navigation: Promise.resolve(),
 
     /** Navigate to a hash. Called on page load and hashchange. */
     navigate(hash) {
+        this.navigation = this.navigation.then(() => this._navigate(hash));
+        return this.navigation;
+    },
+
+    async _navigate(hash) {
         // Default
         if (!hash || hash === '#') {
             hash = DEFAULT_HASH;
@@ -349,14 +380,13 @@ const Router = {
 
         const page = PAGES.find((p) => p.hash === hash);
         if (!page) {
-            return this.navigate(DEFAULT_HASH);
+            return this._navigate(DEFAULT_HASH);
         }
 
-        // Leaving a settings page with pending edits → push the whole config
-        // to the cloud as one transaction (failure → retry/discard dialog).
+        // Leaving a settings page waits for one whole-config upload.
         if (this.currentPage && hash !== this.currentPage.hash
                 && ConfigSync.isConfigPage(this.currentPage.hash)) {
-            ConfigSync.flush();
+            if (!await ConfigSync.flush()) return;
         }
 
         // Destroy previous page if needed
@@ -384,6 +414,7 @@ const Router = {
         const loadAndInit = () => {
             const initFn = resolveFn(page.initFn);
             if (initFn) initFn();
+            applyConfigSyncState();
         };
 
         if (page.module && !this.loadedModules[page.module]) {
@@ -429,9 +460,10 @@ function resolveFn(nameOrFn) {
 document.addEventListener('DOMContentLoaded', () => {
     Sidebar.init();
 
-    // Opening the dashboard asks the server-owned importer for one extra
-    // pass.  The request returns immediately; the same serialized worker also
-    // handles startup and 30-minute imports, so multiple tabs are harmless.
+    ConfigSync.startStatusPolling();
+
+    // Opening the dashboard asks the standalone maintenance service for one
+    // extra pass. The request returns immediately and repeated wakes coalesce.
     proxyApi('/api/proxy/agent-usage/import', { method: 'POST' }).catch((error) => {
         console.warn('Failed to schedule agent usage import:', error);
     });
@@ -451,13 +483,19 @@ document.addEventListener('DOMContentLoaded', () => {
         Router.navigate(window.location.hash);
     });
 
-    // Best-effort upload when the tab is closed/reloaded while config edits
-    // are still pending — the SPA router only catches in-app navigation, so
-    // pagehide covers the cases the router can't (close tab, F5, external nav).
-    window.addEventListener('pagehide', () => {
-        if ((ConfigSync.dirty || ConfigSync.uploading) && navigator.sendBeacon) {
-            navigator.sendBeacon('/api/proxy/sync/config/upload');
+    window.addEventListener('beforeunload', (event) => {
+        if (ConfigSync.dirty || ConfigSync.uploading) {
+            event.preventDefault();
+            event.returnValue = '设置尚未同步，请先离开设置页完成上传。';
         }
+    });
+
+    window.addEventListener('config-sync-ready', () => {
+        reloadCurrentConfigPage();
+    });
+    window.addEventListener('config-sync-rolled-back', () => {
+        ConfigSync.dirty = false;
+        reloadCurrentConfigPage();
     });
 
     // Initial navigation

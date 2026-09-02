@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Compatibility entry point.  Dashboard startup is centralized in start.sh so
-# there can never be a second Flask process (and a second usage importer)
-# competing with the managed token-dashboard service.
+# Compatibility entry point. Dashboard startup is centralized in start.sh;
+# the dashboard is a foreground process and no longer has a systemd owner.
 set -Eeuo pipefail
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"

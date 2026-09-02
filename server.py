@@ -11,7 +11,7 @@ Usage: python3 server.py --port <PORT> [--token-board-db <PATH>] [--schema-dir <
 import argparse
 import signal
 
-from app import create_app
+from app import create_app, start_config_session
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI API Usage Dashboard Server")
@@ -53,14 +53,11 @@ if __name__ == "__main__":
         )
         app.config["DATA_STORE"].load()
         if args.token_board_db:
-            from app.services.runtime_tasks import start_runtime_tasks
-            start_runtime_tasks(app, app.config["TOKEN_BOARD_DB"], args.token_board_db)
+            start_config_session(app)
 
         print(f" * Starting on http://{args.host}:{args.port}")
         app.run(host=args.host, port=args.port, debug=False)
     finally:
         if app is not None:
-            from app.services.runtime_tasks import stop_runtime_tasks
-            # Leave enough time for SQLite's bounded busy timeout and an
-            # in-progress session parse to observe the stop event cleanly.
-            stop_runtime_tasks(app, join_timeout=10.0)
+            from app.services.runtime_tasks import stop_dashboard_tasks
+            stop_dashboard_tasks(app, join_timeout=10.0)

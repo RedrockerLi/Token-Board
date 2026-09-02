@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app.services.sync.settings import SyncConfig
 from app.services.sync.webdav import (
@@ -75,6 +76,27 @@ class WebDAVContractTest(unittest.TestCase):
             source.write_bytes(b"fixture")
             with self.assertRaises(WebDAVError):
                 transaction.publish_versioned_artifact(str(source), "config")
+
+    def test_config_publish_accepts_put_without_listing_confirmation(self):
+        from app.services.sync import webdav
+
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "artifact.db"
+            source.write_bytes(b"fixture")
+            calls = []
+
+            def put(config, path, remote_filename=None, **kwargs):
+                calls.append(remote_filename)
+
+            with patch.object(webdav, "upload_artifact", side_effect=put), \
+                    patch.object(webdav, "list_artifacts",
+                                 side_effect=AssertionError("must not list")):
+                result = webdav.publish_config_artifact(
+                    SyncConfig("https://dav.example", "sync", "u", "p"),
+                    str(source),
+                )
+            self.assertEqual(result.name, calls[0])
+            self.assertTrue(result.name.startswith("token-board_config_"))
 
     def test_retry_uses_a_fresh_artifact_name(self):
         class RetryClient(_MemoryClient):

@@ -126,6 +126,8 @@
             <span class="mobile-toolbar__context">控制台</span>
         </div>
 
+        <div id="configSyncStatusBar" class="config-sync-status" style="display:none" role="status"></div>
+
         <!-- ═══ Page: Dashboard (existing token board) ═══ -->
         <div class="page-container" id="page-dashboard" style="display:none;">
 
@@ -274,35 +276,6 @@
             <button class="modal__close" onclick="closeMoreUsersModal()">&times;</button>
         </div>
         <div id="moreUsersList" style="max-height:55vh;overflow-y:auto;padding:2px 0;"></div>
-    </div>
-</div>
-
-<!-- ═══ Modal: 配置上传失败 (retry / discard) ═══ -->
-<div class="modal-overlay" id="configSyncModal" style="display:none">
-    <div class="modal" style="max-width:440px;">
-        <div class="modal__header">
-            <h3>设置保存失败</h3>
-            <button class="modal__close" onclick="closeModal('configSyncModal')">&times;</button>
-        </div>
-        <div id="configSyncMsg" style="padding:10px 0; font-size:14px; line-height:1.7; color:var(--color-text-secondary);"></div>
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:10px;">
-            <button class="btn btn--sm" onclick="configSyncRetry()">重试上传</button>
-            <button class="btn btn--sm" style="color:var(--color-danger);" onclick="configSyncDiscard()">丢弃设置</button>
-        </div>
-    </div>
-</div>
-
-<!-- ═══ Modal: 云端配置已更新 ═══ -->
-<div class="modal-overlay" id="configSyncUpdatedModal" style="display:none">
-    <div class="modal" style="max-width:440px;">
-        <div class="modal__header">
-            <h3>配置已更新</h3>
-            <button class="modal__close" onclick="reloadAfterConfigSync()">&times;</button>
-        </div>
-        <div id="configSyncUpdatedMsg" style="padding:10px 0; font-size:14px; line-height:1.7; color:var(--color-text-secondary);"></div>
-        <div style="display:flex; justify-content:flex-end; margin-top:10px;">
-            <button class="btn btn--sm btn--primary" onclick="reloadAfterConfigSync()">重新设置</button>
-        </div>
     </div>
 </div>
 

@@ -2,7 +2,7 @@
 
 from app.routes.proxy.common import (
     _proxy_db, api_error, bp_proxy, current_app, jsonify, request,
-    require_json_object,
+    require_json_object, require_config_writable,
 )
 from app.routes.contract import status_for
 
@@ -26,6 +26,7 @@ def list_accounts():
 
 
 @bp_proxy.route("/accounts", methods=["POST"])
+@require_config_writable
 def create_account():
     data = require_json_object(force=True)
     if not data.get("name"):
@@ -39,6 +40,7 @@ def create_account():
 
 
 @bp_proxy.route("/accounts/<int:account_id>", methods=["PUT"])
+@require_config_writable
 def update_account(account_id):
     data = require_json_object(force=True)
     ok = _proxy_db().update_account(account_id, data)
@@ -48,6 +50,7 @@ def update_account(account_id):
 
 
 @bp_proxy.route("/accounts/<int:account_id>", methods=["DELETE"])
+@require_config_writable
 def delete_account(account_id):
     # mode: "detach" (default) = unbind keys (account_id → NULL); "cascade" = delete keys too.
     mode = request.args.get("mode", "detach")
@@ -64,6 +67,7 @@ def delete_account(account_id):
 
 
 @bp_proxy.route("/accounts/<int:account_id>/cancel-deletion", methods=["POST"])
+@require_config_writable
 def cancel_account_deletion(account_id):
     result = _proxy_db().cancel_account_deletion(account_id)
     if not result["ok"]:
@@ -76,6 +80,7 @@ def cancel_account_deletion(account_id):
 
 
 @bp_proxy.route("/accounts/<int:account_id>/cloud-keys", methods=["POST"])
+@require_config_writable
 def confirm_cloud_key(account_id):
     """补填 cloud-only 密钥的明文：云端镜像里有、本机没有 → 写入 upstream_keys。
 
@@ -96,6 +101,7 @@ def confirm_cloud_key(account_id):
 
 
 @bp_proxy.route("/accounts/<int:account_id>/models", methods=["POST"])
+@require_config_writable
 def update_account_models(account_id):
     """Fetch models from upstream and store them for this account."""
     db = _proxy_db()

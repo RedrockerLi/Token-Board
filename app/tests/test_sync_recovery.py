@@ -90,39 +90,26 @@ class SyncRecoveryTest(unittest.TestCase):
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
-    def test_config_pending_remote_deletion_republishes_before_snapshot_commit(self):
+    def test_config_pending_is_discarded_before_startup_pull(self):
         temp, proxy, _ = self._repo_layout()
         try:
             pending = config_sync._pending_config_path(proxy)
             shutil.copy2(proxy, pending)
             set_sync_state_many(proxy, {
                 "config_pending_path": pending,
-                "config_pending_remote_artifact":
-                    "token-board_config_20260825_010000.db",
+                "config_pending_remote_artifact": "old.db",
                 "config_pending_remote_etag": '"old"',
             })
             config = SyncConfig(
                 "https://dav.example/remote", "token-board-sync", "user", "pass")
-            replacement = RemoteArtifact(
-                "token-board_config_20260825_010001.db", etag='"new"')
-            with patch.object(config_sync, "find_artifact", return_value=None), \
-                    patch.object(config_sync, "latest_artifact", return_value=None), \
-                    patch.object(config_sync, "publish_versioned_artifact",
-                                 return_value=replacement) as publish, \
-                    patch.object(config_sync, "publish_schema_manifest"):
-                result = config_sync._recover_config_pending(
-                    proxy, config, str(Path(temp) / "schema"))
-                self.assertEqual(result["status"], "ok", result)
-                self.assertIsNone(config_sync._recover_config_pending(
-                    proxy, config, str(Path(temp) / "schema")))
+            with patch.object(config_sync, "latest_artifact", return_value=None):
+                result = config_sync.sync_config_pull(
+                    proxy, str(Path(temp) / "schema"), config=config)
 
-            publish.assert_called_once()
+            self.assertEqual(result["status"], "empty", result)
             self.assertFalse(os.path.exists(pending))
             self.assertIsNone(get_sync_state(proxy, "config_pending_path"))
-            self.assertEqual(get_sync_state(proxy, "remote_artifact"),
-                             replacement.name)
-            self.assertTrue((Path(temp) / "data" /
-                             "token-board_config_snapshot.db").exists())
+            self.assertIsNone(get_sync_state(proxy, "config_pending_remote_artifact"))
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 

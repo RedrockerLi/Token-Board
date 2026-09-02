@@ -49,7 +49,7 @@
 ### 智能体管理（统一 IR + 可扩展 adapter registry）
 
 - 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，可有多个 `agent_subscription_instances`，软件与订阅通过 `agent_subscription_bindings` 多对多绑定。
-- 用量来自**服务器内置导入**：[runtime_tasks.py](../app/services/runtime_tasks.py) 管理唯一 worker，在看板服务器启动时立即运行、每 30 分钟运行，浏览器打开看板时再异步唤醒；[agent_usage](../app/services/agent_usage/) 按 `agent_kind` 选择独立 adapter，把各来源归一为 Python Usage IR，再写成 `request_log` 行。`event_id` 幂等，`project` 与 `session_id` 只保存在本机。
+- 用量来自**token-maintenance 导入服务**：[maintenance.py](../maintenance.py) 管理唯一 worker，在维护服务启动时立即运行、每 30 分钟运行，浏览器打开看板时通过 Unix datagram socket 异步唤醒；[agent_usage](../app/services/agent_usage/) 按 `agent_kind` 选择独立 adapter，把各来源归一为 Python Usage IR，再写成 `request_log` 行。`event_id` 幂等，`project` 与 `session_id` 只保存在本机。
 - dashboard 的条目以软件/智能体为单位：理论消费来自导入用量，实际消费来自绑定订阅；未绑定时实际消费为 0，一个订阅绑定多个启用软件时按绑定软件数平分。没有绑定关系不会自动推断。
 
 ## 三、单上游多密钥

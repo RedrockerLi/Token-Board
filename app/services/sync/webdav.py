@@ -115,7 +115,10 @@ def list_artifacts(config, prefix: str) -> list[RemoteArtifact]:
         headers={"Depth": "1"},
     )
     if not resp.ok:
-        return []
+        if resp.status_code in (404, 409, 410):
+            return []
+        raise WebDAVError(
+            f"PROPFIND failed: HTTP {resp.status_code} — {resp.text[:200]}")
 
     # Keep this dependency-free. Each response block may expose href,
     # getetag and getlastmodified; missing properties remain None.
@@ -410,6 +413,22 @@ def publish_versioned_artifact(config: SyncConfig, src_path: str, base: str,
     return ArtifactTransaction(
         WebDAVClient(config), retry_count=1).publish_versioned_artifact(
             src_path, base, expected)
+
+
+def publish_config_artifact(config: SyncConfig, src_path: str,
+                            base: str = "token-board_config") -> RemoteArtifact:
+    """Publish a configuration artifact using PUT acknowledgement only.
+
+    Configuration sync intentionally has a simpler single-editor contract than
+    dashboard export.  Some WebDAV providers make a freshly uploaded file
+    invisible to directory PROPFIND for a short period; requiring an immediate
+    listing confirmation turns a successful PUT into a sticky local failure.
+    Dashboard publication continues to use ``publish_versioned_artifact`` and
+    its stronger confirmation protocol.
+    """
+    remote_name = _make_timestamped_name(base + ".db")
+    upload_artifact(config, src_path, remote_filename=remote_name)
+    return RemoteArtifact(remote_name)
 
 
 def test_connection(config: SyncConfig) -> str | None:

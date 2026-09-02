@@ -1,8 +1,8 @@
 # 总体架构
 
-Token Board 由两个独立进程组成，共享同一份版本化数据库 schema。C++17 代理负责转发与计费，Python/Flask 看板负责配置管理与用量可视化。代理写 `token-board.db`，看板管理它的配置并把聚合结果写进 `dashboard.db`。
+Token Board 由三个进程边界组成，共享同一份版本化数据库 schema。C++17 代理负责转发与计费，Python/Flask 看板负责配置管理与用量可视化，`token-maintenance` 负责本机运行时维护。代理写 `token-board.db`，看板管理它的配置并把聚合结果写进 `dashboard.db`。
 
-## 两个进程，一份 schema
+## 三个进程边界，一份 schema
 
 ```
                  ┌──────────────────────────────────────────┐
@@ -15,10 +15,16 @@ Token Board 由两个独立进程组成，共享同一份版本化数据库 sche
 
                  ┌──────────────────────────────────────────┐
                  │  server.py  (Python/Flask, 固定端口 5000) │
-                 │  配置 CRUD │ 看板 API │ Agent 导入 │ 同步  │
+                 │  配置 CRUD │ 看板 API │ 删除收尾 │ 同步  │
                  │        │          │          │       │   │
                  │        ▼          ▼          ▼       ▼   │
                  │   data/token-board.db  data/dashboard.db WebDAV│
+                 └──────────────────────────────────────────┘
+
+                 ┌──────────────────────────────────────────┐
+                 │ token-maintenance (Python, systemd)      │
+                 │ FX 预热 │ 账单物化 │ Agent 导入/唤醒       │
+                 │ health JSON + Unix datagram socket        │
                  └──────────────────────────────────────────┘
 ```
 
@@ -37,9 +43,10 @@ Dashboard V1.4；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原�
 
 ```
 ├── server.py               看板入口
-├── start.sh                默认安装 token-dashboard；--all 再启动代理
+├── start.sh                前台仪表板；--all 执行升级并重启后台服务
+├── maintenance.py          FX、账单物化和 Agent 导入维护服务
 ├── app/                    Flask 应用包
-│   ├── __init__.py         应用工厂与后台任务
+│   ├── __init__.py         应用工厂与配置会话启动
 │   ├── routes.py           数据看板蓝图(/、/api/*)
 │   ├── routes/proxy/        代理、账单、智能体与同步 API
 │   ├── db/proxy/            token-board.db 访问层
@@ -60,8 +67,7 @@ Dashboard V1.4；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原�
 
 ## 数据库升级边界
 
-服务启动前，`start.sh`、`scripts/start-proxy.sh` 和 systemd 的
-`ExecStartPre` 统一调用 `python3 -m app.db.schema_upgrade.cli`。这个边界负责
+只有 `start.sh --all` 调用 `python3 -m app.db.schema_upgrade.cli`。这个边界负责
 初始化数据库、执行同 Major SQL、识别 `schema/transitions/*/transition.json`、
 在双 shadow 上执行跨库数据转换、校验并发布 manifest。普通 V1 transition 会在
 两个数据库中写入相同的 `generation_id`；发布中断时，下一次 Python 启动会依据
@@ -78,7 +84,7 @@ Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查�
 
 看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。代理和智能体用量都按日×统一身份×模型批量导出到 Dashboard V1 的 `daily_usage`，订阅周期费用按绑定关系分摊到 `monthly_recurring_costs`，再以云端权威模型同步到 WebDAV。
 
-智能体用量由看板内的 importer worker 采集。服务器启动立即执行一次，之后每 1800 秒执行一次；前端页面加载时可异步唤醒同一个 worker。worker 串行扫描已登记的软件日志并写入 `token-board.db/request_log`，因此不会因定时任务和浏览器刷新并发扫描而重复计量。`project` 与 `session_id` 仅作为本机数据库字段保存。
+智能体用量由 `token-maintenance` 内的 importer worker 采集。服务启动立即执行一次，之后每 1800 秒执行一次；前端页面加载时通过 Unix datagram socket 异步唤醒同一个 worker。worker 串行扫描已登记的软件日志并写入 `token-board.db/request_log`，因此不会因定时任务和浏览器刷新并发扫描而重复计量。`project` 与 `session_id` 仅作为本机数据库字段保存。
 
 `dashboard.db` 是纯存档，V1 使用统一的 `accounts`、`daily_usage` 和 `monthly_recurring_costs`；`accounts.account_kind` 区分代理上游与智能体软件。它不保存价格表，也不承担重算配置价格的职责。
 

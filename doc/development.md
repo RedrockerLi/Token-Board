@@ -20,9 +20,9 @@ cd proxy
 ./build/token_proxy --db ../data/token-board.db --port 8800
 ```
 
-代理的手动启动也必须先通过 Python schema-upgrade 边界。`token_proxy` 的
-`--schema-dir` 仅为旧启动命令保留，C++ 不读取该目录、不创建数据库、不执行
-SQL；直接启动旧数据库会在 schema 校验阶段失败。
+数据库升级只在 `bash start.sh --all` 中执行。代理的手动启动和
+`token-maintenance` 都只做 current schema 验证；`--schema-dir` 仅为旧启动命令
+保留，C++ 不读取 SQL、不创建数据库、不执行升级，直接启动旧数据库会快速失败。
 
 Release 构建额外加 `-O3 -march=native -flto`。构建产物有两个:`token_proxy`(完整代理)和 `format_conv_test`(codec 自测,见下)。
 
@@ -56,16 +56,17 @@ python3 scripts/mock_upstream.py --port 9100
 
 | 脚本 | 用途 |
 |------|------|
-| `bash start.sh` | 一键:固定端口 5000 启动看板并安装 `token-dashboard` 开机自启服务;Agent 用量由同一进程在启动时、每 30 分钟以及浏览器打开时采集;`--all` 额外编译并起代理;`--no-browser` 不开浏览器 |
+| `bash start.sh` | 快速前台启动固定端口 5000 的看板；不迁移数据库、不重启后台服务；启动后异步拉取云端配置；`--no-browser` 不开浏览器 |
+| `bash start.sh --all` | 编译代理、升级两个数据库、安装/重启 `token-proxy` 与 `token-maintenance`，然后启动前台看板 |
 | `bash scripts/start-proxy.sh` | 代理:无参前台调试;`--daemon` 后台;`--install`/`--uninstall` 管理 systemd 用户服务 |
 | `bash scripts/start-dashboard.sh [--no-browser]` | 兼容入口，转发到统一的 `start.sh`（不再另起第二个看板进程） |
-| `bash scripts/status.sh` | 状态检查:代理二进制、systemd、8800 健康、看板服务与端口、数据库行数 |
+| `bash scripts/status.sh` | 状态检查:代理二进制、proxy/maintenance systemd、8800 健康、看板端口、数据库行数 |
 
 ## 数据写入
 
 用量数据来自代理转发和已注册智能体软件:消费报告页点「导出数据」触发 `sync_dashboard`(见 [sync.md](sync.md)),把 `request_log`
 按 日×账户/软件(id)×模型 增量聚合写进 `dashboard.db`(纯存档,写时固化的费用直接入库,改价不回溯)。
-Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由通用 importer 负责游标、幂等和写入 `request_log`；Codex 额外处理 `token_count` 累计量、fork replay 和 live/archive 会话目录。`project`、`session_id` 只写本机 proxy 请求日志,不作为 API 字段。
+Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由 `token-maintenance` 的通用 importer 负责游标、幂等和写入 `request_log`；仪表板打开时通过本地 socket 异步唤醒导入。`project`、`session_id` 只写本机 proxy 请求日志,不作为 API 字段。
 
 ## 前端
 

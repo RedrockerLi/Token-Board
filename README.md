@@ -17,19 +17,19 @@
 ## 快速开始
 
 ```bash
-# 启动仪表板并设置开机自启（同时启动 Agent 用量采集）
+# 快速启动前台仪表板（不迁移数据库、不重启后台服务）
 bash start.sh
 
-# 启动全部:额外编译并设置代理开机自启
+# 系统升级：编译代理、按需升级数据库、重启 proxy/maintenance 后启动仪表板
 bash start.sh --all
 
 # 不自动打开浏览器
 bash start.sh --no-browser
 ```
 
-浏览器会打开仪表板,通过左侧导航栏切换功能页面。端口约定:代理监听 **8800**,仪表板固定监听 **5000**（可用 `TB_DASHBOARD_PORT` 覆盖）,所以以后开机后直接访问 `http://localhost:5000` 即可。两个服务都默认只绑定 `127.0.0.1`(仅本机可访问)——仪表板持有全部密钥,代理是本机工具的本地端点;需跨机器直连时用反向代理鉴权/防火墙自行处理。
+浏览器会打开前台仪表板，通过左侧导航栏切换功能页面。仪表板固定监听 **5000**，代理监听 **8800**。仪表板不会开机自启；需要查看页面时运行 `bash start.sh`，按 Ctrl+C 关闭。`token-proxy` 与 `token-maintenance` 由 systemd 用户服务常驻。
 
-> 仪表板和代理的开机自启基于 systemd 用户服务。非 systemd 环境(如 macOS)时,`start.sh` 会回退为前台运行。
+> 旧的 `token-dashboard` 服务已单独禁用并移除。非 systemd 环境时，仪表板以前台方式运行。
 
 ## 配置 AI 工具
 
@@ -122,9 +122,9 @@ export OPENAI_API_KEY=<本地密钥>
 
 用量存档采用**追加模式**:每次导出上传生成带时间戳的文件,云端旧文件保留不删,拉取时自动取最新。**云端永远是最新版本**,每台机器的本地存档永远是云端的一个历史版本;上传失败自动回滚(本地与检查点不动)。
 
-配置同步是**云端权威镜像**:仪表板启动时从云端拉取配置合并(改名/编辑/删除跨机生效);在管理页改配置会立即写入本机(代理即时生效),退出设置界面时作为**一次事务**上传云端——上传前校验云端是否已被其他机器改过,若本地落后则自动拉取云端配置并丢弃本机未同步修改,提示用户重新设置并刷新页面;自动拉取失败时弹窗让用户选择**重试上传**或**丢弃设置**(回滚到上次同步快照)。
+配置同步是**云端权威镜像**：仪表板启动后异步拉取最新配置，拉取完成前设置为只读；管理页修改立即写入本机，离开设置页时整份配置上传。PUT 成功即视为成功；失败会立即恢复最近一次云端基线。单编辑者模型不做多机冲突检测。
 
-同步边界按数据性质划分: `token-board.db` 中普通配置和本地代理密钥会上传,上游 API Key 明文与 WebDAV 密码不上传;智能体订阅/软件配置会上传。本机生成的请求日志、导入游标、账单物化结果、汇率缓存、性能数据和在途请求不上传。dashboard 导出的聚合结果单独上传。配置云端文件统一使用 `token-board_config_YYYYMMDD_HHMMSS.db`;配置页退出时自动执行同步。机制详见 [doc/sync.md](doc/sync.md)。
+同步边界按数据性质划分：普通配置和本地代理客户端密钥上传；上游 API Key 明文、WebDAV bootstrap 凭证、请求日志、导入游标、账单物化结果、汇率缓存、性能数据和在途请求不上传。Dashboard 聚合结果走独立同步链路。配置云端文件使用 `token-board_config_YYYYMMDD_HHMMSS.db`，机制详见 [doc/sync.md](doc/sync.md)。
 
 ## 运维
 
@@ -156,25 +156,21 @@ cd proxy
 | `--host` | `127.0.0.1` | 绑定地址(默认仅本机可访问) |
 | `--log-level` | `info` | 日志级别 |
 
-数据库升级由 Python 统一负责。启动脚本会在代理或看板启动前调用
-`app.db.schema_upgrade.cli`；手动启动时也必须先执行该命令。升级规则、V1 配对
-transition、shadow 发布和失败恢复见
+数据库升级由 Python 统一负责，但只有 `bash start.sh --all` 会执行升级；普通
+`bash start.sh` 只做只读 schema 验证。升级规则、V1 配对 transition、shadow 发布和失败恢复见
 [doc/database-migrations.md](doc/database-migrations.md)。
 
 ### systemd 服务
 
-`start.sh` 默认安装并启用 `token-dashboard` 用户服务；这个 Python 进程同时运行网页服务器和 Agent 用量导入 worker。`start.sh --all` 再额外编译、安装并启用 `token-proxy`。单独管理:
+`start.sh` 只启动前台仪表板。`start.sh --all` 编译并升级后安装/重启 `token-proxy` 与 `token-maintenance` 用户服务。单独管理:
 
 ```bash
-systemctl --user status token-dashboard      # 仪表板 + 用量导入状态
-systemctl --user restart token-dashboard     # 重启（启动后立即导入一次）
-journalctl --user -u token-dashboard -f      # 网页与导入日志
-
-bash scripts/start-proxy.sh --install      # 安装为 systemd 用户服务
-bash scripts/start-proxy.sh --uninstall    # 移除服务
-systemctl --user status token-proxy        # 查看状态
-systemctl --user restart token-proxy       # 重启
-journalctl --user -u token-proxy -f        # 查看日志
+systemctl --user status token-maintenance   # FX、计费、Agent 导入
+systemctl --user restart token-maintenance
+systemctl --user status token-proxy         # 查看代理状态
+systemctl --user restart token-proxy
+journalctl --user -u token-maintenance -f
+journalctl --user -u token-proxy -f
 ```
 
 用户服务通常在登录后启动;若需无人值守(开机未登录也启动),可执行 `sudo loginctl enable-linger <用户>` 启用 linger。`start.sh` 会检测并提示,不会自行提权。
@@ -185,7 +181,7 @@ journalctl --user -u token-proxy -f        # 查看日志
 bash scripts/status.sh
 ```
 
-检查代理二进制、systemd 服务、8800 健康检查、仪表板服务与固定端口、数据库行数。
+检查代理二进制、proxy/maintenance 服务、8800 健康检查、前台仪表板端口和数据库行数。
 
 ### 数据目录
 
@@ -200,7 +196,7 @@ bash scripts/status.sh
 多账户聚合时,回退顺序是 冷却跳过 → 并发满跳过 → 429/5xx 回退。想固定走某个账户,就把它排在链最前,且只给这个模型配它。
 
 **智能体用量为什么没有出现?**
-确认“智能体管理 → 软件管理”中已启用对应的软件来源,并检查数据目录是否指向实际的 agent 数据目录。导入器在看板启动、每 30 分钟以及打开看板时运行；导入后的本机请求日志需要在消费报告中点击“导出数据”才会进入 dashboard 存档。订阅绑定需要在软件编辑页手动维护,不会自动推断。
+确认“智能体管理 → 软件管理”中已启用对应的软件来源,并检查数据目录是否指向实际的 agent 数据目录。导入器由 `token-maintenance` 在启动、每 30 分钟以及打开看板时异步运行；导入后的本机请求日志需要在消费报告中点击“导出数据”才会进入 dashboard 存档。订阅绑定需要在软件编辑页手动维护,不会自动推断。
 
 **为什么我的非流式请求总是走到 Deepseek API,而不走 plan?**
 这是上游限制,不是路由故障。部分 plan 上游(如 opencode.ai 的 zen/go)**只接受流式请求**——实测对非流式 `/v1/chat/completions` 一律返回 HTTP 500,对流式则正常。代理会把这类非流式请求自动回退到下一候选账户(通常是 Deepseek API),所以客户端能正常拿到结果,只是用不到便宜的 plan 额度。想让 plan 账户接管非流式流量,请在客户端把请求配成 `stream: true`(OpenCode/Cherry Studio 等默认已开;自建调用在请求体里加 `"stream": true` 即可)。

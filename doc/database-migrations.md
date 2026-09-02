@@ -6,7 +6,7 @@
 `app.db.schema_upgrade`。C++ 代理不会读取 SQL、创建数据库、执行迁移或运行
 数据转换；它只在打开数据库时校验 Python 已经准备好的 V1 schema。
 
-本地启动前由 Python 先执行：
+系统升级前由 Python 先执行（唯一入口是 `bash start.sh --all`）：
 
 ```bash
 PYTHONPATH=. python3 -m app.db.schema_upgrade.cli \
@@ -16,8 +16,8 @@ PYTHONPATH=. python3 -m app.db.schema_upgrade.cli \
   --timezone Asia/Shanghai
 ```
 
-`start.sh`、`scripts/start-proxy.sh` 和生成的 systemd unit 都把这个命令放在
-服务启动前。`app.db.proxy`、Dashboard writer 等运行时访问层只做只读版本校验；
+只有 `start.sh --all` 把这个命令放在服务重启前。普通 `start.sh`、
+`scripts/start-proxy.sh` 和生成的 systemd unit 都不执行迁移。`app.db.proxy`、Dashboard writer 等运行时访问层只做只读版本校验；
 如果数据库未准备好，会要求先执行上述 Python 边界。C++ 的 `--schema-dir`
 参数仍保留用于兼容旧启动器，但已废弃且会被忽略。
 

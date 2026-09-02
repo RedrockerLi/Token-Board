@@ -53,32 +53,33 @@ def create_app(token_board_db_path: str | None = None, host: str = "127.0.0.1",
         from app.db.proxy_db import ProxyDatabase  # noqa: E402
         from app.routes.proxy_routes import bp_proxy  # noqa: E402
 
-        # Direct server.py launches use the same unattended local upgrade
-        # boundary as start.sh.  The C++ proxy still opens only V1; this call
-        # completes the upgrade before ProxyDatabase creates its connection.
-        from app.db.schema_upgrade import ensure_local_databases  # noqa: E402
-        dash_db_path = str(Path(token_board_db_path).resolve().parent / "dashboard.db")
-        ensure_local_databases(
-            token_board_db_path, dash_db_path,
-            str(schema_root),
-            source_timezone="Asia/Shanghai",
-        )
-
         pdb = ProxyDatabase(token_board_db_path, schema_dir=str(schema_root))
         flask_app.config["TOKEN_BOARD_DB"] = pdb
         flask_app.register_blueprint(bp_proxy)
         print(f" * Proxy management enabled (DB: {token_board_db_path})")
 
-        # Pull latest config from cloud on startup. Tests use isolated V1
-        # fixtures and deliberately do not touch network state.
-        if not testing:
-            from app.services.sync.config_sync import sync_config_download  # noqa: E402
-            try:
-                if sync_config_download(
-                        token_board_db_path, schema_dir=str(schema_root)):
-                    print(" * Config synced from cloud")
-            except Exception:
-                flask_app.logger.exception("startup config sync failed")
+        # Schema upgrades are owned by ``start.sh --all``. Runtime facades
+        # verify the current schema only. The dashboard starts a lightweight,
+        # asynchronous cloud-config session after its DataStore is loaded.
+        from app.services.runtime_tasks import start_dashboard_tasks  # noqa: E402
+        from app.services.sync.config_session import ConfigSession  # noqa: E402
+
+        def start_finalizer() -> None:
+            if not testing:
+                start_dashboard_tasks(flask_app, pdb)
+
+        session = ConfigSession(
+            token_board_db_path,
+            schema_dir=str(schema_root),
+            on_writable=start_finalizer,
+        )
+        if testing:
+            session._set_state("local_only")
+        flask_app.config["CONFIG_SESSION"] = session
+        flask_app.config["MAINTENANCE_SOCKET"] = str(
+            Path(token_board_db_path).resolve().parent / "token-maintenance.sock")
+
+        dash_db_path = str(Path(token_board_db_path).resolve().parent / "dashboard.db")
 
         # Reconcile the local dashboard archive: mirror normalized accounts
         # (id → name) into dashboard.accounts and backfill any legacy
@@ -99,11 +100,25 @@ def create_app(token_board_db_path: str | None = None, host: str = "127.0.0.1",
         print(" * Dashboard access token required: /login (loopback bypassed "
               "only when not exposed)")
 
-    # Start threads only after every fallible application-construction step.
-    # server.py opts out here and starts them after the initial DataStore load,
-    # giving its try/finally ownership of the complete worker lifetime.
+    # Background maintenance is owned by token-maintenance.service. The
+    # dashboard only starts its configuration-gated deletion finalizer after
+    # the async cloud baseline has completed.
     if token_board_db_path and start_background_tasks:
-        from app.services.runtime_tasks import start_runtime_tasks  # noqa: E402
-        start_runtime_tasks(flask_app, pdb, token_board_db_path)
+        if testing:
+            # Test apps may still exercise the legacy in-process worker. The
+            # production server never takes this branch; maintenance.py owns
+            # those workers there.
+            from app.services.runtime_tasks import start_runtime_tasks
+            start_runtime_tasks(flask_app, pdb, token_board_db_path)
+        else:
+            start_config_session(flask_app)
 
     return flask_app
+
+
+def start_config_session(flask_app) -> None:
+    """Begin the production dashboard's asynchronous config pull."""
+    session = flask_app.config.get("CONFIG_SESSION")
+    if session is not None and not flask_app.config.get("CONFIG_SESSION_STARTED"):
+        flask_app.config["CONFIG_SESSION_STARTED"] = True
+        session.start()
