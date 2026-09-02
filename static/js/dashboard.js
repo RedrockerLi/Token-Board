@@ -93,10 +93,7 @@ function loadPendingDashboardUserDeletes() {
 }
 
 var pendingDashboardUserDeletes = new Set(loadPendingDashboardUserDeletes());
-var moreUsersDeleteRequests = new Set();
 var moreUsersClosePromise = null;
-var moreUsersDeleteChain = Promise.resolve();
-var moreUsersDeletePrepared = false;
 var moreUsersModalSessionOpen = false;
 
 function persistPendingDashboardUserDeletes() {
@@ -115,7 +112,9 @@ function populateKeyNameSelector(keyNames) {
     if (!keySel) return '';
     var prevKeyVal = keySel.value;
     keySel.innerHTML = '<option value="">总览 (所有用户)</option>';
-    allKeyNames = (keyNames || []).slice();
+    allKeyNames = (keyNames || []).filter(function (name) {
+        return !pendingDashboardUserDeletes.has(name);
+    });
     allKeyNames.slice(0, KEY_SELECTOR_TOP).forEach(function (name) {
         var opt = document.createElement('option');
         opt.value = name;
@@ -139,10 +138,13 @@ function populateKeyNameSelector(keyNames) {
 function renderMoreUsersList() {
     var list = document.getElementById('moreUsersList');
     if (!list) return;
-    if (!allKeyNames.length) {
+    var visibleNames = allKeyNames.filter(function (name) {
+        return !pendingDashboardUserDeletes.has(name);
+    });
+    if (!visibleNames.length) {
         list.innerHTML = '<div class="td-empty">暂无其他用户</div>';
     } else {
-        list.innerHTML = allKeyNames.map(function (name) {
+        list.innerHTML = visibleNames.map(function (name) {
             var active = (name === currentKeyName) ? ' more-user-row--active' : '';
             return '<div class="more-user-row' + active + '">' +
                 '<button type="button" class="btn btn--sm more-user-item" data-name="' +
@@ -157,7 +159,6 @@ function renderMoreUsersList() {
 function openMoreUsersModal() {
     if (!moreUsersModalSessionOpen) {
         moreUsersModalSessionOpen = true;
-        moreUsersDeletePrepared = false;
     }
     renderMoreUsersList();
     openModal('moreUsersModal');
@@ -174,34 +175,47 @@ async function closeMoreUsersModalImpl() {
     Array.from(controls).forEach(function (control) { control.disabled = true; });
 
     try {
-        var requests = Array.from(moreUsersDeleteRequests);
-        if (requests.length) await Promise.all(requests);
-
-        var names = Array.from(pendingDashboardUserDeletes);
+        var names = Array.from(pendingDashboardUserDeletes).sort();
         if (!names.length) {
             closeModal('moreUsersModal');
             moreUsersModalSessionOpen = false;
-            moreUsersDeletePrepared = false;
             return true;
         }
 
-        await uploadDashboardUserDeletions();
+        var result = await deleteDashboardUsers(names);
+        if (!result || result.status !== 'ok') {
+            throw new Error((result && result.message) || '删除失败');
+        }
         pendingDashboardUserDeletes.clear();
         persistPendingDashboardUserDeletes();
         closeModal('moreUsersModal');
         moreUsersModalSessionOpen = false;
-        moreUsersDeletePrepared = false;
         await refreshData();
         if (typeof showToast === 'function') {
-            showToast('已将 ' + names.length + ' 个用户的删除统一上传到云端');
+            var suffix = result.uploaded ? '并已上传到云端' : '并已保存到本机';
+            showToast('已删除 ' + result.deleted_names.length + ' 个用户' + suffix);
         }
         return true;
     } catch (err) {
+        if (err && err.name === 'HttpError' && err.status === 404) {
+            // Another machine may already have removed every queued name.
+            // The desired state is satisfied, so do not trap the user in a
+            // retry loop for a request that has no remaining work.
+            pendingDashboardUserDeletes.clear();
+            persistPendingDashboardUserDeletes();
+            closeModal('moreUsersModal');
+            moreUsersModalSessionOpen = false;
+            await refreshData();
+            if (typeof showToast === 'function') {
+                showToast('待删除用户已不存在');
+            }
+            return true;
+        }
         if (typeof showToast === 'function') {
-            showToast('删除结果上传失败：' + (err.message || '上传失败') +
-                '；删除仍保留在本机，关闭窗口可重试', 'error');
+            showToast('删除提交失败：' + (err.message || '操作失败') +
+                '；删除队列已保留，关闭窗口可重试', 'error');
         } else {
-            alert('删除结果上传失败：' + (err.message || '同步失败'));
+            alert('删除提交失败：' + (err.message || '操作失败'));
         }
         return false;
     } finally {
@@ -244,14 +258,11 @@ async function deleteMoreUser(name, button) {
         return;
     }
 
-    var shouldPrepare = !moreUsersDeletePrepared;
     var row = button && button.closest ? button.closest('.more-user-row') : null;
     var controls = row ? row.querySelectorAll('button') : [];
     Array.from(controls).forEach(function (control) { control.disabled = true; });
 
     try {
-        await deleteDashboardUserLocal(name, shouldPrepare);
-        if (shouldPrepare) moreUsersDeletePrepared = true;
         pendingDashboardUserDeletes.add(name);
         persistPendingDashboardUserDeletes();
         removeMoreUserFromList(name);
@@ -260,17 +271,13 @@ async function deleteMoreUser(name, button) {
             var keySel = document.getElementById('keyNameSelector');
             if (keySel) keySel.value = '';
         }
-        // The first delete also refreshes the dashboard that was pulled from
-        // cloud. Later deletes only update the local picker and avoid another
-        // round trip while the user is still choosing names.
-        if (shouldPrepare) await refreshData();
         if (typeof showToast === 'function') {
-            showToast('用户「' + name + '」已从看板移除');
+            showToast('已将用户「' + name + '」加入删除队列，关闭窗口后提交');
         }
     } catch (err) {
         Array.from(controls).forEach(function (control) { control.disabled = false; });
         if (typeof showToast === 'function') {
-            showToast('删除失败：' + (err.message || '操作失败'), 'error');
+            showToast('加入删除队列失败：' + (err.message || '操作失败'), 'error');
         } else {
             alert('删除失败：' + (err.message || '同步失败'));
         }
@@ -820,16 +827,7 @@ function bindDashboardEvents() {
         moreList.addEventListener('click', function (e) {
             var deleteBtn = e.target.closest ? e.target.closest('.more-user-delete') : null;
             if (deleteBtn) {
-                var request = moreUsersDeleteChain.then(function () {
-                    return deleteMoreUser(deleteBtn.dataset.name, deleteBtn);
-                });
-                moreUsersDeleteChain = request.catch(function () { });
-                moreUsersDeleteRequests.add(request);
-                request.then(function () {
-                    moreUsersDeleteRequests.delete(request);
-                }, function () {
-                    moreUsersDeleteRequests.delete(request);
-                });
+                deleteMoreUser(deleteBtn.dataset.name, deleteBtn);
                 return;
             }
             var btn = e.target.closest ? e.target.closest('.more-user-item') : null;

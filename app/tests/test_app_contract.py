@@ -14,6 +14,26 @@ from app.tests.support import AppDatabaseTestCase
 
 
 class AppContractTest(AppDatabaseTestCase):
+    def test_billing_config_uses_fixed_next_period_pricing(self) -> None:
+        app = create_app(str(self.proxy_path), testing=True,
+                         start_background_tasks=False)
+        client = app.test_client()
+        initial = client.get("/api/proxy/billing-config")
+        self.assertEqual(initial.status_code, 200)
+        self.assertNotIn("price_change_effective", initial.get_json())
+
+        saved = client.put("/api/proxy/billing-config", json={
+            "cancellation_mode": "immediate",
+        })
+        self.assertEqual(saved.status_code, 200)
+        self.assertNotIn("price_change_effective", saved.get_json())
+
+        rejected = client.put("/api/proxy/billing-config", json={
+            "price_change_effective": "current_period",
+            "cancellation_mode": "immediate",
+        })
+        self.assertEqual(rejected.status_code, 400)
+
     def test_public_facades_and_v1_http_contract(self) -> None:
         app = create_app(str(self.proxy_path), testing=True,
                          start_background_tasks=False)
@@ -41,7 +61,7 @@ class AppContractTest(AppDatabaseTestCase):
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT major,minor FROM schema_version WHERE id=1"
-            ).fetchone(), (1, 11))
+            ).fetchone(), (1, 12))
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM accounts WHERE id=?", (account_id,)
             ).fetchone()[0], 1)

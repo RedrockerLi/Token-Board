@@ -196,7 +196,9 @@ def rebuild_snapshot(proxy_path: Path) -> None:
     conn = sqlite_runtime.connect(temporary, "snapshot_restore")
     try:
         for table in ("request_attempts", "request_log",
-                      "billing_period_charges", "fx_rates"):
+                      "billing_period_charges",
+                      "agent_subscription_period_charges",
+                      "agent_subscription_charge_allocations", "fx_rates"):
             if table_exists(conn, table):
                 conn.execute(f"DELETE FROM {table}")
         conn.commit()

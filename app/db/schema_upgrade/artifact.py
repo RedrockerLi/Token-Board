@@ -14,7 +14,8 @@ def strip_runtime_artifact(path: Path, database_name: str) -> None:
         return
     runtime_tables = (
         "request_log", "request_attempts", "billing_period_charges",
-        "agent_subscription_period_charges", "agent_software_runtime",
+        "agent_subscription_period_charges", "agent_subscription_charge_allocations",
+        "agent_software_runtime",
         "fx_rates", "sync_state",
     )
     conn = sqlite_runtime.connect(path, "snapshot_restore")

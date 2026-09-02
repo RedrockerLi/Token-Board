@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sqlite3
+import threading
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from app.core import sqlite_runtime
 from app.db.schema_upgrade import upgrade_downloaded_artifact
@@ -13,6 +17,8 @@ from app.db.schema_upgrade.coordinator import inspect_version
 from app.db.migrations import schema_dir_for
 
 log = logging.getLogger(__name__)
+
+_DASHBOARD_TRANSACTION_LOCK = threading.RLock()
 from app.services.sync.webdav import (
     RemoteArtifact,
     WebDAVConflict,
@@ -66,13 +72,23 @@ _DASHBOARD_PENDING_KEYS = (
 )
 
 
+@dataclass(frozen=True)
+class PreparedDashboard:
+    """Durable candidate whose bytes and export boundary move together."""
+
+    path: Path
+    max_log_id: int
+    checksum: str
+    expected_remote: RemoteArtifact | None
+
+
 def _pending_dashboard_path(dash_db_path: str) -> str:
     """Return the durable sidecar used between remote and local commits."""
     path = Path(dash_db_path)
     return str(path.with_name(f".{path.stem}.pending{path.suffix}"))
-def _prepare_dashboard_pending(token_board_db_path: str, source_path: str,
-                               dash_db_path: str, max_id: int) -> str:
-    """Install a durable prepared export before any remote PUT is attempted."""
+def _prepare_pending(token_board_db_path: str, source_path: str,
+                     dash_db_path: str, max_id: int,
+                     expected_remote: RemoteArtifact | None) -> PreparedDashboard:
     pending_path = _pending_dashboard_path(dash_db_path)
     safe_copy_db(source_path, pending_path)
     set_sync_state_many(token_board_db_path, {
@@ -81,10 +97,51 @@ def _prepare_dashboard_pending(token_board_db_path: str, source_path: str,
         "dashboard_pending_remote_artifact": "",
         "dashboard_pending_remote_etag": "",
     })
-    return pending_path
+    return PreparedDashboard(
+        path=Path(pending_path),
+        max_log_id=max_id,
+        checksum=file_checksum(Path(pending_path)),
+        expected_remote=expected_remote,
+    )
+
+
+def _prepared_from_state(token_board_db_path: str) -> PreparedDashboard | None:
+    pending_path = get_sync_state(token_board_db_path, "dashboard_pending_path")
+    max_value = get_sync_state(
+        token_board_db_path, "dashboard_pending_export_max_id")
+    if not pending_path and not max_value:
+        return None
+    if not pending_path or not max_value:
+        raise RuntimeError("dashboard pending state is incomplete")
+    path = Path(pending_path)
+    if not path.exists():
+        raise FileNotFoundError(f"durable dashboard export is missing: {path}")
+    return PreparedDashboard(
+        path=path,
+        max_log_id=int(max_value),
+        checksum=file_checksum(path),
+        expected_remote=_stored_dashboard_artifact(token_board_db_path),
+    )
+
+
+def _discard_unpublished_dashboard_pending(token_board_db_path: str) -> None:
+    """Discard only a candidate that has not been confirmed by WebDAV."""
+    if not Path(token_board_db_path).exists():
+        return
+    try:
+        pending_name = get_sync_state(
+            token_board_db_path, "dashboard_pending_remote_artifact")
+    except sqlite3.OperationalError:
+        return
+    if pending_name:
+        return
+    pending_path = get_sync_state(token_board_db_path, "dashboard_pending_path")
+    if pending_path:
+        Path(pending_path).unlink(missing_ok=True)
+    clear_sync_state_many(token_board_db_path, _DASHBOARD_PENDING_KEYS)
 def _commit_dashboard_pending(token_board_db_path: str, dash_db_path: str,
                               pending_path: str, max_id: int,
-                              published: RemoteArtifact,
+                              published: RemoteArtifact | None,
                               schema_dir: str | None,
                               export_result: dict | None = None,
                               *, recovered: bool = False) -> dict:
@@ -102,16 +159,19 @@ def _commit_dashboard_pending(token_board_db_path: str, dash_db_path: str,
     # the source high-water mark.
     safe_copy_db(pending_path, dash_db_path)
     proxy_db.set_export_mark(max_id)
-    set_sync_state_many(token_board_db_path, {
-        "dashboard_remote_artifact": published.name,
-        "dashboard_remote_etag": published.etag or "",
-        "sync_health": "ok",
-    })
-    version = inspect_version(Path(dash_db_path), "dashboard")
-    record_remote_metadata(
-        token_board_db_path, "dashboard", file_checksum(Path(dash_db_path)),
-        version.major if version else None,
-        version.minor if version else None)
+    state = {"sync_health": "ok"}
+    if published is not None:
+        state.update({
+            "dashboard_remote_artifact": published.name,
+            "dashboard_remote_etag": published.etag or "",
+        })
+    set_sync_state_many(token_board_db_path, state)
+    if published is not None:
+        version = inspect_version(Path(dash_db_path), "dashboard")
+        record_remote_metadata(
+            token_board_db_path, "dashboard", file_checksum(Path(dash_db_path)),
+            version.major if version else None,
+            version.minor if version else None)
     cleaned = proxy_db.cleanup_exported_logs(max_id)
     if cleaned > 0:
         log.info("cleaned archived request_log rows: count=%d", cleaned)
@@ -122,12 +182,15 @@ def _commit_dashboard_pending(token_board_db_path: str, dash_db_path: str,
     clear_sync_state_many(token_board_db_path, _DASHBOARD_PENDING_KEYS)
     upload_count = _count_dashboard_rows(dash_db_path)
     if export_result is None:
-        message = f"仪表板：上传 {upload_count} 条至云端"
+        message = (f"仪表板：上传 {upload_count} 条至云端" if published
+                   else f"仪表板：本地提交 {upload_count} 条")
         exported = 0
     else:
+        verb = "上传" if published is not None else "本地提交"
+        suffix = "至云端" if published is not None else ""
         message = (
             f"仪表板：导出 {export_result.get('record_count', 0)} 条，"
-            f"上传 {upload_count} 条至云端"
+            f"{verb} {upload_count} 条{suffix}"
         )
         exported = export_result.get("record_count", 0)
     return {
@@ -136,6 +199,7 @@ def _commit_dashboard_pending(token_board_db_path: str, dash_db_path: str,
         "dashboard_records": upload_count,
         "record_count": exported,
         "recovered": recovered,
+        "uploaded": published is not None,
     }
 def _recover_dashboard_pending(token_board_db_path: str,
                                dash_db_path: str,
@@ -237,8 +301,7 @@ def _download_dashboard_shadow(token_board_db_path: str, dash_db_path: str,
         "resolved_schema_dir": resolved_schema_dir,
     }
 def _export_dashboard(token_board_db_path: str, target_path: str,
-                      schema_dir: str | None,
-                      remember_cutoff: bool = False) -> dict:
+                      schema_dir: str | None) -> dict:
     """Export local request usage into a dashboard file without uploading."""
     from app.db.dashboard_db import DashboardDatabase
     from app.db.proxy_db import ProxyDatabase
@@ -257,12 +320,6 @@ def _export_dashboard(token_board_db_path: str, target_path: str,
     if purged > 0:
         log.info("purged zero-usage archive rows: count=%d", purged)
 
-    if remember_cutoff:
-        # Keep both the bytes and the exact export boundary until the
-        # separate upload succeeds; requests arriving after this point must
-        # not be skipped.
-        _prepare_dashboard_pending(
-            token_board_db_path, target_path, target_path, max_id)
     return {
         "status": "ok",
         "record_count": export_result.get("record_count", 0),
@@ -270,230 +327,255 @@ def _export_dashboard(token_board_db_path: str, target_path: str,
         "max_id": max_id,
         "resolved_schema_dir": resolved_schema_dir,
     }
-def _publish_dashboard(token_board_db_path: str, dash_db_path: str,
-                       config: SyncConfig, expected: RemoteArtifact | None,
-                       max_id: int, schema_dir: str | None,
-                       export_result: dict | None = None,
-                       local_target_path: str | None = None,
-                       pending_path: str | None = None) -> dict:
-    """Publish a durable prepared dashboard and then commit it locally."""
-    local_target_path = local_target_path or dash_db_path
-    pending_path = pending_path or _pending_dashboard_path(local_target_path)
+def _publish_prepared(token_board_db_path: str, dash_db_path: str,
+                      prepared: PreparedDashboard, config: SyncConfig,
+                      schema_dir: str | None,
+                      export_result: dict | None = None) -> dict:
+    """Publish and commit exactly the candidate described by ``prepared``."""
+    if file_checksum(prepared.path) != prepared.checksum:
+        raise RuntimeError("prepared dashboard changed before upload")
     published = publish_versioned_artifact(
-        config, dash_db_path, "dashboard_sync", expected)
-    # Record the confirmed remote identity before any later local operation;
-    # if the process dies now, recovery can determine whether the exact file
-    # still exists or must be republished.
+        config, str(prepared.path), "dashboard_sync",
+        prepared.expected_remote)
     set_sync_state_many(token_board_db_path, {
-        "dashboard_pending_path": pending_path,
-        "dashboard_pending_export_max_id": str(max_id),
+        "dashboard_pending_path": str(prepared.path),
+        "dashboard_pending_export_max_id": str(prepared.max_log_id),
         "dashboard_pending_remote_artifact": published.name,
         "dashboard_pending_remote_etag": published.etag or "",
     })
-    publish_schema_manifest(config, dash_db_path, "dashboard_sync")
+    publish_schema_manifest(config, str(prepared.path), "dashboard_sync")
     return _commit_dashboard_pending(
-        token_board_db_path, local_target_path, pending_path, max_id,
-        published, schema_dir, export_result)
+        token_board_db_path, dash_db_path, str(prepared.path),
+        prepared.max_log_id, published, schema_dir, export_result)
 
 
-def download_dashboard_from_cloud(token_board_db_path: str,
-                                  dash_db_path: str,
-                                  schema_dir: str | None = None) -> dict:
-    """Download the latest dashboard archive into the local database only."""
+def _recover_local_pending(token_board_db_path: str, dash_db_path: str,
+                           schema_dir: str | None) -> dict | None:
+    """Finish a local-only transaction without guessing remote state."""
+    try:
+        prepared = _prepared_from_state(token_board_db_path)
+    except Exception as exc:
+        _mark_sync_degraded(token_board_db_path, "dashboard recovery", exc)
+        return {"status": "error", "message": str(exc), "pending": True}
+    if prepared is None:
+        return None
+    remote_name = get_sync_state(
+        token_board_db_path, "dashboard_pending_remote_artifact")
+    if remote_name:
+        error = RuntimeError(
+            "dashboard pending upload requires the previous WebDAV configuration")
+        _mark_sync_degraded(token_board_db_path, "dashboard recovery", error)
+        return {"status": "error", "message": str(error), "pending": True}
+    return _commit_dashboard_pending(
+        token_board_db_path, dash_db_path, str(prepared.path),
+        prepared.max_log_id, None, schema_dir, recovered=True)
+
+
+def _build_dashboard_candidate(token_board_db_path: str, dash_db_path: str,
+                               candidate_path: str, config: SyncConfig | None,
+                               schema_dir: str | None) -> dict:
+    if config is not None:
+        return _download_dashboard_shadow(
+            token_board_db_path, dash_db_path, candidate_path,
+            schema_dir, config)
+    if not os.path.exists(dash_db_path):
+        return {"status": "error", "message": "本地 dashboard 存档不存在"}
+    safe_copy_db(dash_db_path, candidate_path)
+    return {
+        "status": "ok",
+        "shadow_path": candidate_path,
+        "remote_artifact": None,
+        "remote_pulled": False,
+        "resolved_schema_dir": schema_dir or schema_dir_for(
+            dash_db_path, "dashboard"),
+    }
+
+
+DashboardTransform = Callable[[str, str], dict]
+
+
+def _run_dashboard_transaction_once(
+        token_board_db_path: str, dash_db_path: str,
+        schema_dir: str | None = None,
+        transform: DashboardTransform | None = None) -> dict:
+    """Build, optionally transform, publish, and commit one archive."""
     project_root = Path(dash_db_path).resolve().parent
-    config = load_sync_config(token_board_db_path)
-    if not config:
-        return {"status": "error", "message": "未配置同步服务器"}
     tmp_dir = project_root / "tmp_dash"
     tmp_dir.mkdir(exist_ok=True)
+    config = load_sync_config(token_board_db_path)
 
     try:
-        recovered = _recover_dashboard_pending(
-            token_board_db_path, dash_db_path, config, schema_dir)
-        if recovered is not None:
-            recovered.setdefault("uploaded", recovered.get("status") == "ok")
+        if config is not None:
+            recovered = _recover_dashboard_pending(
+                token_board_db_path, dash_db_path, config, schema_dir)
+        else:
+            recovered = _recover_local_pending(
+                token_board_db_path, dash_db_path, schema_dir)
+        if recovered is not None and recovered.get("status") != "ok":
             return recovered
-        shadow_path = str(tmp_dir / "dash_download.db")
-        prepared = _download_dashboard_shadow(
-            token_board_db_path, dash_db_path, shadow_path, schema_dir, config)
-        if prepared.get("status") != "ok":
-            return prepared
-        safe_copy_db(shadow_path, dash_db_path)
-        remote_artifact = prepared.get("remote_artifact")
-        set_sync_state(
-            token_board_db_path, "dashboard_remote_artifact",
-            remote_artifact.name if remote_artifact else "")
-        set_sync_state(
-            token_board_db_path, "dashboard_remote_etag",
-            (remote_artifact.etag if remote_artifact and remote_artifact.etag else ""))
-        if remote_artifact:
-            remote_version = prepared.get("remote_version")
-            record_remote_metadata(
-                token_board_db_path, "dashboard", prepared["raw_sha256"],
-                remote_version.major if remote_version else None,
-                remote_version.minor if remote_version else None)
-        set_sync_state(token_board_db_path, "sync_health", "ok")
-        return {
-            "status": "ok",
-            "message": "已从云端下载 dashboard 存档",
-            "dashboard_records": _count_dashboard_rows(dash_db_path),
-            "remote_pulled": prepared["remote_pulled"],
-            "uploaded": False,
-        }
-    except WebDAVError as e:
-        _mark_sync_degraded(token_board_db_path, "dashboard download", e)
-        return {"status": "error", "message": f"WebDAV 错误: {e}"}
-    except Exception as e:
-        log.exception("dashboard download failed")
-        _mark_sync_degraded(token_board_db_path, "dashboard download", e)
-        return {"status": "error", "message": f"下载失败: {type(e).__name__}: {e}"}
+
+        candidate_path = str(tmp_dir / "dash_candidate.db")
+        candidate = _build_dashboard_candidate(
+            token_board_db_path, dash_db_path, candidate_path,
+            config, schema_dir)
+        if candidate.get("status") != "ok":
+            return candidate
+
+        from app.db.dashboard_db import reconcile_accounts
+        reconcile_accounts(candidate_path, token_board_db_path)
+        export_result = _export_dashboard(
+            token_board_db_path, candidate_path,
+            candidate["resolved_schema_dir"])
+
+        transform_result = (transform(candidate_path,
+                                      candidate["resolved_schema_dir"])
+                            if transform is not None else {"status": "ok"})
+        if transform_result.get("status") != "ok":
+            return transform_result
+
+        expected = candidate.get("remote_artifact")
+        if config is not None and expected is None:
+            expected = _stored_dashboard_artifact(token_board_db_path)
+            if expected is None:
+                expected = latest_artifact(config, "dashboard_sync")
+        prepared = _prepare_pending(
+            token_board_db_path, candidate_path, dash_db_path,
+            export_result["max_id"], expected)
+
+        if config is None:
+            result = _commit_dashboard_pending(
+                token_board_db_path, dash_db_path, str(prepared.path),
+                prepared.max_log_id, None, candidate["resolved_schema_dir"],
+                export_result)
+        else:
+            result = _publish_prepared(
+                token_board_db_path, dash_db_path, prepared, config,
+                candidate["resolved_schema_dir"], export_result)
+        result.update(transform_result)
+        result.update({
+            "remote_pulled": candidate.get("remote_pulled", False),
+            "uploaded": config is not None,
+        })
+        if transform_result.get("deleted_names"):
+            result["message"] = (
+                f"已删除 {len(transform_result['deleted_names'])} 个用户的看板数据")
+        return result
     finally:
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def export_dashboard_to_local(token_board_db_path: str, dash_db_path: str,
-                              schema_dir: str | None = None) -> dict:
-    """Export local request usage into ``dashboard.db`` without cloud I/O."""
-    try:
-        result = _export_dashboard(
-            token_board_db_path, dash_db_path, schema_dir,
-            remember_cutoff=True)
-        result["message"] = "已将本机最新用量导出到 dashboard"
-        result["uploaded"] = False
-        return result
-    except Exception as e:
-        log.exception("local dashboard export failed")
-        _mark_sync_degraded(token_board_db_path, "dashboard export", e)
-        return {"status": "error", "message": f"导出失败: {type(e).__name__}: {e}"}
+def _normalise_dashboard_user_names(names) -> list[str] | None:
+    if not isinstance(names, (list, tuple)) or any(
+            not isinstance(name, str) for name in names):
+        return None
+    cleaned = {name.strip() for name in names}
+    return sorted(name for name in cleaned if name)
 
 
-def upload_dashboard_to_cloud(token_board_db_path: str, dash_db_path: str,
-                              schema_dir: str | None = None) -> dict:
-    """Upload the current local dashboard file without downloading or exporting."""
-    config = load_sync_config(token_board_db_path)
-    if not config:
-        return {"status": "error", "message": "未配置同步服务器"}
-    if not os.path.exists(dash_db_path):
-        return {"status": "error", "message": "本地 dashboard 存档不存在"}
+def _delete_dashboard_users_transform(names: list[str]) -> DashboardTransform:
+    def transform(candidate_path: str, resolved_schema_dir: str) -> dict:
+        from app.db.dashboard_db import DashboardDatabase
+        dashboard = DashboardDatabase(candidate_path, resolved_schema_dir)
+        found: list[str] = []
+        missing: list[str] = []
+        account_ids: set[int] = set()
+        for name in names:
+            ids = dashboard.get_account_ids_by_name(name)
+            if ids:
+                found.append(name)
+                account_ids.update(ids)
+            else:
+                missing.append(name)
+        if not found:
+            return {
+                "status": "not_found",
+                "message": "未找到指定用户的看板数据",
+                "deleted_names": [],
+                "not_found_names": missing,
+                "deleted_rows": 0,
+            }
+        dashboard.exclude_accounts(account_ids)
+        deleted_rows = dashboard.purge_accounts(account_ids)
+        return {
+            "status": "ok",
+            "deleted_names": found,
+            "not_found_names": missing,
+            "deleted_rows": deleted_rows,
+        }
+    return transform
 
-    try:
-        resolved_schema_dir = schema_dir or schema_dir_for(
-            dash_db_path, "dashboard")
-        recovered = _recover_dashboard_pending(
-            token_board_db_path, dash_db_path, config, resolved_schema_dir)
-        if recovered is not None:
-            recovered.setdefault("uploaded", recovered.get("status") == "ok")
-            return recovered
-        pending = get_sync_state(
-            token_board_db_path, "dashboard_pending_export_max_id")
-        pending_path = get_sync_state(
-            token_board_db_path, "dashboard_pending_path")
-        proxy_mark = get_sync_state(
-            token_board_db_path, "last_exported_log_id")
-        max_id = int(pending) if pending not in (None, "") else int(proxy_mark or 0)
-        if not pending_path or not os.path.exists(pending_path):
-            pending_path = _prepare_dashboard_pending(
-                token_board_db_path, dash_db_path, dash_db_path, max_id)
-        expected = _stored_dashboard_artifact(token_board_db_path)
-        if expected is None:
-            expected = latest_artifact(config, "dashboard_sync")
-        result = _publish_dashboard(
-            token_board_db_path, pending_path, config, expected, max_id,
-            resolved_schema_dir, local_target_path=dash_db_path,
-            pending_path=pending_path)
-        result["uploaded"] = True
-        return result
-    except WebDAVConflict as e:
-        _mark_sync_degraded(token_board_db_path, "dashboard upload conflict", e)
-        return {"status": "conflict", "message": str(e)}
-    except WebDAVError as e:
-        _mark_sync_degraded(token_board_db_path, "dashboard upload", e)
-        return {"status": "error", "message": f"WebDAV 错误: {e}"}
-    except Exception as e:
-        log.exception("dashboard upload failed")
-        _mark_sync_degraded(token_board_db_path, "dashboard upload", e)
-        return {"status": "error", "message": f"上传失败: {type(e).__name__}: {e}"}
 
+def delete_dashboard_users(token_board_db_path: str, dash_db_path: str,
+                           names, schema_dir: str | None = None) -> dict:
+    """Atomically remove several user archives from the next committed copy."""
+    clean_names = _normalise_dashboard_user_names(names)
+    if not clean_names:
+        return {"status": "invalid", "message": "用户名称列表不能为空"}
+    last_error = None
+    with _DASHBOARD_TRANSACTION_LOCK:
+        for attempt in range(3):
+            try:
+                return _run_dashboard_transaction_once(
+                    token_board_db_path, dash_db_path, schema_dir,
+                    _delete_dashboard_users_transform(clean_names))
+            except WebDAVConflict as exc:
+                last_error = exc
+                log.warning("dashboard delete raced with remote update; retry %d/3",
+                            attempt + 1)
+                _discard_unpublished_dashboard_pending(token_board_db_path)
+            except WebDAVError as exc:
+                _mark_sync_degraded(token_board_db_path, "dashboard delete", exc)
+                return {"status": "error", "message": f"WebDAV 错误: {exc}"}
+            except Exception as exc:
+                log.exception("dashboard user delete failed")
+                _mark_sync_degraded(token_board_db_path, "dashboard delete", exc)
+                return {
+                    "status": "error",
+                    "message": f"删除失败: {type(exc).__name__}: {exc}",
+                }
+    return {"status": "conflict", "message": str(last_error)}
 
 def _sync_dashboard_once(token_board_db_path: str, dash_db_path: str,
                          schema_dir: str | None = None) -> dict:
-    """Run the normal pull → export → upload dashboard transaction."""
-    project_root = Path(dash_db_path).resolve().parent
-    tmp_dir = project_root / "tmp_dash"
-    tmp_dir.mkdir(exist_ok=True)
+    """Run the normal pull → export → commit transaction once.
 
+    With no WebDAV configuration the same candidate/commit pipeline is kept
+    local.  This preserves the export high-water mark semantics without
+    pretending that a remote upload happened.
+    """
     config = load_sync_config(token_board_db_path)
-    if not config:
-        return {"status": "error", "message": "未配置同步服务器"}
-
     try:
-        recovered = _recover_dashboard_pending(
-            token_board_db_path, dash_db_path, config, schema_dir)
-        if recovered is not None:
-            recovered.setdefault("remote_pulled", False)
-            recovered.setdefault("uploaded", recovered.get("status") == "ok")
-            return recovered
-        shadow_path = str(tmp_dir / "dash_shadow.db")
-        prepared = _download_dashboard_shadow(
-            token_board_db_path, dash_db_path, shadow_path, schema_dir, config)
-        if prepared.get("status") != "ok":
-            return prepared
-
-        from app.db.dashboard_db import reconcile_accounts
-        reconcile_accounts(shadow_path, token_board_db_path)
-        export_result = _export_dashboard(
-            token_board_db_path, shadow_path,
-            prepared["resolved_schema_dir"], remember_cutoff=False)
-        pending_path = _prepare_dashboard_pending(
-            token_board_db_path, shadow_path, dash_db_path,
-            export_result["max_id"])
-        result = _publish_dashboard(
-            token_board_db_path, pending_path, config,
-            prepared.get("remote_artifact"), export_result["max_id"],
-            prepared["resolved_schema_dir"], export_result,
-            local_target_path=dash_db_path, pending_path=pending_path)
-        result["remote_pulled"] = prepared["remote_pulled"]
-        result["uploaded"] = True
-        return result
+        return _run_dashboard_transaction_once(
+            token_board_db_path, dash_db_path, schema_dir)
     except WebDAVConflict:
         raise
-    except WebDAVError as e:
-        _mark_sync_degraded(token_board_db_path, "dashboard sync", e)
-        return {"status": "error", "message": f"WebDAV 错误: {e}"}
-    except Exception as e:
+    except WebDAVError as exc:
+        _mark_sync_degraded(token_board_db_path, "dashboard sync", exc)
+        return {"status": "error", "message": f"WebDAV 错误: {exc}"}
+    except Exception as exc:
         log.exception("dashboard sync failed")
-        _mark_sync_degraded(token_board_db_path, "dashboard sync", e)
-        return {"status": "error", "message": f"同步失败: {type(e).__name__}: {e}"}
-    finally:
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        _mark_sync_degraded(token_board_db_path, "dashboard sync", exc)
+        return {
+            "status": "error",
+            "message": f"同步失败: {type(exc).__name__}: {exc}",
+        }
 
 
 def sync_dashboard(token_board_db_path: str, dash_db_path: str,
                    schema_dir: str | None = None) -> dict:
     """Run the cloud archive transaction with bounded conflict retries."""
     last_error = None
-    for attempt in range(3):
-        try:
-            return _sync_dashboard_once(
-                token_board_db_path, dash_db_path, schema_dir=schema_dir)
-        except WebDAVConflict as exc:
-            last_error = exc
-            log.warning("dashboard upload raced with remote update; retry %d/3",
-                        attempt + 1)
+    with _DASHBOARD_TRANSACTION_LOCK:
+        for attempt in range(3):
+            try:
+                return _sync_dashboard_once(
+                    token_board_db_path, dash_db_path, schema_dir=schema_dir)
+            except WebDAVConflict as exc:
+                last_error = exc
+                log.warning("dashboard upload raced with remote update; retry %d/3",
+                            attempt + 1)
+                _discard_unpublished_dashboard_pending(token_board_db_path)
     if last_error is not None:
         _mark_sync_degraded(token_board_db_path, "dashboard sync conflict", last_error)
     return {"status": "conflict", "message": str(last_error)}
-
-
-def refresh_dashboard_from_cloud(token_board_db_path: str, dash_db_path: str,
-                                 schema_dir: str | None = None) -> dict:
-    """Compatibility wrapper for download + local export, without uploading."""
-    downloaded = download_dashboard_from_cloud(
-        token_board_db_path, dash_db_path, schema_dir=schema_dir)
-    if downloaded.get("status") != "ok":
-        return downloaded
-    exported = export_dashboard_to_local(
-        token_board_db_path, dash_db_path, schema_dir=schema_dir)
-    return {**downloaded, **exported, "uploaded": False}

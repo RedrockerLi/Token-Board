@@ -26,6 +26,8 @@ class ProxyAccountWriteMixin:
             effective_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             contract_start = (f"{start_date}T00:00:00Z"
                               if valid_from else effective_at)
+            rate_start = (contract_start if valid_from else
+                          f"{now.year:04d}-{now.month:02d}-01T00:00:00Z")
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,valid_from) VALUES(?,?,?,?)",
                 (shared_id, str(uuid.uuid4()), data["name"], start_date),
@@ -43,8 +45,8 @@ class ProxyAccountWriteMixin:
             if is_subscription(account_type):
                 conn.execute(
                     "INSERT INTO billing_rate_events"
-                    "(contract_id,recurring_price,effective_at,effective_rule) VALUES(?,?,?,'immediate')",
-                    (contract_id, float(data.get("monthly_price", 0) or 0), effective_at),
+                    "(contract_id,recurring_price,effective_at,effective_rule) VALUES(?,?,?,'next_period')",
+                    (contract_id, float(data.get("monthly_price", 0) or 0), rate_start),
                 )
             upstream_id = conn.execute(
                 "INSERT INTO upstreams"
@@ -81,6 +83,8 @@ class ProxyAccountWriteMixin:
 
     def _update_account_v1(self, conn: sqlite3.Connection, external_id: int,
                            data: dict) -> bool:
+        if "price_effective" in data:
+            raise ValueError("价格修改统一从下一计费周期生效")
         route = self._v1_route_account(conn, external_id)
         real_id = route["account_id"] if route and route["account_id"] is not None else external_id
         original = conn.execute(
@@ -173,13 +177,11 @@ class ProxyAccountWriteMixin:
                     new_valid_froms=data.get("new_valid_froms"), account_type=final_type)
         if is_subscription(final_type) and ("monthly_price" in data or
                                              original_type != final_type):
-            mode = data.get("price_effective") or self._billing_config_conn(conn)["price_change_effective"]
-            effective_rule = "next_period" if mode == "next_period" else "immediate"
             conn.execute(
                 "INSERT INTO billing_rate_events"
                 "(contract_id,recurring_price,effective_at,effective_rule) VALUES(?,?,?,?)",
                 (original["contract_id"], float(data.get("monthly_price") or 0),
-                 utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"), effective_rule),
+                 utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"), "next_period"),
             )
         conn.commit()
         return conn.total_changes > 0

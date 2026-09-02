@@ -247,9 +247,11 @@ class ProxyPerformanceMixin:
             ).fetchone()[0]
             billing_incomplete = conn.execute(
                 "SELECT COUNT(*) FROM billing_period_charges "
-                "WHERE finalized_at IS NULL "
-                "AND (normalized_recurring_cost IS NULL "
-                "OR (currency!='CNY' AND fx_rate_date!=date(period_start)))"
+                "WHERE finalized_at IS NULL"
+            ).fetchone()[0]
+            billing_incomplete += conn.execute(
+                "SELECT COUNT(*) FROM agent_subscription_period_charges "
+                "WHERE finalized_at IS NULL"
             ).fetchone()[0]
             sync_row = conn.execute(
                 "SELECT value FROM sync_state WHERE key='sync_health'"

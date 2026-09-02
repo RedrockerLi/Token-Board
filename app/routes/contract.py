@@ -35,21 +35,18 @@ class RouteContract:
 ROUTE_CONTRACTS = {
     "dashboard_delete": RouteContract(
         "dashboard_delete", "/api/proxy/dashboard/users", ("DELETE",),
-        {"ok": 200, "not_found": 404, "error": 400},
+        {"ok": 200, "invalid": 400, "not_found": 404,
+         "conflict": 409, "error": 502},
         response_shapes={
-            "ok": ("status", "message"),
-            "not_found": ("status", "message"),
-            "error": ("status", "message"),
-        },
-        messages={"error": "用户名称不能为空"}, json_mode="silent"),
-    "dashboard_upload": RouteContract(
-        "dashboard_upload", "/api/proxy/dashboard/users/upload", ("POST",),
-        {"ok": 200, "conflict": 409, "error": 502},
-        response_shapes={
-            "ok": ("status", "message"),
+            "ok": ("status", "message", "deleted_names", "not_found_names",
+                   "deleted_rows", "uploaded"),
+            "invalid": ("status", "message"),
+            "not_found": ("status", "message", "deleted_names",
+                           "not_found_names"),
             "conflict": ("status", "message"),
             "error": ("status", "message"),
-        }),
+        },
+        messages={"invalid": "用户名称列表不能为空"}, json_mode="silent"),
     "config_test": RouteContract(
         "config_test", "/api/proxy/sync/test", ("POST",),
         {"ok": 200, "error": 400},

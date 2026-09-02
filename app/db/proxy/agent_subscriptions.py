@@ -38,10 +38,7 @@ def _number(value: object, message: str) -> float:
 class ProxySubscriptionMixin:
     def _subscription_price_rule(self, conn: sqlite3.Connection,
                                  data: dict) -> str:
-        mode = data.get("price_effective")
-        if not mode:
-            mode = self._billing_config_conn(conn)["price_change_effective"]
-        return "next_period" if mode == "next_period" else "immediate"
+        return "next_period"
 
     def _subscription_end(self, conn: sqlite3.Connection,
                           valid_from: object, now: datetime) -> datetime:
@@ -258,6 +255,8 @@ class ProxySubscriptionMixin:
 
     def update_agent_subscription_instance(self, instance_id: int,
                                             data: dict) -> bool:
+        if "price_effective" in data:
+            raise ValueError("价格修改统一从下一计费周期生效")
         conn = self._connect()
         try:
             row = conn.execute(
@@ -304,6 +303,8 @@ class ProxySubscriptionMixin:
             conn.close()
 
     def update_agent_subscription(self, subscription_id: int, data: dict) -> bool:
+        if "price_effective" in data:
+            raise ValueError("价格修改统一从下一计费周期生效")
         conn = self._connect()
         try:
             current = conn.execute(

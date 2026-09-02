@@ -55,7 +55,7 @@ class ResponseFormatError extends Error {
 }
 
 /**
- * @typedef {'ok'|'error'|'conflict'|'remote_updated'|'not_found'|'scheduled'} BusinessStatus
+ * @typedef {'ok'|'error'|'invalid'|'conflict'|'remote_updated'|'not_found'|'scheduled'} BusinessStatus
  * A 2xx response may still carry a business failure status.  It is returned
  * as data and is deliberately not converted into HttpError.
  */
@@ -150,19 +150,11 @@ async function fetchRefresh() {
     return requestJSON('/api/refresh');
 }
 
-/** Delete one user's complete usage-dashboard archive on this machine only. */
-async function deleteDashboardUserLocal(name, prepare) {
+/** Delete several users in one complete dashboard archive transaction. */
+async function deleteDashboardUsers(names) {
     return proxyApi('/api/proxy/dashboard/users', {
         method: 'DELETE',
-        body: JSON.stringify({ name: name, prepare: !!prepare }),
-    });
-}
-
-/** Upload the already-modified local Dashboard archive to the cloud. */
-async function uploadDashboardUserDeletions() {
-    return proxyApi('/api/proxy/dashboard/users/upload', {
-        method: 'POST',
-        body: JSON.stringify({}),
+        body: JSON.stringify({ names: names }),
     });
 }
 

@@ -5,8 +5,7 @@ Covers the period_start-lock contract:
     (fx_rate_date == period_start afterwards; rate never re-fetched, even
     when later daily rates arrive or prices change);
   * missing historical rates are fetched on demand via ?date=period_start;
-  * fetch failure degrades to a provisional (unlocked) value that keeps
-    retrying and is never finalized until locked;
+  * fetch failure uses the nearest stored rate as a permanent fallback;
   * CNY rows pass through untouched; frozen rows are never touched.
 """
 
@@ -20,6 +19,8 @@ from app.db.proxy.billing import (
     materialize_agent_subscription_charges,
     materialize_period_charges,
 )
+from app.db.dashboard_db import DashboardDatabase
+from app.db.proxy_db import ProxyDatabase
 from app.services import fx
 
 from app.tests.support import AppDatabaseTestCase
@@ -90,7 +91,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 row = _rates(conn, "2026-07-15T00:00:00Z")
                 self.assertEqual(row[:3], (10.0, "USD", 70.0))
                 self.assertEqual(row[3], "2026-07-15")  # fx_rate_date == period_start
-                self.assertIsNone(row[4])
+                self.assertIsNotNone(row[4])
                 # Later daily rates arrive — the locked value must not move.
                 conn.execute(
                     "INSERT INTO fx_rates(base_currency,quote_currency,date,rate) "
@@ -114,26 +115,26 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 "WHERE period_start='2026-07-15T00:00:00Z'").fetchone()[0]
         self.assertEqual(count, 2)
 
-    def test_price_change_reuses_locked_rate(self) -> None:
+    def test_price_change_does_not_rewrite_frozen_period(self) -> None:
         db = self.proxy_database()
         account_id = self._usd_plan(db)
         self._seed_rate("2026-07-15", 7.0)
         with mock.patch("app.services.fx.requests.get") as get:
             materialize_period_charges(str(self.proxy_path), _at())
             self.assertTrue(db.update_account(account_id, {"monthly_price": 12}))
-            # update_account stamps effective_at with real wall-clock now,
-            # which lies after _at(); move it inside the window so _rate()
-            # sees the immediate price change.
+            # A price event written after period_start belongs to the next
+            # period, even if its historical rule says immediate.
             with sqlite3.connect(self.proxy_path) as conn:
                 conn.execute(
                     "UPDATE billing_rate_events "
-                    "SET effective_at='2026-07-01T00:00:00Z' "
+                    "SET effective_at='2026-07-16T00:00:00Z' "
                     "WHERE recurring_price=12")
             materialize_period_charges(str(self.proxy_path), _at())
             with sqlite3.connect(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-15T00:00:00Z")
-                self.assertEqual(row[:3], (12.0, "USD", 84.0))  # 12 × locked 7.0
+                self.assertEqual(row[:3], (10.0, "USD", 70.0))
                 self.assertEqual(row[3], "2026-07-15")
+                self.assertIsNotNone(row[4])
             get.assert_not_called()
 
     def test_historical_fetch_stores_period_start_exact_row(self) -> None:
@@ -158,32 +159,33 @@ class BillingFxLockTest(AppDatabaseTestCase):
             self.assertEqual(get.call_args.kwargs["params"],
                              {"date": "2026-07-15"})
 
-    def test_fetch_failure_stays_unlocked_and_retries_then_finalizes(self) -> None:
+    def test_fetch_failure_freezes_nearest_fallback(self) -> None:
         db = self.proxy_database()
         self._usd_plan(db, valid_from="2026-06-15")
-        self._seed_rate("2026-07-01", 6.5)  # fallback for the provisional
+        self._seed_rate("2026-07-01", 6.5)  # fallback when start-day FX is absent
         with mock.patch("app.services.fx.requests.get",
                         side_effect=RuntimeError("offline")):
             materialize_period_charges(str(self.proxy_path),
                                        datetime(2026, 7, 20, tzinfo=timezone.utc))
             with sqlite3.connect(self.proxy_path) as conn:
-                # Closed period (06-15 → 07-15) on a degraded rate: provisional,
-                # must NOT be finalized while unlocked.
+                # A missing exact rate uses the nearest stored rate and is
+                # frozen permanently under the new policy.
                 row = _rates(conn, "2026-06-15T00:00:00Z")
                 self.assertEqual(row[:3], (10.0, "USD", 65.0))
                 self.assertNotEqual(row[3], "2026-06-15")
-                self.assertIsNone(row[4])
-        # Network recovers: the same run locks and finalizes the closed period.
+                self.assertIsNotNone(row[4])
+        # A later exact rate must not rewrite the frozen fallback.
         with mock.patch("app.services.fx.requests.get",
                         return_value=_FakeResponse(
-                            {"date": "2026-06-15", "rate": 6.9})):
+                            {"date": "2026-06-15", "rate": 6.9})) as get:
             materialize_period_charges(str(self.proxy_path),
                                        datetime(2026, 7, 20, tzinfo=timezone.utc))
             with sqlite3.connect(self.proxy_path) as conn:
                 row = _rates(conn, "2026-06-15T00:00:00Z")
-                self.assertEqual(row[:3], (10.0, "USD", 69.0))
-                self.assertEqual(row[3], "2026-06-15")
-                self.assertIsNotNone(row[4])  # finalized
+                self.assertEqual(row[:3], (10.0, "USD", 65.0))
+                self.assertNotEqual(row[3], "2026-06-15")
+                self.assertIsNotNone(row[4])
+            get.assert_not_called()
 
     def test_existing_unfrozen_rows_are_corrected_and_frozen_rows_untouched(
             self) -> None:
@@ -197,15 +199,16 @@ class BillingFxLockTest(AppDatabaseTestCase):
             ).fetchone()[0]
             cred_uuid = conn.execute(
                 "SELECT uuid FROM upstream_credentials LIMIT 1").fetchone()[0]
-            # Legacy-rule row: current period written with today's rate.
+            # Legacy-rule row with an unresolved FX conversion. Runtime may
+            # fill the missing conversion but must not rewrite its native
+            # amount; V1.12 performs the one-time price re-anchoring.
             conn.execute(
                 "INSERT INTO billing_period_charges"
                 "(contract_id,credential_uuid,period_start,period_end,"
                 "recurring_charge,currency,normalized_recurring_cost,"
                 "base_currency,fx_rate_date) VALUES(?,?,?,?,?,?,?,?,?)",
                 (contract_id, cred_uuid, "2026-07-15T00:00:00Z",
-                 "2026-08-15T00:00:00Z", 10.0, "USD", 74.0, "CNY",
-                 "2026-07-20"))
+                 "2026-08-15T00:00:00Z", 10.0, "USD", None, "CNY", None))
             # Closed frozen row in the old rule: must never be rewritten.
             conn.execute(
                 "INSERT INTO billing_period_charges"
@@ -221,6 +224,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 current = _rates(conn, "2026-07-15T00:00:00Z")
                 self.assertEqual(current[:3], (10.0, "USD", 70.0))
                 self.assertEqual(current[3], "2026-07-15")  # corrected + locked
+                self.assertIsNotNone(current[4])
                 frozen = _rates(conn, "2026-06-15T00:00:00Z")
                 self.assertEqual(frozen[:3], (10.0, "USD", 66.0))
                 self.assertEqual(frozen[3], "2026-06-20")  # untouched
@@ -246,7 +250,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             self.assertIsNotNone(closed[4])    # finalized at period end
             current = _rates(conn, "2026-08-15T00:00:00Z")
             self.assertEqual(current[:3], (20.0, "CNY", 20.0))
-            self.assertIsNone(current[4])      # current period not finalized
+            self.assertIsNotNone(current[4])   # current period freezes at start
 
     def test_weekend_period_start_echoes_requested_date(self) -> None:
         # 2026-07-18 is a Saturday; v2 echoes the requested date with the
@@ -276,7 +280,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             self.assertTrue(all(d >= "1999-01-01" for d in requested))
             with sqlite3.connect(self.proxy_path) as conn:
                 row = _rates(conn, "1998-12-15T00:00:00Z")
-                self.assertIsNone(row[4])  # never finalized while unlocked
+                self.assertIsNotNone(row[4])
                 self.assertNotEqual(row[3], "1998-12-15")
 
     def test_period_start_before_earliest_stored_rate_uses_earliest(self) -> None:
@@ -288,10 +292,23 @@ class BillingFxLockTest(AppDatabaseTestCase):
             materialize_period_charges(str(self.proxy_path), _at())
             with sqlite3.connect(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-15T00:00:00Z")
-                # 6.8 from the earliest stored row, never 1.0, and unlocked.
+                # 6.8 from the earliest stored row, never 1.0, and frozen.
                 self.assertEqual(row[:3], (10.0, "USD", 68.0))
                 self.assertEqual(row[3], "2026-08-01")
-                self.assertIsNone(row[4])
+                self.assertIsNotNone(row[4])
+
+    def test_no_stored_fx_rate_keeps_native_price_pending(self) -> None:
+        db = self.proxy_database()
+        self._usd_plan(db, valid_from="2026-07-15")
+        with mock.patch("app.services.fx.requests.get",
+                        side_effect=RuntimeError("offline")):
+            materialize_period_charges(str(self.proxy_path), _at())
+        with sqlite3.connect(self.proxy_path) as conn:
+            row = _rates(conn, "2026-07-15T00:00:00Z")
+            self.assertEqual(row[0], 10.0)
+            self.assertIsNone(row[2])
+            self.assertIsNone(row[3])
+            self.assertIsNone(row[4])
 
     def test_agent_subscription_locks_like_plan(self) -> None:
         db = self.proxy_database()
@@ -304,12 +321,86 @@ class BillingFxLockTest(AppDatabaseTestCase):
         with sqlite3.connect(self.proxy_path) as conn:
             row = conn.execute(
                 "SELECT subscription_id,recurring_charge,currency,"
-                "normalized_recurring_cost,fx_rate_date "
+                "normalized_recurring_cost,fx_rate_date,finalized_at "
                 "FROM agent_subscription_period_charges"
             ).fetchone()
             self.assertEqual(row[0], subscription_id)
             self.assertEqual(row[1:4], (10.0, "USD", 70.0))
             self.assertEqual(row[4], "2026-07-15")
+            self.assertIsNotNone(row[5])
+
+    def test_agent_allocation_freezes_period_start_bindings(self) -> None:
+        db = self.proxy_database()
+        subscription_id = db.create_agent_subscription({
+            "name": "allocation-sub", "valid_from": "2026-07-15",
+            "monthly_price": 10, "currency": "CNY",
+        })
+        software_id = db.create_agent_software({
+            "name": "allocation-agent", "agent_kind": "codex",
+            "subscription_ids": [subscription_id],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "UPDATE agent_subscription_bindings SET valid_from=? "
+                "WHERE subscription_id=? AND software_id=?",
+                ("2026-07-15T00:00:00Z", subscription_id, software_id),
+            )
+            conn.commit()
+        materialize_agent_subscription_charges(str(self.proxy_path), _at())
+        with sqlite3.connect(self.proxy_path) as conn:
+            row = conn.execute(
+                "SELECT a.software_id,a.recurring_charge,a.finalized_at "
+                "FROM agent_subscription_charge_allocations a"
+            ).fetchone()
+        self.assertEqual(row[0], software_id)
+        self.assertEqual(row[1], 10.0)
+        self.assertIsNotNone(row[2])
+
+        self.assertTrue(db.update_agent_software(
+            software_id, {"subscription_ids": []}))
+        materialize_agent_subscription_charges(str(self.proxy_path), _at())
+        with sqlite3.connect(self.proxy_path) as conn:
+            allocations = conn.execute(
+                "SELECT software_id,recurring_charge FROM "
+                "agent_subscription_charge_allocations"
+            ).fetchall()
+        self.assertEqual(allocations, [(software_id, 10.0)])
+
+    def test_agent_allocation_exports_as_an_immutable_dashboard_charge(self) -> None:
+        db = self.proxy_database()
+        subscription_id = db.create_agent_subscription({
+            "name": "export-allocation-sub", "valid_from": "2026-07-15",
+            "monthly_price": 10, "currency": "CNY",
+        })
+        software_id = db.create_agent_software({
+            "name": "export-allocation-agent", "agent_kind": "codex",
+            "subscription_ids": [subscription_id],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "UPDATE agent_subscription_bindings SET valid_from=? "
+                "WHERE subscription_id=? AND software_id=?",
+                ("2026-07-15T00:00:00Z", subscription_id, software_id),
+            )
+            conn.commit()
+        proxy = ProxyDatabase(str(self.proxy_path), schema_dir=str(self.root / "schema"))
+        proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
+        with sqlite3.connect(self.dashboard_path) as conn:
+            first = conn.execute(
+                "SELECT recurring_charge,charge_frozen_at FROM monthly_recurring_costs "
+                "WHERE account_id=?", (software_id,)
+            ).fetchone()
+        self.assertEqual(first[0], 10.0)
+        self.assertIsNotNone(first[1])
+
+        self.assertTrue(db.update_agent_software(
+            software_id, {"subscription_ids": []}))
+        proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
+        with sqlite3.connect(self.dashboard_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT recurring_charge FROM monthly_recurring_costs "
+                "WHERE account_id=?", (software_id,)
+            ).fetchone()[0], 10.0)
 
     def test_ensure_rate_historical_fetch_and_guards(self) -> None:
         self.proxy_database()  # initialize the schema

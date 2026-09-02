@@ -22,68 +22,40 @@ def export_data():
         schema_dir=current_app.config.get("SCHEMA_DIR"),
     )
 
-    # Trigger dashboard data reload
+    # A failed transaction deliberately leaves the current DataStore intact;
+    # only a committed candidate is safe to load.
     ds = current_app.config.get("DATA_STORE")
-    if ds:
+    if ds and result.get("status") == "ok":
         ds.load()
 
     return jsonify(result)
 
 
 @bp_proxy.route("/dashboard/users", methods=["DELETE"])
-def delete_dashboard_user():
-    """Delete one user's dashboard archive locally; cloud upload is deferred."""
+def delete_dashboard_users():
+    """Delete several users in one complete dashboard archive transaction."""
     data = request.get_json(silent=True) or {}
-    name = str(data.get("name") or "").strip()
-    prepare = bool(data.get("prepare"))
-    if not name:
-        return jsonify({"status": "error", "message": "用户名称不能为空"}), 400
+    names = data.get("names")
 
     import os as _os
-    from app.services.dashboard_user import delete_dashboard_user_local as _delete_user
+    from app.services.sync.dashboard_sync import delete_dashboard_users as _delete_users
 
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
-    result = _delete_user(
+    result = _delete_users(
         db_path,
         dash_db_path,
-        name,
+        names,
         schema_dir=current_app.config.get("SCHEMA_DIR"),
-        prepare=prepare,
     )
 
-    # The local archive changes immediately; the upload is performed by
-    # POST /dashboard/users/upload when the picker closes.
     ds = current_app.config.get("DATA_STORE")
-    if ds:
+    if ds and result.get("status") == "ok":
         ds.load()
 
     status = result.get("status")
     return jsonify(result), status_for("dashboard_delete", result)
 
-
-@bp_proxy.route("/dashboard/users/upload", methods=["POST"])
-def upload_dashboard_user_deletions():
-    """Upload the local Dashboard archive after picker deletions."""
-    import os as _os
-    from app.services.dashboard_user import (
-        upload_dashboard_user_deletions as _upload_deletions,
-    )
-
-    db_path = current_app.config["TOKEN_BOARD_DB"].db_path
-    dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
-    result = _upload_deletions(
-        db_path,
-        dash_db_path,
-        schema_dir=current_app.config.get("SCHEMA_DIR"),
-    )
-
-    ds = current_app.config.get("DATA_STORE")
-    if ds:
-        ds.load()
-
-    status = result.get("status")
-    return jsonify(result), status_for("dashboard_upload", result)
 
 
 @bp_proxy.route("/sync/config", methods=["GET"])

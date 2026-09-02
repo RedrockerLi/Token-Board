@@ -95,7 +95,6 @@ function resetTimeoutConfig() {
 async function loadBillingConfig() {
     try {
         const cfg = await proxyApi('/api/proxy/billing-config');
-        document.getElementById('billingPriceEffective').value = cfg.price_change_effective || 'current_period';
         document.getElementById('billingCancellationMode').value = cfg.cancellation_mode || 'immediate';
     } catch (err) {
         showToast('加载 Plan 计费设置失败: ' + err.message, 'error');
@@ -109,7 +108,6 @@ async function saveBillingConfig() {
         await proxyApi('/api/proxy/billing-config', {
             method: 'PUT',
             body: JSON.stringify({
-                price_change_effective: document.getElementById('billingPriceEffective').value,
                 cancellation_mode: document.getElementById('billingCancellationMode').value,
             }),
         });
@@ -233,12 +231,7 @@ function initSettingsPage() {
             <div class="chart-card">
                 <div class="chart-card__title" style="margin-bottom:12px;">Plan/智能体订阅计费</div>
                 <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
-                    <label>修改月费的默认生效时间
-                        <select id="billingPriceEffective">
-                            <option value="current_period">本计费周期生效</option>
-                            <option value="next_period">下一计费周期生效</option>
-                        </select>
-                    </label>
+                    <label style="align-self:center;">月费修改固定从下一计费周期生效</label>
                     <label>删除订阅类账户的默认操作
                         <select id="billingCancellationMode">
                             <option value="immediate">本期立即删除（本期计费）</option>

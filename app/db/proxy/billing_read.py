@@ -24,7 +24,6 @@ class ProxyBillingReadMixin:
         try:
             row = self._billing_config_conn(conn)
             return {
-                "price_change_effective": row["price_change_effective"],
                 "cancellation_mode": row["cancellation_mode"],
                 "timezone": "UTC",
             }
@@ -32,9 +31,8 @@ class ProxyBillingReadMixin:
             conn.close()
 
     def update_plan_billing_config(self, data: dict) -> bool:
-        mode = data.get("price_change_effective")
-        if mode not in ("current_period", "next_period"):
-            raise ValueError("价格生效方式必须是 current_period 或 next_period")
+        if "price_change_effective" in data:
+            raise ValueError("价格修改统一从下一计费周期生效")
         cancellation = data.get("cancellation_mode")
         if cancellation not in ("immediate", "end_of_period"):
             raise ValueError("删除默认操作必须是 immediate 或 end_of_period")
@@ -43,8 +41,7 @@ class ProxyBillingReadMixin:
             conn.executemany(
                 "INSERT INTO sync_settings(key,value) VALUES(?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                [("billing.price_change_effective", mode),
-                 ("billing.cancellation_mode", cancellation)],
+                [("billing.cancellation_mode", cancellation)],
             )
             conn.commit()
             return conn.total_changes > 0

@@ -18,7 +18,7 @@ from app.services.sync.common import (
 class ContractAssetTest(unittest.TestCase):
     def test_route_status_matrix_is_explicit(self):
         self.assertEqual(status_for("dashboard_delete", {"status": "not_found"}), 404)
-        self.assertEqual(status_for("dashboard_upload", {"status": "conflict"}), 409)
+        self.assertEqual(status_for("dashboard_delete", {"status": "conflict"}), 409)
         self.assertEqual(status_for("config_upload", {"status": "remote_updated"}), 200)
         self.assertTrue(ROUTE_CONTRACTS["config_test"].force_json)
         self.assertTrue(ROUTE_CONTRACTS["dashboard_delete"].silent_json)
@@ -33,6 +33,7 @@ class ContractAssetTest(unittest.TestCase):
     def test_sync_tables_are_allowlist_with_default_deny(self):
         self.assertIn("client_keys", CONFIG_TABLE_ALLOWLIST)
         self.assertIn("request_log", RUNTIME_TABLE_DENYLIST)
+        self.assertIn("agent_subscription_charge_allocations", RUNTIME_TABLE_DENYLIST)
         self.assertTrue(is_config_sync_table("client_keys"))
         self.assertFalse(is_config_sync_table("request_log"))
         self.assertFalse(is_config_sync_table("future_machine_local_table"))

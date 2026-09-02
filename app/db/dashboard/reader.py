@@ -45,7 +45,9 @@ class DashboardReaderMixin:
             "SELECT d.*,COALESCE(a.name,'unknown') AS display_name,"
             "COALESCE(a.account_kind,'proxy') AS account_kind "
             "FROM daily_usage d LEFT JOIN accounts a ON a.account_id=d.account_id "
-            "WHERE COALESCE(a.account_kind,'proxy')!='legacy'"):
+            "WHERE COALESCE(a.account_kind,'proxy')!='legacy' "
+            "AND NOT EXISTS (SELECT 1 FROM account_exclusions e "
+            "WHERE e.account_id=d.account_id)"):
             y, m = _parse_date(row["date"])
             if not y:
                 continue
@@ -80,20 +82,28 @@ class DashboardReaderMixin:
         for row in conn.execute(
             "SELECT p.month,p.account_id,COALESCE(a.name,'unknown') account_name,"
             "COALESCE(a.account_kind,'proxy') account_kind,"
-            "SUM(CASE WHEN p.normalized_recurring_cost IS NOT NULL "
+            "SUM(CASE WHEN p.charge_frozen_at IS NOT NULL "
+            "AND p.normalized_recurring_cost IS NOT NULL "
             "THEN p.normalized_recurring_cost ELSE 0 END) subscription_cost,"
             "SUM(p.equivalent_cost) virtual_cost,"
             "SUM(CASE WHEN p.normalized_recurring_cost IS NULL THEN 1 ELSE 0 END) "
             "billing_incomplete_count FROM monthly_recurring_costs p "
             "LEFT JOIN accounts a ON a.account_id=p.account_id "
             "WHERE COALESCE(a.account_kind,'proxy')!='legacy' "
+            "AND NOT EXISTS (SELECT 1 FROM account_exclusions e "
+            "WHERE e.account_id=p.account_id) "
+            "AND (p.equivalent_cost<>0 OR p.recurring_charge<>0 "
+            "OR COALESCE(p.normalized_recurring_cost,0)<>0 "
+            "OR p.charge_frozen_at IS NOT NULL) "
             "GROUP BY p.month,p.account_id,a.name ORDER BY p.month,p.account_id"):
             plan_summary.append(dict(row))
             # A subscription can be bound before the software has produced
             # its first usage event. Keep that software/account selectable in
             # the dashboard so its actual recurring cost is not invisible.
             account_name = row["account_name"]
-            if account_name and account_name != "unknown":
+            visible = (row["virtual_cost"] != 0 or
+                       row["subscription_cost"] != 0)
+            if visible and account_name and account_name != "unknown":
                 names.add(account_name)
             # A recurring charge may exist in a month with no metered
             # traffic. Keep that month visible to /api/monthly instead of

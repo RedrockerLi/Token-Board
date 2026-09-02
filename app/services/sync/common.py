@@ -42,7 +42,8 @@ V1_CONFIG_TABLES = [
 CONFIG_TABLE_ALLOWLIST = frozenset(V1_CONFIG_TABLES)
 _RUNTIME_TABLES = [
     "request_log", "request_attempts", "billing_period_charges",
-    "agent_subscription_period_charges", "agent_software_runtime", "fx_rates",
+    "agent_subscription_period_charges", "agent_subscription_charge_allocations",
+    "agent_software_runtime", "fx_rates",
     "sync_state", "sync_config", "perf_events", "in_flight_requests", "session_key_log",
 ]
 RUNTIME_TABLE_DENYLIST = frozenset(_RUNTIME_TABLES)

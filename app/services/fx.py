@@ -13,10 +13,10 @@ each billing period's start date (?date=YYYY-MM-DD, supported by
 frankfurter from 1999-01-04 on).
 
 The table lives in token-board.db (fx_rates) and is excluded from cloud sync.
-Every function is best-effort and never raises
-into the request path; missing data degrades to the nearest stored rate (the
-earliest one when the requested date precedes every row; 1.0 only when the
-pair has never been stored).
+Every function is best-effort and never raises into the request path. Generic
+readers retain the historical 1.0 result when a pair has never been stored;
+the billing materializer treats that ``source_date is None`` state as
+unresolved and does not finalize a financial charge with it.
 """
 
 from dataclasses import dataclass
@@ -45,10 +45,10 @@ class FxResolution:
 class FxRateResolver:
     """Read-only FX resolution with an explicit provisional state.
 
-    ``resolve`` never fetches or writes.  ``ensure`` is the opt-in boundary
-    for historical fetches and returns the same immutable result type.  The
-    materializer may finalize only a locked result, which is equivalent to an
-    exact period-start rate under the existing billing contract.
+    ``resolve`` never fetches or writes. ``ensure`` is the opt-in boundary for
+    historical fetches and returns the same immutable result type. ``locked``
+    still identifies an exact period-start rate; billing may explicitly freeze
+    a non-exact fallback when the configured policy allows it.
     """
 
     @staticmethod
@@ -95,8 +95,9 @@ def get_rate(conn, base: str = "USD", quote: str = "CNY",
     A rate that is not exactly for *date* falls back to the most recent earlier
     row.  When *date* precedes every stored rate (e.g. a past month before the
     first fetch), uses the earliest stored rate so past USD subscriptions are
-    not silently undervalued.  Only when the pair has never been stored does it
-    return 1.0 (no failure — CNY prices are unaffected).
+    not silently undervalued. Only when the pair has never been stored does it
+    return 1.0 for compatibility; billing finalization rejects that unresolved
+    state instead of treating it as a real exchange rate.
     """
     date = date or utc_now().strftime("%Y-%m-%d")
     row = conn.execute(

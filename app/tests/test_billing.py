@@ -337,6 +337,10 @@ class BillingTest(AppDatabaseTestCase):
             "name": "expired-plan", "account_type": "plan",
             "valid_from": "2026-08-01", "monthly_price": 20,
             "base_url": "http://example.test", "upstream_keys": ["sk-expired"],
+            # Pin the credential's billing anchor too. Without this field the
+            # fixture falls back to the machine's creation date, making the
+            # effective deletion boundary depend on today's day-of-month.
+            "new_valid_froms": ["2026-08-01"],
         })
         scheduled_at = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
         expired_at = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)

@@ -312,3 +312,27 @@ class SyncContractTest(unittest.TestCase):
         finally:
             patch.stopall()
             shutil.rmtree(temp, ignore_errors=True)
+
+    def test_dashboard_sync_without_webdav_commits_locally(self) -> None:
+        temp = tempfile.mkdtemp()
+        try:
+            shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
+            (Path(temp) / "data").mkdir()
+            proxy = str(Path(temp) / "data" / "token-board.db")
+            dash = str(Path(temp) / "data" / "dashboard.db")
+            migrate(proxy, str(Path(temp) / "schema"), "token-board")
+            migrate(dash, str(Path(temp) / "schema"), "dashboard")
+
+            result = sync_dashboard(
+                proxy, dash, schema_dir=str(Path(temp) / "schema"))
+
+            self.assertEqual(result["status"], "ok", result)
+            self.assertFalse(result["uploaded"])
+            with sqlite3.connect(proxy) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT value FROM sync_state "
+                        "WHERE key='last_exported_log_id'"
+                    ).fetchone()[0], "0")
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
