@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.db.migrations import migrate
+from app.db.migrations import SchemaVersion, apply_sql_migrations, migrate
+from app.db.proxy_db import ProxyDatabase
 from app.db.schema_upgrade.coordinator import inspect_version
 from app.services.sync.settings import SyncConfig, save_sync_config
 from app.services.sync.webdav import (
@@ -87,6 +88,88 @@ class SyncContractTest(unittest.TestCase):
             conn.close()
             self.assertEqual(row[0], "2026-08-10T04:01:36Z")
             self.assertEqual(secret[0], "sk-local-secret")
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
+    def test_cloud_merge_does_not_resurrect_historical_current_pricing_rate(self) -> None:
+        """A stale cloud current rate must not coexist with a newer local one."""
+        temp = tempfile.mkdtemp()
+        try:
+            shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
+            local = str(Path(temp) / "local.db")
+            remote = str(Path(temp) / "remote.db")
+            migrate(local, str(Path(temp) / "schema"), "token-board")
+            migrate(remote, str(Path(temp) / "schema"), "token-board")
+            for path in (local, remote):
+                conn = sqlite3.connect(path)
+                conn.execute(
+                    "INSERT INTO pricing_rules(id,model_pattern,priority) "
+                    "VALUES(1,'merge-demo',0)"
+                )
+                conn.execute(
+                    "INSERT INTO pricing_rates"
+                    "(id,pricing_rule_id,input_price,cache_read_price,"
+                    "output_price,currency,valid_from) "
+                    "VALUES(1,1,1,0.1,2,'USD','2026-01-01T00:00:00Z')"
+                )
+                conn.commit()
+                conn.close()
+
+            local_db = ProxyDatabase(local, str(Path(temp) / "schema"))
+            self.assertTrue(local_db.update_pricing(1, {
+                "input_price": 3,
+                "cache_read_price": 0.3,
+                "output_price": 4,
+                "currency": "USD",
+            }))
+
+            merge_config_tables(remote, local)
+
+            with sqlite3.connect(local) as conn:
+                current = conn.execute(
+                    "SELECT id,input_price,output_price FROM pricing_rates "
+                    "WHERE pricing_rule_id=1 AND valid_until IS NULL "
+                    "ORDER BY id"
+                ).fetchall()
+            # Configuration downloads are cloud-authoritative: the remote
+            # current version wins, but it must not coexist with local history.
+            self.assertEqual(current, [(1, 1.0, 2.0)])
+            self.assertEqual(len(local_db.get_pricing()), 1)
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
+    def test_pricing_current_rate_migration_repairs_existing_duplicates(self) -> None:
+        temp = tempfile.mkdtemp()
+        try:
+            shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
+            local = str(Path(temp) / "local.db")
+            schema = str(Path(temp) / "schema")
+            apply_sql_migrations(
+                local, schema, "token-board", SchemaVersion(1, 12))
+            with sqlite3.connect(local) as conn:
+                conn.execute(
+                    "INSERT INTO pricing_rules(id,model_pattern,priority) "
+                    "VALUES(1,'migration-demo',0)"
+                )
+                conn.executemany(
+                    "INSERT INTO pricing_rates"
+                    "(id,pricing_rule_id,input_price,cache_read_price,"
+                    "output_price,currency,valid_from) VALUES(?,?,?,?,?,?,?)",
+                    [
+                        (1, 1, 1, 0.1, 2, "USD", "2026-01-01T00:00:00Z"),
+                        (2, 1, 3, 0.3, 4, "USD", "2026-02-01T00:00:00Z"),
+                    ],
+                )
+            migrate(local, schema, "token-board")
+            with sqlite3.connect(local) as conn:
+                current = conn.execute(
+                    "SELECT id FROM pricing_rates WHERE pricing_rule_id=1 "
+                    "AND valid_until IS NULL"
+                ).fetchall()
+                indexes = [row[1] for row in conn.execute(
+                    "PRAGMA index_list(pricing_rates)")]
+            self.assertEqual(current, [(2,)])
+            self.assertIn("idx_pricing_rates_one_current", indexes)
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 

@@ -21,6 +21,13 @@ class ProxyPricingMixin:
                     "r.cache_read_price,r.currency,r.id rate_id FROM pricing_rules pr "
                     "JOIN pricing_rates r ON r.pricing_rule_id=pr.id "
                     "WHERE pr.enabled=1 AND r.valid_until IS NULL "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM pricing_rates newer "
+                    "WHERE newer.pricing_rule_id=r.pricing_rule_id "
+                    "AND newer.valid_until IS NULL "
+                    "AND (newer.valid_from>r.valid_from OR "
+                    "(newer.valid_from=r.valid_from AND newer.id>r.id))"
+                    ") "
                     "ORDER BY pr.priority,pr.id"
                 ).fetchall()
             result = []
@@ -173,7 +180,8 @@ class ProxyPricingMixin:
             current = conn.execute(
                 "SELECT pr.model_pattern,r.* FROM pricing_rules pr JOIN pricing_rates r "
                 "ON r.pricing_rule_id=pr.id WHERE pr.id=? AND pr.enabled=1 "
-                "AND r.valid_until IS NULL", (pricing_id,)
+                "AND r.valid_until IS NULL "
+                "ORDER BY r.valid_from DESC,r.id DESC LIMIT 1", (pricing_id,)
             ).fetchone()
             if current is None:
                 return False
@@ -202,8 +210,15 @@ class ProxyPricingMixin:
                 cache_read_price = data.get("cache_read_price", current["cache_read_price"])
                 if cache_read_price is None:
                     cache_read_price = input_price
-                conn.execute("UPDATE pricing_rates SET valid_until=? WHERE id=?",
-                             (now, current["id"]))
+                # A database upgraded from a pre-V1.13 schema may still have
+                # more than one current rate.  Close every current version so
+                # this edit restores the invariant even before the migration
+                # or after importing a legacy artifact.
+                conn.execute(
+                    "UPDATE pricing_rates SET valid_until=? "
+                    "WHERE pricing_rule_id=? AND valid_until IS NULL",
+                    (now, pricing_id),
+                )
                 new_rate_id = conn.execute(
                     "INSERT INTO pricing_rates"
                     "(pricing_rule_id,input_price,cache_read_price,output_price,currency,valid_from) "

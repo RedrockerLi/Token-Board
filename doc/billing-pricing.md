@@ -6,6 +6,8 @@ V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库按 `requested
 
 `pricing_rules` 保存 pattern 与显式 priority；每条规则有带 `valid_from/valid_until` 的 `pricing_rates` 历史。`model_pattern` 支持 `*` / `?` GLOB 通配，单位为每百万 tokens：
 
+每条规则同时只能有一个 `valid_until IS NULL` 的当前 rate；改价会关闭当前版本并创建新版本，旧版本保留用于历史计费。
+
 - `input_price`:未命中缓存的输入单价
 - `output_price`:输出单价
 - `cache_read_price`:缓存命中的输入单价,缺省回落 `input_price`

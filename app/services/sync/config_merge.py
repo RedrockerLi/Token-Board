@@ -15,6 +15,105 @@ def _schema_major(conn: sqlite3.Connection) -> int:
     row = conn.execute("SELECT major FROM schema_version WHERE id=1").fetchone()
     return int(row[0]) if row else 0
 
+
+def _rate_version_key(row) -> tuple[str, int]:
+    """Order pricing versions chronologically without relying on row order."""
+
+    return str(row["valid_from"]), int(row["id"])
+
+
+def _normalize_current_pricing_rates(conn: sqlite3.Connection) -> None:
+    """Close all but the newest current rate for every pricing rule.
+
+    This is deliberately safe to run against pre-V1.13 databases.  It also
+    makes config merges idempotent when an older artifact already contains
+    duplicate current rows.
+    """
+
+    rule_ids = [row[0] for row in conn.execute(
+        "SELECT pricing_rule_id FROM pricing_rates "
+        "WHERE valid_until IS NULL GROUP BY pricing_rule_id HAVING count(*)>1"
+    )]
+    for rule_id in rule_ids:
+        rows = conn.execute(
+            "SELECT id,valid_from FROM pricing_rates "
+            "WHERE pricing_rule_id=? AND valid_until IS NULL "
+            "ORDER BY valid_from DESC,id DESC", (rule_id,)
+        ).fetchall()
+        winner = rows[0]
+        for row in rows[1:]:
+            conn.execute(
+                "UPDATE pricing_rates SET valid_until=? "
+                "WHERE id=? AND valid_until IS NULL",
+                (winner["valid_from"], row["id"]),
+            )
+
+
+def _merge_pricing_rates(remote: sqlite3.Connection,
+                         local: sqlite3.Connection) -> None:
+    """Merge pricing history without creating two current versions.
+
+    ``pricing_rates`` is versioned rather than lifecycle-tombstoned.  A
+    generic primary-key upsert can therefore resurrect an old cloud row by
+    writing ``valid_until=NULL`` while a newer local row is still current.
+    Process historical rows first, then current rows in chronological order;
+    before each current upsert, close any other local current version.
+    """
+
+    if (not table_exists(remote, "pricing_rates")
+            or not table_exists(local, "pricing_rates")):
+        return
+    r_info = remote.execute("PRAGMA table_info(pricing_rates)").fetchall()
+    local_columns = {row[1] for row in local.execute(
+        "PRAGMA table_info(pricing_rates)").fetchall()}
+    columns = [row[1] for row in r_info if row[1] in local_columns]
+    primary = [row[1] for row in sorted(r_info, key=lambda value: value[5])
+               if row[5]]
+    if not columns or not primary:
+        return
+    updates = [column for column in columns if column not in primary]
+    placeholders = ",".join("?" for _ in columns)
+    conflict = ",".join(primary)
+    suffix = (" DO UPDATE SET " + ",".join(
+        f"{column}=excluded.{column}" for column in updates)) if updates else " DO NOTHING"
+    statement = (f"INSERT INTO pricing_rates({','.join(columns)}) VALUES({placeholders}) "
+                 f"ON CONFLICT({conflict}){suffix}")
+
+    _normalize_current_pricing_rates(local)
+    remote_rows = [dict(row) for row in remote.execute(
+        f"SELECT {','.join(columns)} FROM pricing_rates")]
+
+    def upsert(row: dict) -> None:
+        local.execute(statement, tuple(row[column] for column in columns))
+
+    for row in (item for item in remote_rows if item["valid_until"] is not None):
+        upsert(row)
+
+    current_rows = sorted(
+        (item for item in remote_rows if item["valid_until"] is None),
+        key=_rate_version_key,
+    )
+    for row in current_rows:
+        rule_id = row["pricing_rule_id"]
+        others = local.execute(
+            "SELECT id,valid_from FROM pricing_rates "
+            "WHERE pricing_rule_id=? AND valid_until IS NULL AND id<>?",
+            (rule_id, row["id"]),
+        ).fetchall()
+        for other in others:
+            # Keep intervals valid even when a cloud artifact is older than a
+            # local unsynchronized version; the cloud row still becomes the
+            # sole current version, as required by cloud-authoritative sync.
+            close_at = max(str(row["valid_from"]), str(other["valid_from"]))
+            local.execute(
+                "UPDATE pricing_rates SET valid_until=? "
+                "WHERE id=? AND valid_until IS NULL",
+                (close_at, other["id"]),
+            )
+        upsert(row)
+
+    _normalize_current_pricing_rates(local)
+
 def merge_config_tables(remote_path: str, local_path: str) -> None:
     """Merge a downloaded, already-upgraded V1 artifact into local V1.
 
@@ -112,12 +211,14 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
 
         merge_table("account_importers", {"cursor_json"})
         for table in ("billing_contracts", "billing_rate_events", "pricing_rules",
-                      "pricing_rates", "pricing_slots", "pricing_length_tiers",
                       "upstream_model_catalog",
                       "proxy_timeout_config", "agent_subscriptions", "agent_software",
                       "agent_subscription_instances",
                       "agent_subscription_rate_events",
                       "agent_subscription_bindings"):
+            merge_table(table)
+        _merge_pricing_rates(remote, local)
+        for table in ("pricing_slots", "pricing_length_tiers"):
             merge_table(table)
 
         # A migrated agent used to be represented by an upstream billing
