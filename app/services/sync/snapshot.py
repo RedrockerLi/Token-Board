@@ -21,9 +21,15 @@ def snapshot_config(db_path: str) -> None:
     safe_copy_db(db_path, snap)
     snapshot = sqlite_runtime.connect(snap, "snapshot_restore")
     try:
-        for table in ("request_attempts", "request_log", "billing_period_charges",
-                      "agent_subscription_period_charges", "agent_software_runtime",
-                      "fx_rates", "sync_state"):
+        # Delete generated children before their parent charge rows. These
+        # tables are deliberately absent from a configuration rollback
+        # snapshot; leaving allocations behind creates orphan foreign keys
+        # when period charges are stripped.
+        for table in ("request_attempts", "request_log",
+                      "agent_subscription_charge_allocations",
+                      "billing_period_charges",
+                      "agent_subscription_period_charges",
+                      "agent_software_runtime", "fx_rates", "sync_state"):
             if table_exists(snapshot, table):
                 snapshot.execute(f"DELETE FROM {table}")
         snapshot.commit()

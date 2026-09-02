@@ -260,6 +260,39 @@ class SyncContractTest(unittest.TestCase):
             patch.stopall()
             shutil.rmtree(temp, ignore_errors=True)
 
+    def test_config_snapshot_removes_generated_charge_children_first(self) -> None:
+        temp, proxy, _ = self._repo_layout()
+        try:
+            from app.services.sync.snapshot import snapshot_config
+            with sqlite3.connect(proxy) as conn:
+                conn.execute("INSERT INTO accounts(id,uuid,name) VALUES(1,'acct','agent')")
+                conn.execute(
+                    "INSERT INTO agent_subscriptions(id,uuid,name,valid_from) "
+                    "VALUES(1,'sub','subscription','2026-01-01')")
+                conn.execute(
+                    "INSERT INTO agent_subscription_instances "
+                    "(id,uuid,subscription_id,valid_from) VALUES(1,'inst',1,'2026-01-01')")
+                conn.execute(
+                    "INSERT INTO agent_subscription_period_charges "
+                    "(id,instance_id,subscription_id,period_start,period_end,"
+                    "recurring_charge,currency) VALUES(1,1,1,'2026-01-01','2026-02-01',1,'CNY')")
+                conn.execute(
+                    "INSERT INTO agent_subscription_charge_allocations "
+                    "(period_charge_id,software_id) VALUES(1,1)")
+                conn.commit()
+            snapshot_config(proxy)
+            with sqlite3.connect(proxy) as conn:
+                self.assertEqual(conn.execute(
+                    "PRAGMA foreign_key_check").fetchall(), [])
+            with sqlite3.connect(str(Path(temp) / "data/token-board_config_snapshot.db")) as conn:
+                self.assertEqual(conn.execute(
+                    "PRAGMA foreign_key_check").fetchall(), [])
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM agent_subscription_charge_allocations"
+                ).fetchone()[0], 0)
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
     def _repo_layout(self) -> tuple[str, str, str]:
         """Temp dir laid out like the repo (schema/ + data/) so that
         ``schema_dir_for`` resolves to a real schema root."""
