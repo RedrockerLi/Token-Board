@@ -124,7 +124,7 @@ export OPENAI_API_KEY=<本地密钥>
 
 配置同步是**云端权威镜像**：仪表板启动后异步拉取最新配置，拉取完成前设置为只读；管理页修改立即写入本机，离开设置页时整份配置上传。PUT 成功即视为成功；失败会立即恢复最近一次云端基线。单编辑者模型不做多机冲突检测。
 
-同步边界按数据性质划分：普通配置和本地代理客户端密钥上传；上游 API Key 明文、WebDAV bootstrap 凭证、请求日志、导入游标、账单物化结果、汇率缓存、性能数据和在途请求不上传。Dashboard 聚合结果走独立同步链路。配置云端文件使用 `token-board_config_YYYYMMDD_HHMMSS.db`，机制详见 [doc/sync.md](doc/sync.md)。
+同步边界按数据性质划分：普通配置和本地代理客户端密钥上传；上游 API Key 明文、WebDAV bootstrap 凭证、请求日志、导入游标、账单物化结果、汇率缓存、性能数据和在途请求不上传。Dashboard 聚合结果走独立同步链路。配置云端文件使用 gzip 压缩的 `token-board_config_YYYYMMDD_HHMMSS.db.gz`（新版仍可读取旧 `.db` artifact），机制详见 [doc/sync.md](doc/sync.md)。
 
 ## 运维
 

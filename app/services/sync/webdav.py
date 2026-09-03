@@ -9,7 +9,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -18,6 +18,11 @@ from requests.auth import HTTPBasicAuth
 
 from app.core import sqlite_runtime
 from app.core.time import utc_now
+from app.services.sync.artifact_codec import (
+    ArtifactCodecError,
+    decode_sqlite_artifact,
+    encode_sqlite_artifact,
+)
 from app.services.sync.settings import SyncConfig
 
 log = logging.getLogger(__name__)
@@ -51,10 +56,14 @@ def _filename_now() -> datetime:
 
 def _make_timestamped_name(base: str,
                            clock: Callable[[], datetime] | None = None) -> str:
-    """dashboard_sync.db → dashboard_sync_20260716_143025.db"""
-    name, ext = base.rsplit(".", 1)
+    """Return a timestamped gzip artifact name for a database base name."""
+    name = base
+    if name.endswith(".gz"):
+        name = name[:-len(".gz")]
+    if name.endswith(".db"):
+        name = name[:-len(".db")]
     stamp = (clock or _filename_now)().strftime("%Y%m%d_%H%M%S")
-    return f"{name}_{stamp}.{ext}"
+    return f"{name}_{stamp}.db.gz"
 
 
 def _schema_manifest(db_path: str, artifact_name: str) -> dict:
@@ -151,18 +160,32 @@ def list_artifacts(config, prefix: str) -> list[RemoteArtifact]:
 
 
 _ARTIFACT_RE = re.compile(
-    r"^(?P<base>token-board_config|dashboard_sync)_(?P<stamp>\d{8}_\d{6})(?:_\w+)?\.db$")
+    r"^(?P<base>token-board_config|dashboard_sync)_"
+    r"(?P<stamp>\d{8}_\d{6})(?:_(?P<attempt>\w+))?\.db"
+    r"(?P<gzip>\.gz)?$")
 
 
-def _artifact_sort_key(name: str) -> tuple[datetime, str]:
+def _artifact_sort_key(name: str) -> tuple[datetime, int, int, str]:
     match = _ARTIFACT_RE.match(name)
     if not match:
-        return (datetime.min, name)
+        return (datetime.min, -1, 0, name)
     try:
         stamp = datetime.strptime(match.group("stamp"), "%Y%m%d_%H%M%S")
     except ValueError:
         stamp = datetime.min
-    return stamp, name
+    attempt_text = match.group("attempt") or ""
+    attempt = int(attempt_text) if attempt_text.isdigit() else 0
+    compression = 1 if match.group("gzip") else 0
+    return stamp, attempt, compression, name
+
+
+def _log_upload_sizes(remote_name: str, source: Path, encoded: Path) -> None:
+    raw_bytes = source.stat().st_size
+    wire_bytes = encoded.stat().st_size
+    log.info(
+        "uploaded artifact name=%s encoding=gzip raw_bytes=%d wire_bytes=%d ratio=%.3f",
+        remote_name, raw_bytes, wire_bytes,
+        wire_bytes / raw_bytes if raw_bytes else 0.0)
 
 
 def latest_artifact(config, base: str) -> RemoteArtifact | None:
@@ -259,11 +282,16 @@ class ArtifactTransaction:
 
         # This call is intentionally per publication, not in __init__; a
         # complete retry invokes this method again and gets a new clock value.
-        remote_name = _make_timestamped_name(base + ".db", self.filename_clock)
+        remote_name = _make_timestamped_name(base, self.filename_clock)
         if _attempt:
-            stem, extension = remote_name.rsplit(".", 1)
-            remote_name = f"{stem}_{_attempt}.{extension}"
-        put(source, remote_name)
+            stem = remote_name[:-len(".db.gz")]
+            remote_name = f"{stem}_{_attempt}.db.gz"
+        try:
+            with encode_sqlite_artifact(source) as encoded:
+                put(str(encoded), remote_name)
+                _log_upload_sizes(remote_name, Path(source), encoded)
+        except ArtifactCodecError as exc:
+            raise WebDAVError(str(exc)) from exc
         # Confirmation is an exact-name PROPFIND observation.  Looking only
         # at the latest artifact would report a false failure if another
         # writer published a newer file between our PUT and this check.
@@ -321,34 +349,66 @@ def _build_url(config: SyncConfig, remote_filename: str | None = None) -> str:
 
 def download_artifact(config: SyncConfig, dest_path: str,
                       remote_filename: str | None = None) -> bool:
-    """Download remote DB. Returns True if downloaded, False if not found (first sync)."""
+    """Download a `.db` or `.db.gz` database artifact atomically.
+
+    Returns True when an artifact was materialized and False when the remote
+    endpoint reports that no artifact exists yet.
+    """
     url = _build_url(config, remote_filename)
-    resp = requests.get(
-        url,
-        auth=HTTPBasicAuth(config.username, config.password),
-        timeout=30,
-    )
-    if resp.status_code in (404, 409, 410):
-        return False  # no remote DB yet — first sync
-    if not resp.ok:
-        raise WebDAVError(f"Download failed: HTTP {resp.status_code}")
-    destination = Path(dest_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".download", dir=destination.parent)
+    remote_name = remote_filename or Path(config.filename).name
+    response = None
+    fd: int | None = None
+    payload_path: Path | None = None
+    wire_bytes = 0
     try:
+        response = requests.get(
+            url,
+            auth=HTTPBasicAuth(config.username, config.password),
+            timeout=30,
+            stream=True,
+        )
+        if response.status_code in (404, 409, 410):
+            return False  # no remote DB yet — first sync
+        if not response.ok:
+            raise WebDAVError(f"Download failed: HTTP {response.status_code}")
+
+        destination = Path(dest_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".payload",
+            dir=destination.parent)
+        payload_path = Path(temporary)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as handle:
-            handle.write(resp.content)
-        os.replace(temporary, destination)
-    except Exception:
+            fd = None
+            for block in response.iter_content(chunk_size=1024 * 1024):
+                if not block:
+                    continue
+                wire_bytes += len(block)
+                handle.write(block)
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
+            decode_sqlite_artifact(payload_path, remote_name, destination)
+        except ArtifactCodecError as exc:
+            raise WebDAVError(str(exc)) from exc
+        raw_bytes = destination.stat().st_size
+        log.info(
+            "downloaded artifact name=%s encoding=%s wire_bytes=%d raw_bytes=%d ratio=%.3f",
+            remote_name, "gzip" if remote_name.endswith(".db.gz") else "identity",
+            wire_bytes, raw_bytes, wire_bytes / raw_bytes if raw_bytes else 0.0)
+        return True
+    except requests.RequestException as exc:
+        raise WebDAVError(f"Download failed: {exc}") from exc
+    finally:
+        if response is not None:
+            close = getattr(response, "close", None)
+            if close is not None:
+                close()
+        if fd is not None:
             os.close(fd)
-        except OSError:
-            log.debug("download temporary descriptor already closed")
-        Path(temporary).unlink(missing_ok=True)
-        raise
-    return True
+        if payload_path is not None:
+            payload_path.unlink(missing_ok=True)
 
 
 def _ensure_folder(config: SyncConfig, remote_filename: str | None = None):
@@ -426,8 +486,13 @@ def publish_config_artifact(config: SyncConfig, src_path: str,
     Dashboard publication continues to use ``publish_versioned_artifact`` and
     its stronger confirmation protocol.
     """
-    remote_name = _make_timestamped_name(base + ".db")
-    upload_artifact(config, src_path, remote_filename=remote_name)
+    remote_name = _make_timestamped_name(base)
+    try:
+        with encode_sqlite_artifact(src_path) as encoded:
+            upload_artifact(config, str(encoded), remote_filename=remote_name)
+            _log_upload_sizes(remote_name, Path(src_path), encoded)
+    except ArtifactCodecError as exc:
+        raise WebDAVError(str(exc)) from exc
     return RemoteArtifact(remote_name)
 
 

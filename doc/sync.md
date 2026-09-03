@@ -36,19 +36,27 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 
 每次上传生成带时间戳的新文件，云端旧文件不删除：
 
-- 配置：`token-board_config_YYYYMMDD_HHMMSS.db`；
-- Dashboard：`dashboard_sync_YYYYMMDD_HHMMSS.db`。
+- 配置：`token-board_config_YYYYMMDD_HHMMSS.db.gz`；
+- Dashboard：`dashboard_sync_YYYYMMDD_HHMMSS.db.gz`。
 
-运行时只识别上述新前缀，旧的 `proxy_config_*.db` 不会被新版本拉取。配置的默认裸文件名为 `token-board_config.db`，仅用于生成/测试 URL；正常发布使用时间戳文件。
+新版同时读取时间戳 `.db.gz` 和旧 `.db` artifact；同一时间戳同时存在两种格式时优先 gzip。旧的 `proxy_config_*.db` 不会被新版本拉取。配置的默认裸文件名为 `token-board_config.db`，仅用于生成/测试 URL；正常发布使用时间戳 gzip 文件。
+
+### Artifact 压缩
+
+配置和 Dashboard 的 SQLite artifact 在上传前使用 Python 标准库 gzip level 6 压缩，文件名以 `.db.gz` 表示编码；schema manifest 仍以 JSON 原文上传。下载端先流式保存 gzip payload，再解压到同目录临时文件，校验 gzip 完整性和 SQLite header 后原子替换目标文件。gzip 使用固定 `mtime=0`，但 SHA-256 仍针对解压后的 SQLite 字节。
+
+压缩只作用于网络 artifact，不作用于正在使用的本地数据库、配置 snapshot、draft 或 pending 文件。内存按 1 MiB 分块处理，解压后的 artifact 超过 1 GiB、损坏或不是 SQLite 时会失败且不会覆盖已有文件。
+
+首次 gzip 上传前应先升级所有具有同步写权限的设备。升级后客户端可继续读取旧 `.db`，但只发布 `.db.gz`，不长期双写未压缩文件；因此旧客户端不能继续写入 gzip artifact。首次 gzip 发布后如需回滚到旧客户端，必须先将最新 `.db.gz` 解压并重新发布为 `.db`。
 
 ## 配置同步
 
 配置同步采用“启动拉取、单编辑者、云端权威”模型：
 
-1. 看板启动后立即开放用量查看，同时异步列出 `token-board_config_*.db`，拉取最新文件，通过 `app.db.schema_upgrade.upgrade_downloaded_artifact` 在 shadow 中完成 SQL 和 transition，再合入本机配置。拉取完成前配置 API 为只读。
+1. 看板启动后立即开放用量查看，同时异步列出 `token-board_config_*.db.gz` 和旧 `token-board_config_*.db`，拉取最新文件，通过 `app.db.schema_upgrade.upgrade_downloaded_artifact` 在 shadow 中完成 SQL 和 transition，再合入本机配置。拉取完成前配置 API 为只读。
 2. 管理页修改立即写入本机，代理可以立即使用；离开配置页时前端调用 `/api/proxy/sync/config/upload`。
 3. 配置上传只执行时间戳 artifact 的 WebDAV PUT；HTTP 2xx 即视为成功，不做 config hash/ETag 冲突检查，不做上传后 PROPFIND 确认。
-4. 上传副本保留普通配置和本地代理客户端密钥，删除运行时数据、导入游标、上游 API Key 明文与 WebDAV 密码。成功后推进 `token-board_config_snapshot.db` 本地权威快照。
+4. 上传副本保留普通配置和本地代理客户端密钥，删除运行时数据、导入游标、上游 API Key 明文与 WebDAV 密码；副本压缩后上传。成功后推进 `token-board_config_snapshot.db` 本地权威快照。
 5. 上传失败立即恢复最近成功的权威快照，不创建或恢复 durable pending。旧版本遗留 pending 会在下一次拉取前清理。
 
 配置合并按稳定 UUID/upstream credential UUID 做 upsert。云端缺失的普通配置行会变成停用 tombstone；本机上游 API Key 和 WebDAV bootstrap 凭证始终保留，需要在每台机器本地填写。
@@ -57,11 +65,11 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 
 `POST /api/proxy/export` 执行以下完整事务：
 
-1. 拉取最新 `dashboard_sync_*.db` 到 shadow；首次同步则以本地 dashboard 为种子。
+1. 拉取最新 `dashboard_sync_*.db.gz` 或旧 `dashboard_sync_*.db` 到 shadow；首次同步则以本地 dashboard 为种子。
 2. 通过同一个 Python schema-upgrade 边界对 shadow 应用 dashboard SQL/transition，
    再同步账户/软件名称镜像。
 3. 取 `request_log` 的 `(last_exported_log_id, max_id]`，按日×账户/软件×模型聚合到 shadow；同时物化并归档 Plan 与智能体订阅费用。
-4. 上传 shadow 为新的 `dashboard_sync_*.db`。
+4. 压缩并上传 shadow 为新的 `dashboard_sync_*.db.gz`。
 5. 只有上传成功后才推进 `sync_state.last_exported_log_id`、替换本地 dashboard，并清理已归档且超过 30 天的明细。
 
 任一步失败都会删除 shadow，不推进高水位，不替换本地 dashboard，也不清理未确认上传的明细。多机器同时上传时仍要求避免并发，后完成的完整文件可能覆盖先完成的文件。
