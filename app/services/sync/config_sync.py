@@ -211,7 +211,7 @@ def _pull_current(db_path: str, config: SyncConfig,
             raise WebDAVError(
                 f"拒绝跨 Major 配置同步: remote=V{remote_version.major}.{remote_version.minor}, "
                 f"local=V{local_version.major}.{local_version.minor}")
-        upgrade_downloaded_artifact(
+        upgrade_result = upgrade_downloaded_artifact(
             str(remote_path), TOKEN_BOARD_DATABASE_NAME,
             schema_dir or schema_dir_for(db_path, TOKEN_BOARD_DATABASE_NAME),
             local_token_board_path=db_path, configuration_only=True)
@@ -222,9 +222,9 @@ def _pull_current(db_path: str, config: SyncConfig,
             raise WebDAVError("云端 schema minor 高于本机，当前配置保持只读")
 
         merge_config_tables(str(remote_path), db_path)
-        if remote_version and remote_version.major == 0:
-            # Publish the migrated V1 representation without requiring a
-            # directory listing confirmation.
+        if upgrade_result.upgraded:
+            # Publish any upgraded artifact (V0 or same-major V1) as a new
+            # immutable gzip artifact. The old remote file is never changed.
             publish_path = tmp_dir / "token-board_config_v1.db"
             _build_upload_copy(db_path, publish_path)
             published = publish_config_artifact(config, str(publish_path))

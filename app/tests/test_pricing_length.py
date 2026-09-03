@@ -22,7 +22,7 @@ class PricingLengthTest(AppDatabaseTestCase):
                  prompt + completion, requested_at),
             )
             return conn.execute(
-                "SELECT pricing_status,pricing_rate_id,equivalent_cost "
+                "SELECT pricing_status,equivalent_cost "
                 "FROM request_log WHERE event_id=?", (event_id,)
             ).fetchone()
 
@@ -60,10 +60,10 @@ class PricingLengthTest(AppDatabaseTestCase):
             "2999-01-01T00:00:00Z")
 
         self.assertEqual(below[0], "rated")
-        self.assertAlmostEqual(below[2], (999 + 2) / 1_000_000)
-        self.assertAlmostEqual(at_first[2], (1000 * 2 + 4) / 1_000_000)
+        self.assertAlmostEqual(below[1], (999 + 2) / 1_000_000)
+        self.assertAlmostEqual(at_first[1], (1000 * 2 + 4) / 1_000_000)
         self.assertAlmostEqual(
-            at_second[2], (1500 * 3 + 500 * 0.25 + 2) / 1_000_000)
+            at_second[1], (1500 * 3 + 500 * 0.25 + 2) / 1_000_000)
 
         db.create_pricing({
             "model_pattern": "tiered-slot",
@@ -75,9 +75,9 @@ class PricingLengthTest(AppDatabaseTestCase):
         })
         tiered_slot = self._insert_pending(
             "tier-slot", "tiered-slot", 1000, 0, 0, "2999-01-01T00:00:00Z")
-        self.assertAlmostEqual(tiered_slot[2], 0.006)
+        self.assertAlmostEqual(tiered_slot[1], 0.006)
 
-    def test_length_tier_updates_are_versioned_and_update_payload_is_compatible(self) -> None:
+    def test_length_tier_updates_are_in_place_and_update_payload_is_compatible(self) -> None:
         db = self.proxy_database()
         pricing_id = db.create_pricing({
             "model_pattern": "history-tiered",
@@ -85,33 +85,27 @@ class PricingLengthTest(AppDatabaseTestCase):
             "output_price": 2.0,
             "length_tiers": [{"threshold_tokens": 1000, "input_price": 3.0}],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
-            old_valid_from = conn.execute(
-                "SELECT valid_from FROM pricing_rates WHERE pricing_rule_id=?",
-                (pricing_id,),
-            ).fetchone()[0]
-
         old = self._insert_pending(
-            "tier-history-old", "history-tiered", 1000, 0, 0, old_valid_from)
-        self.assertAlmostEqual(old[2], 0.003)
+            "tier-history-old", "history-tiered", 1000, 0, 0,
+            "2020-01-01T00:00:00Z")
+        self.assertAlmostEqual(old[1], 0.003)
 
         # Omitting length_tiers preserves the current tier configuration.
         self.assertTrue(db.update_pricing(pricing_id, {"input_price": 1.5}))
         self.assertEqual(len(db.get_pricing()[0]["length_tiers"]), 1)
 
-        # Supplying [] explicitly clears tiers and creates another rate.
+        # Supplying [] explicitly clears tiers in place.
         self.assertTrue(db.update_pricing(pricing_id, {"length_tiers": []}))
         current = db.get_pricing()[0]
         self.assertEqual(current["length_tiers"], [])
         new = self._insert_pending(
             "tier-history-new", "history-tiered", 1000, 0, 0,
             "2999-01-01T00:00:00Z")
-        self.assertAlmostEqual(new[2], 0.0015)
+        self.assertAlmostEqual(new[1], 0.0015)
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT count(*) FROM pricing_rates WHERE pricing_rule_id=?",
-                (pricing_id,),
-            ).fetchone()[0], 3)
+                "SELECT count(*) FROM pricing_rules WHERE id=?", (pricing_id,)
+            ).fetchone()[0], 1)
             self.assertAlmostEqual(conn.execute(
                 "SELECT equivalent_cost FROM request_log WHERE event_id=?",
                 ("tier-history-old",),
@@ -141,7 +135,7 @@ class PricingLengthTest(AppDatabaseTestCase):
             columns = {row[1] for row in conn.execute(
                 "PRAGMA table_info(pricing_length_tiers)")}
         self.assertEqual(columns, {
-            "pricing_rate_id", "threshold_tokens", "input_price",
+            "pricing_rule_id", "threshold_tokens", "input_price",
             "cache_read_price", "output_price",
         })
 

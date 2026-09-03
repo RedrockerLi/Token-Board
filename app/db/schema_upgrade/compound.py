@@ -183,7 +183,8 @@ def _apply_shadows(
         versions: dict[str, SchemaVersion], scope: str,
         source_timezone: ZoneInfo,
         metadata: dict | None = None,
-        generation_id: str | None = None) -> dict[str, dict]:
+        generation_id: str | None = None,
+        target_versions: dict[str, SchemaVersion] | None = None) -> dict[str, dict]:
     """Apply selected plugins and final SQL to writable shadow files."""
     metadata = metadata or {}
     reports: dict[str, dict] = {}
@@ -208,7 +209,8 @@ def _apply_shadows(
         contexts.append((transition, module, context))
 
     for name, shadow in shadow_paths.items():
-        target = latest_version(schema_root, name, 1)
+        target = (target_versions or {}).get(
+            name, latest_version(schema_root, name, 1))
         apply_sql_migrations(str(shadow), str(schema_root), name, target=target)
 
     generation_id = generation_id or uuid.uuid4().hex
@@ -219,7 +221,9 @@ def _apply_shadows(
                 record_transition(shadow_paths[name], transition, generation_id)
 
     for name, shadow in shadow_paths.items():
-        verify(shadow, name, latest_version(schema_root, name, 1))
+        target = (target_versions or {}).get(
+            name, latest_version(schema_root, name, 1))
+        verify(shadow, name, target)
     return reports
 
 
@@ -288,8 +292,8 @@ def _run_copy_pair(proxy: Path, dashboard: Path, schema_root: Path,
     write_manifest(manifest_path, manifest)
     generation_id = uuid.uuid4().hex
     reports = _apply_shadows(
-        {TOKEN_BOARD_DATABASE_NAME: proxy_shadow,
-         DASHBOARD_DATABASE_NAME: dashboard_shadow},
+        {TOKEN_BOARD_DATABASE_NAME: proxy,
+         DASHBOARD_DATABASE_NAME: dashboard},
         {TOKEN_BOARD_DATABASE_NAME: proxy_shadow,
          DASHBOARD_DATABASE_NAME: dashboard_shadow},
         schema_root, transitions,
@@ -359,8 +363,18 @@ def _run_rebuild_pair(proxy: Path, dashboard: Path, schema_root: Path,
         _prepare_copy_shadow(source, name, target, schema_root)
     proxy_shadow = work_dir / "token-board.v1-shadow.db"
     dashboard_shadow = work_dir / "dashboard.v1-shadow.db"
-    apply_sql_migrations(str(proxy_shadow), str(schema_root), TOKEN_BOARD_DATABASE_NAME)
-    apply_sql_migrations(str(dashboard_shadow), str(schema_root), DASHBOARD_DATABASE_NAME)
+    # The historical 0-to-1 plugin writes the V1.13 pricing layout.  Land the
+    # rebuild there first, then let the V1 pricing transition finish the
+    # destructive flattening. This keeps the published 0-to-1 plugin and its
+    # checksum compatible while allowing V1 to evolve independently.
+    pricing_landing = SchemaVersion(1, 13)
+    apply_sql_migrations(
+        str(proxy_shadow), str(schema_root), TOKEN_BOARD_DATABASE_NAME,
+        target=pricing_landing)
+    dashboard_landing = latest_version(schema_root, DASHBOARD_DATABASE_NAME, 1)
+    apply_sql_migrations(
+        str(dashboard_shadow), str(schema_root), DASHBOARD_DATABASE_NAME,
+        target=dashboard_landing)
     manifest["sources"] = {
         TOKEN_BOARD_DATABASE_NAME: str(proxy_source),
         DASHBOARD_DATABASE_NAME: str(dashboard_source),
@@ -384,7 +398,36 @@ def _run_rebuild_pair(proxy: Path, dashboard: Path, schema_root: Path,
         {TOKEN_BOARD_DATABASE_NAME: proxy_shadow,
          DASHBOARD_DATABASE_NAME: dashboard_shadow},
         schema_root, transitions, versions, "local-pair", source_timezone,
-        {"spool_proxy_path": proxy}, generation_id)
+        {"spool_proxy_path": proxy}, generation_id,
+        {TOKEN_BOARD_DATABASE_NAME: pricing_landing,
+         DASHBOARD_DATABASE_NAME: dashboard_landing})
+
+    # A V0 rebuild can expose a V1 transition after the legacy transform has
+    # landed. Run those routes in the same shadow barrier before publishing.
+    v1_versions = {
+        TOKEN_BOARD_DATABASE_NAME: pricing_landing,
+        DASHBOARD_DATABASE_NAME: dashboard_landing,
+    }
+    v1_transitions = select_transitions(
+        schema_root, "local-pair", v1_versions,
+        {TOKEN_BOARD_DATABASE_NAME: proxy_shadow,
+         DASHBOARD_DATABASE_NAME: dashboard_shadow})
+    if v1_transitions:
+        proxy_v1_source = work_dir / "token-board.v1-source.db"
+        dashboard_v1_source = work_dir / "dashboard.v1-source.db"
+        copy_sqlite(proxy_shadow, proxy_v1_source)
+        copy_sqlite(dashboard_shadow, dashboard_v1_source)
+        reports.update(_apply_shadows(
+            {TOKEN_BOARD_DATABASE_NAME: proxy_v1_source,
+             DASHBOARD_DATABASE_NAME: dashboard_v1_source},
+            {TOKEN_BOARD_DATABASE_NAME: proxy_shadow,
+             DASHBOARD_DATABASE_NAME: dashboard_shadow},
+            schema_root, v1_transitions, v1_versions, "local-pair",
+            source_timezone, generation_id=generation_id))
+        transitions = transitions + v1_transitions
+        manifest["transition"] = [
+            item.transition_id for item, _module in transitions
+        ]
     manifest["verification"] = reports
     manifest["generation_id"] = generation_id
     manifest["stage"] = "verified"

@@ -2,7 +2,6 @@
 
 import math
 
-from app.core.time import utc_now
 from app.db.proxy.common import sqlite3
 
 
@@ -17,30 +16,20 @@ class ProxyPricingMixin:
         conn = self._connect()
         try:
             rows = conn.execute(
-                    "SELECT pr.id,pr.model_pattern,r.input_price,r.output_price,"
-                    "r.cache_read_price,r.currency,r.id rate_id FROM pricing_rules pr "
-                    "JOIN pricing_rates r ON r.pricing_rule_id=pr.id "
-                    "WHERE pr.enabled=1 AND r.valid_until IS NULL "
-                    "AND NOT EXISTS ("
-                    "SELECT 1 FROM pricing_rates newer "
-                    "WHERE newer.pricing_rule_id=r.pricing_rule_id "
-                    "AND newer.valid_until IS NULL "
-                    "AND (newer.valid_from>r.valid_from OR "
-                    "(newer.valid_from=r.valid_from AND newer.id>r.id))"
-                    ") "
-                    "ORDER BY pr.priority,pr.id"
+                    "SELECT id,model_pattern,input_price,output_price,"
+                    "cache_read_price,currency FROM pricing_rules "
+                    "ORDER BY priority,id"
                 ).fetchall()
             result = []
             for row in rows:
                 item = dict(row)
                 item["slots"] = [dict(slot) for slot in conn.execute(
                     "SELECT id,start_minute,end_minute,multiplier FROM pricing_slots "
-                    "WHERE pricing_rate_id=? ORDER BY id", (row["rate_id"],))]
+                    "WHERE pricing_rule_id=? ORDER BY id", (row["id"],))]
                 item["length_tiers"] = [dict(tier) for tier in conn.execute(
                     "SELECT threshold_tokens,input_price,cache_read_price,output_price "
-                    "FROM pricing_length_tiers WHERE pricing_rate_id=? "
-                    "ORDER BY threshold_tokens", (row["rate_id"],))]
-                item.pop("rate_id", None)
+                    "FROM pricing_length_tiers WHERE pricing_rule_id=? "
+                    "ORDER BY threshold_tokens", (row["id"],))]
                 result.append(item)
             return result
         finally:
@@ -94,44 +83,26 @@ class ProxyPricingMixin:
         return sorted(normalized, key=lambda tier: tier["threshold_tokens"])
 
     @staticmethod
-    def _insert_pricing_slots(conn, pricing_id: int, slots) -> None:
-        """Insert time-slot multipliers for a pricing row.
-
-        slots: iterable of {start_minute, end_minute, multiplier} with
-        boundaries in UTC+0 minutes ([0,1439]; start>end means overnight).
-        """
-        if not slots:
-            return
-        rate_id = pricing_id
-        row = conn.execute(
-            "SELECT id FROM pricing_rates WHERE pricing_rule_id=? AND valid_until IS NULL "
-            "ORDER BY valid_from DESC,id DESC LIMIT 1", (pricing_id,)
-        ).fetchone()
-        if row is None:
-            raise ValueError("计价规则没有当前 rate")
-        ProxyPricingMixin._insert_pricing_slots_for_rate(conn, row[0], slots)
-
-    @staticmethod
-    def _insert_pricing_slots_for_rate(conn, rate_id: int, slots) -> None:
+    def _insert_pricing_slots_for_rule(conn, rule_id: int, slots) -> None:
         if not slots:
             return
         for s in slots:
             conn.execute(
                 "INSERT INTO pricing_slots"
-                "(pricing_rate_id,start_minute,end_minute,multiplier) VALUES(?,?,?,?)",
-                (rate_id, int(s["start_minute"]), int(s["end_minute"]),
+                "(pricing_rule_id,start_minute,end_minute,multiplier) VALUES(?,?,?,?)",
+                (rule_id, int(s["start_minute"]), int(s["end_minute"]),
                  float(s.get("multiplier", 1.0))),
             )
 
     @staticmethod
-    def _insert_pricing_length_tiers(conn, rate_id: int, tiers) -> None:
+    def _insert_pricing_length_tiers(conn, rule_id: int, tiers) -> None:
         if not tiers:
             return
         conn.executemany(
             "INSERT INTO pricing_length_tiers"
-            "(pricing_rate_id,threshold_tokens,input_price,cache_read_price,output_price) "
+            "(pricing_rule_id,threshold_tokens,input_price,cache_read_price,output_price) "
             "VALUES(?,?,?,?,?)",
-            [(rate_id, tier["threshold_tokens"], tier["input_price"],
+            [(rule_id, tier["threshold_tokens"], tier["input_price"],
               tier["cache_read_price"], tier["output_price"])
              for tier in tiers],
         )
@@ -152,23 +123,14 @@ class ProxyPricingMixin:
                 "SELECT COALESCE(max(priority),-1)+1 FROM pricing_rules"
             ).fetchone()[0]
             pid = conn.execute(
-                "INSERT INTO pricing_rules(model_pattern,priority) VALUES(?,?)",
-                (data["model_pattern"], priority),
-            ).lastrowid
-            conn.execute(
-                "INSERT INTO pricing_rates"
-                "(pricing_rule_id,input_price,cache_read_price,output_price,currency,valid_from) "
-                "VALUES(?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                (pid, input_price, cache_read_price,
+                "INSERT INTO pricing_rules"
+                "(model_pattern,priority,input_price,cache_read_price,output_price,currency) "
+                "VALUES(?,?,?,?,?,?)",
+                (data["model_pattern"], priority, input_price, cache_read_price,
                  data["output_price"], currency),
-            )
-            rate_id = conn.execute(
-                "SELECT id FROM pricing_rates WHERE pricing_rule_id=? "
-                "AND valid_until IS NULL ORDER BY valid_from DESC,id DESC LIMIT 1",
-                (pid,),
-            ).fetchone()[0]
-            self._insert_pricing_slots_for_rate(conn, rate_id, data.get("slots"))
-            self._insert_pricing_length_tiers(conn, rate_id, length_tiers)
+            ).lastrowid
+            self._insert_pricing_slots_for_rule(conn, pid, data.get("slots"))
+            self._insert_pricing_length_tiers(conn, pid, length_tiers)
             conn.commit()
             return pid
         finally:
@@ -178,10 +140,7 @@ class ProxyPricingMixin:
         conn = self._connect()
         try:
             current = conn.execute(
-                "SELECT pr.model_pattern,r.* FROM pricing_rules pr JOIN pricing_rates r "
-                "ON r.pricing_rule_id=pr.id WHERE pr.id=? AND pr.enabled=1 "
-                "AND r.valid_until IS NULL "
-                "ORDER BY r.valid_from DESC,r.id DESC LIMIT 1", (pricing_id,)
+                "SELECT * FROM pricing_rules WHERE id=?", (pricing_id,)
             ).fetchone()
             if current is None:
                 return False
@@ -191,56 +150,43 @@ class ProxyPricingMixin:
             length_tiers = None
             if "length_tiers" in data:
                 length_tiers = self._validate_length_tiers(data["length_tiers"])
+            fields = []
+            values = []
             if "model_pattern" in data:
-                conn.execute("UPDATE pricing_rules SET model_pattern=? WHERE id=?",
-                             (data["model_pattern"], pricing_id))
-            rate_changed = any(key in data for key in
-                               ("input_price", "output_price", "cache_read_price",
-                                "currency", "slots", "length_tiers"))
-            if rate_changed:
-                now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
-                old_slots = [dict(row) for row in conn.execute(
-                    "SELECT start_minute,end_minute,multiplier FROM pricing_slots "
-                    "WHERE pricing_rate_id=? ORDER BY id", (current["id"],))]
-                old_length_tiers = [dict(row) for row in conn.execute(
-                    "SELECT threshold_tokens,input_price,cache_read_price,output_price "
-                    "FROM pricing_length_tiers WHERE pricing_rate_id=? "
-                    "ORDER BY threshold_tokens", (current["id"],))]
-                input_price = data.get("input_price", current["input_price"])
-                cache_read_price = data.get("cache_read_price", current["cache_read_price"])
-                if cache_read_price is None:
-                    cache_read_price = input_price
-                # A database upgraded from a pre-V1.13 schema may still have
-                # more than one current rate.  Close every current version so
-                # this edit restores the invariant even before the migration
-                # or after importing a legacy artifact.
+                fields.append("model_pattern=?")
+                values.append(data["model_pattern"])
+            for field in ("input_price", "cache_read_price", "output_price", "currency"):
+                if field in data:
+                    fields.append(f"{field}=?")
+                    value = data[field]
+                    if field == "cache_read_price" and value is None:
+                        value = data.get("input_price", current["input_price"])
+                    values.append(value)
+            if fields:
                 conn.execute(
-                    "UPDATE pricing_rates SET valid_until=? "
-                    "WHERE pricing_rule_id=? AND valid_until IS NULL",
-                    (now, pricing_id),
+                    f"UPDATE pricing_rules SET {','.join(fields)} WHERE id=?",
+                    (*values, pricing_id),
                 )
-                new_rate_id = conn.execute(
-                    "INSERT INTO pricing_rates"
-                    "(pricing_rule_id,input_price,cache_read_price,output_price,currency,valid_from) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (pricing_id, input_price, cache_read_price,
-                     data.get("output_price", current["output_price"]), currency, now),
-                ).lastrowid
-                self._insert_pricing_slots_for_rate(
-                    conn, new_rate_id, data.get("slots", old_slots))
-                self._insert_pricing_length_tiers(
-                    conn, new_rate_id,
-                    length_tiers if length_tiers is not None else old_length_tiers)
+            if "slots" in data:
+                conn.execute("DELETE FROM pricing_slots WHERE pricing_rule_id=?", (pricing_id,))
+                self._insert_pricing_slots_for_rule(conn, pricing_id, data["slots"])
+            if length_tiers is not None:
+                conn.execute(
+                    "DELETE FROM pricing_length_tiers WHERE pricing_rule_id=?",
+                    (pricing_id,),
+                )
+                self._insert_pricing_length_tiers(conn, pricing_id, length_tiers)
+            if not fields and "slots" not in data and "length_tiers" not in data:
+                return False
             conn.commit()
-            return conn.total_changes > 0
+            return True
         finally:
             conn.close()
 
     def delete_pricing(self, pricing_id: int) -> bool:
         conn = self._connect()
         try:
-            conn.execute("UPDATE pricing_rules SET enabled=0 WHERE id=? AND enabled=1",
-                         (pricing_id,))
+            conn.execute("DELETE FROM pricing_rules WHERE id=?", (pricing_id,))
             conn.commit()
             return conn.total_changes > 0
         finally:
@@ -259,8 +205,7 @@ class ProxyPricingMixin:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id,priority FROM pricing_rules WHERE enabled=1 "
-                "ORDER BY priority,id"
+                "SELECT id,priority FROM pricing_rules ORDER BY priority,id"
             ).fetchall()
             current_ids = [row["id"] for row in rows]
             if set(pricing_ids) != set(current_ids):
@@ -284,20 +229,10 @@ class ProxyPricingMixin:
                     (temporary_base - offset, row["id"]),
                 )
 
-            # Active rules own the visible order.  Disabled rules are placed
-            # after them so a later create remains appended to active rules.
             for priority, pricing_id in enumerate(pricing_ids):
                 conn.execute(
                     "UPDATE pricing_rules SET priority=? WHERE id=?",
                     (priority, pricing_id),
-                )
-            disabled_ids = [row["id"] for row in conn.execute(
-                "SELECT id FROM pricing_rules WHERE enabled=0 ORDER BY id"
-            ).fetchall()]
-            for offset, pricing_id in enumerate(disabled_ids, len(pricing_ids)):
-                conn.execute(
-                    "UPDATE pricing_rules SET priority=? WHERE id=?",
-                    (offset, pricing_id),
                 )
             conn.commit()
             return True

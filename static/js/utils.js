@@ -107,6 +107,7 @@ function fmtNum(n) {
  * (6 → 3 + 3 in that case) without hardcoding a list of breakpoints.
  */
 (function installStatsGridLayout() {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
     var scheduled = false;
     var observedGrids = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
 
@@ -185,6 +186,7 @@ function esc(s) {
 // Keep each native select as the form/value source, but mirror it with an
 // accessible button + listbox so the expanded state belongs to our theme too.
 (function installThemedSelects() {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
     var instances = new WeakMap();
     var activeInstance = null;
     var nextMenuId = 0;

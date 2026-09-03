@@ -18,9 +18,10 @@ class TransitionRegistryTest(unittest.TestCase):
         transitions = discover(root)
         self.assertEqual(
             [item.transition_id for item in transitions],
-            ["0-to-1", "v1-legacy-agent-billing", "v1-agent-identity"],
+            ["0-to-1", "v1-legacy-agent-billing", "v1-agent-identity",
+             "v1-pricing-current-only"],
         )
-        self.assertEqual([item.order for item in transitions], [0, 1, 2])
+        self.assertEqual([item.order for item in transitions], [0, 1, 2, 3])
         for transition in transitions:
             module = transition.load()
             self.assertTrue(callable(getattr(module, "apply", None)))
@@ -44,7 +45,18 @@ class TransitionRegistryTest(unittest.TestCase):
                  "dashboard": SchemaVersion(1, 3)}, paths)
             self.assertEqual(
                 [item[0].transition_id for item in selected],
-                ["v1-legacy-agent-billing", "v1-agent-identity"],
+                ["v1-legacy-agent-billing", "v1-agent-identity",
+                 "v1-pricing-current-only"],
+            )
+
+            selected = select_transitions(
+                root, "local-pair",
+                {"token-board": SchemaVersion(1, 13),
+                 "dashboard": SchemaVersion(1, 5)}, paths)
+            self.assertEqual(
+                [item[0].transition_id for item in selected],
+                ["v1-legacy-agent-billing", "v1-agent-identity",
+                 "v1-pricing-current-only"],
             )
 
     def test_version_ranges_are_inclusive(self) -> None:

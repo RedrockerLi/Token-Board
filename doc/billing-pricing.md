@@ -1,29 +1,27 @@
 # 计费与定价
 
-V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库按 `requested_at` 选择历史 rate 并固化 `equivalent_cost`；metered 合同同时写 `billed_usage_cost=equivalent_cost`，recurring 合同写 0，真实周期费用来自 `billing_period_charges` 或独立的智能体订阅周期表。上游 API 只展示 api/plan 两种类型，智能体配置走独立管理页。
+V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库在写入 `request_log` 时读取当前模型定价并固化 `equivalent_cost`；metered 合同同时写 `billed_usage_cost=equivalent_cost`，recurring 合同写 0，真实周期费用来自 `billing_period_charges` 或独立的智能体订阅周期表。上游 API 只展示 api/plan 两种类型，智能体配置走独立管理页。
 
 ## 定价模型
 
-`pricing_rules` 保存 pattern 与显式 priority；每条规则有带 `valid_from/valid_until` 的 `pricing_rates` 历史。`model_pattern` 支持 `*` / `?` GLOB 通配，单位为每百万 tokens：
-
-每条规则同时只能有一个 `valid_until IS NULL` 的当前 rate；改价会关闭当前版本并创建新版本，旧版本保留用于历史计费。
+`pricing_rules` 直接保存 pattern、显式 priority 和当前价格；不再有 `pricing_rates` 历史表或价格有效期。`model_pattern` 支持 `*` / `?` GLOB 通配，单位为每百万 tokens。
 
 - `input_price`:未命中缓存的输入单价
 - `output_price`:输出单价
 - `cache_read_price`:缓存命中的输入单价,缺省回落 `input_price`
 
-匹配按 `priority,id`，再在请求时间点选择有效 rate。模型定价页通过拖放一次提交完整优先级顺序；改价关闭旧 rate 并新建 rate，不修改主键或历史行。
+匹配按 `priority,id`。模型定价页通过拖放一次提交完整优先级顺序；改价原地更新当前规则，只影响之后写入的请求。
 
 ### 输入长度条件档
 
-每个 `pricing_rates` 可挂零个或多个 `pricing_length_tiers`。条件使用请求的
+每个定价规则可挂零个或多个 `pricing_length_tiers`。条件使用请求的
 `prompt_tokens`（包含缓存输入）判断，门槛按 `prompt_tokens >= threshold_tokens`
 命中；低于最小门槛时使用基本价格，命中多档时使用已达到的最高门槛档。
 界面用十进制单位输入（`1K=1000`、`1M=1000000`），数据库保存整数 token。
 
-条件档的输入、缓存命中、输出价格可以分别留空；留空字段继承基本 rate，至少要
-覆盖一个字段。先选择长度档，再把时段倍率乘到该档的三类价格上。条件档属于
-历史 rate，新增或编辑条件档会立即生成新 rate，已有请求的冻结金额不回溯。
+条件档的输入、缓存命中、输出价格可以分别留空；留空字段继承基本价格，至少要
+覆盖一个字段。先选择长度档，再把时段倍率乘到该档的三类价格上。新增或编辑条件档
+会原地替换当前条件档，已有请求的冻结金额不回溯。
 
 ## 峰谷档位
 
@@ -34,7 +32,7 @@ V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库按 `requested
 | `start_minute` / `end_minute` | 当日分钟,按 UTC+0 存,范围 `[0,1439]`,`end` 独占 |
 | `multiplier` | 该时段倍率,默认 1.0 |
 
-请求命中时段:取 `requested_at`(UTC)换算成当日分钟 `M = CAST(strftime('%s', requested_at) AS INTEGER) % 86400 / 60`,落在档位区间即命中,倍率乘到三档基础价上。`start > end` 表示跨午夜档(如 22:00–06:00),命中条件是 `M >= start OR M < end`。同一 pricing 有多档命中时取 `id` 最小的一档。
+请求写入时取当前 UTC 时间换算成当日分钟 `M = CAST(strftime('%s', 'now') AS INTEGER) % 86400 / 60`,落在档位区间即命中,倍率乘到三档基础价上。`start > end` 表示跨午夜档(如 22:00–06:00),命中条件是 `M >= start OR M < end`。同一 pricing 有多档命中时取 `id` 最小的一档。
 
 界面按浏览器所在时区输入和显示,存入库的仍是 UTC+0 当日分钟。换算使用浏览器当前的 `getTimezoneOffset()`:
 
@@ -47,15 +45,13 @@ V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库按 `requested
 
 计费载体是 `request_log` 的**单列 `api_cost`**(0007 起 `cost` + `virtual_cost` 合并——api 账户记真实账单,plan 记虚拟口径,统一落这一列)。智能体用量同样进入 request log 以便导出，但订阅实际费用单独记录。
 
-- **第三方/老写入**(`cost_frozen=0`):由触发器 `tr_request_log_insert` 在插入时按当时的 `model_pricing` 单价、档位配置与汇率算好写进当行(0018 版本,USD 定价按请求当天汇率折 CNY)。
-- **代理自身**(`cost_frozen=1`):C++ 在请求**入队时刻**用 `snapshot_request_cost` 快照定价写入,排队延迟不改账;`event_id` 保证本地 spool 重放幂等。
+- **所有新写入**(`pricing_status='pending'`):由 SQLite 触发器在 INSERT 时按当前规则、当前档位和写入当天汇率计算并固化 `equivalent_cost`。
+- 代理、Agent 导入和 spool 重放都走同一触发器；`event_id` 只负责导入/重放幂等。
 
-两条路径共用同一个**取价视图 `v_pricing_rate`**(0018,`model_pricing` 基本价 + 缓存价/币种 COALESCE 的唯一事实源):触发器的子查询与 C++ 的 `stmt_snapshot_price_` 都从视图取价,只有峰谷档位/汇率子查询(依赖每行时刻)留在两端。等价性由两个 ctest 门保证:`pricing_equivalence`(v17 触发器 vs v18 视图触发器逐位相等)+ `pricing_snapshot_equiv`(C++ 快照 vs v18 触发器一致)。
-
-迁移 `0002` 删掉了 `tr_pricing_insert/update/delete` 三个改价回溯触发器,所以:
+V1.14 删除了模型定价历史和改价回溯路径,所以:
 
 - 改价、增删档位、调整优先级、改汇率,都不再重算历史 `request_log`。
-- 历史行在迁移时用"当前配置 + 各记录时刻的档位倍率"回填过一次,此后保持冻结。
+- 历史行的冻结金额在迁移时原样保留,此后保持冻结。
 - `request_log.api_cost` 是唯一可信的记账值,导出到 `dashboard.db` 时直接按它聚合。
 
 ## plan 账户与虚拟消费
@@ -94,8 +90,8 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 
 ## 币种与汇率(CNY / USD)
 
-- `model_pricing` 与 plan/智能体订阅价都可选币种,默认 CNY,可选 USD。输入的单价/月费是**原生币种**金额。
-- USD 计费在写时按**请求当天的 USD→CNY 汇率**换算成 CNY 后再进 `request_log.api_cost`(代理快照与 `tr_request_log_insert` 触发器同样处理)。
+- 模型定价与 plan/智能体订阅价都可选币种,默认 CNY,可选 USD。输入的单价/月费是**原生币种**金额。
+- 模型 USD 计费在写时按**写入当天的 USD→CNY 汇率**换算成 CNY 后再进 `request_log.api_cost`；订阅周期费用仍按其独立的周期锁定规则处理。
 - 订阅费换算到 CNY 按**计费周期开始日(period_start,UTC)汇率**,首次确定后**永久锁定**:USD 行一旦 `fx_rate_date == date(period_start)` 即锁定,汇率只从 `fx_rates` 的该日精确行读取,永不重新拉取、不随当天汇率漂移;`immediate` 改价时金额按「新价 × 锁定汇率」重算,汇率本身不变。已冻结(finalized)周期金额永远不变,改价也不生效。
 - 周期开始日无精确汇率时,按 `?date=period_start` 从 frankfurter **历史接口**拉取并落库后锁定(1999-01-04 起支持,早于此日期不发请求);拉取失败则用最近一条已存汇率作**临时值(provisional,不锁定)**,每轮物化重试;未锁定的 USD 行在周期结束后也**不会冻结**,直到锁定成功(网络恢复后同一次物化内完成锁定并冻结)。
 - 汇率来源 `GET https://api.frankfurter.dev/v2/rate/USD/CNY`(带 `?date=` 支持历史日期;v2 对周末请求回显请求日期、汇率为最近交易日值)。看板启动与首次使用时按 UTC 日拉取一次并存入本机 `fx_rate` 表;当天已有则直接用;拉取失败(或仍为旧数据)则用最近一条已存汇率。请求日期早于所有已存记录(如过去月份早于首次拉取)时用**最早一条已存汇率**,避免 USD 订阅被按 1.0 低估;只有该币种对从未存储过任何记录才按 1.0(等价不换算)。

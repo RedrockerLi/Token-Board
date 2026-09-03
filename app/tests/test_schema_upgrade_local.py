@@ -65,6 +65,34 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertIsNotNone(proxy_marker)
         self.assertEqual(proxy_marker, dash_marker)
 
+    def test_v0_pair_flattens_legacy_model_pricing(self) -> None:
+        proxy = self.root / "data/token-board.db"
+        dashboard = self.root / "data/dashboard.db"
+        migrate(str(proxy), str(self.root / "schema/token-board/v0"), "token-board")
+        migrate(str(dashboard), str(self.root / "schema/dashboard/v0"), "dashboard")
+        with sqlite3.connect(proxy) as conn:
+            conn.execute(
+                "INSERT INTO model_pricing"
+                "(id,model_pattern,input_price,output_price,cache_read_price,currency) "
+                "VALUES(1,'legacy-model',1,2,0.5,'CNY')"
+            )
+            conn.execute(
+                "INSERT INTO pricing_slots"
+                "(pricing_id,start_minute,end_minute,multiplier) VALUES(1,0,1440,2)"
+            )
+            conn.commit()
+        ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
+        with sqlite3.connect(proxy) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT id,input_price,output_price FROM pricing_rules"
+            ).fetchall(), [(1, 1.0, 2.0)])
+            self.assertEqual(conn.execute(
+                "SELECT pricing_rule_id,multiplier FROM pricing_slots"
+            ).fetchall(), [(1, 2.0)])
+            self.assertFalse(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='pricing_rates'"
+            ).fetchone())
+
     def test_v0_pair_imports_durable_usage_spool(self) -> None:
         proxy = self.root / "data/token-board.db"
         dashboard = self.root / "data/dashboard.db"

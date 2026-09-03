@@ -131,7 +131,7 @@ class ProxyBillingReadMixin:
                     r.model, r.prompt_tokens, r.cache_read_tokens,
                     r.completion_tokens,
                     r.total_tokens, r.equivalent_cost AS cost,
-                    r.billed_usage_cost, r.pricing_status, r.pricing_rate_id,
+                    r.billed_usage_cost, r.pricing_status,
                     r.queue_ms, r.accounting_ms, r.is_streaming,
                     r.status_code, r.ttft_ms, r.generation_ms, r.output_tps,
                     r.upstream_ttft_ms, r.upstream_duration_ms,

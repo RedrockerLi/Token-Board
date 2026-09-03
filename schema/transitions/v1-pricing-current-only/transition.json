@@ -1,0 +1,52 @@
+{
+  "id": "v1-pricing-current-only",
+  "databases": ["token-board", "dashboard"],
+  "strategy": "shadow-barrier",
+  "entrypoint": "transition.py",
+  "order": 3,
+  "description": "Flatten model pricing to the current configuration only",
+  "routes": [
+    {
+      "scope": "local-pair",
+      "current": {
+        "token-board": {"major": 1, "min_minor": 0, "max_minor": 13},
+        "dashboard": "1.*"
+      },
+      "prepare": {
+        "token-board": "1.13",
+        "dashboard": "same"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    },
+    {
+      "scope": "token-board-artifact",
+      "current": {
+        "token-board": {"major": 1, "min_minor": 0, "max_minor": 13}
+      },
+      "prepare": {
+        "token-board": "1.13"
+      },
+      "target": {
+        "token-board": "latest"
+      }
+    },
+    {
+      "scope": "dashboard-artifact",
+      "current": {
+        "token-board": {"major": 1, "min_minor": 0, "max_minor": 13},
+        "dashboard": "1.*"
+      },
+      "prepare": {
+        "token-board": "1.13",
+        "dashboard": "same"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    }
+  ]
+}

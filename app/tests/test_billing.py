@@ -59,12 +59,11 @@ class BillingTest(AppDatabaseTestCase):
                 "VALUES('pending','import',?,'model-a',1000000,500000,0,1500000,"
                 "200,?,'pending')", (account_id, requested_at))
             pending = conn.execute(
-                "SELECT pricing_status,pricing_rate_id,equivalent_cost,billed_usage_cost "
+                "SELECT pricing_status,equivalent_cost,billed_usage_cost "
                 "FROM request_log WHERE event_id='pending'").fetchone()
             self.assertEqual(pending[0], "rated")
-            self.assertIsNotNone(pending[1])
+            self.assertAlmostEqual(pending[1], 2.0)
             self.assertAlmostEqual(pending[2], 2.0)
-            self.assertAlmostEqual(pending[3], 2.0)
 
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,model,"
@@ -96,12 +95,12 @@ class BillingTest(AppDatabaseTestCase):
                 "'usd-model',1000000,0,1000000,200,'2026-08-09T00:00:00Z',"
                 "'pending')", (account_id,))
             row = conn.execute(
-                "SELECT pricing_status,pricing_rate_id,equivalent_cost,"
+                "SELECT pricing_status,equivalent_cost,"
                 "billed_usage_cost FROM request_log WHERE event_id='usd-no-fx'"
             ).fetchone()
-            self.assertEqual(row, ("unrated", None, 0.0, 0.0))
+            self.assertEqual(row, ("unrated", 0.0, 0.0))
 
-    def test_pricing_priority_and_historical_price(self) -> None:
+    def test_pricing_priority_and_current_write_time_price(self) -> None:
         db = self.proxy_database()
         account_id = db.create_account({
             "name": "priced-priority", "account_type": "api",
@@ -126,27 +125,61 @@ class BillingTest(AppDatabaseTestCase):
                 "VALUES('prio','import',?,'model-a',1000000,1000000,0,2000000,"
                 "200,?,'pending')", (account_id, requested_at))
             row = conn.execute(
-                "SELECT pricing_rate_id,equivalent_cost FROM request_log "
+                "SELECT equivalent_cost FROM request_log "
                 "WHERE event_id='prio'").fetchone()
-            self.assertIsNotNone(row[0])
             # 1M prompt * 5 + 1M completion * 10 = 15: the specific rule wins
             # over the generic model-* rule (which would give 3).
-            self.assertAlmostEqual(row[1], 15.0)
+            self.assertAlmostEqual(row[0], 15.0)
         # Reorder moves the specific rule down (generic rule now wins).
         self.assertTrue(db.reorder_pricing_order([generic, specific]))
         self.assertEqual([r["model_pattern"] for r in db.get_pricing()],
                          ["model-*", "model-a"])
-        # Historical price change: a later update supersedes, old rate frozen.
+        self.assertTrue(db.reorder_pricing_order([specific, generic]))
+        # A later update changes the current row in place. Existing request
+        # costs remain frozen, while a newly inserted row uses the new price.
         self.assertTrue(db.update_pricing(specific, {"input_price": 6,
                                                      "output_price": 12}))
         with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO request_log(event_id,source_kind,account_id,model,"
+                "prompt_tokens,completion_tokens,total_tokens,status_code,"
+                "requested_at,pricing_status) VALUES('prio-new','import',?,'model-a',"
+                "1000000,1000000,2000000,200,'2020-01-01T00:00:00Z','pending')",
+                (account_id,))
             current = conn.execute(
-                "SELECT count(*) FROM pricing_rates WHERE pricing_rule_id=? "
-                "AND valid_until IS NULL", (specific,)).fetchone()[0]
+                "SELECT count(*) FROM pricing_rules WHERE id=?", (specific,)
+            ).fetchone()[0]
             self.assertEqual(current, 1)
+            self.assertAlmostEqual(conn.execute(
+                "SELECT equivalent_cost FROM request_log WHERE event_id='prio'"
+            ).fetchone()[0], 15.0)
+            self.assertAlmostEqual(conn.execute(
+                "SELECT equivalent_cost FROM request_log WHERE event_id='prio-new'"
+            ).fetchone()[0], 18.0)
+
+    def test_pricing_delete_is_physical_and_cascades_children(self) -> None:
+        db = self.proxy_database()
+        pricing_id = db.create_pricing({
+            "model_pattern": "delete-me", "input_price": 1,
+            "output_price": 2,
+            "slots": [{"start_minute": 0, "end_minute": 1440,
+                       "multiplier": 1.5}],
+            "length_tiers": [{"threshold_tokens": 1000,
+                              "input_price": 2}],
+        })
+        self.assertTrue(db.delete_pricing(pricing_id))
+        with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT count(*) FROM pricing_rates WHERE pricing_rule_id=?",
-                (specific,)).fetchone()[0], 2)
+                "SELECT count(*) FROM pricing_rules WHERE id=?", (pricing_id,)
+            ).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM pricing_slots WHERE pricing_rule_id=?",
+                (pricing_id,)
+            ).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM pricing_length_tiers WHERE pricing_rule_id=?",
+                (pricing_id,)
+            ).fetchone()[0], 0)
 
     def test_recurring_cross_month_anchor_and_cancellation(self) -> None:
         db = self.proxy_database()

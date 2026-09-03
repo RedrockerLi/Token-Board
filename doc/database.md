@@ -70,10 +70,10 @@ Dashboard V1 统一使用 `accounts`、`daily_usage` 和 `monthly_recurring_cost
 | `completion_tokens` | 输出 |
 | `cache_read_tokens` | 输入缓存命中部分 |
 | `total_tokens` | 输入 + 输出 |
-| `api_cost` | api 等价价:api 账户 = 真实账单,plan/agent = 虚拟口径(买套餐省下的金额)。0007 起 `cost` + `virtual_cost` 两列合并为这一列,由触发器或代理快照写时计价固化 |
+| `api_cost` | api 等价价:api 账户 = 真实账单,plan/agent = 虚拟口径(买套餐省下的金额)。0007 起 `cost` + `virtual_cost` 两列合并为这一列,由数据库写入触发器按当前配置固化 |
 | `upstream_key_id` | 实际转发用的上游密钥(0007 起)。无外键,密钥删除后保留 NULL |
 | `event_id` | 幂等键(0012):事件日志重放(COMMIT 结果不确定)时保证同一事件只记一行。代理写入的行为 NULL,重放才填充 |
-| `cost_frozen` | 0 = 由 `tr_request_log_insert` 触发器在插入时计价;1 = 代理在请求入队时刻已把价格快照写死(排队延迟不改账)。第三方/老写入保持 0 |
+| `pricing_status` | 新写入先为 `pending`；当前规则和汇率可用时写为 `rated`，否则写为 `unrated`；历史导入行可保留 `frozen` |
 | `ttft_ms` / `generation_ms` / `output_tps` | 首字节延迟、生成耗时、输出速度(token/s),0009 起 |
 | `upstream_ttft_ms` / `upstream_duration_ms` | 上游侧首字节延迟与总耗时 |
 | `attempt_count` / `fallback_count` | 本请求尝试的上游次数 / 回退次数(0010) |
@@ -86,19 +86,17 @@ Dashboard V1 统一使用 `accounts`、`daily_usage` 和 `monthly_recurring_cost
 
 索引:`idx_rl_account`、`idx_rl_time`、`idx_rl_key`(upstream_key_id)、`idx_rl_ttft_time`(requested_at, ttft_ms)、`idx_request_log_event_id`(event_id,唯一)。
 
-计费触发器 `tr_request_log_insert`(0018 版本,基于 `v_pricing_rate` 视图)只在 `cost_frozen=0` 时触发,按"当前定价 × 命中时段倍率 × 币种汇率"计算 `api_cost` 固化;代理自身快照计价走 `cost_frozen=1`(入队时定价,排队延迟不改账,`stmt_snapshot_price_` 同样读 `v_pricing_rate` 视图)。公式:
+计费触发器 `price_usage_event`(V1.14)只处理 `pricing_status='pending'` 的新行,按"写入时当前定价 × 写入时段倍率 × 写入当天可用汇率"计算并固化 `equivalent_cost`。代理和 Agent 导入共用这一条数据库计价路径。公式:
 
 ```
 api_cost = (miss/1e6) × input_price
          + (cache_read/1e6) × COALESCE(cache_read_price, input_price)
          + (completion/1e6) × output_price
-         ,再乘以 requested_at 命中 pricing_slots 档位的 multiplier(无命中=1.0)
-         ;若命中定价的 currency='USD',再乘以请求当天最近一条 USD→CNY 汇率(缺失按 1.0)
+         ,再乘以写入时刻命中 pricing_slots 档位的 multiplier(无命中=1.0)
+         ;若当前定价的 currency='USD',再乘以写入当天最近一条 USD→CNY 汇率(缺失则 unrated)
 ```
 
-模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY mp.id LIMIT 1`,即第一条匹配生效,`reorder_pricing` 交换 `model_pricing.id` 来改变匹配优先级。所有账户统一记 `api_cost`(api = 真实账单,plan/agent = 虚拟口径)。`prompt_tokens + completion_tokens = 0` 的行只记日志、不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
-
-**`v_pricing_rate` 视图(0018)**:取价部分(`model_pricing` 基本价 + 缓存价/币种 COALESCE)的唯一事实源,触发器与 C++ 快照都从视图取价。峰谷档位(`pricing_slots`)与汇率(`fx_rate`)子查询依赖每行 `minute(requested_at)` / `date(requested_at)`,视图无法参数化,保留在两端。等价回归:`pricing_equivalence`(v17 触发器 vs v18 视图触发器,20 用例逐位相等)+ `pricing_snapshot_equiv`(C++ 快照 vs v18 触发器),均并入 ctest。
+模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY priority,id`,即第一条匹配生效,`reorder_pricing` 修改 `priority` 来改变匹配优先级。所有账户统一记 `equivalent_cost`(api = 真实账单,plan/agent = 虚拟口径)。`prompt_tokens + completion_tokens = 0` 的行只记日志、不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
 
 清理规则:同步进度由 `sync_state.last_exported_log_id` 单值提交检查点记录(无逐行 exported 标记)。
 `cleanup_exported_logs` 只删 `id ≤ 检查点 且 请求时间超过 30 天` 的行;未计入存档的行永久保留。
@@ -108,9 +106,9 @@ api_cost = (miss/1e6) × input_price
 
 key/value 表,存 `last_exported_log_id`:最近一次**完整成功**的拉取-导出-上传事务导出的最大 `request_log.id`。
 
-### model_pricing 与 pricing_slots — 定价
+### pricing_rules 与 pricing_slots — 定价
 
-`model_pricing` 每行一个 `model_pattern`(支持 `*` / `?` GLOB 通配),含 `input_price` / `output_price` / `cache_read_price`(缺省回落 input_price)与 `currency`(`CNY` / `USD`,默认 CNY),单位为原生币种 / 百万 tokens。`pricing_slots` 给每个定价挂若干"当日时段×倍率"档位,`start_minute` / `end_minute` 是 UTC+0 当日分钟 `[0,1439]`,end 独占,`start > end` 表示跨午夜。档位删除随定价 `ON DELETE CASCADE`。价格表无状态——只存当前值,改价只影响之后写入的请求与当月 plan 订阅。
+`pricing_rules` 每行一个 `model_pattern`(支持 `*` / `?` GLOB 通配),含当前 `input_price` / `output_price` / `cache_read_price`(缺省回落 input_price)与 `currency`(`CNY` / `USD`,默认 CNY),单位为原生币种 / 百万 tokens。`pricing_slots` 给每个定价挂若干"当日时段×倍率"档位,`start_minute` / `end_minute` 是 UTC+0 当日分钟 `[0,1439]`,end 独占,`start > end` 表示跨午夜。档位删除随定价 `ON DELETE CASCADE`。价格表只存当前值,改价只影响之后写入的请求与当月 plan 订阅。
 
 ### account_models — 账户模型目录
 
@@ -130,7 +128,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 ### fx_rates 与 account_importers — 仅本机的运行时数据
 
-`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,触发器和代理快照计价按请求日期取最近一条;拉不到用最近存值,仍无则 1.0(不换算)。`agent_software_runtime.cursor_json` 是统一 agent adapter 用量导入的增量游标,保证幂等续传。请求日志、导入游标和汇率缓存都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
+`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,写入触发器按写入当天取最近一条;没有可用汇率时该行标记 `unrated`。`agent_software_runtime.cursor_json` 是统一 agent adapter 用量导入的增量游标,保证幂等续传。请求日志、导入游标和汇率缓存都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
 
 ## dashboard.db
 
@@ -150,9 +148,10 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 每个”行政月 × 账户 × masked 上游密钥”一行:`subscription_cost` 是该密钥无论使用与否都产生的周期月费,`virtual_cost` 是该密钥所承载请求的 api 口径金额。订阅费由 `valid_from`、`deleted_at`(删除默认操作)和 `plan_price_history` 重建;虚拟消费仍按导出批次增量持久化。
 
-### model_pricing / pricing_slots / account_types
+### legacy model_pricing / account_types
 
-已删除(`0003` 迁移)。dashboard 不保留任何价格/账户类型镜像。
+旧版 `model_pricing` 与 `account_types` 已删除；当前模型定价使用
+`pricing_rules`、`pricing_slots` 和 `pricing_length_tiers`。dashboard 不保留任何价格镜像。
 
 ## 连接约定
 

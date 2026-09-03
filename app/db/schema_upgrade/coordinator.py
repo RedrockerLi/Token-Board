@@ -150,7 +150,13 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
             if snapshot.exists():
                 snapshot_version = inspect_version(snapshot, TOKEN_BOARD_DATABASE_NAME)
                 if snapshot_version is not None and snapshot_version.major == 1:
-                    apply_sql_migrations(str(snapshot), str(root), TOKEN_BOARD_DATABASE_NAME)
+                    # Snapshots contain configuration data, so they must use
+                    # the same token-board-artifact transition routes as a
+                    # downloaded configuration artifact instead of bypassing
+                    # data transforms through the raw SQL engine.
+                    upgrade_artifact(
+                        snapshot, TOKEN_BOARD_DATABASE_NAME, root,
+                        source_timezone, configuration_only=True)
                 elif snapshot_version is not None and snapshot_version.major == 0:
                     rebuild_snapshot(proxy)
 

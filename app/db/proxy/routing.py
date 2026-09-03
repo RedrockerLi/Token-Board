@@ -116,7 +116,7 @@ class ProxyRoutingMixin:
                                 session_id: str | None = None) -> bool:
         """Insert one imported software usage row on the caller's connection.
 
-        A pending V1 event lets SQLite select the historical rate and FX.  The
+        A pending V1 event lets SQLite select the current write-time price and FX.  The
         event_id UNIQUE constraint makes INSERT OR IGNORE idempotent across
         idempotent across crashes/restarts.  `requested_at` must be a SQLite UTC
         timestamp "YYYY-MM-DD HH:MM:SS".  Returns True when a row was inserted.

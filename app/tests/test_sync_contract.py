@@ -20,7 +20,7 @@ from app.services.sync.webdav import (
     publish_versioned_artifact,
 )
 from app.services.sync.config_merge import merge_config_tables
-from app.services.sync.config_sync import sync_config_upload
+from app.services.sync.config_sync import sync_config_pull, sync_config_upload
 from app.services.sync.dashboard_sync import sync_dashboard
 from app.services.sync.state import config_hash_of_db
 
@@ -92,8 +92,8 @@ class SyncContractTest(unittest.TestCase):
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
-    def test_cloud_merge_does_not_resurrect_historical_current_pricing_rate(self) -> None:
-        """A stale cloud current rate must not coexist with a newer local one."""
+    def test_cloud_merge_uses_flat_pricing_and_deletes_missing_rules(self) -> None:
+        """Cloud pricing is current-only and absent rules are hard-deleted."""
         temp = tempfile.mkdtemp()
         try:
             shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
@@ -104,19 +104,21 @@ class SyncContractTest(unittest.TestCase):
             for path in (local, remote):
                 conn = sqlite3.connect(path)
                 conn.execute(
-                    "INSERT INTO pricing_rules(id,model_pattern,priority) "
-                    "VALUES(1,'merge-demo',0)"
-                )
-                conn.execute(
-                    "INSERT INTO pricing_rates"
-                    "(id,pricing_rule_id,input_price,cache_read_price,"
-                    "output_price,currency,valid_from) "
-                    "VALUES(1,1,1,0.1,2,'USD','2026-01-01T00:00:00Z')"
+                    "INSERT INTO pricing_rules"
+                    "(id,model_pattern,priority,input_price,cache_read_price,"
+                    "output_price,currency) VALUES(1,'merge-demo',0,1,0.1,2,'USD')"
                 )
                 conn.commit()
                 conn.close()
 
             local_db = ProxyDatabase(local, str(Path(temp) / "schema"))
+            with sqlite3.connect(local) as conn:
+                conn.execute(
+                    "INSERT INTO pricing_rules"
+                    "(id,model_pattern,priority,input_price,cache_read_price,"
+                    "output_price,currency) VALUES(2,'local-only',1,9,9,9,'CNY')"
+                )
+                conn.commit()
             self.assertTrue(local_db.update_pricing(1, {
                 "input_price": 3,
                 "cache_read_price": 0.3,
@@ -128,25 +130,28 @@ class SyncContractTest(unittest.TestCase):
 
             with sqlite3.connect(local) as conn:
                 current = conn.execute(
-                    "SELECT id,input_price,output_price FROM pricing_rates "
-                    "WHERE pricing_rule_id=1 AND valid_until IS NULL "
-                    "ORDER BY id"
+                    "SELECT id,input_price,output_price FROM pricing_rules "
+                    "WHERE id=1"
                 ).fetchall()
             # Configuration downloads are cloud-authoritative: the remote
-            # current version wins, but it must not coexist with local history.
+            # current value wins and a local-only rule is physically removed.
             self.assertEqual(current, [(1, 1.0, 2.0)])
+            with sqlite3.connect(local) as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM pricing_rules WHERE id=2"
+                ).fetchone()[0], 0)
             self.assertEqual(len(local_db.get_pricing()), 1)
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
-    def test_pricing_current_rate_migration_repairs_existing_duplicates(self) -> None:
+    def test_pricing_current_only_artifact_migration_preserves_costs(self) -> None:
         temp = tempfile.mkdtemp()
         try:
             shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
             local = str(Path(temp) / "local.db")
             schema = str(Path(temp) / "schema")
             apply_sql_migrations(
-                local, schema, "token-board", SchemaVersion(1, 12))
+                local, schema, "token-board", SchemaVersion(1, 13))
             with sqlite3.connect(local) as conn:
                 conn.execute(
                     "INSERT INTO pricing_rules(id,model_pattern,priority) "
@@ -155,22 +160,102 @@ class SyncContractTest(unittest.TestCase):
                 conn.executemany(
                     "INSERT INTO pricing_rates"
                     "(id,pricing_rule_id,input_price,cache_read_price,"
-                    "output_price,currency,valid_from) VALUES(?,?,?,?,?,?,?)",
+                    "output_price,currency,valid_from,valid_until) VALUES(?,?,?,?,?,?,?,?)",
                     [
-                        (1, 1, 1, 0.1, 2, "USD", "2026-01-01T00:00:00Z"),
-                        (2, 1, 3, 0.3, 4, "USD", "2026-02-01T00:00:00Z"),
+                        (1, 1, 1, 0.1, 2, "CNY", "2026-01-01T00:00:00Z", None),
+                        (2, 1, 3, 0.3, 4, "CNY", "2026-02-01T00:00:00Z",
+                         "2026-03-01T00:00:00Z"),
                     ],
                 )
-            migrate(local, schema, "token-board")
+                conn.execute(
+                    "INSERT INTO pricing_rules(id,model_pattern,priority) "
+                    "VALUES(2,'disabled-rule',1)"
+                )
+                conn.execute(
+                    "INSERT INTO pricing_rates"
+                    "(id,pricing_rule_id,input_price,cache_read_price,"
+                    "output_price,currency,valid_from) VALUES(3,2,8,8,8,'CNY',"
+                    "'2026-01-01T00:00:00Z')"
+                )
+                conn.execute("UPDATE pricing_rules SET enabled=0 WHERE id=2")
+                conn.commit()
+            before = sqlite3.connect(local).execute(
+                "SELECT count(*),sum(equivalent_cost),sum(billed_usage_cost) FROM request_log"
+            ).fetchone()
+            from app.db.schema_upgrade import upgrade_downloaded_artifact
+            upgrade_downloaded_artifact(local, "token-board", schema)
             with sqlite3.connect(local) as conn:
-                current = conn.execute(
-                    "SELECT id FROM pricing_rates WHERE pricing_rule_id=1 "
-                    "AND valid_until IS NULL"
-                ).fetchall()
-                indexes = [row[1] for row in conn.execute(
-                    "PRAGMA index_list(pricing_rates)")]
-            self.assertEqual(current, [(2,)])
-            self.assertIn("idx_pricing_rates_one_current", indexes)
+                self.assertEqual(conn.execute(
+                    "SELECT id,input_price,output_price FROM pricing_rules"
+                ).fetchall(), [(1, 1.0, 2.0)])
+                self.assertFalse(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='pricing_rates'"
+                ).fetchone())
+                self.assertEqual(conn.execute(
+                    "SELECT count(*),sum(equivalent_cost),sum(billed_usage_cost) FROM request_log"
+                ).fetchone(), before)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM schema_transitions "
+                    "WHERE transition_id='v1-pricing-current-only'"
+                ).fetchone()[0], 1)
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
+    def test_config_pull_republishes_upgraded_pricing_artifact_once(self) -> None:
+        temp, proxy, _ = self._repo_layout()
+        schema = str(Path(temp) / "schema")
+        remote_path = Path(temp) / "remote-v113.db"
+        published_path = Path(temp) / "remote-v114.db"
+        apply_sql_migrations(
+            str(remote_path), schema, "token-board", SchemaVersion(1, 13))
+        with sqlite3.connect(remote_path) as conn:
+            conn.execute(
+                "INSERT INTO pricing_rules(id,model_pattern,priority) "
+                "VALUES(1,'remote-model',0)"
+            )
+            conn.execute(
+                "INSERT INTO pricing_rates"
+                "(id,pricing_rule_id,input_price,cache_read_price,output_price,"
+                "currency,valid_from) VALUES(1,1,1,0.5,2,'CNY',"
+                "'2020-01-01T00:00:00Z')"
+            )
+            conn.commit()
+
+        state = {"artifact": RemoteArtifact(
+            "token-board_config_20260801_000000.db"),
+            "path": remote_path}
+
+        def download(_config, destination, remote_filename=None):
+            del remote_filename
+            shutil.copy2(state["path"], destination)
+            return True
+
+        def publish(_config, source):
+            shutil.copy2(source, published_path)
+            state["artifact"] = RemoteArtifact(
+                "token-board_config_20260903_000000.db.gz")
+            state["path"] = published_path
+            with sqlite3.connect(source) as conn:
+                self.assertFalse(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='pricing_rates'"
+                ).fetchone())
+                self.assertEqual(conn.execute(
+                    "SELECT major,minor FROM schema_version WHERE id=1"
+                ).fetchone(), (1, 14))
+            return state["artifact"]
+
+        try:
+            with patch("app.services.sync.config_sync.latest_artifact",
+                       side_effect=lambda _config, _base: state["artifact"]), \
+                 patch("app.services.sync.config_sync.download_artifact",
+                       side_effect=download), \
+                 patch("app.services.sync.config_sync.publish_config_artifact",
+                       side_effect=publish) as publish_mock:
+                first = sync_config_pull(proxy, schema_dir=schema)
+                second = sync_config_pull(proxy, schema_dir=schema)
+            self.assertEqual(first["status"], "pulled", first)
+            self.assertEqual(second["status"], "pulled", second)
+            self.assertEqual(publish_mock.call_count, 1)
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 

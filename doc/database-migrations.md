@@ -40,7 +40,7 @@ fixture、测试和 V0 历史转换，不是业务代码的升级入口。
 schema/
 ├── token-board/
 │   ├── v0/0-1_initial.sql … 0-19_drop_monthly_price.sql
-│   └── v1/1-0_baseline.sql … 1-13_pricing_current_rate.sql
+│   └── v1/1-0_baseline.sql … 1-14_current_only_pricing.sql
 ├── dashboard/
 │   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
 │   └── v1/1-0_baseline.sql … 1-5_frozen_charges_and_exclusions.sql
@@ -51,7 +51,10 @@ schema/
     ├── v1-legacy-agent-billing/   # V1 配对数据修复
     │   ├── transition.json
     │   └── transition.py
-    └── v1-agent-identity/         # V1 跨库身份对齐
+    ├── v1-agent-identity/         # V1 跨库身份对齐
+    │   ├── transition.json
+    │   └── transition.py
+    └── v1-pricing-current-only/   # 删除模型定价历史并扁平化当前配置
         ├── transition.json
         └── transition.py
 
@@ -65,7 +68,7 @@ app/db/schema_upgrade/
 └── engine_core.py          # shadow、manifest、备份、校验、发布
 ```
 
-当前仓库的 V1 tip 是 Token Board V1.13、Dashboard V1.5。V0 文件保留用于历史库和
+当前仓库的 V1 tip 是 Token Board V1.14、Dashboard V1.5。V0 文件保留用于历史库和
 转换测试；新安装只创建当前 V1 baseline，不重放 V0 历史。
 
 ## 版本与元数据
@@ -114,6 +117,7 @@ prepare/target 版本和 scope。插件只能修改 shadow。选择逻辑集中�
 - `order: 0` `0-to-1`：V0 source → 当前 V1，使用 `rebuild-shadow`；
 - `order: 1` `v1-legacy-agent-billing`：Token Board V1.6/V1.7 billing barrier；
 - `order: 2` `v1-agent-identity`：Token Board V1.8 与 Dashboard V1.3/V1.4 identity barrier。
+- `order: 3` `v1-pricing-current-only`：模型定价历史到当前配置的扁平化。
 
 已发布 transition 的 descriptor、源码和附属数据都会进入 checksum。行为变化应
 创建新的 transition ID，不应原地修改已发布插件。
@@ -140,6 +144,8 @@ manifest 和备份恢复保证：服务不会在未完成的数据转换状态�
 - `v1-legacy-agent-billing`：清理 V1.6 智能体拆分遗留的重复 recurring charge。
 - `v1-agent-identity`：把旧 Dashboard 智能体归档 ID 对齐到 Token Board 的共享身份
   ID；必要时在 Token Board SQL 变更与 Dashboard SQL 变更之间执行跨库修复。
+- `v1-pricing-current-only`：把模型定价历史转换为单一当前配置，适用于本地 pair
+  与下载的 Token Board 配置工件。
 
 ## V0 → V1
 

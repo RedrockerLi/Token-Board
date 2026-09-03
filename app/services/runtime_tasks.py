@@ -232,7 +232,7 @@ def trigger_agent_usage_import(flask_app) -> bool:
         except (OSError, socket.timeout):
             # Testing/embedded apps may intentionally retain the old worker;
             # production has no fallback worker and returns False below.
-            pass
+            log.debug("maintenance importer socket is unavailable: %s", socket_path)
     worker = flask_app.config.get("AGENT_USAGE_IMPORT_WORKER")
     return bool(worker and worker.trigger())
 

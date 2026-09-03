@@ -25,7 +25,7 @@
 
 | 维度 | api(按量) | plan(订阅套餐) |
 |------|-----------|----------------|
-| 计费方式 | 按调用量×单价(`model_pricing`) | 订阅费：月费 × 每把密钥的订阅周期，与调用量无关 | 同 plan：月费 × 每账户一个「订阅」 |
+| 计费方式 | 按调用量×单价(`pricing_rules`) | 订阅费：月费 × 每把密钥的订阅周期，与调用量无关 | 同 plan：月费 × 每账户一个「订阅」 |
 | 是否持有上游密钥 | 是 | 是（**每把密钥 = 一个订阅**） |
 | 是否可被本地密钥路由 | 是 | 是 |
 | 调用量来源 | 代理转发自动记账 | 代理转发自动记账 |
@@ -128,9 +128,9 @@
 | `api_cost` | 写时固化的 api 等价价（api=真实账单，plan=虚拟消费），USD 定价按当日汇率换算为 CNY；智能体导入另有独立订阅成本 |
 | `status_code` / `duration_ms` | 结局 |
 | `ttft_ms` / `generation_ms` / `output_tps` | 性能观测 |
-| `event_id` / `cost_frozen` | 智能体导入幂等标识 / 冻结计价标记 |
+| `event_id` / `pricing_status` | 智能体导入幂等标识 / 当前写入计价状态 |
 
-写时计价的固化：代理自身走 C++ `snapshot_request_cost` 快照（`cost_frozen=1`），智能体导入与兜底走 `tr_request_log_insert` 触发器（`cost_frozen=0`）。改价不回溯。
+写时计价的固化：代理与智能体导入都走 SQLite `price_usage_event` 触发器，按写入时的当前定价计算；改价不回溯。
 
 ### request_attempts（每候选一次尝试一行）
 

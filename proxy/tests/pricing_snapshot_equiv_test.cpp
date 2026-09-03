@@ -3,7 +3,7 @@
 // The runtime no longer contains a second C++ pricing algorithm.  This test
 // therefore seeds the current V1 pricing tables and verifies that a pending
 // UsageEvent is rated by SQLite's V1 trigger, including model matching,
-// cache/slot pricing and historical FX selection.  Keeping this test at the
+// cache/slot pricing and write-time FX selection.  Keeping this test at the
 // C++ boundary ensures Database::open() and the production schema agree while
 // leaving one authoritative implementation of the billing formula.
 //
@@ -90,29 +90,25 @@ int main(int argc, char **argv) {
     assert(sqlite3_open(db_path.c_str(), &seed) == SQLITE_OK);
     bool ok =
         exec_sql(seed, "INSERT INTO pricing_rules "
-                       "(id, model_pattern, priority, enabled) VALUES "
-                       "(1,'gpt-4o',0,1),(2,'gpt-*',10,1),"
-                       "(3,'usd-model',0,1),(4,'slot-model',0,1),"
-                       "(5,'high-token',0,1)") &&
-        exec_sql(seed, "INSERT INTO pricing_rates "
-                       "(id, pricing_rule_id, input_price, cache_read_price, "
-                       "output_price, currency, valid_from) VALUES "
-                       "(1,1,10,0,30,'CNY','2020-01-01T00:00:00Z'),"
-                       "(2,2,1,0.5,2,'CNY','2020-01-01T00:00:00Z'),"
-                       "(3,3,3,0,6,'USD','2020-01-01T00:00:00Z'),"
-                       "(4,4,5,0,5,'CNY','2020-01-01T00:00:00Z'),"
-                       "(5,5,0.001,0,0.002,'CNY','2020-01-01T00:00:00Z')") &&
+                       "(id, model_pattern, priority, input_price, "
+                       "cache_read_price, output_price, currency) VALUES "
+                       "(1,'gpt-4o',0,10,0,30,'CNY'),"
+                       "(2,'gpt-*',10,1,0.5,2,'CNY'),"
+                       "(3,'usd-model',0,3,0,6,'USD'),"
+                       "(4,'slot-model',0,5,0,5,'CNY'),"
+                       "(5,'high-token',0,0.001,0,0.002,'CNY')") &&
         exec_sql(seed, "INSERT INTO pricing_slots "
-                       "(id, pricing_rate_id, start_minute, end_minute, multiplier) VALUES "
-                       "(1,4,600,720,2.0),(2,4,1430,90,3.0)") &&
+                       "(id, pricing_rule_id, start_minute, end_minute, multiplier) VALUES "
+                       "(1,4,0,1440,2.0)") &&
         exec_sql(seed, "INSERT INTO fx_rates "
                        "(base_currency,quote_currency,date,rate) VALUES "
                        "('USD','CNY','2026-08-05',7.1),"
                        "('USD','CNY','2026-08-06',7.2)");
     assert(ok);
 
-    // Fire the V1 pending-event trigger and read all provenance fields.
-    auto rated = [&](const Case &c, int id) -> std::tuple<double, int, int> {
+    // Fire the V1 pending-event trigger. The supplied event time is historical
+    // on purpose; price selection must use the INSERT execution time.
+    auto rated = [&](const Case &c, int id) -> std::tuple<double, int> {
         char sql[768];
         snprintf(sql, sizeof(sql),
                  "INSERT INTO request_log "
@@ -122,14 +118,12 @@ int main(int argc, char **argv) {
                  "datetime(%lld,'unixepoch'),'pending')",
                  id, c.model, c.prompt, c.cache, c.completion,
                  c.prompt + c.completion, c.ts);
-        if (!exec_sql(seed, sql)) return {NAN, -1, -1};
+        if (!exec_sql(seed, sql)) return {NAN, -1};
         sqlite3_stmt *st = nullptr;
         double cost = NAN;
         int status = -1;
-        int rate_id = -1;
         if (sqlite3_prepare_v2(seed,
-                               "SELECT equivalent_cost,pricing_status,"
-                               "COALESCE(pricing_rate_id,-1) FROM request_log "
+                               "SELECT equivalent_cost,pricing_status FROM request_log "
                                "WHERE event_id=?1",
                                -1, &st, nullptr) == SQLITE_OK &&
             sqlite3_bind_text(st, 1, ("event-" + std::to_string(id)).c_str(),
@@ -144,27 +138,22 @@ int main(int argc, char **argv) {
                                       "unrated"
                                 ? 0
                                 : -1);
-            rate_id = sqlite3_column_int(st, 2);
         }
         sqlite3_finalize(st);
-        return {cost, status, rate_id};
+        return {cost, status};
     };
 
     int n = 0;
     for (const auto &c : CASES) {
-        const auto [cost, status, rate_id] = rated(c, n + 1);
+        const auto [cost, status] = rated(c, n + 1);
         assert(!isnan(cost));
-        const bool unrated = std::string(c.label) == "usd-no-fx" ||
-                             std::string(c.label) == "no-match";
+        const bool unrated = std::string(c.label) == "no-match";
         assert(status == (unrated ? 0 : 1));
         if (unrated) {
-            assert(rate_id == -1);
             assert(cost == 0.0);
-        } else {
-            assert(rate_id > 0);
         }
-        printf("  %-22s equivalent_cost=%.12g status=%s rate_id=%d\n",
-               c.label, cost, status == 1 ? "rated" : "unrated", rate_id);
+        printf("  %-22s equivalent_cost=%.12g status=%s\n",
+               c.label, cost, status == 1 ? "rated" : "unrated");
         ++n;
     }
 

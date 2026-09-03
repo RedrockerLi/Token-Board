@@ -32,7 +32,7 @@ V1_CONFIG_TABLES = [
     "accounts", "upstreams", "route_sets", "route_rules", "client_keys",
     "upstream_credentials", "upstream_secrets", "account_importers",
     "billing_contracts",
-    "billing_rate_events", "pricing_rules", "pricing_rates", "pricing_slots",
+    "billing_rate_events", "pricing_rules", "pricing_slots",
     "pricing_length_tiers",
     "proxy_timeout_config", "upstream_model_catalog", "sync_settings",
     "agent_subscriptions", "agent_subscription_instances",

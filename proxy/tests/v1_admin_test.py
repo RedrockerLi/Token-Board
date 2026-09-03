@@ -77,6 +77,14 @@ def main() -> None:
         "name": "codex", "agent_kind": "codex",
         "subscription_ids": [subscription_id],
     })
+    # This smoke test covers the subscription's full first billing period;
+    # real bindings otherwise begin at the moment the software is attached.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE agent_subscription_bindings SET valid_from=? "
+            "WHERE subscription_id=? AND software_id=?",
+            ("2026-08-01T00:00:00Z", subscription_id, software_id),
+        )
     inserted = database.insert_agent_usage(
         software_id, "gpt-test", 1_000_000, 100_000, 0, 1_100_000,
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -90,7 +98,6 @@ def main() -> None:
         "non_streaming_timeout": 120,
     })
     assert database.update_plan_billing_config({
-        "price_change_effective": "next_period",
         "cancellation_mode": "end_of_period",
     })
     fx = sys.modules["app.services.fx"]

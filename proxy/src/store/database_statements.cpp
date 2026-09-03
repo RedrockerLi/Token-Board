@@ -88,9 +88,8 @@ bool Database::prepare_statements() {
             "WHERE route_set_id=?1 AND rr.enabled=1 ORDER BY priority,rr.id",
             stmt_get_aggregate_entries_);
         PREPARE_ON(read_db_,
-            "SELECT pr.id,pr.model_pattern,r.input_price,r.output_price "
-            "FROM pricing_rules pr JOIN pricing_rates r ON r.pricing_rule_id=pr.id "
-            "WHERE pr.enabled=1 AND r.valid_until IS NULL ORDER BY pr.priority,pr.id",
+            "SELECT id,model_pattern,input_price,output_price "
+            "FROM pricing_rules ORDER BY priority,id",
             stmt_get_pricing_);
         PREPARE_ON(read_db_,
             "SELECT streaming_first_byte_timeout,streaming_idle_timeout,"

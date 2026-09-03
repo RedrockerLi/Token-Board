@@ -1,10 +1,13 @@
 """Functional proxy API route group."""
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.routes.proxy.common import bp_proxy, current_app, jsonify, request, _proxy_db
+
+log = logging.getLogger(__name__)
 
 @bp_proxy.route("/logs")
 def request_logs():
@@ -82,7 +85,7 @@ def perf_realtime():
                 item.setdefault("last_error", "maintenance heartbeat stale")
                 maintenance_tasks[name] = item
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass
+        log.debug("maintenance health file is unavailable: %s", maintenance_path)
     payload["background_tasks"] = {**maintenance_tasks, **dashboard_tasks}
     payload["background_health"] = (
         "degraded" if payload.get("sync_health") not in {None, "ok", "unconfigured"}
