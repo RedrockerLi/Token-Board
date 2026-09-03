@@ -29,8 +29,8 @@ Token Board 由三个进程边界组成，共享同一份版本化数据库 sche
 ```
 
 schema 的单一来源是 `schema/` 目录下的版本化 SQL 与 transition，见
-[database-migrations.md](database-migrations.md)。当前 V1 tip 是 Proxy V1.11、
-Dashboard V1.4；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原内容归档
+[database-migrations.md](database-migrations.md)。当前 V1 tip 是 Token Board V1.13、
+Dashboard V1.5；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原内容归档
 在各自 `v0/`。所有生产升级由 Python 的 `app.db.schema_upgrade` 负责；C++
 只校验已准备好的 Proxy V1 数据库，不读取 SQL、不执行迁移。
 
@@ -57,7 +57,7 @@ Dashboard V1.4；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原�
 ├── proxy/                  C++17 代理 CMake 工程
 ├── schema/token-board/v0,v1/     Token Board 历史迁移与当前 V1
 ├── schema/dashboard/v0,v1/ Dashboard 历史迁移与当前 V1
-├── schema/transitions/     V0 转换与 V1 配对数据 transition
+├── schema/transitions/     版本 route 驱动的 V0/V1 数据 transition 插件
 ├── static/                 CSS 与 SPA JavaScript
 ├── templates/index.html    SPA 页面
 └── data/                   运行时 SQLite(token-board.db / dashboard.db)
@@ -69,13 +69,13 @@ Dashboard V1.4；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原�
 
 只有 `start.sh --all` 调用 `python3 -m app.db.schema_upgrade.cli`。这个边界负责
 初始化数据库、执行同 Major SQL、识别 `schema/transitions/*/transition.json`、
-在双 shadow 上执行跨库数据转换、校验并发布 manifest。普通 V1 transition 会在
-两个数据库中写入相同的 `generation_id`；发布中断时，下一次 Python 启动会依据
-manifest 和备份恢复原始文件。
+按当前版本 route 选择插件、在 shadow 上执行数据转换、校验并发布 manifest。
+本地双库 transition 会在两个数据库中写入相同的 `generation_id`；发布中断时，
+下一次 Python 启动会依据 manifest 和备份恢复原始文件。
 
 Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查。C++ 代理打开
 数据库时只验证 `schema_version` 与 `PRAGMA user_version` 一致，并要求当前 Proxy
-运行时最低 schema（目前为 V1.11）；不满足时直接退出并提示先运行 Python
+运行时最低 schema（目前为 V1.10；数据库 tip 为 V1.13）；不满足时直接退出并提示先运行 Python
 升级边界。C++ 的 `--schema-dir` 仅为旧启动器保留，不参与升级。
 
 ## 数据流
@@ -98,7 +98,8 @@ Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查�
 
 **schema 单一 DDL 来源。** 结构变化追加到
 `schema/<库>/v<major>/<major>-<minor>_*.sql`，由 Python 在事务中执行；数据转换
-和跨库协调追加到 `schema/transitions/<transition-id>/`，由统一升级边界在 shadow
-上执行。业务 facade、reconcile 和 C++ 请求路径不承担迁移职责。
+和跨库协调追加到 `schema/transitions/<transition-id>/`，由 registry 根据当前
+版本选择插件，再由统一升级边界在 shadow 上执行。业务 facade、reconcile 和
+C++ 请求路径不承担迁移职责。
 
 **计费是合同驱动。** 路由核心只处理 `api/plan` 上游。智能体订阅使用独立的 `agent_subscriptions`、实例、价格历史和周期费用表；软件用量使用独立的 `agent_software`，通过绑定关系把实际订阅费分摊到统一 dashboard 身份。理论消费来自软件用量，未绑定时实际消费为 0。

@@ -43,9 +43,11 @@ schema/
 │   └── v1/1-0_baseline.sql … 1-13_pricing_current_rate.sql
 ├── dashboard/
 │   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
-│   └── v1/1-0_baseline.sql … 1-4_unify_agent_archive.sql
+│   └── v1/1-0_baseline.sql … 1-5_frozen_charges_and_exclusions.sql
 └── transitions/
-    ├── 0-to-1/                    # V0 → V1 历史转换
+    ├── 0-to-1/                    # V0 → V1 历史转换插件
+    │   ├── transition.json
+    │   └── transition.py
     ├── v1-legacy-agent-billing/   # V1 配对数据修复
     │   ├── transition.json
     │   └── transition.py
@@ -56,8 +58,10 @@ schema/
 app/db/schema_upgrade/
 ├── cli.py                  # 启动和运维入口
 ├── coordinator.py          # 本地库及下载 artifact 的编排
-├── compound.py             # 双库 transition barrier
-├── transition_registry.py  # transition descriptor/checksum/发现
+├── compound.py             # transition runner、shadow 和发布屏障
+├── artifact_runner.py      # 下载 artifact 的同一 transition runner
+├── transition_api.py       # 插件上下文接口
+├── transition_registry.py  # descriptor、版本 route、checksum 和发现
 └── engine_core.py          # shadow、manifest、备份、校验、发布
 ```
 
@@ -71,8 +75,8 @@ app/db/schema_upgrade/
   `major * 10000 + minor`。
 - `schema_migrations` 保存已执行 SQL 的文件名、SHA-256 checksum 和时间。
 - `schema_transitions` 保存数据 transition 的 ID、源码 checksum、配对
-  `generation_id` 和应用时间。两个数据库必须记录同一个 generation，才算完成
-  一次配对 transition。
+  `generation_id` 和应用时间。版本 route 决定 transition 是否适用；该表只记录
+  已完成的 transition，避免重复执行并保证两个数据库使用同一个 generation。
 - 运行时要求数据库处于当前 V1 tip。未知的更高版本不能当作已验证的运行时版本；
   应使用匹配版本的 Python schema-upgrade 工具处理。
 
@@ -87,16 +91,43 @@ app/db/schema_upgrade/
 关系，必须同时注册一个 `schema/transitions/<transition-id>/` transition。启动
 边界会先检测 pending transition，再决定是否执行普通 SQL。
 
-## V1 配对 transition 的原子发布
+## Transition 插件与版本 route
 
-V1 transition 使用双 shadow 和持久 manifest，流程如下：
+每个 `schema/transitions/<id>/transition.json` 声明插件的 `strategy`、`order`、
+适用 `scope` 和当前版本 route。版本 route 中的 `current` 使用 Major 与 Minor
+闭区间；`prepare` 是插件要求的中间 SQL 版本，`target` 是插件完成后要到达的
+版本，`latest` 表示当前 schema tip，`same` 表示保持当前版本。
 
-1. 获取 `schema-upgrade.lock`，并备份两个数据库、WAL/SHM、配置 snapshot 等
+registry 根据当前版本向量选择 route，不调用业务数据查询。插件 entrypoint 只实现：
+
+```python
+apply(context: TransitionContext) -> None
+verify(context: TransitionContext) -> dict
+```
+
+`TransitionContext` 提供只读 source/staged 文件、可写 shadow 文件、当前版本、
+prepare/target 版本和 scope。插件只能修改 shadow。选择逻辑集中在
+`app.db.schema_upgrade.transition_registry`，执行逻辑集中在 runner。
+
+当前 route 顺序为：
+
+- `order: 0` `0-to-1`：V0 source → 当前 V1，使用 `rebuild-shadow`；
+- `order: 1` `v1-legacy-agent-billing`：Token Board V1.6/V1.7 billing barrier；
+- `order: 2` `v1-agent-identity`：Token Board V1.8 与 Dashboard V1.3/V1.4 identity barrier。
+
+已发布 transition 的 descriptor、源码和附属数据都会进入 checksum。行为变化应
+创建新的 transition ID，不应原地修改已发布插件。
+
+## Transition 的原子发布
+
+本地 transition 使用双 shadow 和持久 manifest，流程如下：
+
+1. 获取 `schema-upgrade.lock`，并备份两个数据库、WAL/SHM、请求 spool、配置 snapshot 等
    附属文件。
-2. 将 Token Board 与 Dashboard 复制到 shadow；所有 `needs/apply/verify` 操作只对
+2. 按 route 的 strategy 创建 source/target shadow；所有 `apply/verify` 操作只对
    shadow 执行。
-3. 在同一组 shadow 上执行 descriptor 排序后的 transition，再补齐两个数据库
-   的当前 V1 SQL，并执行 `quick_check`、`foreign_key_check` 和版本校验。
+3. 先把 shadow 准备到 route 要求的版本，执行 descriptor 排序后的 transition，
+   再补齐目标 SQL，并执行 `quick_check`、`foreign_key_check` 和版本校验。
 4. 在两个 shadow 写入相同的 `generation_id` 和 transition checksum。
 5. 记录 manifest 后发布两个数据库；如果发布过程被中断，下次 Python 启动会
    根据 `auto-*.manifest.json` 和备份自动恢复原始数据库，再重新尝试。
@@ -112,8 +143,9 @@ manifest 和备份恢复保证：服务不会在未完成的数据转换状态�
 
 ## V0 → V1
 
-V0 → V1 是显式的历史转换，不由 C++ 执行。正常本地启动时，Python coordinator
-会自动识别成对的 V0 数据库，在服务启动前完成 shadow 转换和发布。
+V0 → V1 是 `0-to-1` 插件负责的跨 Major 历史转换，不由 C++ 执行。正常本地启动
+时，Python coordinator 会把 V0/V0 数据库对交给统一 runner，在服务启动前完成
+shadow 转换和发布。
 
 如需单独操作旧 V0 库，可使用历史工具：
 
@@ -123,14 +155,19 @@ python3 schema/transitions/0-to-1/migrate.py \
   --dashboard-db data/dashboard.db
 ```
 
-上面的默认行为只构建并校验 shadow。确认 manifest 和统计后，使用
+兼容 CLI 的默认行为只构建并校验 shadow。确认 manifest 和统计后，使用
 `--apply --confirm-timezone <timezone>` 才替换源数据库。工具会检查服务是否停止、WAL
 是否可 checkpoint、spool 是否排空，备份数据库和附属文件，并在失败时支持
 `--resume-manifest` 或 `--rollback-manifest`。
 
 下载的配置或 Dashboard artifact 也必须通过
-`app.db.schema_upgrade.upgrade_downloaded_artifact` 的 shadow 路径升级；同步合并
-代码只接受已经完成 V1 upgrade 的 artifact，不得自行执行 SQL 或数据转换。
+`app.db.schema_upgrade.upgrade_downloaded_artifact` 的同一 shadow 路径升级；同步
+合并代码不得自行执行 SQL 或数据转换。
+
+云端没有远程 migration service。云端 artifact 被下载到本地临时文件后，才由
+Python runner 按版本 route 升级；原云端文件保持不变。配置 V0 artifact 合并后
+可以上传新的 V1 artifact，Dashboard artifact 则在导出事务中升级、导出并在
+上传成功后提交本地状态。
 
 ## 新增升级的规则
 
@@ -155,11 +192,11 @@ schema/transitions/<transition-id>/transition.json
 schema/transitions/<transition-id>/transition.py
 ```
 
-descriptor 至少声明 `id`、`databases`、`strategy`、`entrypoint` 和 `order`；
-其中 `databases` 必须明确写为 `["token-board", "dashboard"]`；Python entrypoint 实现
-`needs(token_board, dashboard, ...)`、`apply(...)` 和
-`verify(...)`。源码和 descriptor 会计算 checksum；已经发布的 transition 不应
-原地修改，行为变化应创建新的 transition ID。
+descriptor 至少声明 `id`、`databases`、`strategy`、`entrypoint`、`order` 和
+非空 `routes`；其中 `databases` 必须明确写为 `["token-board", "dashboard"]`。
+Python entrypoint 实现 `apply(context)` 和 `verify(context)`。源码、descriptor
+和附属数据会计算 checksum；已经发布的 transition 不应原地修改，行为变化应
+创建新的 transition ID。
 
 数据转换代码只能操作 shadow，不能从业务 facade、reconcile、C++ 请求路径或
 启动后的后台任务中偷偷补数据。普通业务代码只调用统一的

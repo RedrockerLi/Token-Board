@@ -92,8 +92,10 @@ SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 
 
 - **schema 只通过升级边界改。** 纯结构变化追加
   `schema/<库>/v<major>/<major>-<minor>_*.sql`；需要数据转换或跨库协调时新增
-  `schema/transitions/<transition-id>/transition.json` 和 `transition.py`。
-  两者都由 Python `app.db.schema_upgrade` 在 shadow/事务中执行，业务 facade、
+  `schema/transitions/<transition-id>/transition.json` 和 `transition.py`，并在
+  descriptor 中声明 scope、current/prepare/target 版本 route。entrypoint 实现
+  `apply(context)` 与 `verify(context)`。两者都由 Python `app.db.schema_upgrade`
+  在 shadow/事务中执行，业务 facade、
   reconcile 和 C++ 请求路径不补迁移逻辑。规则见
   [database-migrations.md](database-migrations.md)。
 - **时间存 UTC,显示浏览器当地时间。** 库内 `datetime('now')` 和请求时间存 UTC;前端通过 `Date` 的本机时区显示时间戳,并把当地日期筛选转换为 UTC 范围。峰谷档位边界按 UTC+0 分钟存储,电脑时区变化只改变显示。订阅起始日是 UTC 日期锚点,前端使用可逆的当地日期映射,避免换时区后原样保存改动账期。

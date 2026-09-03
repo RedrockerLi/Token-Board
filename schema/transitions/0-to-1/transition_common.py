@@ -20,13 +20,19 @@ REPO = HERE.parents[2]
 NAMESPACE = uuid.UUID("646d9175-a4f5-4caa-aaf4-98362b8fd550")
 LEGACY_CREDENTIAL_UUID = "00000000-0000-5000-8000-000000000001"
 
-_spec = importlib.util.spec_from_file_location(
-    "token_board_migrations", REPO / "app" / "db" / "migrations.py")
-assert _spec is not None and _spec.loader is not None
-_module = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = _module
-_spec.loader.exec_module(_module)
-migrate = _module.migrate
+try:
+    # The plugin is normally loaded by the application, where the project
+    # package is already importable.  This avoids deriving the application
+    # root from a copied temporary schema directory.
+    from app.db.migrations import migrate
+except ModuleNotFoundError:
+    _spec = importlib.util.spec_from_file_location(
+        "token_board_migrations", REPO / "app" / "db" / "migrations.py")
+    assert _spec is not None and _spec.loader is not None
+    _module = importlib.util.module_from_spec(_spec)
+    sys.modules[_spec.name] = _module
+    _spec.loader.exec_module(_module)
+    migrate = _module.migrate
 
 
 def stable_uuid(kind: str, *parts: object) -> str:

@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from transition_common import (migration_locks, prepare_shadow, read_usage_spool,
-                               source_version)
+from transition_common import (migration_locks, migrate, prepare_shadow,
+                               read_usage_spool, source_version)
 from transition_runtime import (
     atomic_replace,
     rebuild_config_snapshot,
@@ -40,10 +40,16 @@ def resume_transition(
         if stage == "started":
             raise RuntimeError("transition manifest has no durable backup stage")
         if stage == "backed_up":
-            if not Path(manifest["shadows"]["token-board"]).exists():
-                prepare_shadow(proxy, "token-board", schema_root)
-            if not Path(manifest["shadows"]["dashboard"]).exists():
-                prepare_shadow(dashboard, "dashboard", schema_root)
+            if manifest.get("strategy") == "rebuild-shadow":
+                for name in ("token-board", "dashboard"):
+                    shadow = Path(manifest["shadows"][name])
+                    if not shadow.exists():
+                        migrate(str(shadow), str(schema_root), name)
+            else:
+                if not Path(manifest["shadows"]["token-board"]).exists():
+                    prepare_shadow(proxy, "token-board", schema_root)
+                if not Path(manifest["shadows"]["dashboard"]).exists():
+                    prepare_shadow(dashboard, "dashboard", schema_root)
             manifest["stage"] = "shadows_created"
             write_manifest(path, manifest)
             stage = manifest["stage"]

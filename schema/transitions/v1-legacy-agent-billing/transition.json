@@ -3,6 +3,38 @@
   "databases": ["token-board", "dashboard"],
   "strategy": "shadow-barrier",
   "entrypoint": "transition.py",
-  "order": 10,
-  "description": "Remove recurring charge duplication left by the V1.6 agent split"
+  "order": 1,
+  "description": "Remove recurring charge duplication left by the V1.6 agent split",
+  "routes": [
+    {
+      "scope": "local-pair",
+      "current": {
+        "token-board": "1.*",
+        "dashboard": "1.*"
+      },
+      "prepare": {
+        "token-board": "1.6",
+        "dashboard": "same"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    },
+    {
+      "scope": "dashboard-artifact",
+      "current": {
+        "token-board": "1.*",
+        "dashboard": "1.*"
+      },
+      "prepare": {
+        "token-board": "same",
+        "dashboard": "same"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    }
+  ]
 }

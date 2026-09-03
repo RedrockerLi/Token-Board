@@ -55,6 +55,15 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertEqual(self._version(proxy), self._latest("token-board"))
         self.assertEqual(self._version(dashboard), self._latest("dashboard"))
         self.assertTrue(list((self.root / "data").glob("auto-v0-to-v1-*.manifest.json")))
+        with sqlite3.connect(proxy) as proxy_conn, sqlite3.connect(dashboard) as dash_conn:
+            proxy_marker = proxy_conn.execute(
+                "SELECT generation_id FROM schema_transitions WHERE transition_id='0-to-1'"
+            ).fetchone()
+            dash_marker = dash_conn.execute(
+                "SELECT generation_id FROM schema_transitions WHERE transition_id='0-to-1'"
+            ).fetchone()
+        self.assertIsNotNone(proxy_marker)
+        self.assertEqual(proxy_marker, dash_marker)
 
     def test_v0_pair_imports_durable_usage_spool(self) -> None:
         proxy = self.root / "data/token-board.db"
@@ -146,6 +155,23 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertEqual(self._version(remote_proxy), self._latest("token-board"))
         self.assertEqual(self._version(remote_dash), self._latest("dashboard"))
         self.assertEqual(self._version(proxy), (0, 19))
+
+    def test_mixed_local_versions_use_version_routes(self) -> None:
+        proxy = self.root / "data/token-board.db"
+        dashboard = self.root / "data/dashboard.db"
+        migrate(str(proxy), str(self.root / "schema/token-board/v0"), "token-board")
+        migrate(str(dashboard), str(self.root / "schema"), "dashboard")
+        ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
+        self.assertEqual(self._version(proxy), self._latest("token-board"))
+        self.assertEqual(self._version(dashboard), self._latest("dashboard"))
+
+        proxy = self.root / "data/token-board-mixed.db"
+        dashboard = self.root / "data/dashboard-mixed.db"
+        migrate(str(proxy), str(self.root / "schema"), "token-board")
+        migrate(str(dashboard), str(self.root / "schema/dashboard/v0"), "dashboard")
+        ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
+        self.assertEqual(self._version(proxy), self._latest("token-board"))
+        self.assertEqual(self._version(dashboard), self._latest("dashboard"))
 
 
 if __name__ == "__main__":

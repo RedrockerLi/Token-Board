@@ -1,0 +1,48 @@
+{
+  "id": "0-to-1",
+  "databases": ["token-board", "dashboard"],
+  "strategy": "rebuild-shadow",
+  "entrypoint": "transition.py",
+  "order": 0,
+  "description": "Convert V0 databases and artifacts into the current V1 representation",
+  "routes": [
+    {
+      "scope": "local-pair",
+      "current": {
+        "token-board": {"major": 0, "min_minor": 0, "max_minor": 19},
+        "dashboard": {"major": 0, "min_minor": 0, "max_minor": 6}
+      },
+      "prepare": {
+        "token-board": "0.19",
+        "dashboard": "0.6"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    },
+    {
+      "scope": "token-board-artifact",
+      "current": {
+        "token-board": {"major": 0, "min_minor": 0, "max_minor": 19}
+      },
+      "prepare": {"token-board": "0.19"},
+      "target": {"token-board": "latest"}
+    },
+    {
+      "scope": "dashboard-artifact",
+      "current": {
+        "token-board": "1.*",
+        "dashboard": {"major": 0, "min_minor": 0, "max_minor": 6}
+      },
+      "prepare": {
+        "token-board": "latest",
+        "dashboard": "0.6"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    }
+  ]
+}

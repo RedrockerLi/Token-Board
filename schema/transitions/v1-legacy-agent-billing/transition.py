@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
-from app.db.migrations import SchemaVersion
+from app.db.schema_upgrade.transition_api import TransitionContext
 
 
 TRANSITION_ID = "v1-legacy-agent-billing"
@@ -17,42 +16,9 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     ).fetchone() is not None
 
 
-def needs(token_board: Path, dashboard: Path,
-          token_board_version: SchemaVersion | None,
-          dashboard_version: SchemaVersion | None) -> bool:
-    if token_board_version is None or dashboard_version is None:
-        return False
-    if token_board_version.major != 1 or dashboard_version.major != 1:
-        return False
-    p = sqlite3.connect(token_board)
-    d = sqlite3.connect(dashboard)
-    try:
-        if not (_table_exists(p, "account_importers") and
-                _table_exists(p, "billing_contracts") and
-                _table_exists(d, "monthly_recurring_costs")):
-            return False
-        legacy_ids = [row[0] for row in p.execute(
-            "SELECT DISTINCT account_id FROM account_importers WHERE enabled=0 "
-            "AND importer_kind IS NOT NULL"
-        ).fetchall()]
-        if not legacy_ids:
-            return False
-        placeholders = ",".join("?" for _ in legacy_ids)
-        return d.execute(
-            "SELECT 1 FROM monthly_recurring_costs WHERE recurring_charge<>0 "
-            f"AND account_id IN ({placeholders}) LIMIT 1", legacy_ids
-        ).fetchone() is not None
-    finally:
-        d.close()
-        p.close()
-
-
-def apply(token_board_shadow: Path, dashboard_shadow: Path, schema_root: Path,
-          token_board_version: SchemaVersion | None,
-          dashboard_version: SchemaVersion | None) -> None:
-    del schema_root, token_board_version, dashboard_version
-    token_board = sqlite3.connect(token_board_shadow)
-    dashboard = sqlite3.connect(dashboard_shadow)
+def apply(context: TransitionContext) -> None:
+    token_board = sqlite3.connect(context.shadow("token-board"))
+    dashboard = sqlite3.connect(context.shadow("dashboard"))
     try:
         rows = token_board.execute(
             "SELECT DISTINCT account_id FROM account_importers "
@@ -76,9 +42,9 @@ def apply(token_board_shadow: Path, dashboard_shadow: Path, schema_root: Path,
         token_board.close()
 
 
-def verify(token_board: Path, dashboard: Path) -> None:
-    p = sqlite3.connect(token_board)
-    d = sqlite3.connect(dashboard)
+def verify(context: TransitionContext) -> dict:
+    p = sqlite3.connect(context.shadow("token-board"))
+    d = sqlite3.connect(context.shadow("dashboard"))
     try:
         rows = p.execute(
             "SELECT DISTINCT account_id FROM account_importers "
@@ -98,6 +64,7 @@ def verify(token_board: Path, dashboard: Path) -> None:
             ).fetchone():
                 raise RuntimeError(
                     f"legacy agent recurring charge remains for account {account_id}")
+        return {"legacy_accounts": len(rows)}
     finally:
         d.close()
         p.close()

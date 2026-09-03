@@ -188,9 +188,10 @@ def replace(source: Path, shadow: Path) -> None:
     Path(str(source) + "-shm").unlink(missing_ok=True)
 
 
-def rebuild_snapshot(proxy_path: Path) -> None:
-    snapshot = proxy_path.parent / "token-board_config_snapshot.db"
-    temporary = snapshot.with_name("token-board_config_snapshot.db.upgrade-new")
+def rebuild_snapshot(proxy_path: Path,
+                     snapshot_name: str = "token-board_config_snapshot.db") -> None:
+    snapshot = proxy_path.parent / snapshot_name
+    temporary = snapshot.with_name(snapshot.name + ".upgrade-new")
     temporary.unlink(missing_ok=True)
     copy_sqlite(proxy_path, temporary)
     conn = sqlite_runtime.connect(temporary, "snapshot_restore")

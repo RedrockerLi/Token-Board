@@ -7,7 +7,6 @@ import argparse
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -15,16 +14,14 @@ from zoneinfo import ZoneInfo
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(REPO))
 
 from transition_common import (  # noqa: E402
     LEGACY_CREDENTIAL_UUID, assert_offline_and_checkpoint,
-    checksum, mask_key, migration_locks, prepare_shadow, read_usage_spool,
-    shadow_path, source_version, stable_uuid, utc_timestamp,
+    mask_key, migration_locks, read_usage_spool, source_version,
+    stable_uuid, utc_timestamp,
 )
-from transition_runtime import (  # noqa: E402
-    atomic_replace, backup_files, rebuild_config_snapshot,
-    rollback_manifest, write_manifest,
-)
+from transition_runtime import rollback_manifest  # noqa: E402
 from transition_resume import resume_transition  # noqa: E402
 from spool_transform import append_spool_attempts, append_spool_requests  # noqa: E402
 from verify import verify_dashboard, verify_proxy  # noqa: E402
@@ -385,6 +382,14 @@ def transform_dashboard(source: Path, shadow: Path, proxy_source: Path | None,
         new.close()
 
 
+def source_version_value(path: Path):
+    from app.db.migrations import SchemaVersion
+    with sqlite3.connect(path) as conn:
+        value = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    major, minor = divmod(value, 10_000)
+    return SchemaVersion(major, minor)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--token-board-db", default="data/token-board.db")
@@ -420,79 +425,50 @@ def main() -> None:
     if not proxy.is_file() or not dashboard.is_file():
         parser.error("both V0 database files must exist")
     source_tz = ZoneInfo(args.timezone)
-    def inject(stage: str) -> None:
-        if args.inject_failure == stage:
-            raise RuntimeError(f"injected transition failure at stage={stage}")
-    # Include microseconds so a rollback followed immediately by a second
-    # transition cannot reuse the previous manifest/backup directory.
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    manifest_path = proxy.parent / f"v0-to-v1-{stamp}.manifest.json"
-    backup_dir = proxy.parent / f"v0-to-v1-{stamp}.backup"
-    manifest = {"transition": "0-to-1", "stage": "started",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "timezone": args.timezone, "apply": args.apply,
-                "token_board_db": str(proxy), "dashboard_db": str(dashboard),
-                "schema_dir": str(schema_root),
-                "shadows": {"token-board": str(shadow_path(proxy)),
-                            "dashboard": str(shadow_path(dashboard))},
-                "remote_v0_policy": "retain-read-only; publish V1 only after all nodes transition"}
-
+    source_version(proxy, 19)
+    source_version(dashboard, 6)
     with migration_locks(proxy, dashboard):
-        source_version(proxy, 19)
-        source_version(dashboard, 6)
         assert_offline_and_checkpoint(proxy)
         assert_offline_and_checkpoint(dashboard)
         spool_records = read_usage_spool(proxy)
-        manifest["spool"] = {
-            "path": str(Path(str(proxy) + ".request-log.spool")),
-            "records": len(spool_records),
-        }
         sample_conn = sqlite3.connect(proxy)
         try:
             samples = sample_conn.execute(
                 "SELECT created_at FROM upstream_accounts WHERE created_at IS NOT NULL "
                 "ORDER BY created_at LIMIT 3"
             ).fetchall()
-            manifest["timezone_samples"] = [
-                {"source": row[0], "utc": utc_timestamp(row[0], source_tz)}
-                for row in samples
-            ]
         finally:
             sample_conn.close()
-        manifest["backups"] = backup_files(proxy, dashboard, backup_dir)
-        manifest["stage"] = "backed_up"; write_manifest(manifest_path, manifest)
-        inject("backed_up")
-        proxy_shadow = prepare_shadow(proxy, "token-board", schema_root)
-        dashboard_shadow = prepare_shadow(dashboard, "dashboard", schema_root)
-        manifest["stage"] = "shadows_created"; write_manifest(manifest_path, manifest)
-        inject("shadows_created")
-        mapping = transform_proxy(proxy, proxy_shadow, source_tz, spool_records)
-        transform_dashboard(dashboard, dashboard_shadow, proxy, mapping,
-                            mapping.get("credential_masks"))
-        manifest["stage"] = "transformed"; write_manifest(manifest_path, manifest)
-        inject("transformed")
-        manifest["verification"] = {
-            "token-board": verify_proxy(str(proxy), str(proxy_shadow),
-                                   spool_records=spool_records),
-            "dashboard": verify_dashboard(str(dashboard), str(dashboard_shadow)),
-        }
-        manifest["stage"] = "verified"; write_manifest(manifest_path, manifest)
-        inject("verified")
-
-        if args.apply:
-            atomic_replace(proxy, proxy_shadow, manifest_path, manifest, "token_board")
-            inject("token_board_replaced")
-            atomic_replace(dashboard, dashboard_shadow, manifest_path, manifest, "dashboard")
-            inject("dashboard_replaced")
-            manifest["config_snapshot"] = str(rebuild_config_snapshot(proxy))
-            write_manifest(manifest_path, manifest)
-            inject("snapshot_rebuilt")
-            manifest["stage"] = "complete"
-        else:
-            manifest["stage"] = "dry_run_complete"
-        write_manifest(manifest_path, manifest)
-    print(json.dumps({"manifest": str(manifest_path), "stage": manifest["stage"],
-                      "verification": manifest.get("verification")},
+        from app.db.schema_upgrade.compound import (
+            pending_transitions as select_pending,
+            run as run_transitions,
+        )
+        transitions = select_pending(
+            proxy, dashboard, schema_root, source_version_value(proxy),
+            source_version_value(dashboard))
+        if len(transitions) != 1 or transitions[0][0].transition_id != "0-to-1":
+            parser.error("V0 database pair has no unique 0-to-1 transition route")
+        result = run_transitions(
+            proxy, dashboard, schema_root, source_version_value(proxy),
+            source_version_value(dashboard), transitions, args.timezone,
+            apply=args.apply, manifest_prefix="v0-to-v1",
+            inject_failure=args.inject_failure, recover_on_error=False,
+            manifest_extra={
+                "timezone": args.timezone,
+                "apply": args.apply,
+                "timezone_samples": [
+                    {"source": row[0], "utc": utc_timestamp(row[0], source_tz)}
+                    for row in samples
+                ],
+                "spool": {
+                    "path": str(Path(str(proxy) + ".request-log.spool")),
+                    "records": len(spool_records),
+                },
+                "remote_v0_policy":
+                    "retain-read-only; publish V1 only after all nodes transition",
+            })
+    print(json.dumps({"manifest": result.manifest,
+                      "stage": "complete" if args.apply else "dry_run_complete"},
                      ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":

@@ -3,6 +3,38 @@
   "databases": ["token-board", "dashboard"],
   "strategy": "shadow-barrier",
   "entrypoint": "transition.py",
-  "order": 20,
-  "description": "Align legacy dashboard agent archive ids with token-board V1 ids"
+  "order": 2,
+  "description": "Align legacy dashboard agent archive ids with token-board V1 ids",
+  "routes": [
+    {
+      "scope": "local-pair",
+      "current": {
+        "token-board": "1.*",
+        "dashboard": "1.*"
+      },
+      "prepare": {
+        "token-board": "1.8",
+        "dashboard": "1.3"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    },
+    {
+      "scope": "dashboard-artifact",
+      "current": {
+        "token-board": "1.*",
+        "dashboard": "1.*"
+      },
+      "prepare": {
+        "token-board": "1.8",
+        "dashboard": "1.3"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    }
+  ]
 }
