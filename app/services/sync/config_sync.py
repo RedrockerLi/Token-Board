@@ -10,6 +10,7 @@ of this workflow.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import shutil
 import tempfile
 from pathlib import Path
@@ -18,7 +19,7 @@ from app.core import sqlite_runtime
 from app.db.schema_upgrade import upgrade_downloaded_artifact
 from app.db.schema_upgrade.coordinator import inspect_version
 from app.db.migrations import TOKEN_BOARD_DATABASE_NAME, schema_dir_for
-from app.services.sync.common import RUNTIME_TABLE_DENYLIST
+from app.services.sync.common import RUNTIME_TABLE_DELETE_ORDER
 from app.services.sync.config_merge import merge_config_tables, sanitize_upload_columns
 from app.services.sync.settings import SyncConfig, load_sync_config
 from app.services.sync.snapshot import restore_config_snapshot, snapshot_config
@@ -101,11 +102,15 @@ def _build_upload_copy(db_path: str, destination: Path) -> None:
     safe_copy_db(db_path, str(destination))
     conn = sqlite_runtime.connect(destination, "shadow_copy")
     try:
-        for table in RUNTIME_TABLE_DENYLIST:
-            if table_exists(conn, table):
-                conn.execute(f"DELETE FROM {table}")
-        sanitize_upload_columns(conn)
-        conn.commit()
+        with sqlite_runtime.transaction(conn, "immediate"):
+            for table in RUNTIME_TABLE_DELETE_ORDER:
+                if table_exists(conn, table):
+                    conn.execute(f"DELETE FROM {table}")
+            sanitize_upload_columns(conn)
+            violation = conn.execute("PRAGMA foreign_key_check").fetchone()
+            if violation is not None:
+                raise sqlite3.IntegrityError(
+                    f"V1 config upload FK violation: {tuple(violation)}")
     finally:
         conn.close()
     conn = sqlite_runtime.connect(destination, "shadow_copy")

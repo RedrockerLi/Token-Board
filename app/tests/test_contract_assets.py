@@ -11,6 +11,7 @@ from app.services.agent_usage.registry import ADAPTERS, ADAPTER_SPECS
 from app.services.sync.common import (
     CONFIG_TABLE_ALLOWLIST,
     RUNTIME_TABLE_DENYLIST,
+    RUNTIME_TABLE_DELETE_ORDER,
     is_config_sync_table,
 )
 
@@ -35,6 +36,15 @@ class ContractAssetTest(unittest.TestCase):
         self.assertIn("client_keys", CONFIG_TABLE_ALLOWLIST)
         self.assertIn("request_log", RUNTIME_TABLE_DENYLIST)
         self.assertIn("agent_subscription_charge_allocations", RUNTIME_TABLE_DENYLIST)
+        self.assertEqual(set(RUNTIME_TABLE_DELETE_ORDER), RUNTIME_TABLE_DENYLIST)
+        self.assertLess(
+            RUNTIME_TABLE_DELETE_ORDER.index("request_attempts"),
+            RUNTIME_TABLE_DELETE_ORDER.index("request_log"),
+        )
+        self.assertLess(
+            RUNTIME_TABLE_DELETE_ORDER.index("agent_subscription_charge_allocations"),
+            RUNTIME_TABLE_DELETE_ORDER.index("agent_subscription_period_charges"),
+        )
         self.assertTrue(is_config_sync_table("client_keys"))
         self.assertFalse(is_config_sync_table("request_log"))
         self.assertFalse(is_config_sync_table("future_machine_local_table"))

@@ -40,13 +40,24 @@ V1_CONFIG_TABLES = [
     "agent_software",
 ]
 CONFIG_TABLE_ALLOWLIST = frozenset(V1_CONFIG_TABLES)
-_RUNTIME_TABLES = [
-    "request_log", "request_attempts", "billing_period_charges",
-    "agent_subscription_period_charges", "agent_subscription_charge_allocations",
-    "agent_software_runtime", "fx_rates",
-    "sync_state", "sync_config", "perf_events", "in_flight_requests", "session_key_log",
-]
-RUNTIME_TABLE_DENYLIST = frozenset(_RUNTIME_TABLES)
+# Runtime tables can reference one another. Keep this separate from the
+# membership denylist so callers never use an unordered set as a delete plan.
+# Children must be removed before parents when the foreign key has no cascade.
+RUNTIME_TABLE_DELETE_ORDER = (
+    "request_attempts",
+    "request_log",
+    "agent_subscription_charge_allocations",
+    "billing_period_charges",
+    "agent_subscription_period_charges",
+    "agent_software_runtime",
+    "fx_rates",
+    "sync_state",
+    "sync_config",
+    "perf_events",
+    "in_flight_requests",
+    "session_key_log",
+)
+RUNTIME_TABLE_DENYLIST = frozenset(RUNTIME_TABLE_DELETE_ORDER)
 
 
 def is_config_sync_table(name: str) -> bool:
@@ -56,4 +67,5 @@ def is_config_sync_table(name: str) -> bool:
 
 
 __all__ = ["V1_CONFIG_TABLES", "CONFIG_TABLE_ALLOWLIST",
-           "RUNTIME_TABLE_DENYLIST", "is_config_sync_table"]
+           "RUNTIME_TABLE_DENYLIST", "RUNTIME_TABLE_DELETE_ORDER",
+           "is_config_sync_table"]

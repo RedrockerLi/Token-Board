@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from app.core import sqlite_runtime
-from app.services.sync.common import V1_CONFIG_TABLES
+from app.services.sync.common import RUNTIME_TABLE_DELETE_ORDER, V1_CONFIG_TABLES
 from app.services.sync.state import table_exists
 from app.services.sync.storage import safe_copy_db
 
@@ -25,11 +25,7 @@ def snapshot_config(db_path: str) -> None:
         # tables are deliberately absent from a configuration rollback
         # snapshot; leaving allocations behind creates orphan foreign keys
         # when period charges are stripped.
-        for table in ("request_attempts", "request_log",
-                      "agent_subscription_charge_allocations",
-                      "billing_period_charges",
-                      "agent_subscription_period_charges",
-                      "agent_software_runtime", "fx_rates", "sync_state"):
+        for table in RUNTIME_TABLE_DELETE_ORDER:
             if table_exists(snapshot, table):
                 snapshot.execute(f"DELETE FROM {table}")
         snapshot.commit()

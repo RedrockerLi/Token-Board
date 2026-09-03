@@ -236,6 +236,66 @@ class SyncContractTest(unittest.TestCase):
             patch.stopall()
             shutil.rmtree(temp, ignore_errors=True)
 
+    def test_config_upload_with_frozen_agent_charge_allocations_succeeds(self) -> None:
+        temp, proxy, _ = self._repo_layout()
+        captured: dict[str, object] = {}
+        try:
+            from app.services.sync.snapshot import snapshot_config
+
+            with sqlite3.connect(proxy) as conn:
+                conn.execute(
+                    "INSERT INTO accounts(id,uuid,name) VALUES(1,'acct','agent')")
+                conn.execute(
+                    "INSERT INTO agent_subscriptions(id,uuid,name,valid_from) "
+                    "VALUES(1,'sub','subscription','2026-01-01')")
+                conn.execute(
+                    "INSERT INTO agent_subscription_instances "
+                    "(id,uuid,subscription_id,valid_from) "
+                    "VALUES(1,'inst',1,'2026-01-01')")
+                conn.execute(
+                    "INSERT INTO agent_subscription_period_charges "
+                    "(id,instance_id,subscription_id,period_start,period_end,"
+                    "recurring_charge,currency) "
+                    "VALUES(1,1,1,'2026-01-01','2026-02-01',1,'CNY')")
+                conn.execute(
+                    "INSERT INTO agent_subscription_charge_allocations "
+                    "(period_charge_id,software_id) VALUES(1,1)")
+                conn.commit()
+            snapshot_config(proxy)
+
+            def capture(config, path):
+                del config
+                with sqlite3.connect(path) as uploaded:
+                    captured["period_charges"] = uploaded.execute(
+                        "SELECT count(*) FROM agent_subscription_period_charges"
+                    ).fetchone()[0]
+                    captured["allocations"] = uploaded.execute(
+                        "SELECT count(*) FROM agent_subscription_charge_allocations"
+                    ).fetchone()[0]
+                    captured["foreign_key_check"] = uploaded.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                return RemoteArtifact("token-board_config_20260824_120000.db")
+
+            with patch(
+                    "app.services.sync.config_sync.publish_config_artifact",
+                    side_effect=capture):
+                result = sync_config_upload(proxy)
+
+            self.assertEqual(result["status"], "ok", result)
+            self.assertEqual(captured["period_charges"], 0)
+            self.assertEqual(captured["allocations"], 0)
+            self.assertEqual(captured["foreign_key_check"], [])
+            with sqlite3.connect(proxy) as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM agent_subscription_period_charges"
+                ).fetchone()[0], 1)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM agent_subscription_charge_allocations"
+                ).fetchone()[0], 1)
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
     def test_config_upload_failure_rolls_back_to_snapshot(self) -> None:
         temp, proxy, _ = self._repo_layout()
         try:

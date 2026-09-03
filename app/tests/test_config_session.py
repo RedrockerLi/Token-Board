@@ -47,6 +47,25 @@ class ConfigSessionTest(unittest.TestCase):
             self.assertEqual(self._wait(session).state, "writable")
             self.assertTrue(ready.wait(1))
 
+    def test_empty_cloud_seeds_config_once_and_unlocks(self):
+        ready = threading.Event()
+        config = object()
+        with patch("app.services.sync.config_session.load_sync_config",
+                   return_value=config), \
+                patch("app.services.sync.config_session.sync_config_pull",
+                      return_value={"status": "empty", "message": "empty"}), \
+                patch("app.services.sync.config_session.sync_config_upload",
+                      return_value={"status": "ok", "message": "seeded"}) as upload:
+            session = ConfigSession(str(self.db), str(self.schema),
+                                    on_writable=ready.set)
+            session.start()
+            status = self._wait(session)
+
+        self.assertEqual(status.state, "writable")
+        self.assertTrue(ready.wait(1))
+        upload.assert_called_once_with(
+            str(self.db), schema_dir=str(self.schema), config=config)
+
     def test_pull_failure_stays_read_only(self):
         with patch("app.services.sync.config_session.load_sync_config", return_value=object()), \
                 patch("app.services.sync.config_session.sync_config_pull",
