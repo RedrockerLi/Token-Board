@@ -434,9 +434,9 @@ bool Database::log_request(int account_id, int local_key_id,
                     attempts.size(), kLogAttemptsMax);
         }
 
-        // V1.1+ prices every proxy/import UsageEvent in SQLite using
-        // requested_at. A zero value asks that authoritative path to resolve
-        // historical rate/slot/FX data.
+        // V1.14 prices every proxy/import UsageEvent in SQLite at INSERT time
+        // using the current rule, slot multiplier and FX rate. The C++
+        // runtime does not carry a second pricing implementation.
         record.cost = 0.0;
         std::array<unsigned char, 16> random_bytes {};
         sqlite3_randomness(static_cast<int>(random_bytes.size()),

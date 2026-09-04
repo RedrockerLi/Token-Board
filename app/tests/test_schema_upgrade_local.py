@@ -84,8 +84,9 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
         with sqlite3.connect(proxy) as conn:
             self.assertEqual(conn.execute(
-                "SELECT id,input_price,output_price FROM pricing_rules"
-            ).fetchall(), [(1, 1.0, 2.0)])
+                "SELECT id,model_pattern,priority,input_price,output_price "
+                "FROM pricing_rules"
+            ).fetchall(), [(1, "legacy-model", 0, 1.0, 2.0)])
             self.assertEqual(conn.execute(
                 "SELECT pricing_rule_id,multiplier FROM pricing_slots"
             ).fetchall(), [(1, 2.0)])

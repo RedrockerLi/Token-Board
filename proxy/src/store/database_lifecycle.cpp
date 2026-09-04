@@ -2,9 +2,9 @@
 
 namespace {
 
-// Keep this generated/reviewed with the newest proxy V1 SQL file.  It is a
-// validation floor only; the C++ runtime never discovers or executes SQL.
-constexpr int kMinimumRuntimeSchemaMinor = 10;
+// Keep this reviewed with the newest proxy V1 SQL file.  The C++ runtime
+// serves one exact schema contract; Python owns all SQL migrations.
+constexpr int kRequiredRuntimeSchemaMinor = 14;
 
 bool validate_v1_schema(sqlite3 *db, const std::string &path,
                         int &major, int &minor) {
@@ -43,11 +43,11 @@ bool validate_v1_schema(sqlite3 *db, const std::string &path,
                      path.c_str());
         return false;
     }
-    if (major != 1 || minor < kMinimumRuntimeSchemaMinor) {
-        TB_LOG_ERROR("[DB] %s is V%d.%d; run the Python schema-upgrade "
-                     "boundary to V1.%d or newer before starting C++\n",
+    if (major != 1 || minor != kRequiredRuntimeSchemaMinor) {
+        TB_LOG_ERROR("[DB] %s is V%d.%d; run the matching Python "
+                     "schema-upgrade boundary to V1.%d before starting C++\n",
                      path.c_str(), major, minor,
-                     kMinimumRuntimeSchemaMinor);
+                     kRequiredRuntimeSchemaMinor);
         return false;
     }
     return true;

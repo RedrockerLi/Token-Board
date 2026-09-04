@@ -186,8 +186,9 @@ class SyncContractTest(unittest.TestCase):
             upgrade_downloaded_artifact(local, "token-board", schema)
             with sqlite3.connect(local) as conn:
                 self.assertEqual(conn.execute(
-                    "SELECT id,input_price,output_price FROM pricing_rules"
-                ).fetchall(), [(1, 1.0, 2.0)])
+                    "SELECT id,model_pattern,priority,input_price,output_price "
+                    "FROM pricing_rules"
+                ).fetchall(), [(1, "migration-demo", 0, 1.0, 2.0)])
                 self.assertFalse(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='pricing_rates'"
                 ).fetchone())

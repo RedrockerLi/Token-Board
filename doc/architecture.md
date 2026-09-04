@@ -74,8 +74,8 @@ Dashboard V1.5；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原�
 下一次 Python 启动会依据 manifest 和备份恢复原始文件。
 
 Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查。C++ 代理打开
-数据库时只验证 `schema_version` 与 `PRAGMA user_version` 一致，并要求当前 Proxy
-运行时最低 schema（目前为 V1.10；数据库 tip 为 V1.14）；不满足时直接退出并提示先运行 Python
+数据库时只验证 `schema_version` 与 `PRAGMA user_version` 一致，并要求 Proxy
+运行时使用的精确 schema 为当前 V1.14；不满足时直接退出并提示先运行匹配版本的 Python
 升级边界。C++ 的 `--schema-dir` 仅为旧启动器保留，不参与升级。
 
 ## 数据流

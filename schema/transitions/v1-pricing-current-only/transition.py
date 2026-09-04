@@ -68,15 +68,19 @@ def apply(context: TransitionContext) -> None:
             raise RuntimeError("V1 pricing history tables are incomplete")
 
         _stage_schema(conn)
+        # Keep this positional projection in the same order as the staging
+        # table below.  The transition runs before V1.14 drops the historical
+        # pricing tables, so a swapped model_pattern/rate_id here silently
+        # corrupts the published current-only rule.
         current_rules = conn.execute(
-            "SELECT pr.id,pr.model_pattern,pr.priority,r.id,r.input_price,"
+            "SELECT pr.id,r.id,pr.model_pattern,pr.priority,r.input_price,"
             "r.cache_read_price,r.output_price,r.currency "
             "FROM pricing_rules pr LEFT JOIN pricing_rates r "
             "ON r.pricing_rule_id=pr.id AND r.valid_until IS NULL "
             "WHERE pr.enabled=1 ORDER BY pr.id"
         ).fetchall()
-        if any(row[3] is None for row in current_rules):
-            missing = [row[0] for row in current_rules if row[3] is None]
+        if any(row[1] is None for row in current_rules):
+            missing = [row[0] for row in current_rules if row[1] is None]
             raise RuntimeError(
                 f"enabled pricing rules without a current rate: {missing}")
 
@@ -143,6 +147,51 @@ def verify(context: TransitionContext) -> dict:
             raise RuntimeError(
                 f"pricing rule count changed: source={source_rules} "
                 f"shadow={shadow_rules}")
+
+        source_pricing = [tuple(row) for row in source.execute(
+            "SELECT pr.id,pr.model_pattern,pr.priority,r.input_price,"
+            "r.cache_read_price,r.output_price,r.currency "
+            "FROM pricing_rules pr JOIN pricing_rates r "
+            "ON r.pricing_rule_id=pr.id AND r.valid_until IS NULL "
+            "WHERE pr.enabled=1 ORDER BY pr.id"
+        )]
+        shadow_pricing = [tuple(row) for row in shadow.execute(
+            "SELECT id,model_pattern,priority,input_price,cache_read_price,"
+            "output_price,currency FROM pricing_rules ORDER BY id"
+        )]
+        if source_pricing != shadow_pricing:
+            raise RuntimeError(
+                "pricing rule identity/order/price changed during transition")
+
+        source_slots = [tuple(row) for row in source.execute(
+            "SELECT ps.id,pr.id,ps.start_minute,ps.end_minute,ps.multiplier "
+            "FROM pricing_slots ps JOIN pricing_rates r "
+            "ON r.id=ps.pricing_rate_id AND r.valid_until IS NULL "
+            "JOIN pricing_rules pr ON pr.id=r.pricing_rule_id "
+            "WHERE pr.enabled=1 ORDER BY ps.id"
+        )]
+        shadow_slots = [tuple(row) for row in shadow.execute(
+            "SELECT id,pricing_rule_id,start_minute,end_minute,multiplier "
+            "FROM pricing_slots ORDER BY id"
+        )]
+        if source_slots != shadow_slots:
+            raise RuntimeError("pricing slot changed during transition")
+
+        source_tiers = [tuple(row) for row in source.execute(
+            "SELECT pr.id,t.threshold_tokens,t.input_price,"
+            "t.cache_read_price,t.output_price "
+            "FROM pricing_length_tiers t JOIN pricing_rates r "
+            "ON r.id=t.pricing_rate_id AND r.valid_until IS NULL "
+            "JOIN pricing_rules pr ON pr.id=r.pricing_rule_id "
+            "WHERE pr.enabled=1 ORDER BY pr.id,t.threshold_tokens"
+        )]
+        shadow_tiers = [tuple(row) for row in shadow.execute(
+            "SELECT pricing_rule_id,threshold_tokens,input_price,"
+            "cache_read_price,output_price FROM pricing_length_tiers "
+            "ORDER BY pricing_rule_id,threshold_tokens"
+        )]
+        if source_tiers != shadow_tiers:
+            raise RuntimeError("pricing length tier changed during transition")
 
         source_usage = _usage_totals(source) if context.scope != "dashboard-artifact" else None
         shadow_usage = _usage_totals(shadow)

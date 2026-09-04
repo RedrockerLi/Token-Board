@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import importlib.util
+import re
 from pathlib import Path
 
 
@@ -48,6 +49,16 @@ def main() -> None:
         "SELECT major,minor,database_name FROM schema_version").fetchone() == (
             latest_proxy.major, latest_proxy.minor, "token-board")
     conn.close()
+
+    lifecycle = (project_root / "proxy" / "src" / "store" /
+                 "database_lifecycle.cpp").read_text(encoding="utf-8")
+    runtime_minor = re.search(
+        r"constexpr int kRequiredRuntimeSchemaMinor = (\d+);", lifecycle)
+    assert runtime_minor, "C++ runtime schema contract constant is missing"
+    assert int(runtime_minor.group(1)) == latest_proxy.minor, (
+        "C++ runtime schema contract must match the Token Board V1 tip: "
+        f"runtime={runtime_minor.group(1)}, tip={latest_proxy.minor}"
+    )
 
     ordered = Path(tempfile.mkdtemp())
     (ordered / "1-10_ten.sql").write_text("SELECT 10;", encoding="utf-8")

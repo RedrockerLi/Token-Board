@@ -8,7 +8,7 @@
 
 Proxy V1 将身份、转发与计费拆开：`accounts` 是稳定计费主体；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，配置的明文位于 `upstream_secrets`；智能体订阅和软件来源分别位于 `agent_subscriptions` / `agent_software`，不再作为上游账户。
 
-计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/rates/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
+计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
 
 Dashboard V1 统一使用 `accounts`、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存订阅分摊后的实际周期费用。智能体软件删除同样是软删除：账户标记为 `deleted`、软件禁用，但身份、运行游标、绑定和请求归属保留。
 
@@ -132,7 +132,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 ## dashboard.db
 
-可视化**存档**库,表定义在 `schema/dashboard/0001_*.sql`(0001–0006),`user_version` 当前为 6。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
+可视化**存档**库,表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.5),`user_version` 当前为 10005。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
 存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `accounts` 元数据镜像表(0004 + 应用层 `reconcile_accounts` 把旧的名字列桶迁移成 id 桶、删掉名字列)。`accounts` 每行 `account_id → name`(0006 删除了从未被读的 `account_type`/`deleted_at` 镜像列),随配置同步、含已软删账户,供历史显示 JOIN 出名字。看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 V1 ledger 行。
 
