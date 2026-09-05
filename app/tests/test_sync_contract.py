@@ -242,7 +242,7 @@ class SyncContractTest(unittest.TestCase):
                 ).fetchone())
                 self.assertEqual(conn.execute(
                     "SELECT major,minor FROM schema_version WHERE id=1"
-                ).fetchone(), (1, 14))
+                ).fetchone(), (1, 15))
             return state["artifact"]
 
         try:

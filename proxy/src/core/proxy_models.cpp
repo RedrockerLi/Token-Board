@@ -88,10 +88,13 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     if (!used && outcome.attempts.empty() && !fwd.is_timeout) {
         TerminalErrorOptions opts;
         opts.busy_message = "All upstream keys are busy or cooling down";
+        opts.no_candidate_reason = outcome.no_candidate_reason;
         const auto err = render_terminal_error(
             codecs_.get(policy.client_format), &codecs_.get(policy.client_format),
             fwd, outcome.attempts, opts);
         res.status = err.status;
+        if (err.retry_after_seconds > 0)
+            res.set_header("Retry-After", std::to_string(err.retry_after_seconds));
         res.set_content(err.body, "application/json");
         return;
     }
@@ -111,6 +114,8 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
             fwd, outcome.attempts, opts);
         res.status = err.status;
         if (err.close_connection) res.set_header("Connection", "close");
+        if (err.retry_after_seconds > 0)
+            res.set_header("Retry-After", std::to_string(err.retry_after_seconds));
         res.set_content(err.body, "application/json");
     }
 }

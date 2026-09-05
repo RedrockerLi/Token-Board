@@ -8,7 +8,7 @@ comparing the string directly, so adding a type is one row in
 :data:`ACCOUNT_TYPES` — not a new branch in every caller.
 
 The C++ proxy mirrors the parts it needs in ``proxy/src/core/account_types.h``
-(non-routable filter + 429 cooldown class) — keep the two in sync.
+(non-routable filter) — keep the two in sync.
 """
 
 from dataclasses import dataclass
@@ -23,7 +23,7 @@ class AccountTypeSpec:
     holds_keys: bool  # 持有上游密钥（每把 key = 一个并发槽位/冷却单元）
     usage_source: str  # "proxy"（代理转发自动记账）| "import"（后台导入）
     deletion: str  # "immediate"（始终立即删除）| "configurable"（immediate|end_of_period）
-    cooldown: str | None  # "transient"（5s/30s/2min 退避）| "subscription_5h"（429→5h 冷却）| None
+    cooldown: str | None  # "subscription_5h"（明确配额429→5h冷却）| None
     subscription_unit: str | None  # "per_key" | "per_account" | None（非订阅类型）
     label: str  # 设置页类型下拉文案
     short_label: str  # 账户列表徽章文案
@@ -51,7 +51,7 @@ ACCOUNT_TYPES: dict[str, AccountTypeSpec] = {
         holds_keys=True,
         usage_source="proxy",
         deletion="immediate",
-        cooldown="transient",
+        cooldown=None,
         subscription_unit=None,
         label="api — 按调用量计费",
         short_label="API",

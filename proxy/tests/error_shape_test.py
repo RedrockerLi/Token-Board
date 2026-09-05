@@ -8,7 +8,8 @@ json_error with a raw "Upstream error: ..." text).  After the refactor every
 endpoint routes through the shared render_terminal_error(), so the error JSON
 shape is uniform:
 
-  * fail-all busy 429   -> {"error": {"message", "type":"rate_limit_error", "code":429}}
+  * all provider-quota-cooled 429 -> {"error": {"message", "type":"rate_limit_error", "code":429}}
+  * local concurrency capacity -> 503 + Retry-After: 1
   * upstream timeout    -> 504 + Connection: close + {"error":{...,"type":"timeout_error","code":504}}
   * used upstream error -> the structured parse_error_body output (not a
                            synthetic "Upstream error: <raw>" text)
@@ -151,10 +152,11 @@ def main() -> None:
             from v1_fixture import add_plain_route, add_upstream
 
             def plain(key: str, name: str, *,
-                      recurring: bool = False, api_format: str = "openai"):
+                      recurring: bool = False, api_format: str = "openai",
+                      max_concurrency: int = 64):
                 account_id, up, _ = add_upstream(
                     conn, name, base_url, [key], recurring=recurring,
-                    api_format=api_format)
+                    api_format=api_format, max_concurrency=max_concurrency)
                 add_plain_route(conn, f"tb-{name}", name, up, account_id,
                                 model_pattern="*")
 
@@ -163,12 +165,13 @@ def main() -> None:
             plain("sk-chat-500", "chat500")
             plain("sk-chat-to", "chatto")
             plain("sk-chat-stream", "chatstream")
+            plain("sk-chat-cap", "chatcap", max_concurrency=1)
             plain("sk-chat-busy", "chatbusy", recurring=True)
             plain("sk-anth-busy", "anthbusy", recurring=True, api_format="anthropic")
             plain("sk-emb-500", "emb500")
             plain("sk-emb-busy", "embbusy", recurring=True)
             plain("sk-mod-500", "mod500")
-            plain("sk-mod-busy", "modbusy", recurring=True)
+            plain("sk-mod-busy", "modbusy")
 
             # Fast timeout round-trip for the chat timeout case.
             conn.execute(
@@ -225,6 +228,42 @@ def main() -> None:
             assert b"timeout_error" in raw, raw
             print("3 OK: streaming timeout -> 504 + Connection: close")
 
+            # A proxy-generated 504 must not cool the only key.  The next
+            # request must reach the mock and succeed immediately.
+            status, body, _ = send(
+                proxy_port, "POST", "/v1/chat/completions", "tb-chatstream",
+                {**chat, "model": "chatstream-model", "stream": False})
+            assert status == 200, f"post-timeout request must be forwarded: {status} {body}"
+            print("3b OK: proxy timeout does not create cross-request key state")
+
+            # Local per-key capacity is a proxy resource condition, not an
+            # upstream rate limit: it returns 503 while the slot is occupied.
+            first_done = threading.Event()
+            def hold_capacity():
+                try:
+                    send(proxy_port, "POST", "/v1/chat/completions", "tb-chatcap",
+                         {**chat, "model": "chatcap-model", "mock_delay": 2},
+                         timeout=10)
+                finally:
+                    first_done.set()
+            first = threading.Thread(target=hold_capacity)
+            first.start()
+            time.sleep(0.15)
+            status, body, headers = send(
+                proxy_port, "POST", "/v1/chat/completions", "tb-chatcap",
+                {**chat, "model": "chatcap-model"})
+            assert status == 503, (status, body, headers)
+            assert headers.get("Retry-After") == "1", headers
+            assert body["error"]["code"] == 503, body
+            assert body["error"]["type"] == "service_unavailable", body
+            first.join(timeout=10)
+            assert first_done.is_set(), "capacity holder did not finish"
+            status, body, _ = send(
+                proxy_port, "POST", "/v1/chat/completions", "tb-chatcap",
+                {**chat, "model": "chatcap-model"})
+            assert status == 200, (status, body)
+            print("3c OK: local key capacity -> 503 + Retry-After, then releases")
+
             # ── 4. Streaming all-candidates-busy → 429 ──
             send_stream(
                 proxy_port, "/v1/chat/completions", "tb-chatbusy",
@@ -250,7 +289,7 @@ def main() -> None:
                                 "messages": chat["messages"]})
             assert status == 429, f"anth busy status {status}"
             assert body == {"type": "error", "error": {
-                "message": "All upstream accounts are busy, cooling down, or failed",
+                "message": "All upstream keys are in provider quota cooldown",
                 "type": "rate_limit_error", "code": 429}}, body
             print(f"5 OK: Anthropic chat busy-429 envelope -> {body}")
 
@@ -272,20 +311,17 @@ def main() -> None:
                 "tb-embbusy", {"model": "embbusy-model", "input": "hi"})
             assert status == 429, f"emb busy status {status}"
             assert body == {"error": {"message":
-                "All upstream accounts are busy, cooling down, or failed",
+                "All upstream keys are in provider quota cooldown",
                 "type": "rate_limit_error", "code": 429}}, body
             print(f"7 OK: embeddings busy-429 -> {body}")
 
             # ── 8. Models busy-429 (GET, out-of-band status) + no accounting ──
             ctrl(upstream_port, {"set": {"sk-mod-busy": 429}})
-            send(proxy_port, "GET", "/v1/models", "tb-modbusy", None)
+            status1, _, _ = send(proxy_port, "GET", "/v1/models", "tb-modbusy", None)
+            status2, body, _ = send(proxy_port, "GET", "/v1/models", "tb-modbusy", None)
             ctrl(upstream_port, {"clear": ["sk-mod-busy"]})
-            status, body, _ = send(proxy_port, "GET", "/v1/models",
-                "tb-modbusy", None)
-            assert status == 429, f"models busy status {status}"
-            assert body == {"error": {"message":
-                "All upstream keys are busy or cooling down",
-                "type": "rate_limit_error", "code": 429}}, body
+            assert status1 == 429 and status2 == 429, (status1, status2)
+            assert body["error"]["message"] == "mock GoUsageLimitError", body
             assert count_rows(db_path, "modbusy-model") == 0, \
                 "models must not write request_log rows"
             print(f"8 OK: models busy-429 (no accounting) -> {body}")

@@ -74,12 +74,22 @@ int main() {
     assert(candidate_failure_retryable(502));
     assert(!candidate_failure_retryable(400));
 
-    // Cooldown eligibility and slot acquisition are one atomic gate decision.
+    // Eligibility distinguishes local capacity from the provider's explicit
+    // subscription quota cooldown. Ordinary failures must not create a key
+    // state that suppresses the next request.
     AccountGate gate;
-    assert(gate.try_acquire_eligible(101, 1));
+    assert(gate.try_acquire_eligible(101, 1) ==
+           AccountGate::KeyAcquireResult::kAcquired);
     gate.release(101);
-    gate.mark_failure(101, 502);
-    assert(!gate.try_acquire_eligible(101, 1));
+    gate.mark_subscription_cooldown(101);
+    assert(gate.try_acquire_eligible(101, 1) ==
+           AccountGate::KeyAcquireResult::kSubscriptionCooldown);
+    gate.clear_cooldown(101);
+    assert(gate.try_acquire_eligible(101, 1) ==
+           AccountGate::KeyAcquireResult::kAcquired);
+    assert(gate.try_acquire_eligible(101, 1) ==
+           AccountGate::KeyAcquireResult::kConcurrencyFull);
+    gate.release(101);
 
     // Cost-led cold start: with a ledger wired in, a session with no binding
     // prefers the key slot that has accrued the least cost; ties (all-zero)

@@ -24,23 +24,18 @@ Database::AttemptInfo to_attempt(const UpstreamCandidate &candidate,
 }
 }  // namespace
 
-bool AttemptExecutor::acquire(const UpstreamCandidate &candidate) const {
+AccountGate::KeyAcquireResult AttemptExecutor::acquire(
+    const UpstreamCandidate &candidate) const {
     return gate_.try_acquire_eligible(candidate.key_slot_id,
-                                       candidate.account().max_concurrency);
+                                      candidate.account().max_concurrency);
 }
 
 void AttemptExecutor::complete(
     const UpstreamCandidate &candidate,
-    const UpstreamClient::ForwardResult &result,
-    bool downstream_gone) const {
-    if (result.success && result.status_code >= 200 &&
-        result.status_code < 300) {
-        gate_.mark_success(candidate.key_slot_id);
-    } else if (!downstream_gone &&
-               candidate_failure_retryable(result.status_code)) {
-        gate_.record_failure(candidate.key_slot_id,
-               candidate.account().extended_usage_limit_cooldown,
-                             result.usage_limit, result.status_code);
+    const UpstreamClient::ForwardResult &result) const {
+    if (result.status_code == 429 && result.usage_limit &&
+        candidate.account().extended_usage_limit_cooldown) {
+        gate_.mark_subscription_cooldown(candidate.key_slot_id);
     }
     gate_.release(candidate.key_slot_id);
 }
@@ -81,12 +76,20 @@ AttemptOutcome AttemptExecutor::run(
     std::chrono::steady_clock::time_point deadline, int budget_seconds,
     const Forward &forward, const Disconnected &disconnected) const {
     AttemptOutcome outcome;
+    bool saw_concurrency_full = false;
+    bool saw_subscription_cooldown = false;
     for (std::size_t position = 0; position < order.size(); ++position) {
         const std::size_t index = order[position];
         if (index >= candidates.size()) continue;
         const auto &candidate = candidates[index];
-        if (!acquire(candidate))
+        const auto acquire_result = acquire(candidate);
+        if (acquire_result != AccountGate::KeyAcquireResult::kAcquired) {
+            saw_concurrency_full = saw_concurrency_full ||
+                acquire_result == AccountGate::KeyAcquireResult::kConcurrencyFull;
+            saw_subscription_cooldown = saw_subscription_cooldown ||
+                acquire_result == AccountGate::KeyAcquireResult::kSubscriptionCooldown;
             continue;
+        }
 
         const auto now = std::chrono::steady_clock::now();
         const auto remaining = std::chrono::duration_cast<
@@ -108,13 +111,20 @@ AttemptOutcome AttemptExecutor::run(
         outcome.successful = outcome.result.success &&
             outcome.result.status_code >= 200 &&
             outcome.result.status_code < 300;
-        complete(candidate, outcome.result, downstream_gone);
+        complete(candidate, outcome.result);
 
         const bool retry = should_retry(outcome.result, downstream_gone,
                                         position + 1 < order.size());
         if (retry) continue;
         outcome.used = &candidate;
         break;
+    }
+    if (outcome.attempts.empty() && !outcome.budget_exhausted) {
+        outcome.no_candidate_reason = saw_concurrency_full
+            ? NoCandidateReason::kLocalCapacity
+            : saw_subscription_cooldown
+                ? NoCandidateReason::kProviderQuotaCooldown
+                : NoCandidateReason::kNone;
     }
     return outcome;
 }

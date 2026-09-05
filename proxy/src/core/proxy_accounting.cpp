@@ -110,11 +110,8 @@ void ProxyServer::run_cooldown_probe_cycle() {
             continue;  // keep cooling; retry next cycle
         }
         if (fwd.status_code >= 200 && fwd.status_code < 300) {
-            // A successful health probe is a real credential success.  Clear
-            // both the extended quota cooldown and any short circuit-breaker
-            // state left by a racing/transient attempt; otherwise the key can
-            // remain ineligible even after the probe declared it healthy.
-            gate_.mark_success(key_slot_id);
+            // A successful health probe is explicit evidence that the
+            // provider's quota cooldown can be cleared.
             gate_.clear_cooldown(key_slot_id);
             TB_LOG_DEBUG(
                     "[Proxy] cooldown probe: key %d healthy, cooldown cleared "

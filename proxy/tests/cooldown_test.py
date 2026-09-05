@@ -7,14 +7,13 @@ root), and asserts the request_attempts chain for each scenario:
 
   A1  GoUsageLimitError 429 on plan key1 → key1 cools down (5h); same-request
       falls to key2, and a subsequent request skips key1 entirely.
-  A1b plain 429 (no GoUsageLimitError) on plan key1 → transient 5s backoff:
-      a subsequent request ~6s later retries key1 (proves it is NOT a 5h lock).
+  A1b plain 429 (no GoUsageLimitError) on a single key → the next request
+      immediately retries that key (proves there is no cross-request backoff).
   A2  both plan keys GoUsageLimitError → both cool down; requests fall to the
       Deepseek-API fallback and later skip both plan keys.
 
 Usage:
   python3 cooldown_test.py <token_proxy> <schema_dir> <project_root>
-      [--transient-wait SECS]   default 6 (must exceed the 5s transient backoff)
 """
 
 from __future__ import annotations
@@ -109,7 +108,6 @@ def main() -> None:
     ap.add_argument("token_proxy", type=str)
     ap.add_argument("schema_dir", type=str)
     ap.add_argument("project_root", type=str)
-    ap.add_argument("--transient-wait", type=float, default=6.0)
     args = ap.parse_args()
 
     proxy_binary = Path(args.token_proxy).resolve()
@@ -131,7 +129,7 @@ def main() -> None:
         try:
             # back-fill base_url (accounts were inserted with "" then updated)
             build_scenario(conn, "tb-a1", "a1-model", ["sk-a1-p1", "sk-a1-p2"], "sk-a1-d")
-            build_scenario(conn, "tb-a1b", "a1b-model", ["sk-a1b-p1", "sk-a1b-p2"], "sk-a1b-d")
+            build_scenario(conn, "tb-a1b", "a1b-model", ["sk-a1b-p1"], None)
             build_scenario(conn, "tb-a2", "a2-model", ["sk-a2-p1", "sk-a2-p2"], "sk-a2-d")
             conn.execute("UPDATE upstreams SET base_url=?", (base_url,))
             conn.commit()
@@ -163,23 +161,17 @@ def main() -> None:
             print("A1 OK: GoUsageLimitError key1 -> cooldown, fallback key2, "
                   f"skip on next request (chain1={st1}, chain2={st2})")
 
-            # ── A1b: plain 429 → transient backoff, key retried after ~5s ──
+            # ── A1b: plain 429 is not remembered across requests ──
             send(proxy_port, "tb-a1b", {**common, "model": "a1b-model",
-                "mock_status_by_key": {"sk-a1b-p1": 429, "sk-a1b-p2": 200}})
+                "mock_status_by_key": {"sk-a1b-p1": 429}})
             rid, n1, st1, _ = latest_attempts(db_path, "a1b-model")
-            assert st1 == [429, 200], f"A1b req1 chain {st1}"
+            assert n1 == 1 and st1 == [429], f"A1b req1 {n1=} {st1}"
 
             send(proxy_port, "tb-a1b", {**common, "model": "a1b-model"})
             _, n2, st2, _ = latest_attempts(db_path, "a1b-model", rid)
-            assert n2 == 1 and st2 == [200], f"A1b req2 (backoff active): {st2}"
-
-            time.sleep(args.transient_wait)
-            send(proxy_port, "tb-a1b", {**common, "model": "a1b-model"})
-            _, n3, st3, _ = latest_attempts(db_path, "a1b-model", rid + 1)
-            assert st3 == [200], f"A1b req3 must retry key1 after backoff: {st3}"
-            print("A1b OK: plain 429 -> transient backoff only; "
-                  f"key retried after {args.transient_wait}s "
-                  f"(chain1={st1}, chain3={st3})")
+            assert n2 == 1 and st2 == [200], f"A1b req2 must retry key1: {n2=} {st2}"
+            print("A1b OK: plain 429 does not create cross-request key state "
+                  f"(chain1={st1}, chain2={st2})")
 
             # ── A2: both plan keys GoUsageLimit → fall to Deepseek-API ──
             send(proxy_port, "tb-a2", {**common, "model": "a2-model",

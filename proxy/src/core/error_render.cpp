@@ -46,9 +46,11 @@ NormalizedError from_body(int status, const json &body,
 }  // namespace
 
 int no_upstream_status(const UpstreamClient::ForwardResult &result,
-                       const std::vector<Database::AttemptInfo> &attempts) {
+                       const std::vector<Database::AttemptInfo> &attempts,
+                       NoCandidateReason reason) {
     if (result.is_timeout) return 504;
-    if (attempts.empty()) return 429;
+    if (attempts.empty())
+        return reason == NoCandidateReason::kProviderQuotaCooldown ? 429 : 503;
     return result.status_code >= 400 ? result.status_code : 429;
 }
 
@@ -83,7 +85,8 @@ TerminalError render_terminal_error(
     const TerminalErrorOptions &opts) {
     TerminalError out;
     if (!opts.used) {
-        out.status = no_upstream_status(fwd, attempts);
+        out.status = no_upstream_status(fwd, attempts,
+                                        opts.no_candidate_reason);
     } else {
         out.status = fwd.status_code;
         // Chat converted-failure rule: a sub-400 failure is impossible, but
@@ -97,13 +100,20 @@ TerminalError render_terminal_error(
         normalized = from_body(out.status, timeout_error_body(fwd.timeout_secs),
                                true);
     } else if (!opts.used && attempts.empty()) {
-        // Every candidate was busy/cooling before any forward — a busy
-        // signal, not an upstream failure.
-        out.status = 429;
+        const bool provider_cooldown =
+            opts.no_candidate_reason == NoCandidateReason::kProviderQuotaCooldown;
+        out.status = provider_cooldown ? 429 : 503;
+        out.retry_after_seconds = provider_cooldown ? 0 : 1;
+        const char *message = provider_cooldown
+            ? "All upstream keys are in provider quota cooldown"
+            : (opts.busy_message
+                   ? opts.busy_message
+                   : "All upstream key concurrency slots are occupied");
         normalized = from_body(out.status, json{
-            {"message", opts.busy_message ? opts.busy_message
-                                          : "All upstream accounts are busy, cooling down, or failed"},
-            {"type", "rate_limit_error"}, {"code", 429}});
+            {"message", message},
+            {"type", provider_cooldown ? "rate_limit_error"
+                                        : "service_unavailable"},
+            {"code", out.status}});
     } else if (opts.used && opts.passthrough && !fwd.body.empty()) {
         // Same-format upstream error: preserve its structured body verbatim.
         out.body = fwd.body;
@@ -141,7 +151,8 @@ json serialize_normalized_error(const FormatCodec &client_codec,
 NormalizedError render_stream_error(
     const FormatCodec *upstream_codec, const UpstreamClient::ForwardResult &fwd,
     const std::vector<Database::AttemptInfo> &attempts, bool last_timeout,
-    const json &in_stream_error, int last_status, const char *busy_message) {
+    const json &in_stream_error, int last_status,
+    NoCandidateReason no_candidate_reason, const char *busy_message) {
     NormalizedError out;
     out.status = last_timeout ? 504 : last_status;
     if (!in_stream_error.is_null()) {
@@ -160,12 +171,18 @@ NormalizedError render_stream_error(
     } else if (last_timeout) {
         out = from_body(out.status, timeout_error_body(fwd.timeout_secs), true);
     } else if (attempts.empty()) {
-        // No candidate was acquired (all keys are cooling or busy). The
-        // transport result is still default-initialized with status 0, which
-        // is not a valid HTTP status line; normalize this branch to 429.
-        out = from_body(429,
-                        json{{"message", busy_message},
-                             {"type", "rate_limit_error"}, {"code", 429}});
+        const bool provider_cooldown =
+            no_candidate_reason == NoCandidateReason::kProviderQuotaCooldown;
+        const char *message = provider_cooldown
+            ? "All upstream keys are in provider quota cooldown"
+            : busy_message;
+        out = from_body(provider_cooldown ? 429 : 503,
+                        json{{"message", message},
+                             {"type", provider_cooldown
+                                          ? "rate_limit_error"
+                                          : "service_unavailable"},
+                             {"code", provider_cooldown ? 429 : 503}});
+        out.retry_after_seconds = provider_cooldown ? 0 : 1;
     } else {
         out = from_body(out.status,
                         normalize_upstream_error(upstream_codec, fwd,

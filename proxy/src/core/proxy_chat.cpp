@@ -403,7 +403,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     // the session's next preferred route.
 
     if (!used) {
-        const int final_status = no_upstream_status(fwd, attempts);
+        const int final_status = no_upstream_status(
+            fwd, attempts, outcome.no_candidate_reason);
         enqueue_zero_usage(last_attempted ? last_attempted->account().id
                                           : ar.route.account_id,
                            ar.route.local_key_id, model, false, final_status,
@@ -415,10 +416,15 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         // One shared renderer decides the terminal status (no_upstream_status),
         // normalizes the upstream error (parse_error_body) and applies the
         // harness envelope (serialize_error_body).
+        TerminalErrorOptions error_options;
+        error_options.no_candidate_reason = outcome.no_candidate_reason;
         const auto err = render_terminal_error(
-            harness_codec, &codecs_.get(used_upstream_fmt), fwd, attempts);
+            harness_codec, &codecs_.get(used_upstream_fmt), fwd, attempts,
+            error_options);
         res.status = err.status;
         if (err.close_connection) res.set_header("Connection", "close");
+        if (err.retry_after_seconds > 0)
+            res.set_header("Retry-After", std::to_string(err.retry_after_seconds));
         res.set_content(err.body, "application/json");
         return;
     }

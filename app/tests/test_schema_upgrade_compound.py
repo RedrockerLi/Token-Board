@@ -56,7 +56,7 @@ class CompoundSchemaUpgradeTest(unittest.TestCase):
                 "WHERE transition_id='v1-agent-identity'"
             ).fetchone()
         with sqlite3.connect(self.proxy) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10014)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 10015)
             proxy_marker = conn.execute(
                 "SELECT checksum,generation_id FROM schema_transitions "
                 "WHERE transition_id='v1-agent-identity'"

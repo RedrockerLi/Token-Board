@@ -93,7 +93,8 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     const auto &attempts = outcome.attempts;
 
     if (!used) {
-        const int final_status = no_upstream_status(fwd, attempts);
+        const int final_status = no_upstream_status(
+            fwd, attempts, outcome.no_candidate_reason);
         enqueue_zero_usage(last_attempted ? last_attempted->account().id
                                           : ar.route.account_id,
                            ar.route.local_key_id, req_model, false, final_status,
@@ -102,11 +103,15 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                                std::chrono::steady_clock::now() - t0).count()),
                            last_attempted ? last_attempted->key_slot_id : 0,
                            static_cast<int>(attempts.size()), attempts);
+        TerminalErrorOptions error_options;
+        error_options.no_candidate_reason = outcome.no_candidate_reason;
         const auto err = render_terminal_error(
             codecs_.get(policy.client_format), &codecs_.get(policy.client_format),
-            fwd, attempts);
+            fwd, attempts, error_options);
         res.status = err.status;
         if (err.close_connection) res.set_header("Connection", "close");
+        if (err.retry_after_seconds > 0)
+            res.set_header("Retry-After", std::to_string(err.retry_after_seconds));
         res.set_content(err.body, "application/json");
         return;
     }
@@ -156,6 +161,8 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
             fwd, attempts, {.used = true});
         res.status = err.status;
         if (err.close_connection) res.set_header("Connection", "close");
+        if (err.retry_after_seconds > 0)
+            res.set_header("Retry-After", std::to_string(err.retry_after_seconds));
         res.set_content(err.body, "application/json");
     }
 }

@@ -15,6 +15,12 @@ struct AttemptRequest {
     int64_t remaining_budget_ms = 0;
 };
 
+enum class NoCandidateReason {
+    kNone,
+    kLocalCapacity,
+    kProviderQuotaCooldown,
+};
+
 struct AttemptOutcome {
     UpstreamClient::ForwardResult result;
     const UpstreamCandidate *used = nullptr;
@@ -25,6 +31,7 @@ struct AttemptOutcome {
     // upstream error, so callers can record that failed attempt accurately.
     bool successful = false;
     bool budget_exhausted = false;
+    NoCandidateReason no_candidate_reason = NoCandidateReason::kNone;
 };
 
 class AttemptExecutor {
@@ -59,10 +66,10 @@ public:
 
     // Streaming callbacks have longer-lived response state than ordinary
     // Forward callbacks, but use these same gate/cooldown transitions.
-    bool acquire(const UpstreamCandidate &candidate) const;
+    AccountGate::KeyAcquireResult acquire(
+        const UpstreamCandidate &candidate) const;
     void complete(const UpstreamCandidate &candidate,
-                  const UpstreamClient::ForwardResult &result,
-                  bool downstream_gone) const;
+                  const UpstreamClient::ForwardResult &result) const;
     static bool should_retry(const UpstreamClient::ForwardResult &result,
                              bool downstream_gone, bool has_next) noexcept;
 

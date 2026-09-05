@@ -349,8 +349,8 @@ add_test(
             --requests 1000 --concurrency 64
             --min-rps 1000 --max-p95 200 --max-queue-p95 50
 )
-# GoUsageLimitError cooldown discrimination (#4 root B): quota-exhaustion 429
-# cools a plan key down; a plain transient 429 only backs off briefly.
+# GoUsageLimitError cooldown discrimination: quota-exhaustion 429 cools a plan
+# key down; ordinary provider failures never create cross-request key state.
 add_test(
     NAME cooldown_discrimination
     COMMAND ${Python3_EXECUTABLE}
@@ -359,8 +359,8 @@ add_test(
             ${CMAKE_SOURCE_DIR}/../schema
             ${CMAKE_SOURCE_DIR}/..
 )
-# Fallback-matrix experiments A3/A4/B1/B2/B3 (no-fallback 429, fallback
-# backoff recovery, non-streaming 5xx, streaming pre-commit 429, and the
+# Fallback-matrix experiments A3/A4/B1/B2/B3 (provider cooldown, ordinary
+# fallback retry, non-streaming 5xx, streaming pre-commit 429, and the
 # commit-then-stall #5 baseline).
 add_test(
     NAME fallback_matrix

@@ -50,6 +50,41 @@ def main() -> None:
             latest_proxy.major, latest_proxy.minor, "token-board")
     conn.close()
 
+    legacy = Path(tempfile.mkdtemp()) / "token-board.db"
+    migrations.apply_sql_migrations(
+        str(legacy), str(schema_root), "token-board",
+        target=SchemaVersion(1, 14))
+    conn = sqlite3.connect(legacy)
+    conn.execute(
+        "INSERT INTO accounts(id,uuid,name,valid_from) VALUES(?,?,?,?)",
+        (9001, "legacy-api", "legacy-api", "2020-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO accounts(id,uuid,name,valid_from) VALUES(?,?,?,?)",
+        (9002, "legacy-plan", "legacy-plan", "2020-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO billing_contracts(uuid,account_id,charge_type,billing_scope,"
+        "cooldown_policy_json,valid_from) VALUES(?,?,?,?,?,?)",
+        ("contract-api", 9001, "metered", "account", '{"kind":"transient"}',
+         "2020-01-01T00:00:00Z"),
+    )
+    conn.execute(
+        "INSERT INTO billing_contracts(uuid,account_id,charge_type,billing_scope,"
+        "cooldown_policy_json,valid_from) VALUES(?,?,?,?,?,?)",
+        ("contract-plan", 9002, "recurring", "credential",
+         '{"kind":"subscription_5h"}', "2020-01-01T00:00:00Z"),
+    )
+    conn.commit()
+    conn.close()
+    migrations.apply_sql_migrations(str(legacy), str(schema_root), "token-board")
+    conn = sqlite3.connect(legacy)
+    policies = dict(conn.execute(
+        "SELECT account_id,cooldown_policy_json FROM billing_contracts"))
+    assert policies[9001] == '{"kind":"none"}', policies
+    assert policies[9002] == '{"kind":"subscription_5h"}', policies
+    conn.close()
+
     lifecycle = (project_root / "proxy" / "src" / "store" /
                  "database_lifecycle.cpp").read_text(encoding="utf-8")
     runtime_minor = re.search(

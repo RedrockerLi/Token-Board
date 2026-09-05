@@ -12,11 +12,8 @@
 /// request-time behavior in C++:
 ///   * which types may serve proxied traffic (local-key routing / aggregate
 ///     targets) — expressed as the SQL filter applied at route resolution.
-///   * the 429 cooldown class: transient backoff vs a subscription's 5h
-///     per-key cooldown.
+///   * the subscription account semantics used by the request-time router.
 namespace account_types {
-
-enum class CooldownClass { kTransient, kSubscription5h };
 
 /// Account types that must never be routed to.  All other types are routable.
 inline const std::vector<std::string> &non_routable_types() {
@@ -41,13 +38,6 @@ inline std::string routable_filter_sql(const char *col) {
     }
     sql += ") ";
     return sql;
-}
-
-/// Cooldown class for an account type: subscription types cool a key down for
-/// 5h on a 429 (plan); everything else backs off transiently (5s/30s/2min).
-inline CooldownClass cooldown_class(const std::string &account_type) {
-    return account_type == "plan" ? CooldownClass::kSubscription5h
-                                  : CooldownClass::kTransient;
 }
 
 }  // namespace account_types

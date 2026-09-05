@@ -32,20 +32,12 @@ void ProxyServer::handle_streaming(
                 [this] { release_unconsumed_accounting(); });
             auto inflight_guard = make_scope_exit(
                 [this, &inflight_id] { request_finished(inflight_id); });
-            const UpstreamCandidate *used = nullptr;
-            UpstreamClient::ForwardResult final_result;
-            bool committed = false;
-            bool last_timeout = false;
-            int last_status = 429;
-            int last_account_id = 0;
-            int last_slot_id = 0;
-            int last_duration_ms = 0;
-            int attempts_made = 0;
-            std::vector<Database::AttemptInfo> attempts;
-            json last_stream_error;
+            const UpstreamCandidate *used = nullptr; UpstreamClient::ForwardResult final_result;
+            bool committed = false, last_timeout = false; int last_status = 429;
+            int last_account_id = 0, last_slot_id = 0, last_duration_ms = 0, attempts_made = 0;
+            std::vector<Database::AttemptInfo> attempts; json last_stream_error;
             bool first_semantic = true;
-            std::chrono::steady_clock::time_point first_semantic_at;
-            std::chrono::steady_clock::time_point last_semantic_at;
+            std::chrono::steady_clock::time_point first_semantic_at, last_semantic_at;
             int upstream_semantic_ttft = -1;
             bool client_write_failed = false, terminal_error_forwarded = false;
             bool source_terminal_seen = false; ir::Usage final_stream_usage;
@@ -476,8 +468,10 @@ void ProxyServer::handle_streaming(
             const auto err = render_stream_error(
                 &codecs_.get(harness), final_result, attempts, last_timeout,
                 last_stream_error.is_null() ? json() : last_stream_error,
-                last_status);
+                last_status, outcome.no_candidate_reason);
             res.status = err.status;
+            if (err.retry_after_seconds > 0)
+                res.set_header("Retry-After", std::to_string(err.retry_after_seconds));
             if (err.close_connection) {
                 // A timeout invalidates the in-flight stream. Remove the
                 // default keep-alive header before committing the deferred

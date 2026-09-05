@@ -4,7 +4,7 @@ namespace {
 
 // Keep this reviewed with the newest proxy V1 SQL file.  The C++ runtime
 // serves one exact schema contract; Python owns all SQL migrations.
-constexpr int kRequiredRuntimeSchemaMinor = 14;
+constexpr int kRequiredRuntimeSchemaMinor = 15;
 
 bool validate_v1_schema(sqlite3 *db, const std::string &path,
                         int &major, int &minor) {

@@ -112,8 +112,9 @@ public:
         // Set when a non-2xx error body identifies a genuine quota-exhaustion
         // (opencode.ai "Console Go" sends {"type":"error",
         // "error":{"type":"GoUsageLimitError",...},"metadata":{"limitName":…}}).
-        // The caller uses it to distinguish "subscription exhausted — cool this
-        // key down" from a transient 429 (rate limit), which only backs off.
+        // The caller uses it to distinguish an explicit subscription quota
+        // exhaustion from ordinary upstream failures; only the former may
+        // enter the retained 5h provider-quota cooldown.
         bool usage_limit = false;
     };
 
