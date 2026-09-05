@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import socket
@@ -78,6 +79,22 @@ def send(proxy_port: int, method: str, path: str, local_key: str,
         raw = e.read()
         parsed = json.loads(raw) if raw else {}
         return e.code, parsed, e.headers
+
+
+def send_stream(proxy_port: int, path: str, local_key: str,
+                body: dict, timeout: float = 20) -> tuple[int, bytes, object]:
+    """Send a streaming request while keeping the downstream connection open."""
+    conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=timeout)
+    try:
+        conn.request(
+            "POST", path, body=json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {local_key}",
+                     "Content-Type": "application/json",
+                     "Connection": "keep-alive"})
+        response = conn.getresponse()
+        return response.status, response.read(), response.headers
+    finally:
+        conn.close()
 
 
 def ctrl(upstream_port: int, payload: dict) -> None:
@@ -145,6 +162,7 @@ def main() -> None:
             # leak into another.
             plain("sk-chat-500", "chat500")
             plain("sk-chat-to", "chatto")
+            plain("sk-chat-stream", "chatstream")
             plain("sk-chat-busy", "chatbusy", recurring=True)
             plain("sk-anth-busy", "anthbusy", recurring=True, api_format="anthropic")
             plain("sk-emb-500", "emb500")
@@ -155,6 +173,9 @@ def main() -> None:
             # Fast timeout round-trip for the chat timeout case.
             conn.execute(
                 "UPDATE proxy_timeout_config SET non_streaming_timeout=1 "
+                "WHERE endpoint_kind='chat'")
+            conn.execute(
+                "UPDATE proxy_timeout_config SET streaming_first_byte_timeout=1 "
                 "WHERE endpoint_kind='chat'")
             conn.execute(
                 "UPDATE upstreams SET base_url=?", (base_url,))
@@ -192,7 +213,34 @@ def main() -> None:
             assert str(err["message"]).lower().startswith("upstream timeout"), body
             print(f"2 OK: chat timeout -> 504 + Connection: close + {err['type']}")
 
-            # ── 3. Anthropic chat busy-429 → Anthropic envelope ──
+            # ── 3. Streaming first-byte timeout → 504 + Connection: close ──
+            status, raw, headers = send_stream(
+                proxy_port, "/v1/chat/completions", "tb-chatstream",
+                {**chat, "model": "chatstream-model", "stream": True,
+                 "mock_delay": 3}, timeout=10)
+            assert status == 504, (
+                f"stream timeout status {status}: headers={headers}, raw={raw!r}")
+            assert headers.get("Connection") == "close", headers
+            assert headers.get("Keep-Alive") is None, headers
+            assert b"timeout_error" in raw, raw
+            print("3 OK: streaming timeout -> 504 + Connection: close")
+
+            # ── 4. Streaming all-candidates-busy → 429 ──
+            send_stream(
+                proxy_port, "/v1/chat/completions", "tb-chatbusy",
+                {**chat, "model": "chatbusy-model", "stream": True,
+                 "mock_status": 429, "mock_error_type": "GoUsageLimitError"},
+                timeout=10)
+            status, raw, headers = send_stream(
+                proxy_port, "/v1/chat/completions", "tb-chatbusy",
+                {**chat, "model": "chatbusy-model", "stream": True},
+                timeout=10)
+            assert status == 429, (
+                f"stream busy status {status}: headers={headers}, raw={raw!r}")
+            assert b"rate_limit_error" in raw, raw
+            print("4 OK: streaming all-candidates-busy -> 429")
+
+            # ── 5. Anthropic chat busy-429 → Anthropic envelope ──
             # Req1: a recurring key answers 429 GoUsageLimitError → 5h cooldown.
             send(proxy_port, "POST", "/v1/messages", "tb-anthbusy",
                  {"model": "anthbusy-model", "messages": chat["messages"],
@@ -204,9 +252,9 @@ def main() -> None:
             assert body == {"type": "error", "error": {
                 "message": "All upstream accounts are busy, cooling down, or failed",
                 "type": "rate_limit_error", "code": 429}}, body
-            print(f"3 OK: Anthropic chat busy-429 envelope -> {body}")
+            print(f"5 OK: Anthropic chat busy-429 envelope -> {body}")
 
-            # ── 4. Embeddings used-failure 500 → structured, no "Upstream error:" ──
+            # ── 6. Embeddings used-failure 500 → structured, no "Upstream error:" ──
             status, body, _ = send(proxy_port, "POST", "/v1/embeddings",
                 "tb-emb500", {"model": "emb500-model", "input": "hi",
                               "mock_status_by_key": {"sk-emb-500": 500}})
@@ -214,9 +262,9 @@ def main() -> None:
             assert body == {"error": {"message": "mock error",
                                       "type": "mock_error", "code": 500}}, body
             assert "Upstream error" not in json.dumps(body)
-            print(f"4 OK: embeddings used-failure 500 structured -> {body}")
+            print(f"6 OK: embeddings used-failure 500 structured -> {body}")
 
-            # ── 5. Embeddings busy-429 (recurring key cooled) ──
+            # ── 7. Embeddings busy-429 (recurring key cooled) ──
             send(proxy_port, "POST", "/v1/embeddings", "tb-embbusy",
                  {"model": "embbusy-model", "input": "hi",
                   "mock_status": 429, "mock_error_type": "GoUsageLimitError"})
@@ -226,9 +274,9 @@ def main() -> None:
             assert body == {"error": {"message":
                 "All upstream accounts are busy, cooling down, or failed",
                 "type": "rate_limit_error", "code": 429}}, body
-            print(f"5 OK: embeddings busy-429 -> {body}")
+            print(f"7 OK: embeddings busy-429 -> {body}")
 
-            # ── 6. Models busy-429 (GET, out-of-band status) + no accounting ──
+            # ── 8. Models busy-429 (GET, out-of-band status) + no accounting ──
             ctrl(upstream_port, {"set": {"sk-mod-busy": 429}})
             send(proxy_port, "GET", "/v1/models", "tb-modbusy", None)
             ctrl(upstream_port, {"clear": ["sk-mod-busy"]})
@@ -240,9 +288,9 @@ def main() -> None:
                 "type": "rate_limit_error", "code": 429}}, body
             assert count_rows(db_path, "modbusy-model") == 0, \
                 "models must not write request_log rows"
-            print(f"6 OK: models busy-429 (no accounting) -> {body}")
+            print(f"8 OK: models busy-429 (no accounting) -> {body}")
 
-            # ── 7. Models used-failure 500 → structured upstream error ──
+            # ── 9. Models used-failure 500 → structured upstream error ──
             ctrl(upstream_port, {"set": {"sk-mod-500": 500}})
             status, body, _ = send(proxy_port, "GET", "/v1/models",
                 "tb-mod500", None)
@@ -252,7 +300,7 @@ def main() -> None:
             assert err["message"] == "mock GoUsageLimitError", body
             assert err["type"] == "GoUsageLimitError", body
             assert "Upstream error" not in json.dumps(body)
-            print(f"7 OK: models used-failure 500 structured -> {body}")
+            print(f"9 OK: models used-failure 500 structured -> {body}")
 
             print("error_shape tests passed")
         finally:

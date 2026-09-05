@@ -418,7 +418,10 @@ void ProxyServer::handle_streaming(
                                    final_result.duration_ms);
                 return false;
             }
-            if (used) {
+            // AttemptOutcome::used identifies the terminal candidate even when
+            // its attempt failed. Only a successful terminal attempt may take
+            // the success/accounting path below.
+            if (used && final_result.success) {
                 auto usage = usage_from_ir(
                     final_stream_usage,
                     ir::parse_api_format(used->account().api_format));
@@ -475,6 +478,14 @@ void ProxyServer::handle_streaming(
                 last_stream_error.is_null() ? json() : last_stream_error,
                 last_status);
             res.status = err.status;
+            if (err.close_connection) {
+                // A timeout invalidates the in-flight stream. Remove the
+                // default keep-alive header before committing the deferred
+                // error response so clients do not reuse this connection.
+                res.headers.erase("Keep-Alive");
+                res.headers.erase("Connection");
+                res.set_header("Connection", "close");
+            }
             if (last_account_id) {
                 enqueue_zero_usage(last_account_id, local_key_id,
                                    resolved_model, true, err.status,

@@ -160,11 +160,12 @@ NormalizedError render_stream_error(
     } else if (last_timeout) {
         out = from_body(out.status, timeout_error_body(fwd.timeout_secs), true);
     } else if (attempts.empty()) {
-        out = from_body(out.status,
+        // No candidate was acquired (all keys are cooling or busy). The
+        // transport result is still default-initialized with status 0, which
+        // is not a valid HTTP status line; normalize this branch to 429.
+        out = from_body(429,
                         json{{"message", busy_message},
-                             {"type", out.status == 429 ? "rate_limit_error"
-                                                        : "upstream_error"},
-                             {"code", out.status}});
+                             {"type", "rate_limit_error"}, {"code", 429}});
     } else {
         out = from_body(out.status,
                         normalize_upstream_error(upstream_codec, fwd,
