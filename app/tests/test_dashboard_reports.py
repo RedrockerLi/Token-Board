@@ -146,6 +146,31 @@ class DashboardReportsTest(AppDatabaseTestCase):
         self.assertAlmostEqual(costs, 17.0)
         self.assertAlmostEqual(theoretical, 20.0)
 
+    def test_daily_model_filter_uses_virtual_cost_not_subscription(self) -> None:
+        model_a = self.client.get(
+            "/api/daily?year=2026&month=8&model=model-a").get_json()
+        self.assertEqual(len(model_a["days"]), 1)
+        row = model_a["days"][0]
+        self.assertEqual(row["date"], "2026-08-09")
+        # The model view is virtual/equivalent: it must never inherit the
+        # account-level subscription fee that is anchored to 2026-08-01.
+        self.assertAlmostEqual(row["cost"], 7.0)
+        self.assertAlmostEqual(row["theoretical_cost"], 7.0)
+        self.assertAlmostEqual(row["metered_cost"], 3.0)
+        self.assertAlmostEqual(row["recurring_cost"], 0.0)
+        self.assertAlmostEqual(row["actual_cost"], 3.0)
+
+        plan_model = self.client.get(
+            "/api/daily?year=2026&month=8&model=plan-model").get_json()
+        self.assertEqual(len(plan_model["days"]), 1)
+        row = plan_model["days"][0]
+        self.assertEqual(row["date"], "2026-08-11")
+        self.assertAlmostEqual(row["cost"], 9.0)
+        self.assertAlmostEqual(row["theoretical_cost"], 9.0)
+        self.assertAlmostEqual(row["metered_cost"], 0.0)
+        self.assertAlmostEqual(row["recurring_cost"], 0.0)
+        self.assertAlmostEqual(row["actual_cost"], 0.0)
+
     def test_frozen_dashboard_cost_does_not_change_after_live_delete(self) -> None:
         before = self.client.get("/api/summary").get_json()
         before_month = next(

@@ -84,9 +84,10 @@ def api_daily():
         daily_equivalent_by_model[day][ce["model"]] += equiv
         daily_actual[day] += actual
 
-    # Recurring fees are immutable facts keyed by exact period_start.  Agent
-    # rows only exist for software-bound allocations, so an unbound
-    # subscription cannot leak into the Dashboard archive or this graph.
+    # Recurring fees are immutable account-level facts keyed by exact
+    # period_start.  They have no model attribution: exclude them from a
+    # model-filtered timeline, where `cost` keeps the api-equivalent/virtual
+    # meaning used by by_model and monthly model views.
     daily_recurring = defaultdict(float)
     for row in _store().plan_summary:
         if api_key_name and row.get("account_name") != api_key_name:
@@ -94,11 +95,12 @@ def api_daily():
         if platform_filter and platform_filter not in {"agent", ""}:
             # Proxy recurring rows have no model/platform attribution.
             continue
-        period_start = str(row.get("period_start") or "")
-        if period_start[:4].isdigit() and period_start[5:7].isdigit():
-            if int(period_start[:4]) == year and int(period_start[5:7]) == month:
-                day = period_start[:10]
-                daily_recurring[day] += float(row.get("subscription_cost", 0) or 0)
+        if not model_filter:
+            period_start = str(row.get("period_start") or "")
+            if period_start[:4].isdigit() and period_start[5:7].isdigit():
+                if int(period_start[:4]) == year and int(period_start[5:7]) == month:
+                    day = period_start[:10]
+                    daily_recurring[day] += float(row.get("subscription_cost", 0) or 0)
 
     # Build sorted daily result
     sorted_days = sorted(set(daily_tokens.keys()) |
@@ -108,6 +110,11 @@ def api_daily():
     result = []
     for day in sorted_days:
         dt = daily_tokens[day]
+        recurring_cost = daily_recurring.get(day, 0)
+        metered_cost = daily_actual.get(day, 0)
+        theoretical_cost = round(daily_equivalent.get(day, 0), 4)
+        cost = (theoretical_cost if model_filter
+                else round(metered_cost + recurring_cost, 4))
         result.append({
             "date": day,
             "output_tokens": dt["output_tokens"],
@@ -117,13 +124,11 @@ def api_daily():
             "total_tokens": (dt["output_tokens"] + dt["input_cache_hit"] +
                              dt["input_cache_miss"]),
             "requests": dt["requests"],
-            "theoretical_cost": round(daily_equivalent.get(day, 0), 4),
-            "metered_cost": round(daily_actual.get(day, 0), 4),
-            "recurring_cost": round(daily_recurring.get(day, 0), 4),
-            "cost": round(daily_actual.get(day, 0) +
-                           daily_recurring.get(day, 0), 4),
-            "actual_cost": round(daily_actual.get(day, 0) +
-                                  daily_recurring.get(day, 0), 4),
+            "theoretical_cost": theoretical_cost,
+            "metered_cost": round(metered_cost, 4),
+            "recurring_cost": round(recurring_cost, 4),
+            "cost": cost,
+            "actual_cost": round(metered_cost + recurring_cost, 4),
             "by_model": {
                 m: {
                     "output_tokens": v["output"],
