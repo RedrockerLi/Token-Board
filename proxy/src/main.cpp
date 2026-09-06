@@ -57,10 +57,10 @@ int main(int argc, char *argv[]) {
         TB_LOG_ERROR( "FATAL: Cannot open database\n");
         return 1;
     }
-    if (db.schema_major() != 1) {
+    if (db.schema_major() != 2) {
         TB_LOG_ERROR(
-                "FATAL: Runtime requires a V1 database; run "
-                "schema/transitions/0-to-1/migrate.py first\n");
+                "FATAL: Runtime requires a V2 database; run the "
+                "Python schema-upgrade boundary first\n");
         db.close();
         return 1;
     }

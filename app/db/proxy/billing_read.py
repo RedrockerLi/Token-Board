@@ -1,6 +1,12 @@
 """ProxyDatabase methods for ProxyBillingReadMixin."""
 
-from app.db.proxy.common import datetime
+from app.core.time import format_utc, utc_now
+from app.db.proxy.common import datetime, timedelta
+from app.services.billing_report import (
+    _agent_allocation_sql,
+    _proxy_charge_sql,
+    live_request_sql,
+)
 
 
 def _filter_bound(value: str | None, *, end: bool = False) -> str | None:
@@ -19,6 +25,12 @@ def _filter_bound(value: str | None, *, end: bool = False) -> str | None:
 
 
 class ProxyBillingReadMixin:
+    @staticmethod
+    def _utc_window(days: int) -> tuple[str, str]:
+        now = utc_now()
+        return (format_utc(now - timedelta(days=int(days))),
+                format_utc(now))
+
     def get_plan_billing_config(self) -> dict:
         conn = self._connect()
         try:
@@ -55,17 +67,22 @@ class ProxyBillingReadMixin:
         date_to: str | None = None,
         days: int = 30,
     ) -> list[dict]:
-        """Aggregated billing by account + model + date.
+        """Aggregated current-state billing by account + model + date.
 
-        Defaults to the last *days* days (rolling 30d window). Groups by the
-        account_name snapshot, so deleted accounts' history is preserved.
+        Frozen request rows remain available for audit, but detached rows do
+        not belong to the current consumption view.  The shared live request
+        predicate is therefore applied before grouping.
         """
         conn = self._connect()
         try:
+            now = utc_now()
+            start = (_filter_bound(date_from) or
+                     format_utc(now - timedelta(days=int(days))))
+            end = _filter_bound(date_to, end=True) or format_utc(now)
             sql = """
                 SELECT
-                    COALESCE(ai.name, a.name, 'unknown') AS account_name,
-                    COALESCE(r.account_identity_id, r.account_id) AS account_id,
+                    live_account.name AS account_name,
+                    live_account.id AS account_id,
                     r.agent_software_id,
                     r.model,
                     date(r.requested_at) AS date,
@@ -76,36 +93,15 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost
                 FROM request_log r
-                LEFT JOIN accounts a ON a.id = r.account_id
-                LEFT JOIN account_identities ai
-                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
-                WHERE 1=1
-                  AND COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
-                  AND (COALESCE(ai.account_kind,a.account_kind)='agent' OR
-                       (r.billing_unit_id IS NULL AND NOT EXISTS(SELECT 1 FROM billing_contracts bc
-                                 WHERE bc.account_id=r.account_id
-                                 AND bc.charge_type='recurring'
-                                 AND bc.valid_from<=r.requested_at
-                                 AND (bc.valid_until IS NULL
-                                      OR bc.valid_until>r.requested_at))))
-            """
-            params = []
+            """ + live_request_sql("r")
+            params = {"start": start, "end": end, "now": end}
             if account_id:
-                sql += " AND COALESCE(r.account_identity_id,r.account_id) = ?"
-                params.append(account_id)
-            if date_from:
-                sql += " AND r.requested_at >= ?"
-                params.append(_filter_bound(date_from))
-            else:
-                sql += " AND r.requested_at >= datetime('now', '-' || ? || ' days')"
-                params.append(str(days))
-            if date_to:
-                sql += " AND r.requested_at <= ?"
-                params.append(_filter_bound(date_to, end=True))
+                sql += " AND live_account.id=:account_id"
+                params["account_id"] = account_id
 
             sql += """
-                GROUP BY COALESCE(r.account_identity_id,r.account_id), r.model, date(r.requested_at)
-                ORDER BY date(r.requested_at) DESC, COALESCE(r.account_identity_id,r.account_id), r.model
+                GROUP BY live_account.id, r.model, date(r.requested_at)
+                ORDER BY date(r.requested_at) DESC, live_account.id, r.model
             """
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
@@ -163,40 +159,64 @@ class ProxyBillingReadMixin:
             conn.close()
 
     def get_daily_billing(self, days: int = 30) -> list[dict]:
-        """Daily actual usage cost plus a separate theoretical-cost field."""
+        """Daily metered and recurring cost, assigned to period-start dates."""
         conn = self._connect()
         try:
+            start, end = self._utc_window(days)
+            request_params = {"start": start, "end": end, "now": end}
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
-                    COALESCE(ai.name, a.name, 'unknown') AS account_name,
-                    COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
+                    live_account.id AS account_id,
+                    live_account.name AS account_name,
+                    COALESCE(SUM(r.billed_usage_cost), 0) AS metered_cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost,
-                    CASE WHEN COALESCE(ai.account_kind,a.account_kind)='agent' THEN 'agent'
+                    CASE WHEN live_account.account_kind='agent' THEN 'agent'
                          WHEN r.billing_unit_id IS NOT NULL THEN 'plan'
-                         WHEN EXISTS(SELECT 1 FROM billing_contracts bc
-                         WHERE bc.account_id=r.account_id
-                         AND bc.charge_type='recurring')
-                         THEN 'plan' ELSE 'api' END AS account_type,
+                         ELSE 'api' END AS account_type,
                     COUNT(*) AS requests,
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
-                LEFT JOIN accounts a ON a.id = r.account_id
-                LEFT JOIN account_identities ai
-                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
-                WHERE COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
-                  AND (COALESCE(ai.account_kind,a.account_kind)='agent' OR
-                       (r.billing_unit_id IS NULL AND NOT EXISTS(SELECT 1 FROM billing_contracts bc
-                                 WHERE bc.account_id=r.account_id
-                                 AND bc.charge_type='recurring'
-                                 AND bc.valid_from<=r.requested_at
-                                 AND (bc.valid_until IS NULL
-                                      OR bc.valid_until>r.requested_at))))
-                  AND r.requested_at >= datetime('now', '-' || ? || ' days')
-                GROUP BY date(r.requested_at), COALESCE(r.account_identity_id,r.account_id)
-                ORDER BY date, COALESCE(r.account_identity_id,r.account_id)
-            """, (str(days),)).fetchall()
-            return [dict(r) for r in rows]
+            """ + live_request_sql("r") + """
+                GROUP BY date(r.requested_at), live_account.id
+                ORDER BY date, live_account.id
+            """, request_params).fetchall()
+            result = {}
+            for row in rows:
+                item = dict(row)
+                item["recurring_cost"] = 0.0
+                item["cost"] = float(item["metered_cost"] or 0)
+                result[(item["date"], item["account_id"])] = item
+
+            recurring_queries = (
+                """SELECT date(c.period_start) date,live_account.id account_id,
+                          live_account.name account_name,
+                          COALESCE(SUM(c.normalized_recurring_cost),0) recurring_cost,
+                          'plan' account_type
+                """ + _proxy_charge_sql() + """
+                   GROUP BY date(c.period_start),live_account.id""",
+                """SELECT date(charge.period_start) date,live_software.id account_id,
+                          live_agent_account.name account_name,
+                          COALESCE(SUM(allocation.normalized_recurring_cost),0) recurring_cost,
+                          'agent' account_type
+                """ + _agent_allocation_sql() + """
+                   GROUP BY date(charge.period_start),live_software.id""",
+            )
+            for sql in recurring_queries:
+                for row in conn.execute(sql, request_params):
+                    key = (row["date"], row["account_id"])
+                    item = result.setdefault(key, {
+                        "date": row["date"], "account_id": row["account_id"],
+                        "account_name": row["account_name"],
+                        "metered_cost": 0.0, "equivalent_cost": 0.0,
+                        "account_type": row["account_type"],
+                        "requests": 0, "total_tokens": 0,
+                        "recurring_cost": 0.0, "cost": 0.0,
+                    })
+                    item["recurring_cost"] += float(row["recurring_cost"] or 0)
+                    item["cost"] = (float(item.get("metered_cost") or 0) +
+                                    float(item["recurring_cost"] or 0))
+            return sorted(result.values(), key=lambda row: (row["date"], row["account_id"] or 0))
         finally:
             conn.close()
 
@@ -204,6 +224,8 @@ class ProxyBillingReadMixin:
         """Daily traffic with separate actual and theoretical cost fields."""
         conn = self._connect()
         try:
+            start, end = self._utc_window(days)
+            params = {"start": start, "end": end, "now": end}
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
@@ -212,17 +234,37 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.cache_read_tokens), 0) AS cache_hit_tokens,
                     MAX(COALESCE(SUM(r.prompt_tokens), 0) - COALESCE(SUM(r.cache_read_tokens), 0), 0) AS cache_miss_tokens,
                     COUNT(*) AS requests,
-                    COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
+                    COALESCE(SUM(r.billed_usage_cost), 0) AS metered_cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost
                 FROM request_log r
-                LEFT JOIN accounts a ON a.id=r.account_id
-                LEFT JOIN account_identities ai
-                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
-                WHERE COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
-                  AND r.requested_at >= datetime('now', '-' || ? || ' days')
+            """ + live_request_sql("r") + """
                 GROUP BY date(r.requested_at)
                 ORDER BY date
-            """, (str(days),)).fetchall()
-            return [dict(r) for r in rows]
+            """, params).fetchall()
+            result = {row["date"]: dict(row) for row in rows}
+            recurring_sql = (
+                "SELECT date(c.period_start) date,"
+                "COALESCE(SUM(c.normalized_recurring_cost),0) recurring_cost "
+                + _proxy_charge_sql() + "GROUP BY date(c.period_start)",
+                "SELECT date(charge.period_start) date,"
+                "COALESCE(SUM(allocation.normalized_recurring_cost),0) recurring_cost "
+                + _agent_allocation_sql() + "GROUP BY date(charge.period_start)",
+            )
+            for sql in recurring_sql:
+                for row in conn.execute(sql, params):
+                    item = result.setdefault(row["date"], {
+                        "date": row["date"], "input_tokens": 0,
+                        "output_tokens": 0, "cache_hit_tokens": 0,
+                        "cache_miss_tokens": 0, "requests": 0,
+                        "metered_cost": 0.0, "equivalent_cost": 0.0,
+                    })
+                    item["recurring_cost"] = (
+                        float(item.get("recurring_cost") or 0) +
+                        float(row["recurring_cost"] or 0))
+            for item in result.values():
+                item.setdefault("recurring_cost", 0.0)
+                item["cost"] = (float(item.get("metered_cost") or 0) +
+                                float(item["recurring_cost"] or 0))
+            return [result[key] for key in sorted(result)]
         finally:
             conn.close()

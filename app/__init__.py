@@ -39,7 +39,7 @@ def create_app(token_board_db_path: str | None = None, host: str = "127.0.0.1",
     flask_app.config["SCHEMA_DIR"] = str(schema_root)
     # Keep the dashboard archive next to an explicitly supplied token-board DB.
     # Embedded deployments and the App testbench must read the same
-    # normalized V1 dataset, not the repository's default data/ directory.
+    # normalized V2 dataset, not the repository's default data/ directory.
     data_dir = (Path(token_board_db_path).resolve().parent
                 if token_board_db_path else root / "data")
     flask_app.config["DATA_STORE"] = DataStore(
@@ -80,17 +80,6 @@ def create_app(token_board_db_path: str | None = None, host: str = "127.0.0.1",
             Path(token_board_db_path).resolve().parent / "token-maintenance.sock")
 
         dash_db_path = str(Path(token_board_db_path).resolve().parent / "dashboard.db")
-
-        # Reconcile the local dashboard archive: mirror normalized accounts
-        # (id → name) into dashboard.accounts and backfill any legacy
-        # name-keyed buckets to account_id. Runs before the DataStore loads
-        # (server.py calls .load() after create_app), so names display right.
-        try:
-            from app.db.dashboard_db import reconcile_accounts  # noqa: E402
-            if Path(dash_db_path).exists():
-                reconcile_accounts(dash_db_path, token_board_db_path)
-        except Exception:
-            flask_app.logger.exception("dashboard account reconcile failed")
 
     # ── Access-token auth (off-loopback or TB_DASHBOARD_TOKEN) ──
     from app import dashboard_auth  # noqa: E402

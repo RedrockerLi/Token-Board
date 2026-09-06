@@ -52,9 +52,8 @@ def main() -> None:
     duration = float(os.environ.get("TOKEN_BOARD_SOAK_SECONDS", "60"))
     workers = int(os.environ.get("TOKEN_BOARD_SOAK_WORKERS", "64"))
     sys.path.insert(0, str(project))
-    from app.db.migrations import migrate
     from scripts.mock_upstream import Handler as MockHandler
-    from v1_fixture import add_plain_route, add_upstream
+    from v1_fixture import add_plain_route, add_upstream, ensure_v2_database
 
     upstream_port = free_port()
     upstream = StressHTTPServer(("127.0.0.1", upstream_port), MockHandler)
@@ -63,7 +62,7 @@ def main() -> None:
     try:
         with tempfile.TemporaryDirectory() as temp:
             db = Path(temp) / "token-board.db"
-            migrate(str(db), str(schema), "token-board")
+            ensure_v2_database(db, schema)
             conn = sqlite3.connect(db)
             try:
                 account, upstream_id, _ = add_upstream(

@@ -38,7 +38,6 @@ def main(root: Path) -> int:
         root / "app" / "services" / "sync" / "dashboard_sync.py",
         root / "app" / "services" / "sync" / "snapshot.py",
         root / "app" / "services" / "sync" / "webdav.py",
-        root / "app" / "db" / "dashboard" / "reconcile.py",
     )
     for path in workflow_files:
         text = path.read_text(encoding="utf-8")

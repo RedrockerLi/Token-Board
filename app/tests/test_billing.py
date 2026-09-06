@@ -236,11 +236,11 @@ class BillingTest(AppDatabaseTestCase):
                 "WHERE subscription_id=?", (subscription_id,)
             ).fetchone()[0]
             conn.execute(
-                "UPDATE agent_subscriptions SET valid_until=? WHERE id=?",
+                "UPDATE agent_subscriptions SET ends_at=? WHERE id=?",
                 ("2000-01-01T00:00:00Z", subscription_id),
             )
             conn.execute(
-                "UPDATE agent_subscription_instances SET valid_until=? WHERE id=?",
+                "UPDATE agent_subscription_instances SET ends_at=? WHERE id=?",
                 ("2000-01-01T00:00:00Z", instance_id),
             )
             conn.commit()
@@ -405,7 +405,7 @@ class BillingTest(AppDatabaseTestCase):
                 "ORDER BY c.runtime_id LIMIT 1", (account_id,)
             ).fetchone()[0]
             conn.execute(
-                "UPDATE upstream_credentials SET deleted_at=? WHERE uuid=?",
+                "UPDATE upstream_credentials SET ends_at=? WHERE uuid=?",
                 ("2020-01-01T00:00:00Z", expired_uuid),
             )
             conn.commit()
@@ -656,11 +656,15 @@ class BillingTest(AppDatabaseTestCase):
         self.assertIn(account_id, [a["id"] for a in db.get_accounts()])
         with sqlite3.connect(self.proxy_path) as conn:
             account = conn.execute(
-                "SELECT lifecycle_state,deleted_at FROM accounts WHERE id=?",
+                "SELECT id FROM accounts WHERE id=?",
                 (account_id,),
             ).fetchone()
-            self.assertEqual(account[0], "active")
-            self.assertIsNotNone(account[1])
+            self.assertIsNotNone(account)
+            ends_at = conn.execute(
+                "SELECT ends_at FROM billing_contracts WHERE account_id=?",
+                (account_id,),
+            ).fetchone()[0]
+            self.assertIsNotNone(ends_at)
             columns = {row[1] for row in conn.execute(
                 "PRAGMA table_info(billing_contracts)"
             )}
@@ -717,14 +721,14 @@ class BillingTest(AppDatabaseTestCase):
             result = db.delete_account(account_id)
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["deferred"], result)
-        self.assertEqual(result["effective_deleted_at"], "2026-09-14T23:59:59Z")
+        self.assertEqual(result["effective_ends_at"], "2026-09-14T23:59:59Z")
         with sqlite3.connect(self.proxy_path) as conn:
-            account_deleted_at = conn.execute(
-                "SELECT deleted_at FROM accounts WHERE id=?", (account_id,)
+            contract_ends_at = conn.execute(
+                "SELECT ends_at FROM billing_contracts WHERE account_id=?", (account_id,)
             ).fetchone()[0]
-            self.assertEqual(account_deleted_at, "2026-09-14T23:59:59Z")
+            self.assertEqual(contract_ends_at, "2026-09-14T23:59:59Z")
             expiries = dict(conn.execute(
-                "SELECT uuid,deleted_at FROM upstream_credentials WHERE upstream_id=?",
+                "SELECT uuid,ends_at FROM upstream_credentials WHERE upstream_id=?",
                 (upstream_id,),
             ).fetchall())
             self.assertEqual(expiries[first], "2026-08-31T23:59:59Z")
@@ -749,7 +753,7 @@ class BillingTest(AppDatabaseTestCase):
         with patch("app.db.proxy.lifecycle.utc_now", return_value=fixed_now):
             deleted = db.delete_account(account_id)
             self.assertTrue(deleted["deferred"], deleted)
-            self.assertEqual(deleted["effective_deleted_at"],
+            self.assertEqual(deleted["effective_ends_at"],
                              "2026-08-31T23:59:59Z")
 
             cancelled = db.cancel_account_deletion(account_id)
@@ -757,11 +761,10 @@ class BillingTest(AppDatabaseTestCase):
         self.assertTrue(cancelled["ok"], cancelled)
         self.assertEqual(cancelled["restored_credentials"], 1)
         with sqlite3.connect(self.proxy_path) as conn:
-            self.assertEqual(conn.execute(
-                "SELECT lifecycle_state,deleted_at FROM accounts WHERE id=?",
-                (account_id,)).fetchone(), ("active", None))
+            self.assertIsNotNone(conn.execute(
+                "SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone())
             self.assertIsNone(conn.execute(
-                "SELECT c.deleted_at FROM upstream_credentials c "
+                "SELECT c.ends_at FROM upstream_credentials c "
                 "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=?",
                 (account_id,)).fetchone()[0])
             self.assertEqual(conn.execute(

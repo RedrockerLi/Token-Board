@@ -43,7 +43,11 @@ def create_account():
 @require_config_writable
 def update_account(account_id):
     data = require_json_object(force=True)
-    ok = _proxy_db().update_account(account_id, data)
+    try:
+        ok = _proxy_db().update_account(account_id, data)
+    except ValueError as exc:
+        from app.db.proxy.common import ConflictError
+        return api_error(str(exc), 409 if isinstance(exc, ConflictError) else 400)
     if not ok:
         return api_error("No fields to update or account not found", 400)
     return jsonify({"status": "ok"})
@@ -59,11 +63,12 @@ def delete_account(account_id):
         return api_error("mode must be 'detach' or 'cascade'", 400)
     result = _proxy_db().delete_account(account_id, mode=mode)
     if not result["ok"]:
-        return api_error(result["error"] or "Account not found", 400)
+        return api_error(result["error"] or "Account not found",
+                         result.get("status", 404))
     return jsonify({"status": "ok",
                     "cancellation_mode": result.get("cancellation_mode"),
                     "cancelled_at": result.get("cancelled_at"),
-                    "effective_deleted_at": result.get("effective_deleted_at"),
+                    "effective_ends_at": result.get("effective_ends_at"),
                     "deferred": result.get("deferred", False)})
 
 

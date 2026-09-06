@@ -1,8 +1,18 @@
-"""Small normalized V1 fixtures shared by proxy integration tests."""
+"""Small normalized V2 fixtures shared by proxy integration tests."""
 
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
+
+
+def ensure_v2_database(db_path: str | Path, schema_dir: str | Path) -> None:
+    """Create a V2 proxy/dashboard pair for an integration fixture."""
+    from app.db.schema_upgrade import ensure_local_databases
+
+    path = Path(db_path)
+    dashboard = path.with_name(f"{path.stem}.dashboard.db")
+    ensure_local_databases(str(path), str(dashboard), Path(schema_dir))
 
 
 def _id(conn, table: str) -> int:
@@ -16,7 +26,8 @@ def add_upstream(conn, name: str, base_url: str, keys: list[str], *,
                  auth_scheme: str = "bearer", max_concurrency: int = 64):
     account_id = _id(conn, "accounts")
     conn.execute(
-        "INSERT INTO accounts(id,uuid,name,valid_from) VALUES(?,?,?,'2020-01-01')",
+        "INSERT INTO accounts(id,uuid,name,account_kind,valid_from) "
+        "VALUES(?,?,?,'proxy','2020-01-01')",
         (account_id, str(uuid.uuid4()), name),
     )
     conn.execute(
@@ -40,7 +51,8 @@ def add_upstream(conn, name: str, base_url: str, keys: list[str], *,
         credential_uuid = str(uuid.uuid4())
         conn.execute(
             "INSERT INTO upstream_credentials(uuid,runtime_id,upstream_id,"
-            "position,key_masked,valid_from) VALUES(?,?,?,?,?,'2020-01-01')",
+            "position,key_masked,enabled,valid_from) "
+            "VALUES(?,?,?,?,?,1,'2020-01-01')",
             (credential_uuid, runtime, upstream_id, position,
              secret[:3] + '…' + secret[-3:]),
         )

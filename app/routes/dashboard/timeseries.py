@@ -62,7 +62,7 @@ def api_daily():
         daily_tokens[day]["requests"] += ru["count"]
         daily_tokens[day]["by_model"][ru["model"]]["requests"] += ru["count"]
 
-    # Daily cost aggregation from the canonical V1 usage ledger.  The legacy
+    # Daily cost aggregation from the canonical V2 usage ledger.  The legacy
     # `cost` field is the api-equivalent amount (theoretical for plan/agent),
     # and `actual_cost` is the metered bill.
     daily_equivalent = defaultdict(float)
@@ -84,9 +84,27 @@ def api_daily():
         daily_equivalent_by_model[day][ce["model"]] += equiv
         daily_actual[day] += actual
 
+    # Recurring fees are immutable facts keyed by exact period_start.  Agent
+    # rows only exist for software-bound allocations, so an unbound
+    # subscription cannot leak into the Dashboard archive or this graph.
+    daily_recurring = defaultdict(float)
+    for row in _store().plan_summary:
+        if api_key_name and row.get("account_name") != api_key_name:
+            continue
+        if platform_filter and platform_filter not in {"agent", ""}:
+            # Proxy recurring rows have no model/platform attribution.
+            continue
+        period_start = str(row.get("period_start") or "")
+        if period_start[:4].isdigit() and period_start[5:7].isdigit():
+            if int(period_start[:4]) == year and int(period_start[5:7]) == month:
+                day = period_start[:10]
+                daily_recurring[day] += float(row.get("subscription_cost", 0) or 0)
+
     # Build sorted daily result
     sorted_days = sorted(set(daily_tokens.keys()) |
-                         set(daily_equivalent.keys()))
+                         set(daily_equivalent.keys()) |
+                         set(daily_recurring.keys()) |
+                         set(daily_actual.keys()))
     result = []
     for day in sorted_days:
         dt = daily_tokens[day]
@@ -99,9 +117,13 @@ def api_daily():
             "total_tokens": (dt["output_tokens"] + dt["input_cache_hit"] +
                              dt["input_cache_miss"]),
             "requests": dt["requests"],
-            "cost": round(daily_equivalent.get(day, 0), 4),
             "theoretical_cost": round(daily_equivalent.get(day, 0), 4),
-            "actual_cost": round(daily_actual.get(day, 0), 4),
+            "metered_cost": round(daily_actual.get(day, 0), 4),
+            "recurring_cost": round(daily_recurring.get(day, 0), 4),
+            "cost": round(daily_actual.get(day, 0) +
+                           daily_recurring.get(day, 0), 4),
+            "actual_cost": round(daily_actual.get(day, 0) +
+                                  daily_recurring.get(day, 0), 4),
             "by_model": {
                 m: {
                     "output_tokens": v["output"],

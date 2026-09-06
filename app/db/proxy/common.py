@@ -38,6 +38,10 @@ from app.domain.account_types import (
 )
 
 
+class ConflictError(ValueError):
+    """A valid request rejected because the live resource is in transition."""
+
+
 def _generate_key() -> str:
     """Generate a local proxy key: 'tb-' + 32 random hex chars."""
     return "tb-" + secrets.token_hex(16)
@@ -119,16 +123,12 @@ def _iter_months(first: str, last: str):
 
 def _cancellation_end(config: sqlite3.Row, now: datetime, anchor_day: int,
                       account_type: str) -> datetime:
-    """`deleted_at` a plan/agent key or account should receive on cancellation.
+    """Return a confirmed future ``ends_at`` for a subscription unit.
 
-    api accounts are always terminated immediately (no subscription lifecycle).
-    For subscription types the configured default deletion operation decides:
-      'immediate'     → deleted_at = now (本期计费, 立即停止路由).
-      'end_of_period' → deleted_at = end of the current billing period
-                        (本期计费, 下期不计费); the entity keeps routing until
-                        then because a future deleted_at is treated as active.
-    `_billing_period_month(end, anchor_day)` must still equal the current
-    period, hence the -1s before the next period's start.
+    API accounts are always terminated immediately. For subscriptions, the
+    configured policy chooses immediate hard deletion or the current period's
+    end boundary. The latter keeps the unit live and billable until the
+    lifecycle finalizer physically deletes it.
     """
     if deletion_policy(account_type) == "immediate" or config["cancellation_mode"] == "immediate":
         return now

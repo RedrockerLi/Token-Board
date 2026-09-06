@@ -113,8 +113,8 @@ class ProxyAccountWriteMixin:
             "bc.valid_from contract_valid_from,"
             "(SELECT recurring_price FROM billing_rate_events WHERE contract_id=bc.id "
             "ORDER BY effective_at DESC,id DESC LIMIT 1) current_price FROM accounts a "
-            "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.valid_until IS NULL "
-            "WHERE a.id=? AND a.account_kind='proxy' AND a.lifecycle_state='active'",
+            "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.ends_at IS NULL "
+            "WHERE a.id=? AND a.account_kind='proxy'",
             (real_id,),
         ).fetchone()
         if original is None:

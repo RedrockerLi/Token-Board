@@ -34,10 +34,10 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             )
             conn.executemany(
                 "INSERT INTO monthly_recurring_costs"
-                "(month,account_id,billing_unit_id,recurring_charge,equivalent_cost) "
+                "(period_start,account_id,billing_unit_id,recurring_charge,equivalent_cost) "
                 "VALUES(?,?,?,?,?)",
-                [("2026-08", 7, "unit-7", 3, 0),
-                 ("2026-08", 8, "unit-8", 4, 0)],
+                [("2026-08-01T00:00:00Z", 7, "unit-7", 3, 0),
+                 ("2026-08-01T00:00:00Z", 8, "unit-8", 4, 0)],
             )
             conn.commit()
 
@@ -212,7 +212,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         dashboard.purge_accounts({7})
         self.assertEqual(dashboard.upsert_account_batch([{
             "account_id": 7, "name": "remove-me",
-            "lifecycle_state": "deleted", "updated_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
             "account_kind": "proxy",
         }]), 1)
         self.assertEqual(dashboard.upsert_frozen_plan_charge(
@@ -259,9 +259,9 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             )
             conn.executemany(
                 "INSERT INTO monthly_recurring_costs"
-                "(month,account_id,billing_unit_id,recurring_charge,"
+                "(period_start,account_id,billing_unit_id,recurring_charge,"
                 "equivalent_cost,normalized_recurring_cost,charge_frozen_at) "
-                "VALUES('2026-08',?,?,0,0,0,?)",
+                "VALUES('2026-08-01T00:00:00Z',?,?,0,0,0,?)",
                 [(14, "zen-unit", "2026-08-15T00:00:00Z"),
                  (17, "lm-unit", "2026-08-18T00:00:00Z")],
             )

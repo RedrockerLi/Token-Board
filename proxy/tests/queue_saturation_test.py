@@ -79,6 +79,8 @@ def main() -> None:
     binary = Path(sys.argv[1]).resolve()
     schema = Path(sys.argv[2]).resolve()
     project = Path(sys.argv[3]).resolve()
+    sys.path.insert(0, str(project))
+    from v1_fixture import ensure_v2_database
     spec = importlib.util.spec_from_file_location(
         "queue_test_migrations", project / "app/db/migrations.py")
     assert spec is not None and spec.loader is not None
@@ -92,10 +94,10 @@ def main() -> None:
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
         db = Path(directory) / "token-board.db"
-        migrations.migrate(str(db), str(schema), "token-board")
+        ensure_v2_database(db, schema)
         with sqlite3.connect(db) as conn:
             conn.executescript("""
-                INSERT INTO accounts(id,uuid,name) VALUES(1,'a','queue');
+                INSERT INTO accounts(id,uuid,name,account_kind) VALUES(1,'a','queue','proxy');
                 INSERT INTO route_sets(id,uuid,account_id,name) VALUES(1,'r',1,'queue');
                 INSERT INTO client_keys(id,uuid,key_value,label,route_set_id)
                     VALUES(1,'c','tb-queue','queue',1);
@@ -108,8 +110,8 @@ def main() -> None:
             conn.executescript("""
                 INSERT INTO route_rules(route_set_id,model_pattern,priority,upstream_id)
                     VALUES(1,'*',0,1);
-                INSERT INTO upstream_credentials(uuid,runtime_id,upstream_id,position,key_masked)
-                    VALUES('u',1,1,0,'sk-queue');
+                INSERT INTO upstream_credentials(uuid,runtime_id,upstream_id,position,key_masked,enabled)
+                    VALUES('u',1,1,0,'sk-queue',1);
                 INSERT INTO upstream_secrets(credential_uuid,secret_value)
                     VALUES('u','sk-queue');
             """)

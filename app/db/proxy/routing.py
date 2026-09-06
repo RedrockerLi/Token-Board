@@ -29,9 +29,9 @@ class ProxyRoutingMixin:
                 "JOIN route_sets rs ON rs.id=ck.route_set_id "
                 "LEFT JOIN upstreams u ON u.account_id=rs.account_id AND u.enabled=1 "
                 "LEFT JOIN accounts a ON a.id=rs.account_id "
-                "WHERE ck.enabled=1 AND ck.deleted_at IS NULL "
+                "WHERE ck.enabled=1 "
                 "AND (rs.account_id IS NULL OR "
-                "(a.account_kind='proxy' AND a.lifecycle_state='active')) "
+                "(a.account_kind='proxy')) "
                 "ORDER BY ck.id"
             ).fetchall()
             return [dict(r) for r in rows]
@@ -51,7 +51,7 @@ class ProxyRoutingMixin:
             "SELECT 1 FROM route_sets rs LEFT JOIN accounts a "
             "ON a.id=rs.account_id WHERE rs.id=? AND rs.enabled=1 "
             "AND (rs.account_id IS NULL OR "
-            "(a.account_kind='proxy' AND a.lifecycle_state='active'))",
+            "(a.account_kind='proxy'))",
             (account_id,),
         ).fetchone()
         if row is None:

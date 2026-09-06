@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a V1 fixture with Python before running a C++ runtime test."""
+"""Prepare a V2 fixture with Python before running a C++ runtime test."""
 
 from __future__ import annotations
 
@@ -14,11 +14,12 @@ def main() -> int:
     schema_root = Path(sys.argv[2]).resolve()
     project_root = Path(sys.argv[3]).resolve()
     sys.path.insert(0, str(project_root))
-    from app.db.migrations import apply_sql_migrations
+    from app.db.schema_upgrade import ensure_local_databases
 
     with tempfile.TemporaryDirectory(prefix="token-board-cpp-test-") as raw:
         database = Path(raw) / "token-board.db"
-        apply_sql_migrations(str(database), str(schema_root), "token-board")
+        dashboard = Path(raw) / "dashboard.db"
+        ensure_local_databases(str(database), str(dashboard), schema_root)
         return subprocess.run(
             [str(executable), str(schema_root), str(database)],
             check=False,

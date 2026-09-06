@@ -1,4 +1,4 @@
-"""Cloud-authoritative configuration merge for synchronized V1 tables."""
+"""Cloud-authoritative configuration merge for synchronized V2 tables."""
 
 import sqlite3
 
@@ -17,7 +17,7 @@ def _schema_major(conn: sqlite3.Connection) -> int:
 
 
 def merge_config_tables(remote_path: str, local_path: str) -> None:
-    """Merge a downloaded, already-upgraded V1 artifact into local V1.
+    """Merge a downloaded, already-upgraded V2 artifact into local V2.
 
     V0 artifacts are upgraded by :mod:`app.db.schema_upgrade` before this
     function is called.  Keeping that boundary explicit prevents the running
@@ -31,18 +31,18 @@ def merge_config_tables(remote_path: str, local_path: str) -> None:
     finally:
         probe_remote.close()
         probe_local.close()
-    if remote_major != 1 or local_major != 1:
+    if remote_major != 2 or local_major != 2:
         raise RuntimeError(
-            "配置合并只接受 V1 shadow；请先通过 schema upgrade coordinator "
+            "配置合并只接受 V2 shadow；请先通过 schema upgrade coordinator "
             f"转换 remote=V{remote_major}, local=V{local_major}")
     if remote_major != local_major:
         raise RuntimeError(
             f"配置同步拒绝跨 Major 合并: remote=V{remote_major}, local=V{local_major}")
-    _merge_v1_config(remote_path, local_path)
+    _merge_v2_config(remote_path, local_path)
 
 
-def _merge_v1_config(remote_path: str, local_path: str) -> None:
-    """Merge normalized V1 configuration without importing local secrets.
+def _merge_v2_config(remote_path: str, local_path: str) -> None:
+    """Merge normalized V2 configuration without importing local secrets.
 
     Stable UUIDs are authoritative. Missing live child rows are hard-deleted;
     proxy accounts, Agent subscriptions and Agent software retain their
@@ -102,14 +102,14 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                     next_runtime += 1
                 local.execute(
                     "INSERT INTO upstream_credentials"
-                    "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,created_at,disabled_at,deleted_at) "
+                    "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,created_at,enabled,ends_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET "
                     "upstream_id=excluded.upstream_id,position=excluded.position,"
                     "key_masked=excluded.key_masked,valid_from=excluded.valid_from,"
-                    "disabled_at=excluded.disabled_at,deleted_at=excluded.deleted_at",
+                    "enabled=excluded.enabled,ends_at=excluded.ends_at",
                     (row["uuid"], runtime_id, row["upstream_id"], row["position"],
                      row["key_masked"], row["valid_from"], row["created_at"],
-                     row["disabled_at"], row["deleted_at"]),
+                     row["enabled"], row["ends_at"]),
                 )
 
         merge_table("account_importers", {"cursor_json"})
@@ -162,7 +162,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                     info[1] for info in sorted(table_info(remote, table), key=lambda value: value[5])
                     if info[5]) + f" FROM {table}")}
             for table in ("accounts", "upstreams", "route_sets", "route_rules",
-                          "client_keys", "account_importers",
+                          "client_keys", "account_importers", "upstream_model_catalog",
                           "agent_subscriptions", "agent_software",
                           "agent_subscription_instances", "agent_subscription_bindings",
                           "agent_subscription_rate_events")
@@ -177,6 +177,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
         # subscriptions use the separate identity tables instead.
         hard_delete_order = (
             "route_rules", "client_keys", "agent_subscription_bindings",
+            "upstream_model_catalog", "upstreams", "route_sets",
             "agent_subscription_rate_events", "agent_subscription_instances",
             "agent_subscriptions", "agent_software",
         )
@@ -206,27 +207,28 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                 elif table == "agent_software":
                     local.execute("DELETE FROM agent_software_runtime WHERE software_id=?", identity)
                     local.execute(f"DELETE FROM {table} WHERE {where}", identity)
+                elif table == "upstream_model_catalog":
+                    local.execute(f"DELETE FROM {table} WHERE {where}", identity)
+                elif table == "upstreams":
+                    upstream_id = identity[0]
+                    local.execute(
+                        "UPDATE request_attempts SET upstream_id=NULL,"
+                        "upstream_key_id=NULL,credential_uuid=NULL WHERE upstream_id=?",
+                        (upstream_id,),
+                    )
+                    for credential in local.execute(
+                            "SELECT uuid FROM upstream_credentials WHERE upstream_id=?",
+                            (upstream_id,)).fetchall():
+                        from app.db.proxy.deletion import purge_credential
+                        purge_credential(local, credential[0])
+                    local.execute("DELETE FROM upstream_model_catalog WHERE upstream_id=?",
+                                  (upstream_id,))
+                    local.execute("DELETE FROM upstreams WHERE id=?", (upstream_id,))
+                elif table == "route_sets":
+                    from app.db.proxy.deletion import purge_route_sets
+                    purge_route_sets(local, [identity[0]])
                 else:
                     local.execute(f"DELETE FROM {table} WHERE {where}", identity)
-        tombstones = {
-            "accounts": (
-                "lifecycle_state=CASE WHEN account_kind='agent' THEN 'deleted' "
-                "ELSE 'disabled' END,"
-                "disabled_at=CASE WHEN account_kind='agent' THEN NULL ELSE ? END,"
-                "deleted_at=CASE WHEN account_kind='agent' THEN ? ELSE deleted_at END,"
-                "updated_at=?",
-                (now, now, now),
-            ),
-            "upstreams": ("enabled=0", ()), "route_sets": ("enabled=0", ()),
-            "route_rules": ("enabled=0", ()), "client_keys": ("enabled=0", ()),
-            "account_importers": ("enabled=0", ()),
-            "agent_subscriptions": ("lifecycle_state='deleted',valid_until=?", (now,)),
-            "agent_software": ("enabled=0,updated_at=?", (now,)),
-            "agent_subscription_instances": (
-                "lifecycle_state='deleted',valid_until=?,updated_at=?", (now, now)),
-            "agent_subscription_bindings": (
-                "lifecycle_state='deleted',valid_until=?,updated_at=?", (now, now)),
-        }
         for table, identities in remote_ids.items():
             if table in hard_delete_tables:
                 continue
@@ -235,24 +237,32 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
             for row in local.execute(f"SELECT {','.join(primary)} FROM {table}").fetchall():
                 identity = tuple(row)
                 if identity not in identities:
+                    where = " AND ".join(f"{column}=?" for column in primary)
                     if table == "accounts":
                         kind = local.execute(
-                            "SELECT account_kind FROM accounts WHERE id=?",
-                            identity).fetchone()
+                            "SELECT account_kind FROM accounts WHERE id=?", identity).fetchone()
                         if kind is not None and kind[0] == "proxy":
                             from app.db.proxy.deletion import purge_proxy_account
                             purge_proxy_account(local, int(identity[0]))
-                            continue
-                    clause, params = tombstones[table]
-                    where = " AND ".join(f"{column}=?" for column in primary)
-                    local.execute(f"UPDATE {table} SET {clause} WHERE {where}",
-                                  (*params, *identity))
+                        elif kind is not None:
+                            local.execute("UPDATE request_log SET account_id=NULL,"
+                                          "account_identity_id=COALESCE(account_identity_id,?) "
+                                          "WHERE account_id=?", (identity[0], identity[0]))
+                            local.execute("UPDATE request_attempts SET account_id=NULL "
+                                          "WHERE account_id=?", (identity[0],))
+                            local.execute("DELETE FROM agent_subscription_bindings WHERE software_id=?", identity)
+                            local.execute("DELETE FROM agent_software_runtime WHERE software_id=?", identity)
+                            local.execute("DELETE FROM agent_software WHERE id=?", identity)
+                            local.execute("DELETE FROM accounts WHERE id=?", identity)
+                    elif table == "upstream_credentials":
+                        from app.db.proxy.deletion import purge_credential
+                        purge_credential(local, identity[0])
+                    else:
+                        local.execute(f"DELETE FROM {table} WHERE {where}", identity)
         for row in local.execute("SELECT uuid FROM upstream_credentials").fetchall():
             if row["uuid"] not in remote_credential_ids:
-                local.execute(
-                    "UPDATE upstream_credentials SET disabled_at=COALESCE(disabled_at,?) "
-                    "WHERE uuid=?",
-                    (now, row["uuid"]))
+                from app.db.proxy.deletion import purge_credential
+                purge_credential(local, row["uuid"])
 
         # Model pricing has no lifecycle tombstone in the flattened schema.
         # A cloud-authoritative artifact that omits a rule therefore removes
@@ -271,7 +281,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
         local.execute("UPDATE config_state SET generation=generation+1 WHERE id=1")
         violation = local.execute("PRAGMA foreign_key_check").fetchone()
         if violation:
-            raise sqlite3.IntegrityError(f"V1 config merge FK violation: {tuple(violation)}")
+            raise sqlite3.IntegrityError(f"V2 config merge FK violation: {tuple(violation)}")
         local.commit()
     except Exception:
         local.rollback()

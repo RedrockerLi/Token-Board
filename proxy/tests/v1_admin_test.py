@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normalized V1 admin CRUD and independent agent management smoke test."""
+"""Normalized V2 admin CRUD and independent agent management smoke test."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def load(name: str, path: Path):
 
 def latest_version(schema_root: Path, database: str) -> int:
     versions = []
-    for path in (schema_root / database / "v1").glob("*.sql"):
+    for path in (schema_root / database / "v2").glob("*.sql"):
         major, minor = path.name.split("_", 1)[0].split("-")
         versions.append(int(major) * 10000 + int(minor))
     return max(versions)
@@ -45,12 +45,14 @@ def main() -> None:
     load("app.domain.account_types", project / "app/domain/account_types.py")
     load("app.services.fx", project / "app/services/fx.py")
     migrations = load("app.db.migrations", project / "app/db/migrations.py")
-    dashboard_module = load("app.db.dashboard_db", project / "app/db/dashboard_db.py")
     proxy_module = load("app.db.proxy_db", project / "app/db/proxy_db.py")
     billing_module = load("app.db.proxy.billing", project / "app/db/proxy/billing.py")
+    from app.db.schema_upgrade import ensure_local_databases
 
-    db_path = Path(tempfile.mkdtemp()) / "token-board.db"
-    migrations.migrate(str(db_path), str(schema_root), "token-board")
+    directory = Path(tempfile.mkdtemp())
+    db_path = directory / "token-board.db"
+    dashboard_path = directory / "dashboard.db"
+    ensure_local_databases(str(db_path), str(dashboard_path), str(schema_root))
     database = proxy_module.ProxyDatabase.__new__(proxy_module.ProxyDatabase)
     database.db_path = str(db_path)
     database.schema_dir = str(schema_root)
@@ -137,9 +139,6 @@ def main() -> None:
             "GROUP BY subscription_id,period_start"
         ).fetchone()
         assert charge and charge[0] == subscription_id and charge[2] == 1
-    dashboard_path = db_path.parent / "dashboard.db"
-    migrations.migrate(str(dashboard_path), str(schema_root), "dashboard")
-    dashboard_module.reconcile_accounts(str(dashboard_path), str(db_path))
     migrations.schema_dir_for = lambda _path, _name: str(schema_root)
     exported = database.export_to_dashboard(
         str(dashboard_path), 0, database.get_max_log_id())
@@ -157,7 +156,7 @@ def main() -> None:
         ).fetchone()[0] == 20
     finally:
         dashboard.close()
-    print("V1 admin CRUD passed")
+    print("V2 admin CRUD passed")
 
 
 if __name__ == "__main__":

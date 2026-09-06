@@ -32,7 +32,9 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
 
     def _latest(self, database: str) -> tuple[int, int]:
         versions = []
-        for path in (self.root / "schema" / database / "v1").glob("*.sql"):
+        major_dirs = list((self.root / "schema" / database).glob("v[0-9]*"))
+        latest_major_dir = max(major_dirs, key=lambda path: int(path.name[1:]))
+        for path in latest_major_dir.glob("*.sql"):
             major, minor = path.name.split("_", 1)[0].split("-")
             versions.append((int(major), int(minor)))
         return max(versions)
@@ -438,9 +440,9 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                 "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=? "
                 "ORDER BY c.runtime_id", (account_id,)
             ).fetchall()
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0][1], rows[1][1])
-        self.assertNotEqual(rows[0][0], rows[1][0])
+        # The deleted V0 key is terminal live configuration and is physically
+        # removed during V2 conversion; only the active key remains.
+        self.assertEqual(len(rows), 1)
 
     def test_downloaded_v0_proxy_and_dashboard_artifacts_upgrade_in_shadow(self) -> None:
         proxy = self.root / "data/token-board.db"
@@ -460,8 +462,8 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         dashboard_result = upgrade_shadow(
             str(remote_dash), "dashboard", self.root / "schema",
             local_token_board_path=str(local_proxy))
-        self.assertEqual(proxy_result.current.major, 1)
-        self.assertEqual(dashboard_result.current.major, 1)
+        self.assertEqual(proxy_result.current.major, 2)
+        self.assertEqual(dashboard_result.current.major, 2)
         self.assertEqual(self._version(remote_proxy), self._latest("token-board"))
         self.assertEqual(self._version(remote_dash), self._latest("dashboard"))
         self.assertEqual(self._version(proxy), (0, 19))

@@ -3,8 +3,8 @@
 import hashlib
 import json
 
-from app.core.time import parse_runtime_timestamp, utc_now
-from app.db.proxy.common import _billing_period_month
+from app.core.time import format_utc, parse_runtime_timestamp, utc_now
+from app.db.proxy.common import _billing_period_month, _period_start
 
 
 def _billing_event_payload_hash(event) -> str:
@@ -12,7 +12,7 @@ def _billing_event_payload_hash(event) -> str:
         key: event[key] for key in (
             "event_key", "event_kind", "account_id", "account_uuid",
             "account_kind",
-            "month", "billing_unit_id", "recurring_charge",
+            "month", "period_start", "billing_unit_id", "recurring_charge",
             "normalized_recurring_cost", "currency", "base_currency",
             "fx_rate_date",
         )
@@ -32,7 +32,7 @@ class ProxyExportMixin:
         row. The high-water mark is advanced by the caller ONLY after the whole
         pull-export-upload transaction succeeds, so nothing here marks rows.
 
-        plan subscription fees are persisted per (account, month) only after
+        plan subscription fees are persisted per (account, period_start) only after
         the source period charge is frozen. Billing events have their own
         high-water mark and are acknowledged by the caller only after the
         dashboard candidate is committed.
@@ -57,31 +57,6 @@ class ProxyExportMixin:
             dash_db = DashboardDatabase(
                 target_path, schema_dir=self.schema_dir)
 
-            # The generic daily ledger has a foreign key to the mirror, so
-            # identities must be upserted before usage rows.
-            dash_db.upsert_account_batch([
-                {"account_id": row["id"], "name": row["name"],
-                 "lifecycle_state": row["lifecycle_state"],
-                 "updated_at": row["updated_at"],
-                 "account_kind": row["account_kind"]}
-                for row in conn.execute(
-                    "SELECT id,name,lifecycle_state,updated_at,account_kind "
-                    "FROM accounts ORDER BY id")
-            ])
-            # Historical identities outlive the live accounts row.  Mirror
-            # them as deleted identities so a later export can still render
-            # the name after real-time configuration has been purged.
-            dash_db.upsert_account_batch([
-                {"account_id": row["id"], "name": row["name"],
-                 "lifecycle_state": "active" if row["live_id"] is not None else "deleted",
-                 "updated_at": row["updated_at"],
-                 "account_kind": row["account_kind"]}
-                for row in conn.execute(
-                    "SELECT i.id,i.name,i.account_kind,i.updated_at,a.id AS live_id "
-                    "FROM account_identities i LEFT JOIN accounts a ON a.id=i.id "
-                    "ORDER BY i.id")
-            ])
-
             # A) usage + frozen cost: keyed by account_id (the identity). The
             #    display name comes from the dashboard `accounts` mirror.
             cost_columns = (
@@ -105,7 +80,6 @@ class ProxyExportMixin:
                 WHERE r.id > ? AND r.id <= ?
                   AND COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
                   AND LOWER(r.model) != 'unknown' AND r.model != ''
-                  AND r.account_id IS NOT NULL
                   -- Only successful requests carry real usage; failed/aborted
                   -- requests (timeouts, auth/limit rejections, client
                   -- disconnect) record zero tokens and must not pollute the
@@ -114,6 +88,20 @@ class ProxyExportMixin:
                 GROUP BY date(r.requested_at), COALESCE(r.account_identity_id,r.account_id), r.model
                 ORDER BY date(r.requested_at), COALESCE(r.account_identity_id,r.account_id), r.model
             """, (mark, max_id)).fetchall()
+
+            identity_ids = sorted({int(row["account_id"]) for row in rows
+                                   if row["account_id"] is not None})
+            if identity_ids:
+                placeholders = ",".join("?" for _ in identity_ids)
+                dash_db.upsert_account_batch([
+                    {"account_id": row["id"], "name": row["name"],
+                     "updated_at": row["updated_at"],
+                     "account_kind": row["account_kind"]}
+                    for row in conn.execute(
+                        f"SELECT id,name,updated_at,account_kind "
+                        f"FROM account_identities WHERE id IN ({placeholders})",
+                        identity_ids)
+                ])
 
             dash_count = dash_db.upsert_proxy_batch([
                 {
@@ -163,7 +151,7 @@ class ProxyExportMixin:
                 "AND ai.account_kind='proxy' AND "
                 "(r.billing_unit_id IS NOT NULL OR (bc.charge_type='recurring' "
                 "AND bc.valid_from<=r.requested_at AND "
-                "(bc.valid_until IS NULL OR bc.valid_until>r.requested_at)))",
+                "(bc.ends_at IS NULL OR bc.ends_at>r.requested_at)))",
                 (mark, max_id),
             ).fetchall()
             for log in plan_logs:
@@ -178,12 +166,13 @@ class ProxyExportMixin:
                 anchor_day = (log["billing_anchor_day"] or
                               (meta.get("anchor").day if meta.get("anchor") else 1))
                 month = _billing_period_month(requested, int(anchor_day))
-                bucket = (month, meta["account_id"],
+                period_start = format_utc(_period_start(month, int(anchor_day)))
+                bucket = (period_start, meta["account_id"],
                           meta["billing_unit_id"])
                 virtual_buckets[bucket] = virtual_buckets.get(bucket, 0.0) + float(log["api_cost"] or 0)
-            for (month, account_id, billing_unit_id), virtual_cost in virtual_buckets.items():
+            for (period_start, account_id, billing_unit_id), virtual_cost in virtual_buckets.items():
                 dash_db.accumulate_plan_summary(
-                    month=month, account_id=account_id,
+                    period_start=period_start, account_id=account_id,
                     billing_unit_id=billing_unit_id,
                     subscription_cost=0.0, virtual_cost=virtual_cost,
                     refresh_subscription=False,

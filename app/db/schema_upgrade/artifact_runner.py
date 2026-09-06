@@ -59,8 +59,8 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
                     raise UpgradeError("dashboard V0 upgrade requires local V1 proxy identity")
                 proxy_version = inspect_version(
                     local_token_board_path, TOKEN_BOARD_DATABASE_NAME)
-                if proxy_version is None or proxy_version.major != 1:
-                    raise UpgradeError("dashboard V0 upgrade requires a current V1 proxy")
+                if proxy_version is None or proxy_version.major not in (1, 2):
+                    raise UpgradeError("dashboard V0 upgrade requires a current V1/V2 proxy")
                 scope = "dashboard-artifact"
                 versions = {
                     TOKEN_BOARD_DATABASE_NAME: proxy_version,
@@ -160,6 +160,17 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
                             {TOKEN_BOARD_DATABASE_NAME: proxy_version},
                             "token-board-artifact", ZoneInfo(source_timezone),
                             generation_id=uuid.uuid4().hex)
+            # V2 artifacts are the only artifacts accepted by runtime
+            # services.  A V0 download first needs the historical V0->V1
+            # transformer above, but the same shadow must immediately pass
+            # through the compound V1->V2 schema migration before it can be
+            # published.  This closes the old V0->V1-only escape hatch.
+            shadow_version = inspect_version(shadow, database_name)
+            if (shadow_version is not None and shadow_version.major == 1 and
+                    (schema_root / database_name / "v2").is_dir()):
+                apply_sql_migrations(
+                    str(shadow), str(schema_root), database_name,
+                    target=latest_version(schema_root, database_name, 2))
             if configuration_only:
                 strip_runtime_artifact(shadow, database_name)
             replace(path, shadow)
@@ -169,12 +180,21 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
             assert latest is not None
             return UpgradeResult(str(path), database_name, current, latest, True)
 
-        if current.major != 1:
+        if current.major not in (1, 2):
             raise UpgradeError(
                 f"unsupported {database_name} schema V{current.major}.{current.minor}")
-        artifact_shadow = work / f"{database_name}.v1-shadow.db"
+        artifact_shadow = work / f"{database_name}.v{current.major}-shadow.db"
         copy_sqlite(path, artifact_shadow)
-        if database_name == TOKEN_BOARD_DATABASE_NAME:
+        if current.major == 2:
+            if database_name == DASHBOARD_DATABASE_NAME and local_token_board_path:
+                proxy_version = inspect_version(
+                    local_token_board_path, TOKEN_BOARD_DATABASE_NAME)
+                if proxy_version is None or proxy_version.major != 2:
+                    raise UpgradeError("dashboard V2 upgrade requires a current V2 proxy")
+            apply_sql_migrations(
+                str(artifact_shadow), str(schema_root), database_name,
+                target=latest_version(schema_root, database_name, 2))
+        elif database_name == TOKEN_BOARD_DATABASE_NAME:
             versions = {TOKEN_BOARD_DATABASE_NAME: current}
             paths = {TOKEN_BOARD_DATABASE_NAME: path}
             transitions = select_transitions(
@@ -192,8 +212,8 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
         elif database_name == DASHBOARD_DATABASE_NAME and local_token_board_path:
             proxy_version = inspect_version(
                 local_token_board_path, TOKEN_BOARD_DATABASE_NAME)
-            if proxy_version is None or proxy_version.major != 1:
-                raise UpgradeError("dashboard V1 upgrade requires a current V1 proxy")
+            if proxy_version is None or proxy_version.major not in (1, 2):
+                raise UpgradeError("dashboard upgrade requires a current V1/V2 proxy")
             proxy_shadow = work / "local-token-board.v1-shadow.db"
             copy_sqlite(local_token_board_path, proxy_shadow)
             dashboard_version = inspect_version(artifact_shadow, DASHBOARD_DATABASE_NAME)
@@ -218,7 +238,18 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
         else:
             apply_sql_migrations(
                 str(artifact_shadow), str(schema_root), database_name)
-        expected = latest_version(schema_root, database_name, 1)
+        # V2 is a compound major transition applied only after the V1 artifact
+        # route has finished on the shadow.  It is intentionally never applied
+        # to the live file in-place.
+        current_shadow = inspect_version(artifact_shadow, database_name)
+        assert current_shadow is not None
+        if current_shadow.major == 1 and (schema_root / database_name / "v2").is_dir():
+            apply_sql_migrations(
+                str(artifact_shadow), str(schema_root), database_name,
+                target=latest_version(schema_root, database_name, 2))
+        expected = latest_version(
+            schema_root, database_name,
+            inspect_version(artifact_shadow, database_name).major)
         verify(artifact_shadow, database_name, expected)
         if configuration_only:
             strip_runtime_artifact(artifact_shadow, database_name)

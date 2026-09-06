@@ -31,9 +31,8 @@ class DataStore:
         self.api_key_names: list[str] = []
         self.platforms: list[str] = []             # discovered platform names
         self.models: list[str] = []                # unique model names
-        # DashboardDatabase accepts only normalized V1; retain this attribute
-        # as a read-only compatibility flag for templates and old clients.
-        self.is_v1 = True
+        # DashboardDatabase accepts only normalized V2 rows.
+        self.is_v2 = True
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -43,8 +42,8 @@ class DataStore:
         if not db_path.exists():
             log.warning("dashboard archive not found: %s", db_path)
             self._commit([], [], [], [], [], [], [], [])
-            return
-        self._load_from_db(str(db_path))
+        else:
+            self._load_from_db(str(db_path))
 
     # ── helpers ─────────────────────────────────────────────────────────
 
@@ -55,9 +54,9 @@ class DataStore:
         db = DashboardDatabase(db_path, schema_dir=self.schema_dir)
         conn = db._connect()
         try:
-            # Opening the façade already verified the V1 schema.  Do not probe
+            # Opening the façade already verified the V2 schema.  Do not probe
             # or branch on historical table layouts in the request path.
-            self.is_v1 = True
+            self.is_v2 = True
         finally:
             conn.close()
         (

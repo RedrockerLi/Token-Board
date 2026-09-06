@@ -1,8 +1,8 @@
 """Automatic local and downloaded-database schema upgrades.
 
-The proxy process only runs V1 databases.  This package is the boundary that
-may read V0 files: it creates checked shadow copies, upgrades same-major
-minors, runs the V0->V1 transformer and atomically publishes the result.
+Runtime services only run V2 databases. This package is the compatibility
+boundary for V0/V1 files: it creates checked shadow copies, performs the
+compound V1→V2 migration, and atomically publishes the result.
 """
 
 from .coordinator import (UpgradeResult, ensure_local_databases,

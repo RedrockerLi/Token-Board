@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.db.migrations import migrate
+from app.db.schema_upgrade import ensure_local_databases
 from app.services.sync import config_sync, dashboard_sync
 from app.services.sync.settings import SyncConfig, save_sync_config
 from app.services.sync.state import get_sync_state, set_sync_state_many
@@ -26,8 +26,7 @@ class SyncRecoveryTest(unittest.TestCase):
         (Path(temp) / "data").mkdir()
         proxy = str(Path(temp) / "data" / "token-board.db")
         dash = str(Path(temp) / "data" / "dashboard.db")
-        migrate(proxy, str(Path(temp) / "schema"), "token-board")
-        migrate(dash, str(Path(temp) / "schema"), "dashboard")
+        ensure_local_databases(proxy, dash, Path(temp) / "schema")
         save_sync_config(proxy, SyncConfig(
             "https://dav.example/remote", "token-board-sync", "user", "pass"))
         return temp, proxy, dash

@@ -36,7 +36,7 @@ def main():
     schema = Path(sys.argv[2]).resolve()
     root = Path(sys.argv[3]).resolve()
     sys.path.insert(0, str(root))
-    from app.db.migrations import migrate
+    from v1_fixture import ensure_v2_database
     from scripts.mock_upstream import Handler
 
     upstream_port = free_port()
@@ -45,9 +45,10 @@ def main():
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
         db = Path(directory) / "token-board.db"
-        migrate(str(db), str(schema), "token-board")
+        ensure_v2_database(db, schema)
         conn = sqlite3.connect(db)
-        conn.execute("INSERT INTO accounts(id,uuid,name) VALUES(1,'account-1','v1')")
+        conn.execute("INSERT INTO accounts(id,uuid,name,account_kind) "
+                     "VALUES(1,'account-1','v1','proxy')")
         conn.execute(
             "INSERT INTO upstreams(id,account_id,name,base_url,api_format,auth_scheme,max_concurrency) "
             "VALUES(1,1,'mock',?,'openai','bearer',128)",
@@ -60,8 +61,8 @@ def main():
             "INSERT INTO client_keys(id,uuid,key_value,label,route_set_id) "
             "VALUES(1,'client-1','tb-v1','v1',1)")
         conn.execute(
-            "INSERT INTO upstream_credentials(uuid,runtime_id,upstream_id,position,key_masked) "
-            "VALUES('credential-1',1,1,0,'sk-…mock')")
+            "INSERT INTO upstream_credentials(uuid,runtime_id,upstream_id,position,key_masked,enabled) "
+            "VALUES('credential-1',1,1,0,'sk-…mock',1)")
         conn.execute(
             "INSERT INTO upstream_secrets(credential_uuid,secret_value) "
             "VALUES('credential-1','sk-mock')")

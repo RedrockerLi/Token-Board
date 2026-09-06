@@ -26,7 +26,7 @@ class BillingUnit:
     owner_kind: str
     charge_domain: str
     valid_from: date
-    valid_until: datetime | None
+    ends_at: datetime | None
     currency: str
     credential_uuid: str | None = None
     credential_identity: str | None = None
@@ -40,7 +40,7 @@ class BillingUnit:
         return self.valid_from.day
 
 
-def _parsed_valid_until(value: object) -> datetime | None:
+def _parsed_ends_at(value: object) -> datetime | None:
     if value in (None, ""):
         return None
     return parse_runtime_timestamp(value)
@@ -55,8 +55,7 @@ class BillingUnitResolver:
         now = format_utc(moment)
         contracts = conn.execute(
             "SELECT bc.id,bc.uuid,bc.account_id,bc.billing_scope,bc.currency,"
-            "bc.valid_until,a.valid_from account_valid_from,a.created_at account_created_at,"
-            "a.deleted_at account_deleted_at "
+            "bc.ends_at,a.valid_from account_valid_from,a.created_at account_created_at "
             "FROM billing_contracts bc JOIN accounts a ON a.id=bc.account_id "
             "WHERE bc.charge_type='recurring' AND bc.valid_from<=? "
             "AND a.account_kind='proxy'",
@@ -64,23 +63,16 @@ class BillingUnitResolver:
         ).fetchall()
         units: list[BillingUnit] = []
         for contract in contracts:
-            valid_until = min(
-                (value for value in (
-                    _parsed_valid_until(contract["valid_until"]),
-                    _parsed_valid_until(contract["account_deleted_at"]),
-                ) if value is not None),
-                default=None,
-            )
+            ends_at = _parsed_ends_at(contract["ends_at"])
             if contract["billing_scope"] == "credential":
                 seen: set[tuple[int, str]] = set()
                 credentials = conn.execute(
-                    "SELECT c.runtime_id,c.uuid,c.key_masked,c.valid_from,c.created_at,c.deleted_at "
+                    "SELECT c.runtime_id,c.uuid,c.key_masked,c.valid_from,c.created_at,c.ends_at "
                     "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
                     "WHERE u.account_id=? "
-                    "AND (c.disabled_at IS NULL OR c.disabled_at>?) "
-                    "AND (c.deleted_at IS NULL OR c.deleted_at>?) "
+                    "AND (c.ends_at IS NULL OR c.ends_at>?) "
                     "ORDER BY c.position,c.runtime_id",
-                    (contract["account_id"], now, now),
+                    (contract["account_id"], now),
                 ).fetchall()
                 for credential in credentials:
                     identity = (contract["account_id"], credential["key_masked"])
@@ -90,8 +82,8 @@ class BillingUnitResolver:
                     valid_from = (
                         _parse_iso_date(credential["valid_from"])
                         or parse_runtime_timestamp(credential["created_at"]).date())
-                    credential_end = _parsed_valid_until(credential["deleted_at"])
-                    unit_end = min((value for value in (valid_until, credential_end)
+                    credential_end = _parsed_ends_at(credential["ends_at"])
+                    unit_end = min((value for value in (ends_at, credential_end)
                                     if value is not None), default=None)
                     units.append(BillingUnit(
                         billing_unit_id=f"credential:{credential['uuid']}",
@@ -100,7 +92,7 @@ class BillingUnitResolver:
                         owner_kind="proxy",
                         charge_domain="proxy_credential",
                         valid_from=valid_from,
-                        valid_until=unit_end,
+                        ends_at=unit_end,
                         currency=str(contract["currency"]),
                         credential_uuid=str(credential["uuid"]),
                         credential_identity=f"{contract['account_id']}:{credential['key_masked']}",
@@ -119,7 +111,7 @@ class BillingUnitResolver:
                     owner_kind="proxy",
                     charge_domain="proxy_subscription",
                     valid_from=valid_from,
-                    valid_until=valid_until,
+                    ends_at=ends_at,
                     currency=str(contract["currency"]),
                     key_masked="subscription",
                     contract_id=int(contract["id"]),
@@ -131,13 +123,11 @@ class BillingUnitResolver:
         moment = utc_now() if at is None else at
         now = format_utc(moment)
         rows = conn.execute(
-            "SELECT i.id,i.uuid,i.subscription_id,i.valid_from,i.valid_until,s.currency "
+            "SELECT i.id,i.uuid,i.subscription_id,i.valid_from,i.ends_at,s.currency "
             "FROM agent_subscription_instances i "
             "JOIN agent_subscriptions s ON s.id=i.subscription_id "
-            "WHERE (s.lifecycle_state='active' OR "
-            "(s.lifecycle_state='deleted' AND s.valid_until>=?)) "
-            "AND (i.lifecycle_state='active' OR "
-            "(i.lifecycle_state='deleted' AND i.valid_until>=?)) "
+            "WHERE (s.ends_at IS NULL OR s.ends_at>=?) "
+            "AND (i.ends_at IS NULL OR i.ends_at>=?) "
             "AND i.valid_from<=?", (now, now, now),
         ).fetchall()
         return [BillingUnit(
@@ -147,14 +137,14 @@ class BillingUnitResolver:
             owner_kind="agent",
             charge_domain="agent_subscription",
             valid_from=_parse_iso_date(str(row["valid_from"])[:10]),
-            valid_until=_parsed_valid_until(row["valid_until"]),
+            ends_at=_parsed_ends_at(row["ends_at"]),
             currency=str(row["currency"]),
             subscription_id=int(row["subscription_id"]),
         ) for row in rows]
 
     @staticmethod
     def end_stamp(unit: BillingUnit) -> str | None:
-        return format_utc(unit.valid_until) if unit.valid_until else None
+        return format_utc(unit.ends_at) if unit.ends_at else None
 
 
 __all__ = ["BillingUnit", "BillingUnitResolver"]

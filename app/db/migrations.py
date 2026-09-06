@@ -95,7 +95,8 @@ def _infer_database_name(db_path: str, schema_dir: str) -> str:
 
 
 def _resolve_schema_dir(schema_dir: str, database_name: str,
-                        current: SchemaVersion | None) -> Path:
+                        current: SchemaVersion | None,
+                        requested: SchemaVersion | None = None) -> Path:
     supplied = Path(schema_dir).resolve()
     if not supplied.is_dir():
         # Compatibility for a path that disappeared while packaging.  A
@@ -122,15 +123,27 @@ def _resolve_schema_dir(schema_dir: str, database_name: str,
         raise MigrationError(
             f"no schema/{database_name}/vN directory below {supplied}")
     majors.sort(key=lambda item: item[0])
-    if current is None:
-        return majors[-1][1]
-    latest = majors[-1][0]
-    if current.major != latest:
+    if requested is not None:
+        selected_major = requested.major
+    elif current is None:
+        # V2 is a transformation of V1, not a standalone baseline.  A fresh
+        # database therefore starts at the newest pre-V2 major so the normal
+        # coordinator can immediately run the pair migration.  Keeping this
+        # baseline selection here also makes fixture creation deterministic;
+        # selecting v0 would bypass the published V1 schema entirely.
+        available_majors = [major for major, _ in majors]
+        selected_major = (
+            max(major for major in available_majors if major < max(available_majors))
+            if len(available_majors) > 1
+            else available_majors[0]
+        )
+    else:
+        selected_major = current.major
+    selected = dict(majors).get(selected_major)
+    if selected is None:
         raise MigrationError(
-            f"{database_name} schema is V{current.major}.{current.minor}, but this "
-            f"program uses V{latest}; run schema/transitions/"
-            f"{current.major}-to-{latest} before starting")
-    return majors[-1][1]
+            f"no schema/{database_name}/v{selected_major} directory below {supplied}")
+    return selected
 
 
 def _sql_steps(schema_dir: str | Path) -> list[MigrationStep]:
@@ -249,14 +262,19 @@ def _run_locked(db_path: str, schema_dir: str, database_name: str,
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA journal_mode=WAL")
         current = _database_version(conn, database_name)
-        selected = _resolve_schema_dir(schema_dir, database_name, current)
+        # The requested target selects the major explicitly for a shadow
+        # upgrade.  Ordinary startup remains on the database's current major
+        # until the coordinator has copied it to a V2 shadow.
+        selected = _resolve_schema_dir(
+            schema_dir, database_name, current, target)
         steps = _sql_steps(selected)
         target_major = steps[0].version.major
         if current is None and target_major >= 1:
             # Must be set before the runner creates metadata tables; changing
             # auto_vacuum after the first table would require a full VACUUM.
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        if current is not None and current.major != target_major:
+        if (current is not None and current.major != target_major and
+                not (target_major == current.major + 1)):
             raise MigrationError(
                 f"major schema mismatch: database V{current.major}.{current.minor}, "
                 f"files V{target_major}; use a transition tool")
@@ -275,7 +293,8 @@ def _run_locked(db_path: str, schema_dir: str, database_name: str,
             raise MigrationError(
                 f"database is already V{current.major}.{current.minor}, "
                 f"cannot move backwards to V{requested.major}.{requested.minor}")
-        if current is not None and current.minor > latest.minor:
+        if (current is not None and current.major == target_major and
+                current.minor > latest.minor):
             print(f"warning: {database_name} V{current.major}.{current.minor} "
                   f"is newer than known V{latest.major}.{latest.minor}; "
                   "continuing under same-major compatibility", file=sys.stderr)

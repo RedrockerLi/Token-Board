@@ -110,7 +110,7 @@ def _build_upload_copy(db_path: str, destination: Path) -> None:
             violation = conn.execute("PRAGMA foreign_key_check").fetchone()
             if violation is not None:
                 raise sqlite3.IntegrityError(
-                    f"V1 config upload FK violation: {tuple(violation)}")
+                    f"V2 config upload FK violation: {tuple(violation)}")
     finally:
         conn.close()
     conn = sqlite_runtime.connect(destination, "shadow_copy")
@@ -151,6 +151,9 @@ def _upload_current(db_path: str, config: SyncConfig,
         published = publish_config_artifact(config, str(config_path))
         try:
             _record_authority(db_path, config_path, published)
+            version = inspect_version(config_path, TOKEN_BOARD_DATABASE_NAME)
+            if version and version.major >= 2:
+                set_sync_state(db_path, "token_board_v2_manifest", "1")
         except Exception:
             # The remote PUT is already authoritative. Never restore the old
             # snapshot after a successful PUT; force a fresh pull instead.
@@ -207,10 +210,14 @@ def _pull_current(db_path: str, config: SyncConfig,
         remote_version = inspect_version(remote_path, TOKEN_BOARD_DATABASE_NAME)
         local_version = inspect_version(Path(db_path), TOKEN_BOARD_DATABASE_NAME)
         if (remote_version and local_version and
-                remote_version.major not in {0, local_version.major}):
+                remote_version.major > local_version.major):
             raise WebDAVError(
                 f"拒绝跨 Major 配置同步: remote=V{remote_version.major}.{remote_version.minor}, "
                 f"local=V{local_version.major}.{local_version.minor}")
+        if (remote_version and local_version and local_version.major >= 2 and
+                remote_version.major < 2 and
+                get_sync_state(db_path, "token_board_v2_manifest") == "1"):
+            raise WebDAVError("V2 节点拒绝 V2 manifest 发布后的 V1 配置产物")
         upgrade_result = upgrade_downloaded_artifact(
             str(remote_path), TOKEN_BOARD_DATABASE_NAME,
             schema_dir or schema_dir_for(db_path, TOKEN_BOARD_DATABASE_NAME),
@@ -225,10 +232,15 @@ def _pull_current(db_path: str, config: SyncConfig,
         if upgrade_result.upgraded:
             # Publish any upgraded artifact (V0 or same-major V1) as a new
             # immutable gzip artifact. The old remote file is never changed.
-            publish_path = tmp_dir / "token-board_config_v1.db"
+            publish_path = tmp_dir / (
+                "token-board_config_v2.db"
+                if upgraded_version and upgraded_version.major >= 2
+                else "token-board_config_v1.db")
             _build_upload_copy(db_path, publish_path)
             published = publish_config_artifact(config, str(publish_path))
             _record_authority(db_path, publish_path, published)
+            if upgraded_version and upgraded_version.major >= 2:
+                set_sync_state(db_path, "token_board_v2_manifest", "1")
         else:
             _record_authority(db_path, remote_path, remote_artifact)
             # Record raw remote identity, not upgraded shadow bytes.
@@ -236,6 +248,8 @@ def _pull_current(db_path: str, config: SyncConfig,
                 db_path, TOKEN_BOARD_DATABASE_NAME, raw_sha256,
                 remote_version.major if remote_version else None,
                 remote_version.minor if remote_version else None)
+            if remote_version and remote_version.major >= 2:
+                set_sync_state(db_path, "token_board_v2_manifest", "1")
         return {
             "status": "pulled",
             "message": "已拉取云端配置",

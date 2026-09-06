@@ -138,7 +138,6 @@ bool Database::load_routing_config(RoutingConfig &config) {
         "LEFT JOIN accounts a ON a.id=rs.account_id "
         "WHERE ck.enabled=1 AND rs.enabled=1 "
         "AND (rs.account_id IS NULL OR COALESCE(a.account_kind,'proxy')='proxy') "
-        "AND (ck.deleted_at IS NULL OR ck.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
         "ORDER BY ck.id";
     if (sqlite3_prepare_v2(read_db_, routes_sql.c_str(), -1, &stmt,
                            nullptr) != SQLITE_OK) {
@@ -178,12 +177,12 @@ bool Database::load_routing_config(RoutingConfig &config) {
         "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
         "JOIN accounts a ON a.id=u.account_id "
         "LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
-        "AND bc.valid_until IS NULL "
+        "AND bc.ends_at IS NULL "
         "LEFT JOIN upstream_credentials c ON c.upstream_id=u.id "
-        "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
-        "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+        "AND c.enabled=1 "
+        "AND (c.ends_at IS NULL OR c.ends_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
         "LEFT JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
-        "WHERE rr.enabled=1 AND u.enabled=1 AND a.lifecycle_state='active' "
+        "WHERE rr.enabled=1 AND u.enabled=1 "
         "AND a.account_kind='proxy' "
         "ORDER BY rr.route_set_id,rr.priority,rr.id,c.position,c.runtime_id";
     if (sqlite3_prepare_v2(read_db_, rules_sql.c_str(), -1, &stmt,

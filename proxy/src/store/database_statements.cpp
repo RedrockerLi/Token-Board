@@ -17,7 +17,7 @@ bool Database::prepare_statements() {
         PREPARE_ON(read_db_,
             "SELECT ck.id,ck.key_value,ck.route_set_id,COALESCE(ck.label,'') "
             "FROM client_keys ck WHERE ck.key_value=?1 AND ck.enabled=1 "
-            "AND (ck.deleted_at IS NULL OR ck.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            "",
             stmt_lookup_key_);
         PREPARE_ON(read_db_,
             "SELECT rs.id,rs.name,COALESCE(u.base_url,''),COALESCE(u.api_format,'openai'),"
@@ -40,7 +40,6 @@ bool Database::prepare_statements() {
             "LEFT JOIN accounts a ON a.id=rs.account_id "
             "WHERE ck.key_value=?1 AND ck.enabled=1 AND rs.enabled=1 "
             "AND (rs.account_id IS NULL OR COALESCE(a.account_kind,'proxy')='proxy') "
-            "AND (ck.deleted_at IS NULL OR ck.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
             "ORDER BY u.id LIMIT 1",
             stmt_lookup_route_);
         PREPARE_ON(read_db_,
@@ -48,8 +47,8 @@ bool Database::prepare_statements() {
             "JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
             "JOIN upstreams u ON u.id=c.upstream_id JOIN accounts a ON a.id=u.account_id "
             "WHERE u.account_id=?1 AND a.account_kind='proxy' "
-            "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
-            "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "AND c.enabled=1 "
+            "AND (c.ends_at IS NULL OR c.ends_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
             "ORDER BY c.position,c.runtime_id",
             stmt_get_upstream_keys_);
         PREPARE_ON(write_db_,
@@ -65,19 +64,19 @@ bool Database::prepare_statements() {
             "(SELECT id FROM client_keys WHERE id=?2),?12,"
             "(SELECT uuid FROM upstream_credentials WHERE runtime_id=?12),"
             "?3,?4,?5,?6,?7,?8,CASE WHEN EXISTS(SELECT 1 FROM billing_contracts "
-            "WHERE account_id=?1 AND charge_type='recurring' AND valid_until IS NULL) "
+            "WHERE account_id=?1 AND charge_type='recurring' AND ends_at IS NULL) "
             "THEN 0 ELSE ?8 END,?9,?10,?11,COALESCE(?13,0),COALESCE(?14,0),"
             "COALESCE(?15,0),COALESCE(?16,0),COALESCE(?17,0),?18,?19,"
             "strftime('%Y-%m-%dT%H:%M:%fZ',?20,'unixepoch'),?22,?23,'pending',?1,"
             "CASE WHEN EXISTS(SELECT 1 FROM billing_contracts WHERE account_id=?1 "
-            "AND charge_type='recurring' AND valid_until IS NULL) THEN COALESCE("
+            "AND charge_type='recurring' AND ends_at IS NULL) THEN COALESCE("
             "(SELECT uuid FROM upstream_credentials WHERE runtime_id=?12),"
             "(SELECT 'contract:' || uuid FROM billing_contracts WHERE account_id=?1 "
-            "AND charge_type='recurring' AND valid_until IS NULL ORDER BY id DESC LIMIT 1)) END,"
+            "AND charge_type='recurring' AND ends_at IS NULL ORDER BY id DESC LIMIT 1)) END,"
             "(SELECT uuid FROM billing_contracts WHERE account_id=?1 AND charge_type='recurring' "
-            "AND valid_until IS NULL ORDER BY id DESC LIMIT 1),"
+            "AND ends_at IS NULL ORDER BY id DESC LIMIT 1),"
             "(SELECT billing_anchor_day FROM billing_contracts WHERE account_id=?1 "
-            "AND charge_type='recurring' AND valid_until IS NULL ORDER BY id DESC LIMIT 1))",
+            "AND charge_type='recurring' AND ends_at IS NULL ORDER BY id DESC LIMIT 1))",
             stmt_insert_log_);
         PREPARE_ON(write_db_, "SELECT id FROM request_log WHERE event_id=?1",
                    stmt_find_log_event_);
@@ -110,8 +109,8 @@ bool Database::prepare_statements() {
             "FROM upstream_credentials c JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
             "JOIN upstreams u ON u.id=c.upstream_id JOIN accounts a ON a.id=u.account_id "
             "WHERE c.runtime_id=?1 AND a.account_kind='proxy' "
-            "AND (c.disabled_at IS NULL OR c.disabled_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
-            "AND (c.deleted_at IS NULL OR c.deleted_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "AND c.enabled=1 "
+            "AND (c.ends_at IS NULL OR c.ends_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
             "AND u.enabled=1",
             stmt_lookup_probe_target_);
         PREPARE_ON(write_db_,

@@ -169,9 +169,10 @@ class BillingFxLockTest(AppDatabaseTestCase):
             materialize_period_charges(str(self.proxy_path),
                                        datetime(2026, 7, 20, tzinfo=timezone.utc))
             with sqlite3.connect(self.proxy_path) as conn:
-                # A missing exact rate uses the nearest stored rate and is
-                # frozen permanently under the new policy.
-                row = _rates(conn, "2026-06-15T00:00:00Z")
+                # Runtime materializes only the period containing the
+                # recovery timestamp. A missing exact rate uses the nearest
+                # stored rate and is frozen permanently.
+                row = _rates(conn, "2026-07-15T00:00:00Z")
                 self.assertEqual(row[:3], (10.0, "USD", 65.0))
                 self.assertNotEqual(row[3], "2026-06-15")
                 self.assertIsNotNone(row[4])
@@ -182,7 +183,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             materialize_period_charges(str(self.proxy_path),
                                        datetime(2026, 7, 20, tzinfo=timezone.utc))
             with sqlite3.connect(self.proxy_path) as conn:
-                row = _rates(conn, "2026-06-15T00:00:00Z")
+                row = _rates(conn, "2026-07-15T00:00:00Z")
                 self.assertEqual(row[:3], (10.0, "USD", 65.0))
                 self.assertNotEqual(row[3], "2026-06-15")
                 self.assertIsNotNone(row[4])
@@ -245,10 +246,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
         materialize_period_charges(str(self.proxy_path),
                                    datetime(2026, 8, 20, tzinfo=timezone.utc))
         with sqlite3.connect(self.proxy_path) as conn:
-            closed = _rates(conn, "2026-07-15T00:00:00Z")
-            self.assertEqual(closed[:3], (20.0, "CNY", 20.0))
-            self.assertIsNone(closed[3])       # no fx_rate_date for CNY
-            self.assertIsNotNone(closed[4])    # finalized at period end
+            self.assertIsNone(_rates(conn, "2026-07-15T00:00:00Z"))
             current = _rates(conn, "2026-08-15T00:00:00Z")
             self.assertEqual(current[:3], (20.0, "CNY", 20.0))
             self.assertIsNotNone(current[4])   # current period freezes at start
@@ -280,7 +278,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             self.assertTrue(requested)  # 1999-01-15 period did try
             self.assertTrue(all(d >= "1999-01-01" for d in requested))
             with sqlite3.connect(self.proxy_path) as conn:
-                row = _rates(conn, "1998-12-15T00:00:00Z")
+                row = _rates(conn, "1999-02-15T00:00:00Z")
                 self.assertIsNotNone(row[4])
                 self.assertNotEqual(row[3], "1998-12-15")
 

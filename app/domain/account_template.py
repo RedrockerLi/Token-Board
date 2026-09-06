@@ -2,13 +2,13 @@
 
 ``account_type`` and ``is_aggregate`` are UI/template compatibility values,
 not storage-table identities.  This adapter is the single place that derives
-them from the normalized V1 records the application actually stores, so the
+them from the normalized V2 records the application actually stores, so the
 three upstream shapes (api / plan / aggregate) are produced from one routine
 instead of being re-derived inside SQL projections in several callers.
 
 The behavioral spec of each type stays in :data:`account_types.ACCOUNT_TYPES`;
 this adapter maps normalized rows onto that spec and onto the ``is_aggregate``
-flag.  It never probes V0 table layouts — it only reads the normalized V1
+flag.  It never probes V0/V1 table layouts — it only reads the normalized V2
 rows that ``accounts_read``/``lifecycle`` already query.
 """
 
@@ -39,7 +39,7 @@ class AccountTemplate:
     valid_from: str = ""
     max_concurrency: int = 0
     created_at: str = ""
-    deleted_at: str | None = None
+    ends_at: str | None = None
     key_count: int = 0
     keys: list[dict] = field(default_factory=list)
     cloud_keys: list[dict] = field(default_factory=list)
@@ -59,7 +59,7 @@ class AccountTemplate:
             "valid_from": self.valid_from,
             "max_concurrency": self.max_concurrency,
             "created_at": self.created_at,
-            "deleted_at": self.deleted_at,
+            "ends_at": self.ends_at,
             "key_count": self.key_count,
             "keys": self.keys,
             "cloud_keys": self.cloud_keys,
@@ -96,7 +96,7 @@ class AccountTemplateAdapter:
             valid_from=row.get("valid_from") or "",
             max_concurrency=int(row.get("max_concurrency") or 0),
             created_at=row.get("created_at"),
-            deleted_at=row.get("deleted_at"),
+            ends_at=row.get("ends_at"),
             key_count=int(row.get("key_count") or 0),
         )
 
@@ -108,6 +108,6 @@ class AccountTemplateAdapter:
             is_aggregate=True,
             account_type="aggregate",
             created_at=row.get("created_at"),
-            deleted_at=row.get("deleted_at"),
+            ends_at=row.get("ends_at"),
             keys=entries,
         )

@@ -2,11 +2,12 @@
 
 namespace {
 
-// Keep this reviewed with the newest proxy V1 SQL file.  The C++ runtime
+// Keep this reviewed with the newest proxy V2 SQL file.  The C++ runtime
 // serves one exact schema contract; Python owns all SQL migrations.
-constexpr int kRequiredRuntimeSchemaMinor = 21;
+constexpr int kRequiredRuntimeSchemaMajor = 2;
+constexpr int kRequiredRuntimeSchemaMinor = 0;
 
-bool validate_v1_schema(sqlite3 *db, const std::string &path,
+bool validate_v2_schema(sqlite3 *db, const std::string &path,
                         int &major, int &minor) {
     sqlite3_stmt *version = nullptr;
     if (sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &version, nullptr) !=
@@ -43,10 +44,12 @@ bool validate_v1_schema(sqlite3 *db, const std::string &path,
                      path.c_str());
         return false;
     }
-    if (major != 1 || minor != kRequiredRuntimeSchemaMinor) {
+    if (major != kRequiredRuntimeSchemaMajor ||
+        minor != kRequiredRuntimeSchemaMinor) {
         TB_LOG_ERROR("[DB] %s is V%d.%d; run the matching Python "
-                     "schema-upgrade boundary to V1.%d before starting C++\n",
+                     "schema-upgrade boundary to V%d.%d before starting C++\n",
                      path.c_str(), major, minor,
+                     kRequiredRuntimeSchemaMajor,
                      kRequiredRuntimeSchemaMinor);
         return false;
     }
@@ -79,7 +82,7 @@ bool Database::open(const std::string &path, const std::string &schema_dir) {
     sqlite3_exec(write_db_, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr);
     sqlite3_exec(write_db_, "PRAGMA busy_timeout=5000", nullptr, nullptr, nullptr);
 
-    if (!validate_v1_schema(write_db_, path, schema_major_, schema_minor_)) {
+    if (!validate_v2_schema(write_db_, path, schema_major_, schema_minor_)) {
         TB_LOG_ERROR("[DB] schema validation failed; Python must upgrade it first\n");
         sqlite3_close(write_db_);
         write_db_ = nullptr;
@@ -173,5 +176,5 @@ void Database::close() {
 // ── Schema validation ────────────────────────────────────────────────────
 //
 // Python app.db.schema_upgrade owns SQL migrations and data transitions.
-// The C++ runtime only validates the prepared Proxy V1 metadata before it
+// The C++ runtime only validates the prepared Proxy V2 metadata before it
 // starts serving requests; schema_dir is intentionally not consulted here.

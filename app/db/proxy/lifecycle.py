@@ -1,187 +1,126 @@
-"""ProxyDatabase methods for ProxyLifecycleMixin."""
+"""The single live-resource lifecycle module for Token-Board V2."""
 
 from app.core.time import parse_runtime_timestamp, utc_now
-from app.db.proxy.common import (
-    _billing_period_month, _cancellation_end, _next_month,
-    _parse_iso_date, _period_start, sqlite3, timedelta, uuid,
-)
+from app.db.proxy.common import _cancellation_end, _parse_iso_date, sqlite3, uuid
 
 
 class ProxyLifecycleMixin:
     def delete_account(self, account_id: int, mode: str = "detach") -> dict:
-        """Terminate a proxy account after its current charge is frozen.
-
-        Recurring accounts are rejected until the period-start billing worker
-        has written their immutable charge rows.  Deletion only consumes those
-        rows: it never invokes the materializer.  Immediate deletion removes
-        the live routing/credential/contract graph in this transaction while
-        preserving ``account_identities``, request history and frozen ledgers.
-        End-of-period deletion keeps the live graph until the configured
-        boundary, when :meth:`finalize_deferred_deletions` performs the same
-        purge.  ``mode`` remains an API compatibility parameter; hard deletion
-        removes account-owned route sets and their keys in either mode.
-        """
+        """Delete or schedule one proxy graph, without a tombstone."""
+        del mode
         conn = self._connect()
         try:
             route = self._v1_route_account(conn, account_id)
             real_id = (route["account_id"] if route and route["account_id"] is not None
                        else account_id)
             account = conn.execute(
-                "SELECT a.created_at,a.valid_from,bc.charge_type "
-                "FROM accounts a LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
-                "AND bc.valid_until IS NULL WHERE a.id=? AND a.account_kind='proxy' "
-                "AND a.lifecycle_state='active'",
-                (real_id,),
+                "SELECT a.created_at,a.valid_from,bc.id contract_id,bc.charge_type,"
+                "bc.ends_at FROM accounts a LEFT JOIN billing_contracts bc "
+                "ON bc.account_id=a.id "
+                "WHERE a.id=? AND a.account_kind='proxy' "
+                "ORDER BY CASE WHEN bc.ends_at IS NULL THEN 0 ELSE 1 END,bc.id DESC "
+                "LIMIT 1", (real_id,),
             ).fetchone()
             if account is None:
                 return {"ok": False, "error": "Account not found"}
             now = utc_now()
+            now_text = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if (account["ends_at"] is not None and
+                    account["ends_at"] > now_text):
+                conn.rollback()
+                return {"ok": False, "status": 409,
+                        "error": "账户已进入结束流程，请先撤销结束"}
             if account["charge_type"] == "recurring":
-                from app.db.proxy.billing import proxy_billing_ready
-                # Deletion is deliberately not a billing trigger.  The
-                # period-start worker (or resource creation at today's
-                # boundary) must have written the immutable charge first.
-                if not proxy_billing_ready(conn, real_id, now):
-                    return {"ok": False,
-                            "error": "当前计费周期尚未固化，请等待账单周期任务完成后重试"}
-            anchor = (_parse_iso_date(account["valid_from"])
-                      or parse_runtime_timestamp(account["created_at"]).date())
-            # The settings page and the delete confirmation both describe the
-            # current global default. Read that same setting in this transaction
-            # instead of relying on a client-side preview.
+                from app.db.proxy.billing import (
+                    materialize_period_charges_conn, proxy_billing_ready,
+                )
+                materialize_period_charges_conn(conn, now, current_only=True)
+                pending = (not proxy_billing_ready(conn, real_id, now) or
+                           conn.execute(
+                               "SELECT 1 FROM billing_period_charges c "
+                               "JOIN billing_contracts bc ON bc.id=c.contract_id "
+                               "WHERE bc.account_id=? AND c.period_start=("
+                               "SELECT max(c2.period_start) FROM billing_period_charges c2 "
+                               "WHERE c2.contract_id=c.contract_id AND c2.period_start<=?) "
+                               "AND c.finalized_at IS NULL LIMIT 1",
+                               (real_id, now_text),
+                           ).fetchone() is not None)
+                if pending:
+                    conn.rollback()
+                    return {"ok": False, "status": 409,
+                            "error": "当前计费周期汇率未能固化，删除已取消"}
+
             config = self._billing_config_conn(conn)
             deferred = (account["charge_type"] == "recurring" and
                         config["cancellation_mode"] == "end_of_period")
-            effective = (_period_start(
-                _next_month(_billing_period_month(now, anchor.day)), anchor.day)
-                         - timedelta(seconds=1)) if deferred else now
-            timestamp = effective.strftime("%Y-%m-%dT%H:%M:%SZ")
-            conn.execute("UPDATE accounts SET deleted_at=? WHERE id=?", (timestamp, real_id))
-            upstream_ids = [row[0] for row in conn.execute(
-                "SELECT id FROM upstreams WHERE account_id=?", (real_id,))]
-            if upstream_ids:
-                placeholders = ",".join("?" for _ in upstream_ids)
-                if deferred:
-                    # A plan's keys are independent subscription units.  Do
-                    # not anchor the whole upstream to the account/upstream
-                    # creation date: calculate each key's current period from
-                    # its own valid_from (or created_at), then keep the
-                    # account alive until the latest key expires.
-                    credential_rows = conn.execute(
-                        f"SELECT uuid,valid_from,created_at,deleted_at "
-                        f"FROM upstream_credentials WHERE upstream_id IN ({placeholders}) "
-                        "AND (disabled_at IS NULL OR disabled_at>?) "
-                        "AND (deleted_at IS NULL OR deleted_at>?)",
-                        (*upstream_ids, now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         now.strftime("%Y-%m-%dT%H:%M:%SZ")),
-                    ).fetchall()
-                    key_expiries = []
-                    for credential in credential_rows:
-                        existing_end = parse_runtime_timestamp(credential["deleted_at"])
-                        if existing_end is not None and existing_end > now:
-                            end = existing_end
-                        else:
-                            key_anchor = (
-                                _parse_iso_date(credential["valid_from"])
-                                or parse_runtime_timestamp(credential["created_at"]).date()
-                            )
-                            end = _cancellation_end(
-                                config, now, key_anchor.day, "plan")
-                            conn.execute(
-                                "UPDATE upstream_credentials SET deleted_at=? "
-                                "WHERE uuid=? AND deleted_at IS NULL",
-                                (end.strftime("%Y-%m-%dT%H:%M:%SZ"), credential["uuid"]),
-                            )
-                        key_expiries.append(end)
-                    if key_expiries:
-                        effective = max(key_expiries)
-                        timestamp = effective.strftime("%Y-%m-%dT%H:%M:%SZ")
-            else:
-                conn.execute(
-                    f"UPDATE upstream_credentials SET deleted_at=? WHERE upstream_id IN ({placeholders}) "
-                    "AND deleted_at IS NULL", (timestamp, *upstream_ids))
-            # The account boundary is derived from the final per-key expiry
-            # above, not necessarily from the account creation anchor.
-            conn.execute("UPDATE accounts SET deleted_at=? WHERE id=?",
-                         (timestamp, real_id))
             if not deferred:
-                from app.db.proxy.deletion import purge_expired_secrets, purge_route_sets
-
-                route_set_ids = [row[0] for row in conn.execute(
-                    "SELECT id FROM route_sets WHERE account_id=?", (real_id,)
-                ).fetchall()]
-                purge_route_sets(conn, route_set_ids)
-                conn.execute(
-                    "DELETE FROM upstream_model_catalog WHERE upstream_id IN "
-                    "(SELECT id FROM upstreams WHERE account_id=?)", (real_id,))
-                purge_expired_secrets(conn, timestamp)
-                conn.execute("UPDATE accounts SET lifecycle_state='deleted' WHERE id=?", (real_id,))
-                conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
-                if upstream_ids:
-                    placeholders = ",".join("?" for _ in upstream_ids)
-                    conn.execute(
-                        f"UPDATE route_rules SET enabled=0 WHERE upstream_id IN ({placeholders})",
-                        upstream_ids)
                 from app.db.proxy.deletion import purge_proxy_account
                 purge_proxy_account(conn, real_id)
-            conn.commit()
-            return {"ok": conn.total_changes > 0, "error": "",
-                    "cancellation_mode": ("end_of_period" if deferred
-                                           else "immediate"),
-                    "cancelled_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "effective_deleted_at": timestamp, "deferred": deferred}
-        finally:
-            conn.close()
-
-    def cancel_account_deletion(self, account_id: int) -> dict:
-        """Cancel an account deletion that has not reached its effective time.
-
-        End-of-period cancellation deliberately leaves the account and its
-        routing graph live, recording only future ``deleted_at`` timestamps.
-        Reversing that operation therefore clears the account marker and the
-        future credential markers in one transaction.  An account whose
-        deadline has passed is not recoverable here: the finalizer may already
-        have disabled its routing graph, and treating that state as pending
-        would make the result depend on a race with the background sweep.
-        """
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            now = utc_now()
-            now_text = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-            route = self._v1_route_account(conn, account_id)
-            real_id = (route["account_id"] if route and route["account_id"] is not None
-                       else account_id)
-            account = conn.execute(
-                "SELECT id,deleted_at FROM accounts "
-                "WHERE id=? AND account_kind='proxy' AND lifecycle_state='active' "
-                "AND deleted_at IS NOT NULL AND deleted_at>?",
-                (real_id, now_text),
-            ).fetchone()
-            if account is None:
-                conn.rollback()
-                return {
-                    "ok": False,
-                    "error": "Account deletion is not pending or has expired",
-                }
-
-            restored = conn.execute(
-                "UPDATE upstream_credentials SET deleted_at=NULL "
-                "WHERE upstream_id IN (SELECT id FROM upstreams WHERE account_id=?) "
-                "AND deleted_at IS NOT NULL AND deleted_at>?",
-                (real_id, now_text),
-            )
-            conn.execute(
-                "UPDATE accounts SET deleted_at=NULL,updated_at=? WHERE id=?",
-                (now_text, real_id),
-            )
+                effective = None
+            else:
+                rows = conn.execute(
+                    "SELECT c.uuid,c.valid_from,c.created_at,c.ends_at "
+                    "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
+                    "WHERE u.account_id=? AND (c.ends_at IS NULL OR c.ends_at>?)",
+                    (real_id, now_text),
+                ).fetchall()
+                expiries = []
+                for row in rows:
+                    end = parse_runtime_timestamp(row["ends_at"])
+                    if end is None or end <= now:
+                        anchor = (_parse_iso_date(row["valid_from"]) or
+                                  parse_runtime_timestamp(row["created_at"]).date())
+                        end = _cancellation_end(config, now, anchor.day, "plan")
+                        conn.execute("UPDATE upstream_credentials SET ends_at=? WHERE uuid=?",
+                                     (end.strftime("%Y-%m-%dT%H:%M:%SZ"), row["uuid"]))
+                    expiries.append(end)
+                effective_dt = max(expiries, default=now)
+                effective = effective_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                conn.execute("UPDATE billing_contracts SET ends_at=? WHERE id=?",
+                             (effective, account["contract_id"]))
             conn.commit()
             return {
                 "ok": True,
                 "error": "",
+                "cancellation_mode": "end_of_period" if deferred else "immediate",
                 "cancelled_at": now_text,
-                "restored_credentials": restored.rowcount,
+                "effective_ends_at": effective,
+                "deferred": deferred,
             }
+        finally:
+            conn.close()
+
+    def cancel_account_deletion(self, account_id: int) -> dict:
+        """Clear only future ends_at values; deleted rows are never restored."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now_text = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            route = self._v1_route_account(conn, account_id)
+            real_id = (route["account_id"] if route and route["account_id"] is not None
+                       else account_id)
+            exists = conn.execute(
+                "SELECT 1 FROM accounts a WHERE a.id=? AND a.account_kind='proxy' "
+                "AND EXISTS (SELECT 1 FROM billing_contracts bc "
+                "WHERE bc.account_id=a.id AND bc.ends_at>?)",
+                (real_id, now_text),
+            ).fetchone()
+            if exists is None:
+                conn.rollback()
+                return {"ok": False,
+                        "error": "Account deletion is not pending or has expired"}
+            restored = conn.execute(
+                "UPDATE upstream_credentials SET ends_at=NULL "
+                "WHERE upstream_id IN (SELECT id FROM upstreams WHERE account_id=?) "
+                "AND ends_at>?", (real_id, now_text),
+            )
+            conn.execute("UPDATE billing_contracts SET ends_at=NULL WHERE account_id=?",
+                         (real_id,))
+            conn.execute("UPDATE accounts SET updated_at=? WHERE id=?",
+                         (now_text, real_id))
+            conn.commit()
+            return {"ok": True, "error": "", "cancelled_at": now_text,
+                    "restored_credentials": restored.rowcount}
         except BaseException:
             conn.rollback()
             raise
@@ -189,87 +128,53 @@ class ProxyLifecycleMixin:
             conn.close()
 
     def finalize_deferred_deletions(self) -> int:
-        """Physically purge deferred accounts after their effective boundary.
-
-        Idempotent and safe to call on every maintenance sweep.  Historical
-        identities, request rows and frozen financial facts remain available
-        for reporting/export.
-        """
+        """Physically delete ended Plan units and empty parent graphs."""
         conn = self._connect()
         try:
             now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
-            from app.db.proxy.deletion import purge_expired_secrets
-
-            purge_expired_secrets(conn, now)
+            from app.db.proxy.deletion import purge_credential, purge_proxy_account
+            expired = conn.execute(
+                "SELECT c.uuid FROM upstream_credentials c "
+                "WHERE c.ends_at IS NOT NULL AND c.ends_at<=?", (now,),
+            ).fetchall()
+            for row in expired:
+                purge_credential(conn, row["uuid"])
             pending = conn.execute(
-                "SELECT id FROM accounts WHERE lifecycle_state='active' "
-                "AND account_kind='proxy' AND deleted_at IS NOT NULL AND deleted_at<=?",
-                (now,)
+                "SELECT a.id FROM accounts a JOIN billing_contracts bc "
+                "ON bc.account_id=a.id WHERE a.account_kind='proxy' "
+                "AND bc.ends_at IS NOT NULL AND bc.ends_at<=? "
+                "AND NOT EXISTS (SELECT 1 FROM upstream_credentials c "
+                "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=a.id)",
+                (now,),
             ).fetchall()
             for row in pending:
-                real_id = row["id"]
-                conn.execute("UPDATE accounts SET lifecycle_state='deleted' WHERE id=?",
-                             (real_id,))
-                from app.db.proxy.deletion import purge_route_sets
+                purge_proxy_account(conn, int(row["id"]))
 
-                route_set_ids = [item[0] for item in conn.execute(
-                    "SELECT id FROM route_sets WHERE account_id=?", (real_id,)
-                ).fetchall()]
-                purge_route_sets(conn, route_set_ids)
-                conn.execute(
-                    "DELETE FROM upstream_model_catalog WHERE upstream_id IN "
-                    "(SELECT id FROM upstreams WHERE account_id=?)", (real_id,))
-                conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
-                conn.execute(
-                    "UPDATE route_rules SET enabled=0 WHERE upstream_id IN "
-                    "(SELECT id FROM upstreams WHERE account_id=?)", (real_id,))
-                from app.db.proxy.deletion import purge_proxy_account
-                purge_proxy_account(conn, real_id)
-            # Agent bindings and subscription pricing are live configuration.
-            # Frozen charges/allocations refer to stable identity values and
-            # no longer own these rows, so the entire expired live graph can
-            # be purged without touching historical financial facts.
-            conn.execute(
-                "DELETE FROM agent_subscription_bindings "
-                "WHERE valid_until IS NOT NULL AND valid_until<=?", (now,)
-            )
+            conn.execute("DELETE FROM agent_subscription_bindings "
+                         "WHERE ends_at IS NOT NULL AND ends_at<=?", (now,))
             from app.db.proxy.deletion import (
-                purge_agent_subscription,
-                purge_agent_subscription_instance,
+                purge_agent_subscription, purge_agent_subscription_instance,
             )
-            expired_instances = conn.execute(
+            instances = conn.execute(
                 "SELECT id FROM agent_subscription_instances "
-                "WHERE valid_until IS NOT NULL AND valid_until<=?", (now,)
+                "WHERE ends_at IS NOT NULL AND ends_at<=?", (now,),
             ).fetchall()
-            for row in expired_instances:
+            for row in instances:
                 purge_agent_subscription_instance(conn, int(row["id"]))
-            expired_subscriptions = conn.execute(
+            subscriptions = conn.execute(
                 "SELECT s.id FROM agent_subscriptions s "
-                "WHERE s.valid_until IS NOT NULL AND s.valid_until<=? "
+                "WHERE s.ends_at IS NOT NULL AND s.ends_at<=? "
                 "AND NOT EXISTS (SELECT 1 FROM agent_subscription_instances i "
-                "WHERE i.subscription_id=s.id)", (now,)
+                "WHERE i.subscription_id=s.id)", (now,),
             ).fetchall()
-            for row in expired_subscriptions:
+            for row in subscriptions:
                 purge_agent_subscription(conn, int(row["id"]))
-            # Software parser configuration has no financial FK of its own;
-            # request_log.agent_software_id is intentionally a historical
-            # scalar.  Keep the shared account identity, but remove the live
-            # parser/runtime rows after the software is deleted.
-            conn.execute(
-                "DELETE FROM agent_software_runtime WHERE software_id IN ("
-                "SELECT id FROM accounts WHERE account_kind='agent' "
-                "AND lifecycle_state='deleted')")
-            conn.execute(
-                "DELETE FROM agent_software WHERE id IN ("
-                "SELECT id FROM accounts WHERE account_kind='agent' "
-                "AND lifecycle_state='deleted')")
             conn.commit()
-            return len(pending)
+            return len(expired) + len(instances) + len(subscriptions)
         finally:
             conn.close()
 
     def update_account_models(self, account_id: int, models: list[str]) -> int:
-        """Replace all models for an account. Returns count of models stored."""
         conn = self._connect()
         try:
             route = self._v1_route_account(conn, account_id)
@@ -292,67 +197,57 @@ class ProxyLifecycleMixin:
             route = self._v1_route_account(conn, account_id)
             if route is None or route["upstream_id"] is None:
                 return []
-            rows = conn.execute(
-                "SELECT model_id FROM upstream_model_catalog WHERE upstream_id=? ORDER BY model_id",
-                (route["upstream_id"],),
-            ).fetchall()
-            return [row[0] for row in rows]
+            return [row[0] for row in conn.execute(
+                "SELECT model_id FROM upstream_model_catalog "
+                "WHERE upstream_id=? ORDER BY model_id", (route["upstream_id"],)
+            ).fetchall()]
         finally:
             conn.close()
 
     def get_plain_keys(self, account_id: int) -> list[str]:
-        """Plaintext upstream keys of an account (server-side only — never
-        sent to the client; used by the concurrency-test route to hit the
-        upstream directly)."""
         conn = self._connect()
         try:
             route = self._v1_route_account(conn, account_id)
             if route is None or route["upstream_id"] is None:
                 return []
             rows = conn.execute(
-                "SELECT s.secret_value FROM upstream_credentials c JOIN upstream_secrets s "
-                "ON s.credential_uuid=c.uuid WHERE c.upstream_id=? "
-                "AND c.disabled_at IS NULL "
-                "AND (c.deleted_at IS NULL OR c.deleted_at>"
-                "strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
-                "ORDER BY c.position,c.runtime_id", (route["upstream_id"],)
+                "SELECT s.secret_value FROM upstream_credentials c "
+                "JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+                "WHERE c.upstream_id=? AND c.enabled=1 "
+                "AND (c.ends_at IS NULL OR c.ends_at>strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
+                "ORDER BY c.position,c.runtime_id", (route["upstream_id"],),
             ).fetchall()
             return [row[0] for row in rows if row[0]]
         finally:
             conn.close()
 
     def get_aggregates(self) -> list[dict]:
-        """Aggregate accounts (is_aggregate=1) with their model entries."""
         conn = self._connect()
         try:
-            rows = conn.execute(
-                "SELECT id,name,created_at FROM route_sets WHERE account_id IS NULL "
-                "AND enabled=1 ORDER BY id"
-            ).fetchall()
             result = []
-            for row in rows:
+            for row in conn.execute(
+                "SELECT id,name,created_at FROM route_sets "
+                "WHERE account_id IS NULL AND enabled=1 ORDER BY id"
+            ):
                 entries = conn.execute(
                     "SELECT rr.id,rr.model_pattern pattern,u.account_id upstream_account_id,"
                     "a.name upstream_account_name,COALESCE(rr.target_model,rr.model_pattern) upstream_model "
                     "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
                     "JOIN accounts a ON a.id=u.account_id AND a.account_kind='proxy' "
-                    "WHERE rr.route_set_id=? AND rr.enabled=1 "
-                    "ORDER BY rr.priority,rr.id", (row["id"],)
+                    "WHERE rr.route_set_id=? AND rr.enabled=1 ORDER BY rr.priority,rr.id",
+                    (row["id"],),
                 ).fetchall()
-                result.append({**dict(row), "entries": [dict(entry) for entry in entries]})
+                result.append({**dict(row), "entries": [dict(item) for item in entries]})
             return result
         finally:
             conn.close()
 
     def create_aggregate(self, data: dict) -> int:
-        """Create an aggregate account (is_aggregate=1) + its model entries."""
         conn = self._connect()
         try:
             aggregate_id = self._next_shared_id(conn)
-            conn.execute(
-                "INSERT INTO route_sets(id,uuid,name,account_id) VALUES(?,?,?,NULL)",
-                (aggregate_id, str(uuid.uuid4()), data["name"]),
-            )
+            conn.execute("INSERT INTO route_sets(id,uuid,name,account_id) VALUES(?,?,?,NULL)",
+                         (aggregate_id, str(uuid.uuid4()), data["name"]))
             self._replace_v1_aggregate_rules(conn, aggregate_id, data.get("entries", []))
             conn.commit()
             return aggregate_id
@@ -363,11 +258,9 @@ class ProxyLifecycleMixin:
         conn = self._connect()
         try:
             if "name" in data:
-                conn.execute(
-                    "UPDATE route_sets SET name=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                    "WHERE id=? AND account_id IS NULL",
-                    (data["name"], agg_id),
-                )
+                conn.execute("UPDATE route_sets SET name=?,updated_at=? "
+                             "WHERE id=? AND account_id IS NULL",
+                             (data["name"], utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"), agg_id))
             if "entries" in data:
                 self._replace_v1_aggregate_rules(conn, agg_id, data["entries"])
             conn.commit()
@@ -376,14 +269,13 @@ class ProxyLifecycleMixin:
             conn.close()
 
     def delete_aggregate(self, agg_id: int) -> bool:
-        """Physically delete an aggregate and its attached local keys."""
         from app.db.proxy.deletion import purge_route_sets
-
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT id FROM route_sets WHERE id=? AND account_id IS NULL "
-                "AND enabled=1", (agg_id,)).fetchone()
+                "SELECT id FROM route_sets WHERE id=? AND account_id IS NULL AND enabled=1",
+                (agg_id,),
+            ).fetchone()
             if row is None:
                 return False
             deleted = purge_route_sets(conn, [agg_id])

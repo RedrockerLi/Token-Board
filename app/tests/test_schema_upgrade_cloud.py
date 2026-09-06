@@ -34,14 +34,14 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
         remote = self.root / "downloaded-artifact.db"
         shutil.copy2(source, remote)
         result = upgrade_shadow(str(remote), "token-board", self.root / "schema")
-        self.assertEqual(result.current.major, 1)
+        self.assertEqual(result.current.major, 2)
         self.assertEqual(sqlite3.connect(source).execute(
             "PRAGMA user_version").fetchone()[0], 19)
         with sqlite3.connect(remote) as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
                              max(int(path.name.split("_", 1)[0].split("-")[0]) * 10000
                                  + int(path.name.split("_", 1)[0].split("-")[1])
-                                 for path in (self.root / "schema/token-board/v1").glob("*.sql")))
+                                 for path in (self.root / "schema/token-board/v2").glob("*.sql")))
             self.assertEqual(conn.execute(
                 "SELECT name FROM accounts WHERE name='cloud-old'").fetchone()[0],
                              "cloud-old")

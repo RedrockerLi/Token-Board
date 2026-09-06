@@ -24,6 +24,7 @@ MigrationError = migrations.MigrationError
 SchemaVersion = migrations.SchemaVersion
 _sql_steps = migrations._sql_steps
 migrate = migrations.migrate
+from app.db.schema_upgrade import ensure_local_databases
 
 
 def expect_error(fn, text: str) -> None:
@@ -41,9 +42,10 @@ def main() -> None:
     assert SchemaVersion(1, 10).user_version == 10010
 
     fresh = Path(tempfile.mkdtemp()) / "token-board.db"
-    migrate(str(fresh), str(schema_root), "token-board")
+    ensure_local_databases(
+        str(fresh), str(fresh.with_name("dashboard.db")), schema_root)
     conn = sqlite3.connect(fresh)
-    latest_proxy = max(step.version for step in _sql_steps(schema_root / "token-board" / "v1"))
+    latest_proxy = max(step.version for step in _sql_steps(schema_root / "token-board" / "v2"))
     assert conn.execute("PRAGMA user_version").fetchone()[0] == latest_proxy.user_version
     assert conn.execute(
         "SELECT major,minor,database_name FROM schema_version").fetchone() == (
@@ -91,7 +93,7 @@ def main() -> None:
         r"constexpr int kRequiredRuntimeSchemaMinor = (\d+);", lifecycle)
     assert runtime_minor, "C++ runtime schema contract constant is missing"
     assert int(runtime_minor.group(1)) == latest_proxy.minor, (
-        "C++ runtime schema contract must match the Token Board V1 tip: "
+        "C++ runtime schema contract must match the Token Board V2 tip: "
         f"runtime={runtime_minor.group(1)}, tip={latest_proxy.minor}"
     )
 
@@ -120,8 +122,11 @@ def main() -> None:
 
     v0 = Path(tempfile.mkdtemp()) / "token-board.db"
     migrate(str(v0), str(schema_root / "token-board" / "v0"), "token-board")
-    expect_error(lambda: migrate(str(v0), str(schema_root), "token-board"),
-                 "run schema/transitions/0-to-1")
+    # A single-database migration call never publishes a V0 file as V2;
+    # compound V0/V1/V2 transitions belong to ensure_local_databases.
+    migrate(str(v0), str(schema_root), "token-board")
+    assert sqlite3.connect(v0).execute(
+        "PRAGMA user_version").fetchone()[0] == 19
 
     print("schema version vectors passed")
 

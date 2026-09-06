@@ -1,4 +1,4 @@
-"""Recurring-charge ledger materialization for the normalized V1 schema.
+"""Recurring-charge ledger materialization for the normalized V2 schema.
 
 Subscription fees in a foreign currency (USD) are converted to CNY at the
 rate on the billing period's start date (period_start), locked once
@@ -22,7 +22,9 @@ from app.core.time import (
     parse_runtime_timestamp, utc_now,
 )
 from app.db.proxy.common import _parse_iso_date
-from app.db.proxy.billing_export import ensure_billing_export_events_conn
+from app.db.proxy.billing_export import (
+    append_billing_export_events_for_finalized_at,
+)
 from app.services import fx
 from app.services.billing_units import BillingUnitResolver
 
@@ -133,7 +135,7 @@ def _rate_from_table(conn: sqlite3.Connection, table: str, owner_column: str,
 
 def _materialize_period_stream(
         conn: sqlite3.Connection, *, owner_id: int, anchor: date,
-        currency: str, valid_until: str | None, moment: datetime, now: str,
+        currency: str, ends_at: str | None, moment: datetime, now: str,
         rate_table: str, rate_owner_column: str, charge_table: str,
         charge_owner_column: str, credential_uuid: str | None,
         attempted: set[tuple[str, str]],
@@ -141,8 +143,8 @@ def _materialize_period_stream(
         current_only: bool = False) -> int:
     """Materialize one recurring stream using the shared Plan algorithm."""
     ended = None
-    if valid_until:
-        ended = parse_runtime_timestamp(valid_until)
+    if ends_at:
+        ended = parse_runtime_timestamp(ends_at)
         if ended is None:
             raise ValueError("billing timestamp cannot be empty")
         ended = ended.replace(microsecond=0)
@@ -243,38 +245,52 @@ def _materialize_period_stream(
         start_dt, end_dt = _next_period(start_dt, anchor_day)
     return changed
 
-
 def _finalize_period_stream(conn: sqlite3.Connection, table: str,
-                            now: str) -> int:
+                            now: str, period_starts: set[str]) -> int:
+    """Freeze only current periods touched by this materialization.
+
+    A normal worker must not turn an old, previously missed row into a new
+    financial/export fact.  Historical repair is intentionally outside the
+    runtime path, so finalization is bounded by the current period starts
+    resolved from the live billing units.
+    """
+    if not period_starts:
+        return 0
+    marks = ",".join("?" for _ in period_starts)
     finalized = conn.execute(
         f"UPDATE {table} SET finalized_at=? WHERE finalized_at IS NULL "
         "AND normalized_recurring_cost IS NOT NULL "
-        "AND (currency='CNY' OR fx_rate_date IS NOT NULL)", (now,)
+        "AND (currency='CNY' OR fx_rate_date IS NOT NULL) "
+        f"AND period_start IN ({marks})",
+        (now, *sorted(period_starts)),
     )
     return max(finalized.rowcount, 0)
 
 
 def materialize_period_charges_conn(conn: sqlite3.Connection,
                                     at: datetime | None = None,
-                                    *, current_only: bool = False) -> int:
+                                    *, current_only: bool = True) -> int:
     """Materialize proxy charges on a caller-owned transaction."""
     moment = as_utc(at or utc_now()).replace(microsecond=0)
     now = format_utc(moment)
     changed = 0
     attempted: set[tuple[str, str]] = set()
+    period_starts: set[str] = set()
     for unit in BillingUnitResolver.proxy_units(conn, at=moment):
+        period_starts.add(_current_period_start(moment, unit.anchor_day))
         changed += _materialize_period_stream(
             conn, owner_id=unit.owner_id, anchor=unit.valid_from,
             currency=unit.currency,
-            valid_until=BillingUnitResolver.end_stamp(unit), moment=moment,
+            ends_at=BillingUnitResolver.end_stamp(unit), moment=moment,
             now=now, rate_table="billing_rate_events",
             rate_owner_column="contract_id",
             charge_table="billing_period_charges",
             charge_owner_column="contract_id",
             credential_uuid=unit.credential_uuid, attempted=attempted,
             current_only=current_only)
-    changed += _finalize_period_stream(conn, "billing_period_charges", now)
-    ensure_billing_export_events_conn(conn)
+    changed += _finalize_period_stream(
+        conn, "billing_period_charges", now, period_starts)
+    append_billing_export_events_for_finalized_at(conn, now)
     return changed
 
 
@@ -284,23 +300,25 @@ def materialize_period_charges(db_path: str,
     conn = sqlite_runtime.connect(db_path, "billing_write")
     try:
         with sqlite_runtime.transaction(conn, "immediate"):
-            return materialize_period_charges_conn(conn, at)
+            return materialize_period_charges_conn(conn, at, current_only=True)
     finally:
         conn.close()
 
 
 def materialize_agent_subscription_charges_conn(
         conn: sqlite3.Connection, at: datetime | None = None,
-        *, current_only: bool = False) -> int:
+        *, current_only: bool = True) -> int:
     """Materialize Agent charges on a caller-owned transaction."""
     moment = as_utc(at or utc_now()).replace(microsecond=0)
     now = format_utc(moment)
     changed = 0
     attempted: set[tuple[str, str]] = set()
+    period_starts: set[str] = set()
     for unit in BillingUnitResolver.agent_units(conn, at=moment):
+        period_starts.add(_current_period_start(moment, unit.anchor_day))
         changed += _materialize_period_stream(
             conn, owner_id=unit.owner_id, anchor=unit.valid_from,
-            currency=unit.currency, valid_until=BillingUnitResolver.end_stamp(unit),
+            currency=unit.currency, ends_at=BillingUnitResolver.end_stamp(unit),
             moment=moment, now=now,
             rate_table="agent_subscription_rate_events",
             rate_owner_column="instance_id",
@@ -312,9 +330,8 @@ def materialize_agent_subscription_charges_conn(
             conn, unit.owner_id, unit.account_id, unit.valid_from,
             unit.subscription_id, now, moment=moment)
     changed += _finalize_period_stream(
-        conn, "agent_subscription_period_charges", now)
-    changed += _materialize_all_agent_charge_allocations(conn, now, moment=moment)
-    ensure_billing_export_events_conn(conn)
+        conn, "agent_subscription_period_charges", now, period_starts)
+    append_billing_export_events_for_finalized_at(conn, now)
     return changed
 
 
@@ -324,7 +341,7 @@ def materialize_agent_subscription_charges(
     conn = sqlite_runtime.connect(db_path, "billing_write")
     try:
         with sqlite_runtime.transaction(conn, "immediate"):
-            return materialize_agent_subscription_charges_conn(conn, at)
+            return materialize_agent_subscription_charges_conn(conn, at, current_only=True)
     finally:
         conn.close()
 
@@ -343,15 +360,15 @@ def _materialize_agent_charge_allocations(
     """Snapshot active software bindings for finalized instance charges."""
     if subscription_id is None:
         return 0
+    current_start = _current_period_start(moment or utc_now(),
+                                          valid_from.day)
     charge_sql = (
         "SELECT id,period_start,recurring_charge,normalized_recurring_cost,"
         "currency,base_currency,fx_rate_date,finalized_at "
         "FROM agent_subscription_period_charges "
-        "WHERE instance_id=? AND finalized_at IS NOT NULL")
-    charge_params: tuple[object, ...] = (instance_id,)
-    if moment is not None:
-        charge_sql += " AND period_start<=?"
-        charge_params += (format_utc(moment),)
+        "WHERE instance_id=? AND finalized_at IS NOT NULL "
+        "AND period_start=?")
+    charge_params: tuple[object, ...] = (instance_id, current_start)
     charges = conn.execute(charge_sql, charge_params).fetchall()
     changed = 0
     for charge in charges:
@@ -363,8 +380,8 @@ def _materialize_agent_charge_allocations(
             continue
         bindings = conn.execute(
             "SELECT software_id FROM agent_subscription_bindings "
-            "WHERE subscription_id=? AND lifecycle_state='active' "
-            "AND valid_from<=? AND (valid_until IS NULL OR valid_until>?) "
+            "WHERE subscription_id=? AND valid_from<=? "
+            "AND (ends_at IS NULL OR ends_at>?) "
             "ORDER BY software_id",
             (subscription_id, charge["period_start"], charge["period_start"]),
         ).fetchall()
@@ -383,21 +400,4 @@ def _materialize_agent_charge_allocations(
               charge["finalized_at"]) for row in bindings],
         )
         changed += denominator
-    return changed
-
-
-def _materialize_all_agent_charge_allocations(
-        conn: sqlite3.Connection, now: str,
-        *, moment: datetime | None = None) -> int:
-    """Backfill allocations for finalized rows created before V1.12."""
-    changed = 0
-    instances = conn.execute(
-        "SELECT i.id,i.valid_from,i.subscription_id "
-        "FROM agent_subscription_instances i"
-    ).fetchall()
-    for instance in instances:
-        changed += _materialize_agent_charge_allocations(
-            conn, instance["id"], None,
-            _parse_iso_date(str(instance["valid_from"])[:10]) or utc_now().date(),
-            instance["subscription_id"], now, moment=moment)
     return changed

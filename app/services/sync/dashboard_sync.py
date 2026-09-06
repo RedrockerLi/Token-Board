@@ -52,7 +52,7 @@ def _mark_sync_degraded(db_path: str, operation: str, exc: Exception) -> None:
     except Exception:
         log.exception("failed to persist sync health for %s", operation)
 def _count_dashboard_rows(db_path: str) -> int:
-    """Count rows in the normalized V1 dashboard archive."""
+    """Count rows in the normalized V2 dashboard archive."""
     conn = sqlite_runtime.connect(db_path, "dashboard_runtime")
     try:
         return (conn.execute("SELECT COUNT(*) FROM daily_usage").fetchone()[0] +
@@ -300,9 +300,14 @@ def _download_dashboard_shadow(token_board_db_path: str, dash_db_path: str,
     local_version = (inspect_version(Path(dash_db_path), "dashboard")
                      if os.path.exists(dash_db_path) else None)
     if (remote_version and local_version and
-            remote_version.major not in {0, local_version.major}):
+            remote_version.major > local_version.major):
         set_sync_state(token_board_db_path, "sync_health", "remote major mismatch")
         return {"status": "error", "message": "云端 dashboard 跨 Major，已暂停同步"}
+    if (remote_version and local_version and
+            local_version.major >= 2 and remote_version.major < 2 and
+            get_sync_state(token_board_db_path, "dashboard_v2_manifest") == "1"):
+        set_sync_state(token_board_db_path, "sync_health", "remote V1 rejected after V2")
+        return {"status": "error", "message": "V2 节点拒绝 V2 manifest 发布后的 V1 dashboard 产物"}
 
     resolved_schema_dir = schema_dir or schema_dir_for(
         dash_db_path, "dashboard")
@@ -310,6 +315,8 @@ def _download_dashboard_shadow(token_board_db_path: str, dash_db_path: str,
         shadow_path, "dashboard", resolved_schema_dir,
         local_token_board_path=token_board_db_path)
     upgraded_version = inspect_version(Path(shadow_path), "dashboard")
+    if upgraded_version and upgraded_version.major >= 2:
+        set_sync_state(token_board_db_path, "dashboard_v2_manifest", "1")
     if (upgraded_version and local_version and
             upgraded_version.major == local_version.major and
             upgraded_version.minor > local_version.minor):
@@ -372,6 +379,9 @@ def _publish_prepared(token_board_db_path: str, dash_db_path: str,
     published = publish_versioned_artifact(
         config, str(prepared.path), "dashboard_sync",
         prepared.expected_remote)
+    published_version = inspect_version(prepared.path, "dashboard")
+    if published_version and published_version.major >= 2:
+        set_sync_state(token_board_db_path, "dashboard_v2_manifest", "1")
     set_sync_state_many(token_board_db_path, {
         "dashboard_pending_path": str(prepared.path),
         "dashboard_pending_export_max_id": str(prepared.max_log_id),
@@ -459,8 +469,6 @@ def _run_dashboard_transaction_once(
         if candidate.get("status") != "ok":
             return candidate
 
-        from app.db.dashboard_db import reconcile_accounts
-        reconcile_accounts(candidate_path, token_board_db_path)
         export_result = _export_dashboard(
             token_board_db_path, candidate_path,
             candidate["resolved_schema_dir"])

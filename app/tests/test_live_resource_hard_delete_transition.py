@@ -6,10 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.db.migrations import SchemaVersion, apply_sql_migrations
 from app.db.schema_upgrade import ensure_local_databases
-from app.db.schema_upgrade.compound import run
-from app.db.schema_upgrade.transition_registry import discover
-from app.db.migrations import SchemaVersion
 
 
 class LiveResourceHardDeleteTransitionTest(unittest.TestCase):
@@ -21,7 +19,13 @@ class LiveResourceHardDeleteTransitionTest(unittest.TestCase):
             (root / "data").mkdir()
             proxy = root / "data/token-board.db"
             dashboard = root / "data/dashboard.db"
-            ensure_local_databases(str(proxy), str(dashboard), root / "schema")
+            # Build a complete V1 pair, then exercise the actual V1 -> V2
+            # shadow migration. The runtime itself is V2-only after this
+            # point; the legacy columns below exist only in this fixture.
+            apply_sql_migrations(str(proxy), str(root / "schema"),
+                                 "token-board", target=SchemaVersion(1, 21))
+            apply_sql_migrations(str(dashboard), str(root / "schema"),
+                                 "dashboard", target=SchemaVersion(1, 7))
 
             with sqlite3.connect(proxy) as conn:
                 conn.executescript(
@@ -78,11 +82,7 @@ class LiveResourceHardDeleteTransitionTest(unittest.TestCase):
                 )
                 conn.commit()
 
-            transition = next(item for item in discover(root / "schema")
-                              if item.transition_id ==
-                              "v1-live-resource-hard-delete")
-            run(proxy, dashboard, root / "schema", SchemaVersion(1, 17),
-                SchemaVersion(1, 6), [(transition, transition.load())])
+            ensure_local_databases(str(proxy), str(dashboard), root / "schema")
 
             with sqlite3.connect(proxy) as conn:
                 self.assertIsNone(conn.execute(

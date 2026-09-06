@@ -65,14 +65,21 @@ def purge_route_sets(conn: sqlite3.Connection,
 
 
 def purge_expired_secrets(conn: sqlite3.Connection, now: str) -> int:
-    """Erase plaintext for credentials that can no longer route."""
-    cursor = conn.execute(
-        "DELETE FROM upstream_secrets WHERE credential_uuid IN ("
-        "SELECT uuid FROM upstream_credentials WHERE "
-        "(deleted_at IS NOT NULL AND deleted_at<=?) OR "
-        "(disabled_at IS NOT NULL AND disabled_at<=?)"
-        ")", (now, now))
-    return max(cursor.rowcount, 0)
+    """V2 compatibility hook; paused credentials retain their secrets."""
+    del conn, now
+    return 0
+
+
+def purge_credential(conn: sqlite3.Connection, credential_uuid: str) -> int:
+    """Physically delete one credential while detaching historical FKs."""
+    conn.execute("UPDATE request_log SET credential_uuid=NULL,upstream_key_id=NULL "
+                 "WHERE credential_uuid=?", (credential_uuid,))
+    conn.execute("UPDATE request_attempts SET credential_uuid=NULL,upstream_key_id=NULL "
+                 "WHERE credential_uuid=?", (credential_uuid,))
+    conn.execute("DELETE FROM upstream_secrets WHERE credential_uuid=?",
+                 (credential_uuid,))
+    return max(conn.execute("DELETE FROM upstream_credentials WHERE uuid=?",
+                           (credential_uuid,)).rowcount, 0)
 
 
 def purge_proxy_account(conn: sqlite3.Connection,
@@ -98,11 +105,22 @@ def purge_proxy_account(conn: sqlite3.Connection,
 
     conn.execute(
         "UPDATE request_log SET account_identity_id=COALESCE(account_identity_id,account_id),"
-        "account_id=NULL,credential_uuid=NULL WHERE account_id=?", (account_id,))
+        "account_id=NULL,route_set_id=NULL,client_key_id=NULL,"
+        "credential_uuid=NULL,upstream_key_id=NULL WHERE account_id=?", (account_id,))
     conn.execute(
         "UPDATE request_attempts SET upstream_id=NULL,credential_uuid=NULL "
         "WHERE account_id=? OR upstream_id IN "
         "(SELECT id FROM upstreams WHERE account_id=?)", (account_id, account_id))
+    conn.execute(
+        "UPDATE request_log SET credential_uuid=NULL,upstream_key_id=NULL "
+        "WHERE credential_uuid IN (SELECT c.uuid FROM upstream_credentials c "
+        "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=?)",
+        (account_id,))
+    conn.execute(
+        "UPDATE request_attempts SET credential_uuid=NULL,upstream_key_id=NULL "
+        "WHERE credential_uuid IN (SELECT c.uuid FROM upstream_credentials c "
+        "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=?)",
+        (account_id,))
     conn.execute(
         "DELETE FROM upstream_secrets WHERE credential_uuid IN "
         "(SELECT c.uuid FROM upstream_credentials c JOIN upstreams u "

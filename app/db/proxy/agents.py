@@ -24,7 +24,7 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                 "SELECT s.id,s.uuid,s.name,s.agent_kind,s.config_json,"
                 "s.created_at,s.updated_at "
                 "FROM agent_software s JOIN accounts a ON a.id=s.id "
-                "WHERE a.account_kind='agent' AND a.lifecycle_state='active' "
+                "WHERE a.account_kind='agent' "
                 "ORDER BY s.name COLLATE NOCASE"
             ).fetchall()
             result = []
@@ -37,8 +37,8 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                 item.pop("status_json", None)
                 item["subscription_ids"] = [r[0] for r in conn.execute(
                     "SELECT subscription_id FROM agent_subscription_bindings "
-                    "WHERE software_id=? AND lifecycle_state='active' "
-                "AND (valid_until IS NULL OR valid_until>strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
+                    "WHERE software_id=? "
+                "AND (ends_at IS NULL OR ends_at>strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
                     "ORDER BY subscription_id", (row["id"],)).fetchall()]
                 result.append(item)
             return result
@@ -58,10 +58,10 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             software_id = self._next_shared_id(conn)
             now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             conn.execute(
-                "INSERT INTO accounts(id,uuid,name,lifecycle_state,valid_from,disabled_at,account_kind) "
-                "VALUES(?,?,?,?,?,?, 'agent')",
+                "INSERT INTO accounts(id,uuid,name,valid_from,account_kind) "
+                "VALUES(?,?,?,?, 'agent')",
                 (software_id, str(uuid.uuid4()), name,
-                 "active", now[:10], None),
+                 now[:10]),
             )
             conn.execute(
                 "INSERT OR IGNORE INTO account_identities"
@@ -93,9 +93,9 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
         conn = self._connect()
         try:
             current = conn.execute(
-                "SELECT s.*,a.lifecycle_state FROM agent_software s "
+                "SELECT s.* FROM agent_software s "
                 "JOIN accounts a ON a.id=s.id WHERE s.id=? "
-                "AND a.account_kind='agent' AND a.lifecycle_state='active'",
+                "AND a.account_kind='agent'",
                 (software_id,),
             ).fetchone()
             if current is None:
@@ -146,42 +146,42 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             row = conn.execute(
                 "SELECT s.id FROM agent_software s JOIN accounts a ON a.id=s.id "
                 "WHERE s.id=? AND a.account_kind='agent' "
-                "AND a.lifecycle_state='active'", (software_id,)
+                "", (software_id,)
             ).fetchone()
             if row is None:
                 return False
-            # Agent identities are stable account identities just like proxy
-            # accounts.  Keep the software, runtime cursor, bindings and
-            # request-log foreign keys so historical usage remains attributable
-            # to the deleted software; only its live lifecycle is terminated.
             now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             conn.execute(
-                "UPDATE accounts SET lifecycle_state='deleted',"
-                "deleted_at=?,disabled_at=NULL,updated_at=? "
-                "WHERE id=? AND account_kind='agent'",
-                (now, now, software_id),
-            )
-            conn.execute(
-                "UPDATE agent_subscription_bindings SET lifecycle_state='deleted',"
-                "valid_until=?,updated_at=? WHERE software_id=? "
-                "AND lifecycle_state='active'",
-                (now, now, software_id),
-            )
-            conn.execute(
-                "UPDATE agent_software SET enabled=0,updated_at=? WHERE id=?",
-                (now, software_id),
-            )
-            # Retain legacy children for auditability, but stop them from
-            # participating in any current import or billing calculation.
-            conn.execute(
-                "UPDATE account_importers SET enabled=0 WHERE account_id=?",
+                "UPDATE request_log SET account_identity_id=COALESCE(account_identity_id,account_id),"
+                "account_id=NULL,agent_software_id=NULL WHERE account_id=?",
                 (software_id,),
             )
             conn.execute(
-                "UPDATE billing_contracts SET valid_until=? WHERE account_id=? "
-                "AND (valid_until IS NULL OR valid_until>?)",
-                (now, software_id, now),
+                "UPDATE request_attempts SET account_id=NULL WHERE account_id=?",
+                (software_id,),
             )
+            conn.execute(
+                "DELETE FROM agent_subscription_bindings WHERE software_id=?",
+                (software_id,),
+            )
+            conn.execute(
+                "DELETE FROM agent_software_runtime WHERE software_id=?",
+                (software_id,),
+            )
+            conn.execute(
+                "DELETE FROM agent_software WHERE id=?", (software_id,)
+            )
+            conn.execute(
+                "DELETE FROM account_importers WHERE account_id=?", (software_id,)
+            )
+            conn.execute(
+                "DELETE FROM billing_rate_events WHERE contract_id IN "
+                "(SELECT id FROM billing_contracts WHERE account_id=?)",
+                (software_id,),
+            )
+            conn.execute("DELETE FROM billing_contracts WHERE account_id=?", (software_id,))
+            conn.execute("DELETE FROM accounts WHERE id=? AND account_kind='agent'",
+                         (software_id,))
             conn.commit()
             return True
         finally:

@@ -61,7 +61,7 @@ class AppContractTest(AppDatabaseTestCase):
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT major,minor FROM schema_version WHERE id=1"
-            ).fetchone(), (1, 21))
+            ).fetchone(), (2, 0))
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM accounts WHERE id=?", (account_id,)
             ).fetchone()[0], 1)
@@ -244,7 +244,7 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertEqual(response.get_json()["restored_credentials"], 1)
         restored = next(row for row in database.get_accounts()
                         if row["id"] == account_id)
-        self.assertIsNone(restored.get("deleted_at"))
+        self.assertIsNone(restored.get("ends_at"))
 
     def test_agent_subscription_has_no_public_lifecycle_status(self) -> None:
         database = self.proxy_database()
@@ -304,7 +304,7 @@ class AppContractTest(AppDatabaseTestCase):
                 "strftime('%Y-%m-%dT00:00:00Z','now','+1 day'),2,'CNY',2)",
                 (contract_id,))
         stats = database.get_stats()
-        self.assertEqual(stats["total_cost"], 5.0)
+        self.assertEqual(stats["total_cost"], 3.0)
         self.assertEqual(stats["today_cost"], 7.0)
 
     def test_routing_mutations_advance_snapshot_generation(self) -> None:
@@ -464,7 +464,7 @@ class AppContractTest(AppDatabaseTestCase):
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM upstream_credentials c JOIN upstreams u "
                 "ON u.id=c.upstream_id WHERE u.account_id=? "
-                "AND c.deleted_at IS NULL", (account_id,)).fetchone()[0], 0)
+                "AND c.ends_at IS NULL", (account_id,)).fetchone()[0], 0)
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM route_sets WHERE id=? AND enabled=1",
                 (account_id,)).fetchone()[0], 0)
@@ -485,7 +485,7 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertEqual(database.get_agent_software()[0]["id"], software_id)
         self.assertNotIn(software_id, [account["id"] for account in database.get_accounts()])
 
-    def test_agent_software_delete_is_soft(self) -> None:
+    def test_agent_software_delete_is_hard(self) -> None:
         database = self.proxy_database()
         software_id = database.create_agent_software({
             "name": "soft-deleted-agent", "agent_kind": "codex",
@@ -499,24 +499,18 @@ class AppContractTest(AppDatabaseTestCase):
 
         self.assertTrue(database.delete_agent_software(software_id))
         with sqlite3.connect(self.proxy_path) as conn:
-            account = conn.execute(
-                "SELECT lifecycle_state,deleted_at FROM accounts WHERE id=?",
-                (software_id,)).fetchone()
-            self.assertEqual(account[0], "deleted")
-            self.assertIsNotNone(account[1])
-            self.assertEqual(conn.execute(
-                "SELECT enabled FROM agent_software WHERE id=?",
-                (software_id,)).fetchone()[0], 0)
-            self.assertIsNotNone(conn.execute(
+            self.assertIsNone(conn.execute(
+                "SELECT id FROM accounts WHERE id=?", (software_id,)).fetchone())
+            self.assertIsNone(conn.execute(
+                "SELECT id FROM agent_software WHERE id=?", (software_id,)).fetchone())
+            self.assertIsNone(conn.execute(
                 "SELECT software_id FROM agent_software_runtime WHERE software_id=?",
                 (software_id,)).fetchone())
-            binding = conn.execute(
-                "SELECT lifecycle_state,valid_until FROM agent_subscription_bindings "
+            self.assertIsNone(conn.execute(
+                "SELECT software_id FROM agent_subscription_bindings "
                 "WHERE software_id=? AND subscription_id=?",
                 (software_id, subscription_id),
-            ).fetchone()
-            self.assertEqual(binding[0], "deleted")
-            self.assertIsNotNone(binding[1])
+            ).fetchone())
         self.assertEqual(database.get_agent_software(), [])
 
     def test_aggregate_route_set_and_model_catalog(self) -> None:

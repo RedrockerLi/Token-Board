@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.db.migrations import migrate
 from app import create_app
+from app.db.schema_upgrade import ensure_local_databases
 from app.services.sync.config_session import ConfigSession
 
 
@@ -23,7 +23,8 @@ class ConfigSessionTest(unittest.TestCase):
         (root / "data").mkdir()
         self.db = root / "data" / "token-board.db"
         self.schema = root / "schema"
-        migrate(str(self.db), str(self.schema), "token-board")
+        ensure_local_databases(str(self.db), str(root / "data" / "dashboard.db"),
+                               self.schema)
 
     def tearDown(self):
         shutil.rmtree(self.temp, ignore_errors=True)
@@ -78,8 +79,6 @@ class ConfigSessionTest(unittest.TestCase):
             self.assertEqual(status.message, "offline")
 
     def test_read_only_config_mutation_is_rejected_by_backend(self):
-        dashboard = self.db.parent / "dashboard.db"
-        migrate(str(dashboard), str(self.schema), "dashboard")
         app = create_app(str(self.db), schema_dir=str(self.schema),
                          testing=True, start_background_tasks=False)
         app.config["CONFIG_SESSION"]._set_state("read_only", "offline")

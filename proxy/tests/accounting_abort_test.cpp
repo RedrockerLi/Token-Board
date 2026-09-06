@@ -94,8 +94,8 @@ int main(int argc, char **argv) {
     sqlite3 *seed = nullptr;
     assert(sqlite3_open(db_path.c_str(), &seed) == SQLITE_OK);
     const bool ok =
-        exec_sql(seed, "INSERT INTO accounts(id,uuid,name,valid_from) "
-                       "VALUES(1,'a','abort','2020-01-01')") &&
+        exec_sql(seed, "INSERT INTO accounts(id,uuid,name,account_kind,valid_from) "
+                       "VALUES(1,'a','abort','proxy','2020-01-01')") &&
         exec_sql(seed, "INSERT INTO route_sets(id,uuid,account_id,name) "
                        "VALUES(1,'r',1,'abort')") &&
         exec_sql(seed, "INSERT INTO client_keys(id,uuid,key_value,label,"

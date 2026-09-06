@@ -129,9 +129,12 @@ def api_summary():
         "total_requests": total_requests,
         "total_cost": total_cost,
         "theoretical_cost": theoretical_cost,
-        # Canonical V1 ledger views. `total_cost`/`theoretical_cost` remain
+        # Canonical V2 ledger views. `total_cost`/`theoretical_cost` remain
         # legacy UI fields; these explicit totals are never computed by
         # account_type or aggregate branches.
+        "metered_cost": round(billed_cost, 4),
+        "recurring_cost": round(plan_subscription_cost, 4),
+        "total_cost": round(billed_cost + plan_subscription_cost, 4),
         "actual_cost": round(billed_cost + plan_subscription_cost, 4),
         "theoretical_total_cost": (
             round(theoretical_cost or 0, 4)

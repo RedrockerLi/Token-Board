@@ -23,7 +23,7 @@ class DashboardReaderMixin:
     def load_rows(self):
         conn = self._connect()
         try:
-            return self._load_v1_rows(conn)
+            return self._load_v2_rows(conn)
         finally:
             conn.close()
 
@@ -37,7 +37,7 @@ class DashboardReaderMixin:
         finally:
             conn.close()
 
-    def _load_v1_rows(self, conn: sqlite3.Connection):
+    def _load_v2_rows(self, conn: sqlite3.Connection):
         token_usages, request_usages, cost_entries, plan_summary = [], [], [], []
         months_set, names, models = set(), set(), set()
         last_month, month_volume = {}, {}
@@ -78,7 +78,7 @@ class DashboardReaderMixin:
             months_set.add((y, m)); names.add(name); models.add(row["model"])
             _track_recency(last_month, month_volume, name, y, m, row["request_count"])
         for row in conn.execute(
-            "SELECT p.month,p.account_id,COALESCE(a.name,'unknown') account_name,"
+            "SELECT p.period_start,p.account_id,COALESCE(a.name,'unknown') account_name,"
             "COALESCE(a.account_kind,'proxy') account_kind,"
             "SUM(CASE WHEN p.charge_frozen_at IS NOT NULL "
             "AND p.normalized_recurring_cost IS NOT NULL "
@@ -91,8 +91,10 @@ class DashboardReaderMixin:
             "AND (p.equivalent_cost<>0 OR p.recurring_charge<>0 "
             "OR COALESCE(p.normalized_recurring_cost,0)<>0 "
             "OR p.charge_frozen_at IS NOT NULL) "
-            "GROUP BY p.month,p.account_id,a.name ORDER BY p.month,p.account_id"):
-            plan_summary.append(dict(row))
+            "GROUP BY p.period_start,p.account_id,a.name ORDER BY p.period_start,p.account_id"):
+            item = dict(row)
+            item["month"] = str(item["period_start"])[:7]
+            plan_summary.append(item)
             # A subscription can be bound before the software has produced
             # its first usage event. Keep that software/account selectable in
             # the dashboard so its actual recurring cost is not invisible.
@@ -104,7 +106,7 @@ class DashboardReaderMixin:
             # A recurring charge may exist in a month with no metered
             # traffic. Keep that month visible to /api/monthly instead of
             # deriving the calendar solely from daily_usage rows.
-            year, month = _parse_date(f"{row['month']}-01")
+            year, month = _parse_date(str(row["period_start"])[:10])
             if year:
                 months_set.add((year, month))
         available = [{"year": y, "month": m, "label": f"{y}-{m:02d}"}

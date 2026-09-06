@@ -24,18 +24,17 @@ class DashboardWriterMixin:
         return sqlite_runtime.connect(self.db_path, "dashboard_runtime")
 
     def upsert_account_batch(self, rows: list[dict]) -> int:
-        """Mirror proxy identities, including whether they are agents."""
+        """Write only identities involved in the current fact batch."""
         if not rows:
             return 0
         conn = self._connect()
         try:
             conn.executemany(
                 """INSERT INTO accounts
-                   (account_id,name,lifecycle_state,updated_at,account_kind)
-                   VALUES(:account_id,:name,:lifecycle_state,:updated_at,:account_kind)
+                   (account_id,name,updated_at,account_kind)
+                   VALUES(:account_id,:name,:updated_at,:account_kind)
                    ON CONFLICT(account_id) DO UPDATE SET
                      name=excluded.name,
-                     lifecycle_state=excluded.lifecycle_state,
                      updated_at=excluded.updated_at,
                      account_kind=excluded.account_kind""",
                 rows,
@@ -54,16 +53,6 @@ class DashboardWriterMixin:
         conn = self._connect()
         try:
             deleted = 0
-            conn.execute(
-                """INSERT OR IGNORE INTO billing_export_receipts
-                   (event_key,account_id,month,billing_unit_id,payload_hash)
-                   SELECT 'legacy:' || account_id || ':' || month || ':' || billing_unit_id,
-                          account_id,month,billing_unit_id,''
-                   FROM monthly_recurring_costs
-                   WHERE account_id IN ({}) AND charge_frozen_at IS NOT NULL""".format(
-                       placeholders),
-                ids,
-            )
             for table in ("monthly_recurring_costs", "daily_usage"):
                 deleted += conn.execute(
                     f"DELETE FROM {table} WHERE account_id IN ({placeholders})",
@@ -145,7 +134,8 @@ class DashboardWriterMixin:
                 # An earlier SQLite failure may already have closed it.
                 conn = None
 
-    def upsert_frozen_plan_charge(self, *, month: str, account_id: int,
+    def upsert_frozen_plan_charge(self, *, period_start: str | None = None,
+                                  month: str | None = None, account_id: int,
                                   billing_unit_id: str, recurring_charge: float,
                                   normalized_recurring_cost: float | None,
                                   currency: str, base_currency: str,
@@ -154,15 +144,17 @@ class DashboardWriterMixin:
         """Insert one immutable recurring charge, updating only an unfrozen row."""
         if (recurring_charge == 0 and (normalized_recurring_cost or 0) == 0):
             return 0
+        period_start = period_start or (
+            month if month and "T" in month else f"{month}-01T00:00:00Z")
         conn = self._connect()
         try:
             cursor = conn.execute(
                 """INSERT INTO monthly_recurring_costs
-                   (month,account_id,billing_unit_id,recurring_charge,equivalent_cost,
+                   (period_start,account_id,billing_unit_id,recurring_charge,equivalent_cost,
                     currency,normalized_recurring_cost,base_currency,fx_rate_date,
                     charge_frozen_at)
                    VALUES(?,?,?,?,0,?,?,?,?,?)
-                   ON CONFLICT(month,account_id,billing_unit_id) DO UPDATE SET
+                   ON CONFLICT(period_start,account_id,billing_unit_id) DO UPDATE SET
                      recurring_charge=excluded.recurring_charge,
                      currency=excluded.currency,
                      normalized_recurring_cost=excluded.normalized_recurring_cost,
@@ -170,7 +162,7 @@ class DashboardWriterMixin:
                      fx_rate_date=excluded.fx_rate_date,
                      charge_frozen_at=excluded.charge_frozen_at
                    WHERE monthly_recurring_costs.charge_frozen_at IS NULL""",
-                (month, account_id, billing_unit_id, recurring_charge, currency,
+                (period_start, account_id, billing_unit_id, recurring_charge, currency,
                  normalized_recurring_cost, base_currency, fx_rate_date, frozen_at),
             )
             conn.commit()
@@ -178,7 +170,8 @@ class DashboardWriterMixin:
         finally:
             conn.close()
 
-    def upsert_frozen_agent_allocation(self, *, month: str, account_id: int,
+    def upsert_frozen_agent_allocation(self, *, period_start: str | None = None,
+                                       month: str | None = None, account_id: int,
                                        billing_unit_id: str,
                                        recurring_charge: float,
                                        normalized_recurring_cost: float | None,
@@ -186,7 +179,7 @@ class DashboardWriterMixin:
                                        fx_rate_date: str | None,
                                        frozen_at: str) -> int:
         return self.upsert_frozen_plan_charge(
-            month=month, account_id=account_id,
+            period_start=period_start, month=month, account_id=account_id,
             billing_unit_id=billing_unit_id,
             recurring_charge=recurring_charge,
             normalized_recurring_cost=normalized_recurring_cost,
@@ -197,7 +190,6 @@ class DashboardWriterMixin:
         """Compatibility adapter: agent names live in the generic mirror."""
         return self.upsert_account_batch([
             {"account_id": row["software_id"], "name": row["name"],
-             "lifecycle_state": "active",
              "updated_at": row.get("updated_at"), "account_kind": "agent"}
             for row in rows
         ])
@@ -216,7 +208,9 @@ class DashboardWriterMixin:
         for (account_id, unit_id), periods in allocations.items():
             for month, values in periods.items():
                 self.upsert_frozen_agent_allocation(
-                    month=month, account_id=account_id,
+                    period_start=(month if "T" in str(month)
+                                  else f"{month}-01T00:00:00Z"),
+                    account_id=account_id,
                     billing_unit_id=unit_id,
                     recurring_charge=float(values.get("recurring_charge", 0) or 0),
                     normalized_recurring_cost=values.get("normalized_recurring_cost"),
@@ -250,22 +244,27 @@ class DashboardWriterMixin:
         finally:
             conn.close()
 
-    def accumulate_plan_summary(self, month: str, account_id: int,
-                                billing_unit_id: str,
-                                subscription_cost: float, virtual_cost: float,
-                                refresh_subscription: bool = False):
+    def accumulate_plan_summary(self, period_start: str | None = None,
+                                account_id: int = 0,
+                                billing_unit_id: str = "",
+                                subscription_cost: float = 0,
+                                virtual_cost: float = 0,
+                                refresh_subscription: bool = False,
+                                month: str | None = None):
         """Accumulate request-derived virtual cost without changing charges."""
+        period_start = period_start or (
+            month if month and "T" in month else f"{month}-01T00:00:00Z")
         conn = self._connect()
         try:
             conn.execute(
                 """INSERT INTO monthly_recurring_costs
-                   (month,account_id,billing_unit_id,recurring_charge,equivalent_cost,
+                   (period_start,account_id,billing_unit_id,recurring_charge,equivalent_cost,
                     normalized_recurring_cost,base_currency)
                    VALUES(?,?,?,0,?,0,'CNY')
-                   ON CONFLICT(month,account_id,billing_unit_id) DO UPDATE SET
+                   ON CONFLICT(period_start,account_id,billing_unit_id) DO UPDATE SET
                      equivalent_cost=monthly_recurring_costs.equivalent_cost+
                                      excluded.equivalent_cost""",
-                (month, account_id, billing_unit_id, virtual_cost),
+                (period_start, account_id, billing_unit_id, virtual_cost),
             )
             conn.commit()
         finally:
@@ -277,7 +276,7 @@ class DashboardWriterMixin:
         frozen_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for month, cost in subscriptions.items():
             self.upsert_frozen_plan_charge(
-                month=month, account_id=account_id,
+                period_start=f"{month}-01T00:00:00Z", account_id=account_id,
                 billing_unit_id=billing_unit_id,
                 recurring_charge=float(cost or 0),
                 normalized_recurring_cost=float(cost or 0),
@@ -286,43 +285,90 @@ class DashboardWriterMixin:
 
     def record_billing_export_event(self, event: dict,
                                     payload_hash: str) -> int:
-        """Apply one immutable billing event and retain its delivery receipt.
-
-        The receipt is deliberately separate from the visible monthly row.
-        Dashboard deletion removes the latter but keeps the receipt, so a
-        later export from another machine cannot resurrect an old charge.
-        """
+        """Apply one immutable billing event by its natural fact key."""
+        if (float(event.get("recurring_charge") or 0) == 0 and
+                float(event.get("normalized_recurring_cost") or 0) == 0):
+            # A zero-valued finalized source fact is retained in Token-Board,
+            # but it is not a Dashboard fact and must not create an empty
+            # account identity.
+            return 0
         conn = self._connect()
         try:
-            existing = conn.execute(
-                "SELECT payload_hash FROM billing_export_receipts "
-                "WHERE event_key=?", (event["event_key"],)
+            account = conn.execute(
+                "SELECT 1 FROM accounts WHERE account_id=?", (event["account_id"],)
             ).fetchone()
+            if account is None:
+                conn.execute(
+                    "INSERT INTO accounts(account_id,name,updated_at,account_kind) "
+                    "VALUES(?,?,?,?)",
+                    (event["account_id"], event["account_name"],
+                     event["frozen_at"], event["account_kind"]),
+                )
+            existing = conn.execute(
+                "SELECT recurring_charge,normalized_recurring_cost,currency,"
+                "base_currency,fx_rate_date,charge_frozen_at FROM monthly_recurring_costs "
+                "WHERE period_start=? AND account_id=? AND billing_unit_id=?",
+                (event["period_start"], event["account_id"], event["billing_unit_id"]),
+            ).fetchone()
+            if existing is None:
+                # V1 Dashboard rows were month-grained.  On the first V2
+                # event, move that provisional month row to the immutable
+                # period_start rather than creating a second charge for the
+                # same account/unit.
+                legacy_period = f"{event['month']}-01T00:00:00Z"
+                if legacy_period != event["period_start"]:
+                    legacy = conn.execute(
+                        "SELECT recurring_charge,normalized_recurring_cost,currency,"
+                        "base_currency,fx_rate_date,charge_frozen_at FROM "
+                        "monthly_recurring_costs WHERE period_start=? AND account_id=? "
+                        "AND billing_unit_id=?",
+                        (legacy_period, event["account_id"], event["billing_unit_id"]),
+                    ).fetchone()
+                    if legacy is not None:
+                        conn.execute(
+                            "UPDATE monthly_recurring_costs SET period_start=? "
+                            "WHERE period_start=? AND account_id=? AND billing_unit_id=?",
+                            (event["period_start"], legacy_period,
+                             event["account_id"], event["billing_unit_id"]),
+                        )
+                        existing = legacy
             if existing is not None:
-                if existing[0] == "":
-                    return 0
-                if existing[0] != payload_hash:
+                current = (existing[0], existing[1], existing[2], existing[3],
+                           existing[4], existing[5])
+                expected = (event["recurring_charge"], event["normalized_recurring_cost"],
+                            event["currency"], event["base_currency"],
+                            event["fx_rate_date"], event["frozen_at"])
+                # An older request-log export may have created a provisional
+                # row for this natural key.  The immutable billing event is
+                # allowed to freeze that row once; after freezing, a payload
+                # change is a data conflict rather than an additive update.
+                if existing[5] is None:
+                    conn.execute(
+                        "UPDATE monthly_recurring_costs SET recurring_charge=?,"
+                        "currency=?,normalized_recurring_cost=?,base_currency=?,"
+                        "fx_rate_date=?,charge_frozen_at=? WHERE period_start=? AND "
+                        "account_id=? AND billing_unit_id=?",
+                        (event["recurring_charge"], event["currency"],
+                         event["normalized_recurring_cost"], event["base_currency"],
+                        event["fx_rate_date"], event["frozen_at"], event["period_start"],
+                         event["account_id"], event["billing_unit_id"]),
+                    )
+                    conn.commit()
+                    return 1
+                if any(current[index] != expected[index] for index in range(6)):
                     raise ValueError(
                         f"billing event payload changed: {event['event_key']}")
-                return 0
-
-            legacy = conn.execute(
-                """SELECT payload_hash FROM billing_export_receipts
-                   WHERE event_key=?""",
-                (f"legacy:{event['account_id']}:{event['month']}:{event['billing_unit_id']}",),
-            ).fetchone()
-            if legacy is not None:
                 return 0
 
             if not (float(event["recurring_charge"] or 0) == 0 and
                     float(event["normalized_recurring_cost"] or 0) == 0):
                 conn.execute(
                     """INSERT INTO monthly_recurring_costs
-                       (month,account_id,billing_unit_id,recurring_charge,
+                       (period_start,account_id,billing_unit_id,recurring_charge,
                         equivalent_cost,currency,normalized_recurring_cost,
                         base_currency,fx_rate_date,charge_frozen_at)
                        VALUES(?,?,?,?,0,?,?,?,?,?)
-                       ON CONFLICT(month,account_id,billing_unit_id) DO UPDATE SET
+                       ON CONFLICT(period_start,account_id,billing_unit_id) DO UPDATE SET
                          recurring_charge=excluded.recurring_charge,
                          currency=excluded.currency,
                          normalized_recurring_cost=excluded.normalized_recurring_cost,
@@ -330,19 +376,12 @@ class DashboardWriterMixin:
                          fx_rate_date=excluded.fx_rate_date,
                          charge_frozen_at=excluded.charge_frozen_at
                        WHERE monthly_recurring_costs.charge_frozen_at IS NULL""",
-                    (event["month"], event["account_id"],
+                    (event["period_start"], event["account_id"],
                      event["billing_unit_id"], event["recurring_charge"],
                      event["currency"], event["normalized_recurring_cost"],
                      event["base_currency"], event["fx_rate_date"],
                      event["frozen_at"]),
                 )
-            conn.execute(
-                """INSERT INTO billing_export_receipts
-                   (event_key,account_id,month,billing_unit_id,payload_hash)
-                   VALUES(?,?,?,?,?)""",
-                (event["event_key"], event["account_id"],
-                 event["month"], event["billing_unit_id"], payload_hash),
-            )
             conn.commit()
             return 1
         finally:

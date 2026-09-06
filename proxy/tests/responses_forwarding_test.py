@@ -147,8 +147,7 @@ def main() -> None:
     schema = Path(sys.argv[2]).resolve()
     root = Path(sys.argv[3]).resolve()
     sys.path.insert(0, str(root))
-    from app.db.migrations import migrate
-    from v1_fixture import add_plain_route, add_upstream
+    from v1_fixture import add_plain_route, add_upstream, ensure_v2_database
 
     upstream_port = free_port()
     upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), FakeResponsesUpstream)
@@ -156,7 +155,7 @@ def main() -> None:
     thread.start()
     with tempfile.TemporaryDirectory() as directory:
         db = Path(directory) / "token-board.db"
-        migrate(str(db), str(schema), "token-board")
+        ensure_v2_database(db, schema)
         conn = sqlite3.connect(db)
         try:
             base = f"http://127.0.0.1:{upstream_port}/v1/"

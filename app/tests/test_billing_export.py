@@ -66,10 +66,10 @@ class BillingExportTest(AppDatabaseTestCase):
         self.assertEqual(deleted["status"], "ok", deleted)
         self.assertEqual(self._dashboard_charge_count(account_id), 0)
         with sqlite3.connect(self.dashboard_path) as conn:
-            self.assertGreater(conn.execute(
-                "SELECT count(*) FROM billing_export_receipts "
-                "WHERE event_key LIKE 'legacy:%'"
-            ).fetchone()[0], 0)
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='billing_export_receipts'"
+            ).fetchone())
 
         second = sync_dashboard(
             self.proxy_path, self.dashboard_path,
@@ -130,7 +130,7 @@ class BillingExportTest(AppDatabaseTestCase):
             pending_billing_mark,
         )
 
-    def test_shared_receipt_blocks_old_event_after_local_mark_reset(self) -> None:
+    def test_deleted_dashboard_rows_have_no_receipt_or_tombstone(self) -> None:
         account_id = self._create_plan()
         materialize_period_charges(
             self.proxy_path,
@@ -150,25 +150,12 @@ class BillingExportTest(AppDatabaseTestCase):
         self.assertEqual(deleted["status"], "ok", deleted)
         self.assertEqual(self._dashboard_charge_count(account_id), 0)
 
-        # Simulate another machine whose local billing mark has not observed
-        # the first export.  The shared dashboard receipt is the correctness
-        # guard in this case.
-        ProxyDatabase(
-            self.proxy_path, schema_dir=str(self.root / "schema")
-        ).set_billing_export_mark(0)
-        ProxyDatabase(
-            self.proxy_path, schema_dir=str(self.root / "schema")
-        ).export_to_dashboard(
-            self.dashboard_path, 0,
-            ProxyDatabase(
-                self.proxy_path, schema_dir=str(self.root / "schema")
-            ).get_max_log_id(),
-        )
         self.assertEqual(self._dashboard_charge_count(account_id), 0)
         with sqlite3.connect(self.dashboard_path) as conn:
-            self.assertGreater(conn.execute(
-                "SELECT count(*) FROM billing_export_receipts"
-            ).fetchone()[0], 0)
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='billing_export_receipts'"
+            ).fetchone())
 
 
 if __name__ == "__main__":

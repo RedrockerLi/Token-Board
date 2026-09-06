@@ -113,7 +113,7 @@ def main() -> None:
     schema_dir = Path(sys.argv[2]).resolve()
     project_root = Path(sys.argv[3]).resolve()
     sys.path.insert(0, str(project_root))
-    from app.db.migrations import migrate
+    from v1_fixture import ensure_v2_database
 
     upstream_port = free_port()
     upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), FakeUpstream)
@@ -122,7 +122,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "token-board.db"
-        migrate(str(db_path), str(schema_dir), "token-board")
+        ensure_v2_database(db_path, schema_dir)
         conn = sqlite3.connect(db_path)
         try:
             from v1_fixture import add_plain_route, add_upstream
@@ -167,7 +167,7 @@ def main() -> None:
                 expected_version = max(
                     int(path.name.split("_", 1)[0].split("-")[0]) * 10000
                     + int(path.name.split("_", 1)[0].split("-")[1])
-                    for path in (schema_dir / "token-board/v1").glob("*.sql"))
+                    for path in (schema_dir / "token-board/v2").glob("*.sql"))
                 assert conn.execute("PRAGMA user_version").fetchone()[0] == expected_version
                 # Logging is now asynchronous (a dedicated accounting thread);
                 # the HTTP response can complete before the row is durable, so
@@ -193,25 +193,44 @@ def main() -> None:
                 )]
                 assert statuses == [401, 503, 200], statuses
 
-                # V1 uses lifecycle closure instead of deleting historical
-                # identities. Request and attempt foreign keys remain stable.
+                # V2 removes the live graph while retaining detached facts and
+                # the stable historical identity.
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute(
-                    "UPDATE client_keys SET enabled=0,deleted_at="
-                    "strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key_value=?",
-                    (local_key,))
+                    "UPDATE request_log SET account_id=NULL,route_set_id=NULL,"
+                    "client_key_id=NULL,upstream_key_id=NULL,credential_uuid=NULL "
+                    "WHERE id=?", (log[0],))
                 conn.execute(
-                    "UPDATE accounts SET lifecycle_state='deleted',deleted_at="
-                    "strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
-                    (account_id,))
+                    "UPDATE request_attempts SET account_id=NULL,upstream_id=NULL,"
+                    "upstream_key_id=NULL,credential_uuid=NULL WHERE request_log_id=?",
+                    (log[0],))
+                conn.execute("DELETE FROM upstream_secrets WHERE credential_uuid IN "
+                             "(SELECT c.uuid FROM upstream_credentials c JOIN upstreams u "
+                             "ON u.id=c.upstream_id WHERE u.account_id=?)", (account_id,))
+                conn.execute("DELETE FROM upstream_credentials WHERE upstream_id IN "
+                             "(SELECT id FROM upstreams WHERE account_id=?)", (account_id,))
+                conn.execute("DELETE FROM route_rules WHERE route_set_id IN "
+                             "(SELECT id FROM route_sets WHERE account_id=?)", (account_id,))
+                conn.execute("DELETE FROM client_keys WHERE route_set_id IN "
+                             "(SELECT id FROM route_sets WHERE account_id=?)", (account_id,))
+                conn.execute("DELETE FROM route_sets WHERE account_id=?", (account_id,))
+                conn.execute("DELETE FROM upstreams WHERE account_id=?", (account_id,))
+                conn.execute("DELETE FROM billing_contracts WHERE account_id=?", (account_id,))
+                conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
                 conn.commit()
                 assert conn.execute(
                     "SELECT account_id FROM request_log WHERE id=?", (log[0],)
+                ).fetchone()[0] is None
+                assert conn.execute(
+                    "SELECT account_identity_id FROM request_log WHERE id=?", (log[0],)
                 ).fetchone()[0] == account_id
-                assert all(row[0] == account_id for row in conn.execute(
+                assert all(row[0] is None for row in conn.execute(
                     "SELECT account_id FROM request_attempts WHERE request_log_id=?",
                     (log[0],),
                 ))
+                assert conn.execute(
+                    "SELECT 1 FROM accounts WHERE id=?", (account_id,)
+                ).fetchone() is None
             finally:
                 conn.close()
         finally:
