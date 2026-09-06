@@ -1,0 +1,25 @@
+{
+  "id": "v1-live-resource-hard-delete",
+  "databases": ["token-board", "dashboard"],
+  "strategy": "shadow-barrier",
+  "entrypoint": "transition.py",
+  "order": 4,
+  "description": "Purge previously soft-deleted proxy live resources while retaining historical identities and frozen ledgers",
+  "routes": [
+    {
+      "scope": "local-pair",
+      "current": {
+        "token-board": "1.17",
+        "dashboard": "1.6"
+      },
+      "prepare": {
+        "token-board": "same",
+        "dashboard": "same"
+      },
+      "target": {
+        "token-board": "latest",
+        "dashboard": "latest"
+      }
+    }
+  ]
+}

@@ -118,6 +118,7 @@ prepare/target 版本和 scope。插件只能修改 shadow。选择逻辑集中�
 - `order: 1` `v1-legacy-agent-billing`：Token Board V1.6/V1.7 billing barrier；
 - `order: 2` `v1-agent-identity`：Token Board V1.8 与 Dashboard V1.3/V1.4 identity barrier。
 - `order: 3` `v1-pricing-current-only`：模型定价历史到当前配置的扁平化。
+- `order: 4` `v1-live-resource-hard-delete`：一次性清理已终态软删除的代理实时资源，保留历史身份、请求日志和冻结账单。
 
 已发布 transition 的 descriptor、源码和附属数据都会进入 checksum。行为变化应
 创建新的 transition ID，不应原地修改已发布插件。
