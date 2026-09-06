@@ -71,8 +71,8 @@ class SyncContractTest(unittest.TestCase):
                 "SELECT secret_value FROM upstream_secrets "
                 "WHERE credential_uuid='credential-local'").fetchone()
             conn.close()
-            self.assertIsNotNone(row[0])
-            self.assertEqual(secret[0], "sk-local-secret")
+            self.assertIsNone(row)
+            self.assertIsNone(secret)
 
             # A remote disabled timestamp is configuration state and is
             # authoritative in the new sync contract.
@@ -88,7 +88,7 @@ class SyncContractTest(unittest.TestCase):
                 "WHERE credential_uuid='credential-local'").fetchone()
             conn.close()
             self.assertEqual(row[0], "2026-08-10T04:01:36Z")
-            self.assertEqual(secret[0], "sk-local-secret")
+            self.assertIsNone(secret)
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
@@ -242,7 +242,7 @@ class SyncContractTest(unittest.TestCase):
                 ).fetchone())
                 self.assertEqual(conn.execute(
                     "SELECT major,minor FROM schema_version WHERE id=1"
-                ).fetchone(), (1, 15))
+                ).fetchone(), (1, 17))
             return state["artifact"]
 
         try:

@@ -23,56 +23,12 @@ class DashboardWriterMixin:
     def _connect(self) -> sqlite3.Connection:
         return sqlite_runtime.connect(self.db_path, "dashboard_runtime")
 
-    @staticmethod
-    def _excluded_ids(conn: sqlite3.Connection,
-                      account_ids: list[int] | set[int] | tuple[int, ...] | None = None
-                      ) -> set[int]:
-        if account_ids is None:
-            rows = conn.execute("SELECT account_id FROM account_exclusions")
-        else:
-            ids = sorted({int(value) for value in account_ids})
-            if not ids:
-                return set()
-            placeholders = ",".join("?" for _ in ids)
-            rows = conn.execute(
-                f"SELECT account_id FROM account_exclusions "
-                f"WHERE account_id IN ({placeholders})", ids)
-        return {int(row[0]) for row in rows}
-
-    def exclude_accounts(self, account_ids: set[int] | list[int] | tuple[int, ...],
-                         excluded_at: str | None = None) -> int:
-        ids = sorted({int(account_id) for account_id in (account_ids or [])})
-        if not ids:
-            return 0
-        conn = self._connect()
-        try:
-            conn.executemany(
-                "INSERT OR IGNORE INTO account_exclusions(account_id,excluded_at) "
-                "VALUES(?,COALESCE(?,strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
-                [(account_id, excluded_at) for account_id in ids],
-            )
-            conn.commit()
-            return len(ids)
-        finally:
-            conn.close()
-
-    def get_excluded_account_ids(self) -> set[int]:
-        conn = self._connect()
-        try:
-            return self._excluded_ids(conn)
-        finally:
-            conn.close()
-
     def upsert_account_batch(self, rows: list[dict]) -> int:
         """Mirror proxy identities, including whether they are agents."""
         if not rows:
             return 0
         conn = self._connect()
         try:
-            excluded = self._excluded_ids(conn, [row["account_id"] for row in rows])
-            rows = [row for row in rows if int(row["account_id"]) not in excluded]
-            if not rows:
-                return 0
             conn.executemany(
                 """INSERT INTO accounts
                    (account_id,name,lifecycle_state,updated_at,account_kind)
@@ -128,8 +84,6 @@ class DashboardWriterMixin:
         """
         conn = self._connect()
         try:
-            if int(account_id) in self._excluded_ids(conn, [account_id]):
-                return 0
             billed = cost if billed_usage_cost is None else billed_usage_cost
             conn.execute(
                 """INSERT INTO daily_usage
@@ -157,10 +111,6 @@ class DashboardWriterMixin:
             return 0
         conn = self._connect()
         try:
-            excluded = self._excluded_ids(conn, [row["account_id"] for row in rows])
-            rows = [row for row in rows if int(row["account_id"]) not in excluded]
-            if not rows:
-                return 0
             conn.executemany(
                 """INSERT INTO daily_usage
                    (date,account_id,model,input_tokens,cache_tokens,output_tokens,
@@ -196,8 +146,6 @@ class DashboardWriterMixin:
             return 0
         conn = self._connect()
         try:
-            if int(account_id) in self._excluded_ids(conn, [account_id]):
-                return 0
             cursor = conn.execute(
                 """INSERT INTO monthly_recurring_costs
                    (month,account_id,billing_unit_id,recurring_charge,equivalent_cost,
@@ -299,8 +247,6 @@ class DashboardWriterMixin:
         """Accumulate request-derived virtual cost without changing charges."""
         conn = self._connect()
         try:
-            if int(account_id) in self._excluded_ids(conn, [account_id]):
-                return
             conn.execute(
                 """INSERT INTO monthly_recurring_costs
                    (month,account_id,billing_unit_id,recurring_charge,equivalent_cost,

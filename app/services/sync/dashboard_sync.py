@@ -460,7 +460,7 @@ def _run_dashboard_transaction_once(
         })
         if transform_result.get("deleted_names"):
             result["message"] = (
-                f"已删除 {len(transform_result['deleted_names'])} 个用户的看板数据")
+                f"已删除 {len(transform_result['deleted_names'])} 个用户的历史看板数据")
         return result
     finally:
         if os.path.exists(tmp_dir):

@@ -26,8 +26,8 @@ class ProxyBillingLedgerMixin:
         try:
             today = utc_now().strftime("%Y-%m-%d")
             rows = conn.execute("""
-                SELECT COALESCE(a.name, 'unknown') AS account_name,
-                       CASE WHEN a.account_kind='agent' THEN 'agent'
+                SELECT COALESCE(ai.name, a.name, 'unknown') AS account_name,
+                       CASE WHEN COALESCE(ai.account_kind,a.account_kind)='agent' THEN 'agent'
                             ELSE r.source_kind END AS source_kind,
                        COALESCE(SUM(r.billed_usage_cost), 0) AS real_cost,
                        COALESCE(SUM(r.equivalent_cost), 0) AS theoretical_cost,
@@ -35,9 +35,11 @@ class ProxyBillingLedgerMixin:
                        COUNT(*) AS requests
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
-                WHERE a.account_kind IN ('proxy','agent')
+                LEFT JOIN account_identities ai
+                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
+                WHERE COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
                   AND date(r.requested_at) = ?
-                GROUP BY r.account_id
+                GROUP BY COALESCE(r.account_identity_id,r.account_id)
                 ORDER BY theoretical_cost DESC
             """, (today,)).fetchall()
             return [dict(r) for r in rows]

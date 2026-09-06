@@ -1,6 +1,6 @@
 """ProxyDatabase methods for ProxyAccountWriteMixin."""
 
-from app.core.time import utc_now
+from app.core.time import billing_period, utc_now
 from app.db.proxy.common import (
     ACCOUNT_TYPES, _parse_iso_date, is_subscription, json,
     spec, sqlite3, uuid,
@@ -31,6 +31,12 @@ class ProxyAccountWriteMixin:
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,valid_from) VALUES(?,?,?,?)",
                 (shared_id, str(uuid.uuid4()), data["name"], start_date),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO account_identities"
+                "(id,uuid,name,account_kind,created_at,updated_at) "
+                "SELECT id,uuid,name,'proxy',created_at,updated_at "
+                "FROM accounts WHERE id=?", (shared_id,)
             )
             contract_id = conn.execute(
                 "INSERT INTO billing_contracts"
@@ -69,6 +75,16 @@ class ProxyAccountWriteMixin:
                     conn, shared_id, [], keys,
                     new_valid_froms=data.get("new_valid_froms"),
                     account_type=account_type)
+            # Freeze at creation only when the configured start is the
+            # current billing boundary. Backdated subscriptions are caught up
+            # by the period-start worker; creation must not fabricate a row
+            # for an old period that tests/operators may still be importing.
+            creation_boundary = billing_period(
+                now, (valid_from or now.date()).day).start.date()
+            if is_subscription(account_type) and (
+                    valid_from is None or creation_boundary == valid_from):
+                from app.db.proxy.billing import materialize_period_charges_conn
+                materialize_period_charges_conn(conn, now, current_only=True)
             conn.commit()
             return shared_id
         finally:
@@ -121,6 +137,10 @@ class ProxyAccountWriteMixin:
         conn.execute(
             "UPDATE accounts SET name=?,valid_from=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
             "WHERE id=?", (name, start, real_id),
+        )
+        conn.execute(
+            "UPDATE account_identities SET name=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE id=?", (name, real_id),
         )
         charge = "recurring" if is_subscription(final_type) else "metered"
         scope = "credential" if final_spec.subscription_unit == "per_key" else "account"

@@ -41,9 +41,12 @@ def update_agent_subscription(subscription_id):
 @bp_proxy.route("/agent-subscriptions/<int:subscription_id>", methods=["DELETE"])
 @require_config_writable
 def delete_agent_subscription(subscription_id):
-    if not _proxy_db().delete_agent_subscription(subscription_id):
+    result = _proxy_db().delete_agent_subscription(subscription_id)
+    if not result:
         return api_error("Subscription not found", 404)
-    return jsonify({"status": "ok"})
+    if not result.get("ok", True):
+        return api_error(result.get("error", "Subscription deletion is not ready"), 409)
+    return jsonify({"status": "ok", **result})
 
 
 @bp_proxy.route("/agent-subscriptions/<int:subscription_id>/instances", methods=["GET"])
@@ -76,9 +79,12 @@ def update_agent_subscription_instance(instance_id):
 @bp_proxy.route("/agent-subscription-instances/<int:instance_id>", methods=["DELETE"])
 @require_config_writable
 def delete_agent_subscription_instance(instance_id):
-    if not _proxy_db().delete_agent_subscription_instance(instance_id):
+    result = _proxy_db().delete_agent_subscription_instance(instance_id)
+    if not result:
         return api_error("Instance not found", 404)
-    return jsonify({"status": "ok"})
+    if not result.get("ok", True):
+        return api_error(result.get("error", "Instance deletion is not ready"), 409)
+    return jsonify({"status": "ok", **result})
 
 
 @bp_proxy.route("/agent-software", methods=["GET"])

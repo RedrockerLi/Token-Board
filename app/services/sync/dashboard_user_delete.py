@@ -43,7 +43,6 @@ def _delete_dashboard_users_transform(names: list[str]) -> DashboardTransform:
                 "not_found_names": missing,
                 "deleted_rows": 0,
             }
-        dashboard.exclude_accounts(account_ids)
         deleted_rows = dashboard.purge_accounts(account_ids)
         return {
             "status": "ok",

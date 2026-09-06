@@ -52,7 +52,8 @@ def update_account(account_id):
 @bp_proxy.route("/accounts/<int:account_id>", methods=["DELETE"])
 @require_config_writable
 def delete_account(account_id):
-    # mode: "detach" (default) = unbind keys (account_id → NULL); "cascade" = delete keys too.
+    # Keep the legacy query parameter for client compatibility. Live account
+    # deletion now purges the account-owned route graph and keys in either mode.
     mode = request.args.get("mode", "detach")
     if mode not in ("detach", "cascade"):
         return api_error("mode must be 'detach' or 'cascade'", 400)

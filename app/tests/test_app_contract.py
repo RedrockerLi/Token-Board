@@ -61,7 +61,7 @@ class AppContractTest(AppDatabaseTestCase):
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT major,minor FROM schema_version WHERE id=1"
-            ).fetchone(), (1, 15))
+            ).fetchone(), (1, 17))
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM accounts WHERE id=?", (account_id,)
             ).fetchone()[0], 1)
@@ -230,6 +230,8 @@ class AppContractTest(AppDatabaseTestCase):
             "new_valid_froms": ["2026-08-01"],
         })
         fixed_now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+        from app.db.proxy.billing import materialize_period_charges
+        materialize_period_charges(str(self.proxy_path), fixed_now)
         with patch("app.db.proxy.lifecycle.utc_now", return_value=fixed_now):
             self.assertTrue(database.delete_account(account_id)["deferred"])
             app = create_app(str(self.proxy_path), testing=True,
@@ -450,13 +452,15 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertTrue(database.delete_key(key_row["id"]))
         self.assertNotIn(key_value, [k["key_value"] for k in database.get_keys()])
 
-        # Immediate deletion disables routing and credentials but keeps the row.
+        # Immediate deletion removes the live row but retains the identity.
         result = database.delete_account(account_id, mode="immediate")
         self.assertTrue(result["ok"], result)
         with sqlite3.connect(self.proxy_path) as conn:
-            self.assertEqual(conn.execute(
-                "SELECT lifecycle_state FROM accounts WHERE id=?",
-                (account_id,)).fetchone()[0], "deleted")
+            self.assertIsNone(conn.execute(
+                "SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone())
+            self.assertIsNotNone(conn.execute(
+                "SELECT id FROM account_identities WHERE id=?", (account_id,)
+            ).fetchone())
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM upstream_credentials c JOIN upstreams u "
                 "ON u.id=c.upstream_id WHERE u.account_id=? "

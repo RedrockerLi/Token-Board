@@ -44,6 +44,19 @@ class ProxyExportMixin:
                     "SELECT id,name,lifecycle_state,updated_at,account_kind "
                     "FROM accounts ORDER BY id")
             ])
+            # Historical identities outlive the live accounts row.  Mirror
+            # them as deleted identities so a later export can still render
+            # the name after real-time configuration has been purged.
+            dash_db.upsert_account_batch([
+                {"account_id": row["id"], "name": row["name"],
+                 "lifecycle_state": "active" if row["live_id"] is not None else "deleted",
+                 "updated_at": row["updated_at"],
+                 "account_kind": row["account_kind"]}
+                for row in conn.execute(
+                    "SELECT i.id,i.name,i.account_kind,i.updated_at,a.id AS live_id "
+                    "FROM account_identities i LEFT JOIN accounts a ON a.id=i.id "
+                    "ORDER BY i.id")
+            ])
 
             # A) usage + frozen cost: keyed by account_id (the identity). The
             #    display name comes from the dashboard `accounts` mirror.
@@ -54,7 +67,7 @@ class ProxyExportMixin:
             rows = conn.execute(f"""
                 SELECT
                     date(r.requested_at) AS date,
-                    r.account_id,
+                    COALESCE(r.account_identity_id,r.account_id) AS account_id,
                     r.model,
                     COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens,
                     COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens,
@@ -62,10 +75,11 @@ class ProxyExportMixin:
                     {cost_columns}
                     COUNT(*) AS request_count
                 FROM request_log r
+                LEFT JOIN account_identities ai
+                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
                 LEFT JOIN accounts a ON a.id = r.account_id
                 WHERE r.id > ? AND r.id <= ?
-                  AND a.id IS NOT NULL
-                  AND a.account_kind IN ('proxy','agent')
+                  AND COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
                   AND LOWER(r.model) != 'unknown' AND r.model != ''
                   AND r.account_id IS NOT NULL
                   -- Only successful requests carry real usage; failed/aborted
@@ -73,8 +87,8 @@ class ProxyExportMixin:
                   -- disconnect) record zero tokens and must not pollute the
                   -- usage archive (they stay in request_log for diagnostics).
                   AND r.status_code BETWEEN 200 AND 299
-                GROUP BY date(r.requested_at), r.account_id, r.model
-                ORDER BY date(r.requested_at), r.account_id, r.model
+                GROUP BY date(r.requested_at), COALESCE(r.account_identity_id,r.account_id), r.model
+                ORDER BY date(r.requested_at), COALESCE(r.account_identity_id,r.account_id), r.model
             """, (mark, max_id)).fetchall()
 
             dash_count = dash_db.upsert_proxy_batch([
@@ -97,20 +111,20 @@ class ProxyExportMixin:
                 "SELECT c.period_start,c.recurring_charge,"
                 "c.normalized_recurring_cost,c.currency,c.base_currency,"
                 "c.fx_rate_date,c.finalized_at,c.credential_uuid,"
-                "bc.uuid contract_uuid,bc.account_id,bc.billing_scope "
+                "c.account_identity_id,c.billing_unit_id,c.contract_uuid_snapshot,"
+                "bc.uuid contract_uuid,COALESCE(c.account_identity_id,bc.account_id) account_id,"
+                "bc.billing_scope "
                 "FROM billing_period_charges c "
-                "JOIN billing_contracts bc ON bc.id=c.contract_id "
-                "JOIN accounts a ON a.id=bc.account_id "
-                "WHERE c.finalized_at IS NOT NULL AND a.account_kind='proxy' "
-                "ORDER BY c.period_start,bc.account_id,c.credential_uuid"
+                "LEFT JOIN billing_contracts bc ON bc.id=c.contract_id "
+                "LEFT JOIN account_identities ai ON ai.id=COALESCE(c.account_identity_id,bc.account_id) "
+                "WHERE c.finalized_at IS NOT NULL AND ai.account_kind='proxy' "
+                "ORDER BY c.period_start,COALESCE(c.account_identity_id,bc.account_id),c.credential_uuid"
             ).fetchall()
             frozen_charge_count = 0
             for charge in frozen_plan_rows:
-                billing_unit_id = (
-                    str(charge["credential_uuid"])
-                    if charge["credential_uuid"] is not None
-                    else f"contract:{charge['contract_uuid']}"
-                )
+                billing_unit_id = (charge["billing_unit_id"] or
+                                   charge["credential_uuid"] or
+                                   f"contract:{charge['contract_uuid_snapshot'] or charge['contract_uuid']}")
                 frozen_charge_count += dash_db.upsert_frozen_plan_charge(
                     month=str(charge["period_start"])[:7],
                     account_id=int(charge["account_id"]),
@@ -126,12 +140,13 @@ class ProxyExportMixin:
             frozen_agent_rows = conn.execute(
                 "SELECT c.period_start,a.software_id,a.recurring_charge,"
                 "a.normalized_recurring_cost,a.currency,a.base_currency,"
-                "a.fx_rate_date,a.finalized_at,s.uuid subscription_uuid "
+                "a.fx_rate_date,a.finalized_at,"
+                "COALESCE(c.subscription_uuid_snapshot,s.uuid) subscription_uuid "
                 "FROM agent_subscription_charge_allocations a "
                 "JOIN agent_subscription_period_charges c "
                 "ON c.id=a.period_charge_id "
-                "JOIN agent_subscription_instances i ON i.id=c.instance_id "
-                "JOIN agent_subscriptions s ON s.id=i.subscription_id "
+                "LEFT JOIN agent_subscription_instances i ON i.id=c.instance_id "
+                "LEFT JOIN agent_subscriptions s ON s.id=COALESCE(c.subscription_id,i.subscription_id) "
                 "WHERE c.finalized_at IS NOT NULL AND a.finalized_at IS NOT NULL "
                 "ORDER BY c.period_start,a.software_id"
             ).fetchall()
@@ -160,21 +175,30 @@ class ProxyExportMixin:
 
             virtual_buckets: dict[tuple[str, int, str], float] = {}
             plan_logs = conn.execute(
-                "SELECT r.account_id,r.upstream_key_id,r.requested_at,"
+                "SELECT COALESCE(r.account_identity_id,r.account_id) account_id,"
+                "r.billing_unit_id,r.billing_anchor_day,r.upstream_key_id,r.requested_at,"
                 "r.equivalent_cost api_cost FROM request_log r "
-                "JOIN billing_contracts bc ON bc.account_id=r.account_id "
-                "JOIN accounts a ON a.id=r.account_id AND a.account_kind='proxy' "
+                "LEFT JOIN billing_contracts bc ON bc.account_id=r.account_id "
+                "LEFT JOIN account_identities ai ON ai.id=COALESCE(r.account_identity_id,r.account_id) "
                 "WHERE r.id>? AND r.id<=? AND r.status_code BETWEEN 200 AND 299 "
-                "AND bc.charge_type='recurring' AND bc.valid_from<=r.requested_at "
-                "AND (bc.valid_until IS NULL OR bc.valid_until>r.requested_at)",
+                "AND ai.account_kind='proxy' AND "
+                "(r.billing_unit_id IS NOT NULL OR (bc.charge_type='recurring' "
+                "AND bc.valid_from<=r.requested_at AND "
+                "(bc.valid_until IS NULL OR bc.valid_until>r.requested_at)))",
                 (mark, max_id),
             ).fetchall()
             for log in plan_logs:
                 meta = by_key_id.get(log["upstream_key_id"]) or by_account.get(log["account_id"])
+                if log["billing_unit_id"]:
+                    meta = dict(meta or {})
+                    meta["billing_unit_id"] = log["billing_unit_id"]
+                    meta["account_id"] = log["account_id"]
                 if meta is None or not meta.get("billing_unit_id"):
                     continue
                 requested = parse_runtime_timestamp(log["requested_at"])
-                month = _billing_period_month(requested, meta["anchor"].day)
+                anchor_day = (log["billing_anchor_day"] or
+                              (meta.get("anchor").day if meta.get("anchor") else 1))
+                month = _billing_period_month(requested, int(anchor_day))
                 bucket = (month, meta["account_id"],
                           meta["billing_unit_id"])
                 virtual_buckets[bucket] = virtual_buckets.get(bucket, 0.0) + float(log["api_cost"] or 0)

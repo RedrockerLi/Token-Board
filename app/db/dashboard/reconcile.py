@@ -16,10 +16,6 @@ def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
     proxy = sqlite_runtime.connect(proxy_path, "proxy_runtime")
     dash = sqlite_runtime.connect(dash_path, "dashboard_runtime")
     try:
-        excluded = {
-            int(row[0]) for row in dash.execute(
-                "SELECT account_id FROM account_exclusions")
-        }
         accounts = proxy.execute(
             "SELECT id,name,lifecycle_state,updated_at,account_kind "
             "FROM accounts ORDER BY id"
@@ -30,8 +26,7 @@ def reconcile_accounts(dash_path: str, proxy_path: str) -> None:
             "name=excluded.name,lifecycle_state=excluded.lifecycle_state,"
             "updated_at=excluded.updated_at,account_kind=excluded.account_kind",
             [(row["id"], row["name"], row["lifecycle_state"],
-              row["updated_at"], row["account_kind"]) for row in accounts
-             if int(row["id"]) not in excluded],
+              row["updated_at"], row["account_kind"]) for row in accounts],
         )
         dash.commit()
     finally:

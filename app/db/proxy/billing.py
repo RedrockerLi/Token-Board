@@ -41,6 +41,44 @@ def _next_period(start: datetime, anchor: int) -> tuple[datetime, datetime]:
     return period.start, period.end
 
 
+def _current_period_start(moment: datetime, anchor: int) -> str:
+    return format_utc(billing_period(moment, anchor).start)
+
+
+def proxy_billing_ready(conn: sqlite3.Connection, account_id: int,
+                        at: datetime | None = None) -> bool:
+    """Whether every currently billable proxy unit has a charge row."""
+    moment = as_utc(at or utc_now()).replace(microsecond=0)
+    units = [u for u in BillingUnitResolver.proxy_units(conn, at=moment)
+             if u.account_id == account_id]
+    for unit in units:
+        start = _current_period_start(moment, unit.anchor_day)
+        row = conn.execute(
+            "SELECT 1 FROM billing_period_charges WHERE contract_id=? "
+            "AND credential_uuid IS ? AND period_start=? LIMIT 1",
+            (unit.contract_id, unit.credential_uuid, start)).fetchone()
+        if row is None:
+            return False
+    return True
+
+
+def agent_billing_ready(conn: sqlite3.Connection, subscription_id: int,
+                        at: datetime | None = None) -> bool:
+    """Whether every currently billable instance has a charge row."""
+    moment = as_utc(at or utc_now()).replace(microsecond=0)
+    units = [u for u in BillingUnitResolver.agent_units(conn, at=moment)
+             if u.subscription_id == subscription_id]
+    for unit in units:
+        start = _current_period_start(moment, unit.anchor_day)
+        row = conn.execute(
+            "SELECT 1 FROM agent_subscription_period_charges "
+            "WHERE instance_id=? AND period_start=? LIMIT 1",
+            (unit.owner_id, start)).fetchone()
+        if row is None:
+            return False
+    return True
+
+
 def _rate(conn: sqlite3.Connection, contract_id: int, start: str,
           as_of: str) -> float:
     """Read the rate effective at the beginning of a billing period."""
@@ -98,7 +136,8 @@ def _materialize_period_stream(
         rate_table: str, rate_owner_column: str, charge_table: str,
         charge_owner_column: str, credential_uuid: str | None,
         attempted: set[tuple[str, str]],
-        charge_subscription_id: int | None = None) -> int:
+        charge_subscription_id: int | None = None,
+        current_only: bool = False) -> int:
     """Materialize one recurring stream using the shared Plan algorithm."""
     ended = None
     if valid_until:
@@ -108,7 +147,9 @@ def _materialize_period_stream(
         ended = ended.replace(microsecond=0)
     cutoff = min(moment, ended) if ended else moment
     anchor_day = anchor.day
-    start_dt, end_dt = _period(_as_utc_datetime(anchor), anchor_day)
+    start_dt, end_dt = (_period(_as_utc_datetime(moment), anchor_day)
+                        if current_only else
+                        _period(_as_utc_datetime(anchor), anchor_day))
     changed = 0
     while start_dt <= cutoff:
         start, end = format_utc(start_dt), format_utc(end_dt)
@@ -162,16 +203,32 @@ def _materialize_period_stream(
                     f"({charge_owner_column},credential_uuid,period_start,period_end,"
                     "recurring_charge,currency,normalized_recurring_cost,base_currency,fx_rate_date,finalized_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (owner_id, credential_uuid, start, end, *values,
+                     (owner_id, credential_uuid, start, end, *values,
                      now if can_finalize else None),
                 )
+                conn.execute(
+                    "UPDATE billing_period_charges SET "
+                    "account_identity_id=(SELECT account_id FROM billing_contracts WHERE id=?),"
+                    "contract_uuid_snapshot=(SELECT uuid FROM billing_contracts WHERE id=?),"
+                    "billing_unit_id=CASE WHEN credential_uuid IS NOT NULL THEN credential_uuid "
+                    "ELSE 'contract:' || (SELECT uuid FROM billing_contracts WHERE id=?) END "
+                    "WHERE id=last_insert_rowid()", (owner_id, owner_id, owner_id))
             else:
                 conn.execute(
                     f"INSERT INTO {charge_table}"
                     f"({charge_owner_column},subscription_id,period_start,period_end,recurring_charge,currency,"
                     "normalized_recurring_cost,base_currency,fx_rate_date,finalized_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (owner_id, charge_subscription_id, start, end, *values,
+                     (owner_id, charge_subscription_id, start, end, *values,
                      now if can_finalize else None),
+                )
+                conn.execute(
+                    "UPDATE agent_subscription_period_charges SET "
+                    "subscription_uuid_snapshot=(SELECT uuid FROM agent_subscriptions WHERE id=?),"
+                    "instance_uuid_snapshot=(SELECT uuid FROM agent_subscription_instances WHERE id=?),"
+                    "subscription_name_snapshot=(SELECT name FROM agent_subscriptions WHERE id=?),"
+                    "instance_label_snapshot=(SELECT label FROM agent_subscription_instances WHERE id=?) "
+                    "WHERE id=last_insert_rowid()",
+                    (charge_subscription_id, owner_id, charge_subscription_id, owner_id),
                 )
             changed += 1
         elif existing["finalized_at"] is None:
@@ -196,60 +253,75 @@ def _finalize_period_stream(conn: sqlite3.Connection, table: str,
     return max(finalized.rowcount, 0)
 
 
+def materialize_period_charges_conn(conn: sqlite3.Connection,
+                                    at: datetime | None = None,
+                                    *, current_only: bool = False) -> int:
+    """Materialize proxy charges on a caller-owned transaction."""
+    moment = as_utc(at or utc_now()).replace(microsecond=0)
+    now = format_utc(moment)
+    changed = 0
+    attempted: set[tuple[str, str]] = set()
+    for unit in BillingUnitResolver.proxy_units(conn, at=moment):
+        changed += _materialize_period_stream(
+            conn, owner_id=unit.owner_id, anchor=unit.valid_from,
+            currency=unit.currency,
+            valid_until=BillingUnitResolver.end_stamp(unit), moment=moment,
+            now=now, rate_table="billing_rate_events",
+            rate_owner_column="contract_id",
+            charge_table="billing_period_charges",
+            charge_owner_column="contract_id",
+            credential_uuid=unit.credential_uuid, attempted=attempted,
+            current_only=current_only)
+    changed += _finalize_period_stream(conn, "billing_period_charges", now)
+    return changed
+
+
 def materialize_period_charges(db_path: str,
                                at: datetime | None = None) -> int:
     """Create/update current charges idempotently and freeze closed periods."""
-    moment = as_utc(at or utc_now()).replace(microsecond=0)
-    now = format_utc(moment)
     conn = sqlite_runtime.connect(db_path, "billing_write")
-    changed = 0
     try:
         with sqlite_runtime.transaction(conn, "immediate"):
-            attempted: set[tuple[str, str]] = set()
-            for unit in BillingUnitResolver.proxy_units(conn, at=moment):
-                changed += _materialize_period_stream(
-                    conn, owner_id=unit.owner_id, anchor=unit.valid_from,
-                    currency=unit.currency,
-                    valid_until=BillingUnitResolver.end_stamp(unit), moment=moment,
-                    now=now, rate_table="billing_rate_events",
-                    rate_owner_column="contract_id",
-                    charge_table="billing_period_charges",
-                    charge_owner_column="contract_id",
-                    credential_uuid=unit.credential_uuid, attempted=attempted)
-            changed += _finalize_period_stream(conn, "billing_period_charges", now)
-            return changed
+            return materialize_period_charges_conn(conn, at)
     finally:
         conn.close()
+
+
+def materialize_agent_subscription_charges_conn(
+        conn: sqlite3.Connection, at: datetime | None = None,
+        *, current_only: bool = False) -> int:
+    """Materialize Agent charges on a caller-owned transaction."""
+    moment = as_utc(at or utc_now()).replace(microsecond=0)
+    now = format_utc(moment)
+    changed = 0
+    attempted: set[tuple[str, str]] = set()
+    for unit in BillingUnitResolver.agent_units(conn, at=moment):
+        changed += _materialize_period_stream(
+            conn, owner_id=unit.owner_id, anchor=unit.valid_from,
+            currency=unit.currency, valid_until=BillingUnitResolver.end_stamp(unit),
+            moment=moment, now=now,
+            rate_table="agent_subscription_rate_events",
+            rate_owner_column="instance_id",
+            charge_table="agent_subscription_period_charges",
+            charge_owner_column="instance_id", credential_uuid=None,
+            charge_subscription_id=unit.subscription_id,
+            attempted=attempted, current_only=current_only)
+        changed += _materialize_agent_charge_allocations(
+            conn, unit.owner_id, unit.account_id, unit.valid_from,
+            unit.subscription_id, now, moment=moment)
+    changed += _finalize_period_stream(
+        conn, "agent_subscription_period_charges", now)
+    changed += _materialize_all_agent_charge_allocations(conn, now, moment=moment)
+    return changed
 
 
 def materialize_agent_subscription_charges(
         db_path: str, at: datetime | None = None) -> int:
     """Materialize agent subscription instances with Plan's exact rules."""
-    moment = as_utc(at or utc_now()).replace(microsecond=0)
-    now = format_utc(moment)
     conn = sqlite_runtime.connect(db_path, "billing_write")
-    changed = 0
     try:
         with sqlite_runtime.transaction(conn, "immediate"):
-            attempted: set[tuple[str, str]] = set()
-            for unit in BillingUnitResolver.agent_units(conn, at=moment):
-                changed += _materialize_period_stream(
-                    conn, owner_id=unit.owner_id, anchor=unit.valid_from,
-                    currency=unit.currency, valid_until=BillingUnitResolver.end_stamp(unit),
-                    moment=moment, now=now,
-                    rate_table="agent_subscription_rate_events",
-                    rate_owner_column="instance_id",
-                    charge_table="agent_subscription_period_charges",
-                    charge_owner_column="instance_id", credential_uuid=None,
-                    charge_subscription_id=unit.subscription_id,
-                    attempted=attempted)
-                changed += _materialize_agent_charge_allocations(
-                    conn, unit.owner_id, unit.account_id, unit.valid_from,
-                    unit.subscription_id, now)
-            changed += _finalize_period_stream(
-                conn, "agent_subscription_period_charges", now)
-            changed += _materialize_all_agent_charge_allocations(conn, now)
-            return changed
+            return materialize_agent_subscription_charges_conn(conn, at)
     finally:
         conn.close()
 
@@ -263,17 +335,21 @@ def materialize_all_period_charges(db_path: str,
 
 def _materialize_agent_charge_allocations(
         conn: sqlite3.Connection, instance_id: int, account_id: int | None,
-        valid_from: date, subscription_id: int | None, now: str) -> int:
+        valid_from: date, subscription_id: int | None, now: str,
+        *, moment: datetime | None = None) -> int:
     """Snapshot active software bindings for finalized instance charges."""
     if subscription_id is None:
         return 0
-    charges = conn.execute(
+    charge_sql = (
         "SELECT id,period_start,recurring_charge,normalized_recurring_cost,"
         "currency,base_currency,fx_rate_date,finalized_at "
         "FROM agent_subscription_period_charges "
-        "WHERE instance_id=? AND finalized_at IS NOT NULL",
-        (instance_id,),
-    ).fetchall()
+        "WHERE instance_id=? AND finalized_at IS NOT NULL")
+    charge_params: tuple[object, ...] = (instance_id,)
+    if moment is not None:
+        charge_sql += " AND period_start<=?"
+        charge_params += (format_utc(moment),)
+    charges = conn.execute(charge_sql, charge_params).fetchall()
     changed = 0
     for charge in charges:
         existing = conn.execute(
@@ -308,7 +384,8 @@ def _materialize_agent_charge_allocations(
 
 
 def _materialize_all_agent_charge_allocations(
-        conn: sqlite3.Connection, now: str) -> int:
+        conn: sqlite3.Connection, now: str,
+        *, moment: datetime | None = None) -> int:
     """Backfill allocations for finalized rows created before V1.12."""
     changed = 0
     instances = conn.execute(
@@ -319,5 +396,5 @@ def _materialize_all_agent_charge_allocations(
         changed += _materialize_agent_charge_allocations(
             conn, instance["id"], None,
             _parse_iso_date(str(instance["valid_from"])[:10]) or utc_now().date(),
-            instance["subscription_id"], now)
+            instance["subscription_id"], now, moment=moment)
     return changed

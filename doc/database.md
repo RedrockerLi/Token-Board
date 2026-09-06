@@ -6,11 +6,11 @@
 
 ## V1 当前结构
 
-Proxy V1 将身份、转发与计费拆开：`accounts` 是稳定计费主体；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，配置的明文位于 `upstream_secrets`；智能体订阅和软件来源分别位于 `agent_subscriptions` / `agent_software`，不再作为上游账户。
+Proxy V1 将历史身份、实时转发与计费拆开：`account_identities` 保存不可删除的历史 ID/UUID/名称，`accounts` 只表示当前实时资源；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，配置的明文位于 `upstream_secrets`；智能体订阅和软件来源分别位于 `agent_subscriptions` / `agent_software`，不再作为上游账户。
 
 计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
 
-Dashboard V1 统一使用 `accounts`、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存订阅分摊后的实际周期费用。智能体软件删除同样是软删除：账户标记为 `deleted`、软件禁用，但身份、运行游标、绑定和请求归属保留。
+Dashboard V1 统一使用历史身份、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存订阅分摊后的实际周期费用。实时软件配置可以物理删除，历史 identity、请求归属和冻结账务继续保留。
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
@@ -27,7 +27,7 @@ Dashboard V1 统一使用 `accounts`、`daily_usage` 和 `monthly_recurring_cost
 | `id` | 主键,递增身份,永不回收 |
 | `name` | 账户名,唯一,可随意改 |
 | `upstream_key` | 上游 API Key |
-| `deleted_at` | 软删除标记:非空 = 账户已停用(行保留、id 不回收,列表/路由过滤 `deleted_at IS NULL`) |
+| `deleted_at` | 到期删除的临时截止时间；生效后实时 `accounts` 行可物理删除，历史身份由 `account_identities` 保留 |
 | `base_url` | 上游 Base URL,如 `https://uni-api.cstcloud.cn/v1` |
 | `api_format` | `openai` / `openai_responses` / `anthropic`,上游线格式 |
 | `is_aggregate` | 是否聚合账户(聚合的模型映射在 `aggregate_entries`) |
@@ -64,7 +64,7 @@ Dashboard V1 统一使用 `accounts`、`daily_usage` 和 `monthly_recurring_cost
 
 | 字段 | 说明 |
 |------|------|
-| `account_id` / `local_key_id` | 用了哪个账户、哪把密钥。账户软删除后行保留,`account_id` 仍指向该账户(id 永存),显示 JOIN `upstream_accounts` 取名字 |
+| `account_id` / `account_identity_id` / `local_key_id` | 实时请求可使用 `account_id`；删除后保留 `account_identity_id` 与 billing 快照，显示 JOIN `account_identities` 取名字 |
 | `model` | 实际调用的模型名(聚合账户为上游模型名) |
 | `prompt_tokens` | 总输入,含缓存命中 |
 | `completion_tokens` | 输出 |
@@ -132,9 +132,9 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 ## dashboard.db
 
-可视化**存档**库,表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.5),`user_version` 当前为 10005。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
+可视化**存档**库,表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.6),`user_version` 当前为 10006。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
-存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `accounts` 元数据镜像表(0004 + 应用层 `reconcile_accounts` 把旧的名字列桶迁移成 id 桶、删掉名字列)。`accounts` 每行 `account_id → name`(0006 删除了从未被读的 `account_type`/`deleted_at` 镜像列),随配置同步、含已软删账户,供历史显示 JOIN 出名字。看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 V1 ledger 行。
+存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `account_identities` 镜像；实时 `accounts` 删除后仍可继续导出历史请求和冻结费用。看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 V1 ledger 行。
 
 ### token_usage / request_usage
 

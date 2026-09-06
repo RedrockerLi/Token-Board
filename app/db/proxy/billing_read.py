@@ -64,8 +64,8 @@ class ProxyBillingReadMixin:
         try:
             sql = """
                 SELECT
-                    COALESCE(a.name, 'unknown') AS account_name,
-                    r.account_id,
+                    COALESCE(ai.name, a.name, 'unknown') AS account_name,
+                    COALESCE(r.account_identity_id, r.account_id) AS account_id,
                     r.agent_software_id,
                     r.model,
                     date(r.requested_at) AS date,
@@ -77,18 +77,21 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
+                LEFT JOIN account_identities ai
+                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
                 WHERE 1=1
-                  AND a.account_kind IN ('proxy','agent')
-                  AND (a.account_kind='agent' OR NOT EXISTS(SELECT 1 FROM billing_contracts bc
+                  AND COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
+                  AND (COALESCE(ai.account_kind,a.account_kind)='agent' OR
+                       (r.billing_unit_id IS NULL AND NOT EXISTS(SELECT 1 FROM billing_contracts bc
                                  WHERE bc.account_id=r.account_id
                                  AND bc.charge_type='recurring'
                                  AND bc.valid_from<=r.requested_at
                                  AND (bc.valid_until IS NULL
-                                      OR bc.valid_until>r.requested_at)))
+                                      OR bc.valid_until>r.requested_at))))
             """
             params = []
             if account_id:
-                sql += " AND r.account_id = ?"
+                sql += " AND COALESCE(r.account_identity_id,r.account_id) = ?"
                 params.append(account_id)
             if date_from:
                 sql += " AND r.requested_at >= ?"
@@ -101,8 +104,8 @@ class ProxyBillingReadMixin:
                 params.append(_filter_bound(date_to, end=True))
 
             sql += """
-                GROUP BY r.account_id, r.model, date(r.requested_at)
-                ORDER BY date(r.requested_at) DESC, r.account_id, r.model
+                GROUP BY COALESCE(r.account_identity_id,r.account_id), r.model, date(r.requested_at)
+                ORDER BY date(r.requested_at) DESC, COALESCE(r.account_identity_id,r.account_id), r.model
             """
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
@@ -124,10 +127,10 @@ class ProxyBillingReadMixin:
             offset = (page - 1) * per_page
             rows = conn.execute(
                 """SELECT
-                    r.id, r.account_id, r.agent_software_id,
-                    CASE WHEN a.account_kind='agent' THEN 'agent'
+                    r.id, COALESCE(r.account_identity_id,r.account_id) AS account_id, r.agent_software_id,
+                    CASE WHEN COALESCE(ai.account_kind,a.account_kind)='agent' THEN 'agent'
                          ELSE r.source_kind END AS source_kind,
-                    COALESCE(a.name, 'unknown') AS account_name,
+                    COALESCE(ai.name, a.name, 'unknown') AS account_name,
                     r.model, r.prompt_tokens, r.cache_read_tokens,
                     r.completion_tokens,
                     r.total_tokens, r.equivalent_cost AS cost,
@@ -139,6 +142,8 @@ class ProxyBillingReadMixin:
                     r.requested_at
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
+                LEFT JOIN account_identities ai
+                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
                 ORDER BY r.requested_at DESC, r.id DESC
                 LIMIT ? OFFSET ?""",
                 (per_page, offset),
@@ -164,10 +169,11 @@ class ProxyBillingReadMixin:
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
-                    COALESCE(a.name, 'unknown') AS account_name,
+                    COALESCE(ai.name, a.name, 'unknown') AS account_name,
                     COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost,
-                    CASE WHEN a.account_kind='agent' THEN 'agent'
+                    CASE WHEN COALESCE(ai.account_kind,a.account_kind)='agent' THEN 'agent'
+                         WHEN r.billing_unit_id IS NOT NULL THEN 'plan'
                          WHEN EXISTS(SELECT 1 FROM billing_contracts bc
                          WHERE bc.account_id=r.account_id
                          AND bc.charge_type='recurring')
@@ -176,16 +182,19 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
                 LEFT JOIN accounts a ON a.id = r.account_id
-                WHERE a.account_kind IN ('proxy','agent')
-                  AND (a.account_kind='agent' OR NOT EXISTS(SELECT 1 FROM billing_contracts bc
+                LEFT JOIN account_identities ai
+                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
+                WHERE COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
+                  AND (COALESCE(ai.account_kind,a.account_kind)='agent' OR
+                       (r.billing_unit_id IS NULL AND NOT EXISTS(SELECT 1 FROM billing_contracts bc
                                  WHERE bc.account_id=r.account_id
                                  AND bc.charge_type='recurring'
                                  AND bc.valid_from<=r.requested_at
                                  AND (bc.valid_until IS NULL
-                                      OR bc.valid_until>r.requested_at)))
+                                      OR bc.valid_until>r.requested_at))))
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
-                GROUP BY date(r.requested_at), r.account_id
-                ORDER BY date, r.account_id
+                GROUP BY date(r.requested_at), COALESCE(r.account_identity_id,r.account_id)
+                ORDER BY date, COALESCE(r.account_identity_id,r.account_id)
             """, (str(days),)).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -206,8 +215,10 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost
                 FROM request_log r
-                JOIN accounts a ON a.id=r.account_id
-                WHERE a.account_kind IN ('proxy','agent')
+                LEFT JOIN accounts a ON a.id=r.account_id
+                LEFT JOIN account_identities ai
+                  ON ai.id=COALESCE(r.account_identity_id,r.account_id)
+                WHERE COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
                   AND r.requested_at >= datetime('now', '-' || ? || ' days')
                 GROUP BY date(r.requested_at)
                 ORDER BY date

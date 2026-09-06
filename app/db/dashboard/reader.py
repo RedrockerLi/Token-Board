@@ -45,9 +45,7 @@ class DashboardReaderMixin:
             "SELECT d.*,COALESCE(a.name,'unknown') AS display_name,"
             "COALESCE(a.account_kind,'proxy') AS account_kind "
             "FROM daily_usage d LEFT JOIN accounts a ON a.account_id=d.account_id "
-            "WHERE COALESCE(a.account_kind,'proxy')!='legacy' "
-            "AND NOT EXISTS (SELECT 1 FROM account_exclusions e "
-            "WHERE e.account_id=d.account_id)"):
+            "WHERE COALESCE(a.account_kind,'proxy')!='legacy'"):
             y, m = _parse_date(row["date"])
             if not y:
                 continue
@@ -90,8 +88,6 @@ class DashboardReaderMixin:
             "billing_incomplete_count FROM monthly_recurring_costs p "
             "LEFT JOIN accounts a ON a.account_id=p.account_id "
             "WHERE COALESCE(a.account_kind,'proxy')!='legacy' "
-            "AND NOT EXISTS (SELECT 1 FROM account_exclusions e "
-            "WHERE e.account_id=p.account_id) "
             "AND (p.equivalent_cost<>0 OR p.recurring_charge<>0 "
             "OR COALESCE(p.normalized_recurring_cost,0)<>0 "
             "OR p.charge_frozen_at IS NOT NULL) "

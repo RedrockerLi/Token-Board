@@ -73,9 +73,6 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         self.assertEqual(result["deleted_rows"], 3)
         self.assertFalse(result["uploaded"])
         self.assertEqual(self._names(), ["keep-me"])
-        self.assertEqual(
-            DashboardDatabase(str(self.dashboard_path), str(self.root / "schema")
-                              ).get_excluded_account_ids(), {7})
 
     def test_batch_delete_publishes_the_mutated_candidate(self) -> None:
         self._configure_webdav()
@@ -209,64 +206,50 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
                          {"ok", "not_found"})
         self.assertEqual(self._names(), ["keep-me"])
 
-    def test_dashboard_exclusion_blocks_later_account_and_charge_replay(self) -> None:
+    def test_deleted_account_can_accept_later_dashboard_charge(self) -> None:
         dashboard = DashboardDatabase(
             str(self.dashboard_path), str(self.root / "schema"))
-        dashboard.exclude_accounts({7})
         dashboard.purge_accounts({7})
         self.assertEqual(dashboard.upsert_account_batch([{
             "account_id": 7, "name": "remove-me",
             "lifecycle_state": "deleted", "updated_at": "2026-01-01T00:00:00Z",
             "account_kind": "proxy",
-        }]), 0)
+        }]), 1)
         self.assertEqual(dashboard.upsert_frozen_plan_charge(
             month="2026-08", account_id=7, billing_unit_id="unit-7",
             recurring_charge=20, normalized_recurring_cost=20,
             currency="CNY", base_currency="CNY", fx_rate_date=None,
-            frozen_at="2026-08-01T00:00:00Z"), 0)
-        self.assertEqual(self._names(), ["keep-me"])
+            frozen_at="2026-08-01T00:00:00Z"), 1)
+        self.assertCountEqual(self._names(), ["keep-me", "remove-me"])
 
-    def test_export_does_not_recreate_excluded_plan_or_zero_rows(self) -> None:
-        proxy = self.proxy_database()
-        account_id = proxy.create_account({
-            "name": "deleted-plan", "account_type": "plan",
-            "currency": "CNY", "monthly_price": 20,
-            "valid_from": "2026-07-01", "base_url": "http://example.test",
-            "upstream_keys": ["sk-deleted-plan"],
-            "new_valid_froms": ["2026-07-01"],
-        })
+    def test_deleted_account_can_accept_later_usage_export(self) -> None:
         with sqlite3.connect(self.proxy_path) as conn:
             conn.execute(
-                "UPDATE billing_rate_events SET effective_at='1990-01-01T00:00:00Z'"
+                "INSERT INTO accounts(id,uuid,name,account_kind) "
+                "VALUES(7,'remove-me-account','remove-me','agent')"
             )
-        dashboard = DashboardDatabase(
-            str(self.dashboard_path), str(self.root / "schema"))
-        dashboard.upsert_account_batch([{
-            "account_id": account_id, "name": "deleted-plan",
-            "lifecycle_state": "deleted", "updated_at": "2026-01-01T00:00:00Z",
-            "account_kind": "proxy",
-        }])
-        dashboard.exclude_accounts({account_id})
-        dashboard.purge_accounts({account_id})
 
-        result = ProxyDatabase(
-            str(self.proxy_path), schema_dir=str(self.root / "schema")
-        ).export_to_dashboard(
-            str(self.dashboard_path), mark=0, max_id=0)
-
-        self.assertEqual(result["record_count"], 0)
-        self.assertNotIn("deleted-plan", self._names())
-
-    def test_delete_exclusion_survives_a_following_export(self) -> None:
         result = delete_dashboard_users(
             str(self.proxy_path), str(self.dashboard_path), ["remove-me"],
             schema_dir=str(self.root / "schema"),
         )
         self.assertEqual(result["status"], "ok", result)
+
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO request_log"
+                "(event_id,source_kind,account_id,model,prompt_tokens,"
+                "completion_tokens,cache_read_tokens,total_tokens,equivalent_cost,"
+                "billed_usage_cost,status_code,requested_at) "
+                "VALUES('remove-me-new-usage','import',7,'new-model',10,5,0,15,"
+                "1.25,1.00,200,'2026-09-06T00:00:00Z')"
+            )
+            max_id = conn.execute("SELECT MAX(id) FROM request_log").fetchone()[0]
+
         ProxyDatabase(
             str(self.proxy_path), schema_dir=str(self.root / "schema")
-        ).export_to_dashboard(str(self.dashboard_path), 0, 0)
-        self.assertEqual(self._names(), ["keep-me"])
+        ).export_to_dashboard(str(self.dashboard_path), 0, max_id)
+        self.assertCountEqual(self._names(), ["keep-me", "remove-me"])
 
     def test_opencode_zen_and_lm_studio_do_not_return_after_export(self) -> None:
         with sqlite3.connect(self.dashboard_path) as conn:

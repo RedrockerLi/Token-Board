@@ -64,6 +64,12 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                  "active", now[:10], None),
             )
             conn.execute(
+                "INSERT OR IGNORE INTO account_identities"
+                "(id,uuid,name,account_kind,created_at,updated_at) "
+                "SELECT id,uuid,name,'agent',created_at,updated_at "
+                "FROM accounts WHERE id=?", (software_id,)
+            )
+            conn.execute(
                 "INSERT INTO agent_software(id,uuid,name,agent_kind,config_json,enabled,created_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?)",
                 (software_id, str(uuid.uuid4()), name, kind, config_json,
@@ -104,6 +110,10 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                 values.append(name)
                 conn.execute("UPDATE accounts SET name=?,updated_at=? WHERE id=?",
                              (name, now, software_id))
+                conn.execute(
+                    "UPDATE account_identities SET name=?,updated_at=? WHERE id=?",
+                    (name, now, software_id),
+                )
             kind = data.get("agent_kind", data.get("kind"))
             if kind is not None:
                 kind = str(kind).strip().lower()

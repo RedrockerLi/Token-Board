@@ -59,7 +59,7 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 4. 上传副本保留普通配置和本地代理客户端密钥，删除运行时数据、导入游标、上游 API Key 明文与 WebDAV 密码；副本压缩后上传。成功后推进 `token-board_config_snapshot.db` 本地权威快照。V0 或 V1 minor/transition 工件都在本地 shadow 中升级，合并成功后才发布新的最新版本工件，远端旧文件不改写。
 5. 上传失败立即恢复最近成功的权威快照，不创建或恢复 durable pending。旧版本遗留 pending 会在下一次拉取前清理。
 
-配置合并按稳定 UUID/upstream credential UUID 做 upsert。云端缺失的普通配置行会变成停用 tombstone；本机上游 API Key 和 WebDAV bootstrap 凭证始终保留，需要在每台机器本地填写。
+配置合并按稳定 UUID/upstream credential UUID 做 upsert。云端缺失的实时配置行按子到父顺序硬删除；`account_identities`、请求历史和冻结账务保留。本机上游 API Key 和 WebDAV bootstrap 凭证始终保留，需要在每台机器本地填写。
 
 ## Dashboard 导出事务
 
@@ -77,7 +77,7 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 
 ### 删除看板用户
 
-`DELETE /api/proxy/dashboard/users` 接收 `{"name":"用户名称","prepare":true/false}`。更多用户窗口中的第一次删除带 `prepare=true`：按“下载云端 dashboard → 本机导出最新用量 → 删除目标用户”的顺序处理，但不上传；同一窗口后续删除只从本机归档移除。窗口关闭时调用 `POST /api/proxy/dashboard/users/upload`，该接口只上传已经修改过的本地 dashboard 存档，不下载、不重新导出，也不接收用户名称。上游账户配置和本机请求明细不在此操作范围内。
+`DELETE /api/proxy/dashboard/users` 接收 `{"names":["用户名称"]}`，只删除目标账号在 dashboard 存档中的历史用量和费用行。删除不会在账号身份上留下排除标记；后续产生的 `request_log` 用量仍会按正常的增量导出流程写回 dashboard，源库中已经冻结的周期账单也会在导出时重新 upsert。由于导出使用高水位标记，已删除的旧请求不会自动重放；如需恢复旧历史，应从旧的 dashboard 存档恢复。
 
 ## 运行时同步健康
 

@@ -9,33 +9,17 @@ from app.db.proxy.common import (
 
 class ProxyLifecycleMixin:
     def delete_account(self, account_id: int, mode: str = "detach") -> dict:
-        """Soft-delete an account. Returns {ok: bool, error: str}.
+        """Terminate a proxy account after its current charge is frozen.
 
-        The row is kept (id is permanent, never recycled) and flagged with
-        deleted_at. The account stops being routed and disappears from lists
-        (queries treat a past deleted_at as gone), but its historical
-        request_log rows keep their account_id and the dashboard archive keeps
-        showing the name (the accounts mirror preserves soft-deleted entries).
-        request_log rows are NOT touched; they are cleaned 30 days after
-        export by the normal high-water-mark cleanup.
-
-        mode:
-          "cascade" — also delete this account's local keys.
-          "detach"  — unbind the keys (account_id → NULL, keys stay for reuse).
-        aggregate_entries referencing this account are deleted so an aggregate
-        chain never routes to a dead account.
-
-        api accounts are always terminated immediately.  subscription accounts
-        follow the configured default deletion operation:
-          'immediate'     — deleted_at = now; local keys & aggregates cleaned up
-                            right here.
-          'end_of_period' — each key keeps its own current billing-period end;
-                            the account deleted_at is the latest of those key
-                            expiries (the account keeps routing until then;
-                            local keys & aggregates are kept so clients can
-                            still reach it).  The cleanup intent is recorded
-                            in deferred_cleanup_mode and performed by the
-                            deletion finalizer once deleted_at has passed.
+        Recurring accounts are rejected until the period-start billing worker
+        has written their immutable charge rows.  Deletion only consumes those
+        rows: it never invokes the materializer.  Immediate deletion removes
+        the live routing/credential/contract graph in this transaction while
+        preserving ``account_identities``, request history and frozen ledgers.
+        End-of-period deletion keeps the live graph until the configured
+        boundary, when :meth:`finalize_deferred_deletions` performs the same
+        purge.  ``mode`` remains an API compatibility parameter; hard deletion
+        removes account-owned route sets and their keys in either mode.
         """
         conn = self._connect()
         try:
@@ -52,6 +36,14 @@ class ProxyLifecycleMixin:
             if account is None:
                 return {"ok": False, "error": "Account not found"}
             now = utc_now()
+            if account["charge_type"] == "recurring":
+                from app.db.proxy.billing import proxy_billing_ready
+                # Deletion is deliberately not a billing trigger.  The
+                # period-start worker (or resource creation at today's
+                # boundary) must have written the immutable charge first.
+                if not proxy_billing_ready(conn, real_id, now):
+                    return {"ok": False,
+                            "error": "当前计费周期尚未固化，请等待账单周期任务完成后重试"}
             anchor = (_parse_iso_date(account["valid_from"])
                       or parse_runtime_timestamp(account["created_at"]).date())
             # The settings page and the delete confirmation both describe the
@@ -104,28 +96,34 @@ class ProxyLifecycleMixin:
                     if key_expiries:
                         effective = max(key_expiries)
                         timestamp = effective.strftime("%Y-%m-%dT%H:%M:%SZ")
-                else:
-                    conn.execute(
-                        f"UPDATE upstream_credentials SET deleted_at=? WHERE upstream_id IN ({placeholders}) "
-                        "AND deleted_at IS NULL", (timestamp, *upstream_ids))
+            else:
+                conn.execute(
+                    f"UPDATE upstream_credentials SET deleted_at=? WHERE upstream_id IN ({placeholders}) "
+                    "AND deleted_at IS NULL", (timestamp, *upstream_ids))
             # The account boundary is derived from the final per-key expiry
             # above, not necessarily from the account creation anchor.
             conn.execute("UPDATE accounts SET deleted_at=? WHERE id=?",
                          (timestamp, real_id))
             if not deferred:
+                from app.db.proxy.deletion import purge_expired_secrets, purge_route_sets
+
+                route_set_ids = [row[0] for row in conn.execute(
+                    "SELECT id FROM route_sets WHERE account_id=?", (real_id,)
+                ).fetchall()]
+                purge_route_sets(conn, route_set_ids)
+                conn.execute(
+                    "DELETE FROM upstream_model_catalog WHERE upstream_id IN "
+                    "(SELECT id FROM upstreams WHERE account_id=?)", (real_id,))
+                purge_expired_secrets(conn, timestamp)
                 conn.execute("UPDATE accounts SET lifecycle_state='deleted' WHERE id=?", (real_id,))
                 conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
-                conn.execute("UPDATE route_sets SET enabled=0 WHERE account_id=?", (real_id,))
-                conn.execute(
-                    "UPDATE client_keys SET enabled=0,deleted_at=? WHERE route_set_id IN "
-                    "(SELECT id FROM route_sets WHERE account_id=?)",
-                    (timestamp, real_id),
-                )
                 if upstream_ids:
                     placeholders = ",".join("?" for _ in upstream_ids)
                     conn.execute(
                         f"UPDATE route_rules SET enabled=0 WHERE upstream_id IN ({placeholders})",
                         upstream_ids)
+                from app.db.proxy.deletion import purge_proxy_account
+                purge_proxy_account(conn, real_id)
             conn.commit()
             return {"ok": conn.total_changes > 0, "error": "",
                     "cancellation_mode": ("end_of_period" if deferred
@@ -191,17 +189,18 @@ class ProxyLifecycleMixin:
             conn.close()
 
     def finalize_deferred_deletions(self) -> int:
-        """Complete end-of-period account deletions whose time has come.
+        """Physically purge deferred accounts after their effective boundary.
 
-        Routing already stopped at deleted_at (queries treat a past
-        deleted_at as gone); this only finishes the cleanup that was deferred
-        at delete time — detach/cascade the local keys and drop aggregate
-        references — and clears the marker.  Idempotent, safe to call on every
-        sweep.
+        Idempotent and safe to call on every maintenance sweep.  Historical
+        identities, request rows and frozen financial facts remain available
+        for reporting/export.
         """
         conn = self._connect()
         try:
             now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            from app.db.proxy.deletion import purge_expired_secrets
+
+            purge_expired_secrets(conn, now)
             pending = conn.execute(
                 "SELECT id FROM accounts WHERE lifecycle_state='active' "
                 "AND account_kind='proxy' AND deleted_at IS NOT NULL AND deleted_at<=?",
@@ -211,16 +210,64 @@ class ProxyLifecycleMixin:
                 real_id = row["id"]
                 conn.execute("UPDATE accounts SET lifecycle_state='deleted' WHERE id=?",
                              (real_id,))
-                conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
-                conn.execute("UPDATE route_sets SET enabled=0 WHERE account_id=?", (real_id,))
+                from app.db.proxy.deletion import purge_route_sets
+
+                route_set_ids = [item[0] for item in conn.execute(
+                    "SELECT id FROM route_sets WHERE account_id=?", (real_id,)
+                ).fetchall()]
+                purge_route_sets(conn, route_set_ids)
                 conn.execute(
-                    "UPDATE client_keys SET enabled=0,deleted_at=COALESCE(deleted_at,?) "
-                    "WHERE route_set_id IN (SELECT id FROM route_sets WHERE account_id=?)",
-                    (now, real_id),
-                )
+                    "DELETE FROM upstream_model_catalog WHERE upstream_id IN "
+                    "(SELECT id FROM upstreams WHERE account_id=?)", (real_id,))
+                conn.execute("UPDATE upstreams SET enabled=0 WHERE account_id=?", (real_id,))
                 conn.execute(
                     "UPDATE route_rules SET enabled=0 WHERE upstream_id IN "
                     "(SELECT id FROM upstreams WHERE account_id=?)", (real_id,))
+                from app.db.proxy.deletion import purge_proxy_account
+                purge_proxy_account(conn, real_id)
+            # Agent bindings and rate events are live configuration.  Their
+            # frozen charges/allocations do not reference the binding rows, so
+            # expired rows can be removed safely; parent subscription and
+            # instance rows remain when financial FKs still point at them.
+            conn.execute(
+                "DELETE FROM agent_subscription_bindings "
+                "WHERE valid_until IS NOT NULL AND valid_until<=?", (now,)
+            )
+            conn.execute(
+                "DELETE FROM agent_subscription_rate_events "
+                "WHERE instance_id IN (SELECT id FROM agent_subscription_instances "
+                "WHERE valid_until IS NOT NULL AND valid_until<=?)", (now,)
+            )
+            # A subscription with no issued financial fact is pure live
+            # configuration and can be removed completely once expired.  Any
+            # parent/instance referenced by a charge remains as an immutable
+            # historical shell.
+            conn.execute(
+                "DELETE FROM agent_subscription_instances WHERE "
+                "valid_until IS NOT NULL AND valid_until<=? AND NOT EXISTS ("
+                "SELECT 1 FROM agent_subscription_period_charges c "
+                "WHERE c.instance_id=agent_subscription_instances.id)", (now,)
+            )
+            conn.execute(
+                "DELETE FROM agent_subscriptions WHERE "
+                "valid_until IS NOT NULL AND valid_until<=? AND NOT EXISTS ("
+                "SELECT 1 FROM agent_subscription_period_charges c "
+                "WHERE c.subscription_id=agent_subscriptions.id) AND NOT EXISTS ("
+                "SELECT 1 FROM agent_subscription_instances i "
+                "WHERE i.subscription_id=agent_subscriptions.id)", (now,)
+            )
+            # Software parser configuration has no financial FK of its own;
+            # request_log.agent_software_id is intentionally a historical
+            # scalar.  Keep the shared account identity, but remove the live
+            # parser/runtime rows after the software is deleted.
+            conn.execute(
+                "DELETE FROM agent_software_runtime WHERE software_id IN ("
+                "SELECT id FROM accounts WHERE account_kind='agent' "
+                "AND lifecycle_state='deleted')")
+            conn.execute(
+                "DELETE FROM agent_software WHERE id IN ("
+                "SELECT id FROM accounts WHERE account_kind='agent' "
+                "AND lifecycle_state='deleted')")
             conn.commit()
             return len(pending)
         finally:
@@ -334,14 +381,18 @@ class ProxyLifecycleMixin:
             conn.close()
 
     def delete_aggregate(self, agg_id: int) -> bool:
-        """Soft-delete an aggregate account (id stays, row flagged deleted_at)."""
+        """Physically delete an aggregate and its attached local keys."""
+        from app.db.proxy.deletion import purge_route_sets
+
         conn = self._connect()
         try:
-            conn.execute(
-                "UPDATE route_sets SET enabled=0,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                "WHERE id=? AND account_id IS NULL AND enabled=1", (agg_id,))
-            conn.execute("UPDATE route_rules SET enabled=0 WHERE route_set_id=?", (agg_id,))
+            row = conn.execute(
+                "SELECT id FROM route_sets WHERE id=? AND account_id IS NULL "
+                "AND enabled=1", (agg_id,)).fetchone()
+            if row is None:
+                return False
+            deleted = purge_route_sets(conn, [agg_id])
             conn.commit()
-            return conn.total_changes > 0
+            return deleted > 0
         finally:
             conn.close()

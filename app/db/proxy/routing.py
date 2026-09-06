@@ -94,16 +94,14 @@ class ProxyRoutingMixin:
             conn.close()
 
     def delete_key(self, key_id: int) -> bool:
-        """Hard-delete a local key. Its request_log rows are kept and their
-        local_key_id is set to NULL via the ON DELETE SET NULL foreign key,
-        so usage/billing data is preserved."""
+        """Hard-delete a local key while preserving request history."""
+        from app.db.proxy.deletion import purge_client_keys
+
         conn = self._connect()
         try:
-            conn.execute(
-                "UPDATE client_keys SET enabled=0,deleted_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                "WHERE id=? AND enabled=1", (key_id,))
+            deleted = purge_client_keys(conn, [key_id])
             conn.commit()
-            return conn.total_changes > 0
+            return deleted > 0
         finally:
             conn.close()
 

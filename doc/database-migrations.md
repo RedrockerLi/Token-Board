@@ -40,10 +40,10 @@ fixture、测试和 V0 历史转换，不是业务代码的升级入口。
 schema/
 ├── token-board/
 │   ├── v0/0-1_initial.sql … 0-19_drop_monthly_price.sql
-│   └── v1/1-0_baseline.sql … 1-14_current_only_pricing.sql
+│   └── v1/1-0_baseline.sql … 1-17_decouple_frozen_ledgers.sql
 ├── dashboard/
 │   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
-│   └── v1/1-0_baseline.sql … 1-5_frozen_charges_and_exclusions.sql
+│   └── v1/1-0_baseline.sql … 1-6_remove_account_exclusions.sql
 └── transitions/
     ├── 0-to-1/                    # V0 → V1 历史转换插件
     │   ├── transition.json
@@ -68,7 +68,7 @@ app/db/schema_upgrade/
 └── engine_core.py          # shadow、manifest、备份、校验、发布
 ```
 
-当前仓库的 V1 tip 是 Token Board V1.14、Dashboard V1.5。V0 文件保留用于历史库和
+当前仓库的 V1 tip 是 Token Board V1.17、Dashboard V1.6。V0 文件保留用于历史库和
 转换测试；新安装只创建当前 V1 baseline，不重放 V0 历史。
 
 ## 版本与元数据

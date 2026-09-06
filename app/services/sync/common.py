@@ -29,7 +29,7 @@ from requests.auth import HTTPBasicAuth
 # and the WebDAV password stay on the machine, while client_keys (the keys
 # accepted by this local proxy) are ordinary synchronized configuration.
 V1_CONFIG_TABLES = [
-    "accounts", "upstreams", "route_sets", "route_rules", "client_keys",
+    "account_identities", "accounts", "upstreams", "route_sets", "route_rules", "client_keys",
     "upstream_credentials", "upstream_secrets", "account_importers",
     "billing_contracts",
     "billing_rate_events", "pricing_rules", "pricing_slots",

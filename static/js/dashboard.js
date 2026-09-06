@@ -150,7 +150,7 @@ function renderMoreUsersList() {
                 '<button type="button" class="btn btn--sm more-user-item" data-name="' +
                 esc(name) + '">' + esc(name) + '</button>' +
                 '<button type="button" class="btn btn--sm more-user-delete" data-name="' +
-                esc(name) + '" title="删除该用户的全部看板数据">删除</button>' +
+                esc(name) + '" title="删除历史数据">删除</button>' +
                 '</div>';
         }).join('');
     }
@@ -193,7 +193,7 @@ async function closeMoreUsersModalImpl() {
         await refreshData();
         if (typeof showToast === 'function') {
             var suffix = result.uploaded ? '并已上传到云端' : '并已保存到本机';
-            showToast('已删除 ' + result.deleted_names.length + ' 个用户' + suffix);
+            showToast('已删除 ' + result.deleted_names.length + ' 个用户的历史数据' + suffix);
         }
         return true;
     } catch (err) {
@@ -254,7 +254,7 @@ async function selectMoreUser(name) {
 }
 
 async function deleteMoreUser(name, button) {
-    if (!confirm('确定删除用户「' + name + '」的全部看板数据吗？\n\n此操作不可恢复。')) {
+    if (!confirm('确定删除用户「' + name + '」的历史数据吗？')) {
         return;
     }
 

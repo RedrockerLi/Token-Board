@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.db.migrations import migrate
+from app.db.migrations import SchemaVersion, apply_sql_migrations, migrate
 from app.db.schema_upgrade import ensure_local_databases
 from app.db.schema_upgrade import upgrade_shadow
 
@@ -43,6 +43,26 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
         self.assertEqual(self._version(proxy), self._latest("token-board"))
         self.assertEqual(self._version(dashboard), self._latest("dashboard"))
+
+    def test_dashboard_v15_upgrade_removes_account_exclusions(self) -> None:
+        dashboard = self.root / "data/dashboard.db"
+        apply_sql_migrations(
+            str(dashboard), str(self.root / "schema"), "dashboard",
+            target=SchemaVersion(1, 5),
+        )
+        with sqlite3.connect(dashboard) as conn:
+            conn.execute(
+                "INSERT INTO account_exclusions(account_id) VALUES(24)")
+            conn.commit()
+
+        apply_sql_migrations(str(dashboard), str(self.root / "schema"), "dashboard")
+
+        with sqlite3.connect(dashboard) as conn:
+            self.assertEqual(self._version(dashboard), (1, 6))
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='account_exclusions'"
+            ).fetchone())
 
     def test_v0_pair_is_upgraded_without_manual_transition(self) -> None:
         proxy = self.root / "data/token-board.db"

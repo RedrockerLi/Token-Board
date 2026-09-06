@@ -1,6 +1,6 @@
 """Subscription parents, billable instances and software bindings."""
 
-from app.core.time import parse_runtime_timestamp, utc_now
+from app.core.time import billing_period, parse_runtime_timestamp, utc_now
 from app.db.proxy.common import (
     _billing_period_month, _next_month, _parse_iso_date,
     _period_start, datetime, json,
@@ -188,6 +188,13 @@ class ProxySubscriptionMixin:
                 (str(uuid.uuid4()), name, currency, parent_start, now, now),
             ).lastrowid
             self._insert_instances(conn, int(sid), instances, now)
+            creation_moment = utc_now()
+            creation_start = parse_runtime_timestamp(parent_start).date()
+            boundary = billing_period(creation_moment, creation_start.day).start.date()
+            if creation_start == boundary:
+                from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+                materialize_agent_subscription_charges_conn(
+                    conn, creation_moment, current_only=True)
             conn.commit()
             return int(sid)
         except sqlite3.IntegrityError as exc:
@@ -245,6 +252,13 @@ class ProxySubscriptionMixin:
                 "SELECT id FROM agent_subscription_instances "
                 "WHERE subscription_id=? AND label=?", (subscription_id, parsed["label"])
             ).fetchone()[0]
+            creation_moment = utc_now()
+            creation_start = parse_runtime_timestamp(parsed["valid_from"]).date()
+            boundary = billing_period(creation_moment, creation_start.day).start.date()
+            if creation_start == boundary:
+                from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+                materialize_agent_subscription_charges_conn(
+                    conn, creation_moment, current_only=True)
             conn.commit()
             return int(iid)
         except sqlite3.IntegrityError as exc:
@@ -294,11 +308,33 @@ class ProxySubscriptionMixin:
             ).fetchone()
             if row is None:
                 return False
+            from app.db.proxy.billing import agent_billing_ready
+            # A delete request may consume a frozen row, but never creates it.
+            if not agent_billing_ready(conn, row["subscription_id"]):
+                return {"ok": False,
+                        "error": "当前计费周期尚未固化，请等待账单周期任务完成后重试"}
+            has_charge = conn.execute(
+                "SELECT 1 FROM agent_subscription_period_charges "
+                "WHERE instance_id=? LIMIT 1", (instance_id,)).fetchone()
+            if has_charge is None:
+                conn.execute(
+                    "DELETE FROM agent_subscription_rate_events WHERE instance_id=?",
+                    (instance_id,))
+                conn.execute(
+                    "DELETE FROM agent_subscription_instances WHERE id=?",
+                    (instance_id,))
+                conn.execute("UPDATE agent_subscriptions SET updated_at=? WHERE id=?",
+                             (now, row["subscription_id"]))
+                conn.commit()
+                return {"ok": True, "deferred": False,
+                        "effective_deleted_at": now}
+            effective = self._subscription_end(conn, row["valid_from"], now_dt)
             self._delete_instance_row(conn, row, now_dt)
             conn.execute("UPDATE agent_subscriptions SET updated_at=? WHERE id=?",
                          (now, row["subscription_id"]))
             conn.commit()
-            return True
+            return {"ok": True, "deferred": True,
+                    "effective_deleted_at": effective.strftime("%Y-%m-%dT%H:%M:%SZ")}
         finally:
             conn.close()
 
@@ -399,10 +435,34 @@ class ProxySubscriptionMixin:
             ).fetchone()
             if row is None:
                 return False
+            from app.db.proxy.billing import agent_billing_ready
+            # A delete request may consume a frozen row, but never creates it.
+            if not agent_billing_ready(conn, subscription_id):
+                return {"ok": False,
+                        "error": "当前计费周期尚未固化，请等待账单周期任务完成后重试"}
+            has_charge = conn.execute(
+                "SELECT 1 FROM agent_subscription_period_charges "
+                "WHERE subscription_id=? LIMIT 1", (subscription_id,)).fetchone()
             instances = conn.execute(
                 "SELECT * FROM agent_subscription_instances "
                 "WHERE subscription_id=? AND lifecycle_state!='deleted'",
                 (subscription_id,)).fetchall()
+            if has_charge is None:
+                conn.execute(
+                    "DELETE FROM agent_subscription_bindings WHERE subscription_id=?",
+                    (subscription_id,))
+                conn.execute(
+                    "DELETE FROM agent_subscription_rate_events WHERE instance_id IN "
+                    "(SELECT id FROM agent_subscription_instances WHERE subscription_id=?)",
+                    (subscription_id,))
+                conn.execute(
+                    "DELETE FROM agent_subscription_instances WHERE subscription_id=?",
+                    (subscription_id,))
+                conn.execute("DELETE FROM agent_subscriptions WHERE id=?",
+                             (subscription_id,))
+                conn.commit()
+                return {"ok": True, "deferred": False,
+                        "effective_deleted_at": now}
             end = self._subscription_end(conn, row["valid_from"], now_dt)
             ends = [self._subscription_end(conn, item["valid_from"], now_dt)
                     for item in instances]
@@ -422,7 +482,8 @@ class ProxySubscriptionMixin:
                 "WHERE subscription_id=? AND lifecycle_state='active'",
                 ("active" if deferred else "deleted", end_text, now, subscription_id))
             conn.commit()
-            return True
+            return {"ok": True, "deferred": deferred,
+                    "effective_deleted_at": end_text}
         finally:
             conn.close()
 

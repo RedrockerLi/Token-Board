@@ -53,7 +53,8 @@ class ProxyDatabase(
         """
         return int(conn.execute(
             "SELECT max(COALESCE((SELECT max(id) FROM accounts),0),"
-            "COALESCE((SELECT max(id) FROM route_sets),0))+1"
+            "COALESCE((SELECT max(id) FROM route_sets),0),"
+            "COALESCE((SELECT max(id) FROM account_identities),0))+1"
         ).fetchone()[0])
 
     @staticmethod
@@ -87,23 +88,26 @@ class ProxyDatabase(
             usage = conn.execute(
                 "SELECT COUNT(*) total_requests,COALESCE(SUM(total_tokens),0) total_tokens,"
                 "COALESCE(SUM(r.billed_usage_cost),0) billed_usage_cost "
-                "FROM request_log r JOIN accounts a ON a.id=r.account_id "
-                "WHERE a.account_kind IN ('proxy','agent') "
+                "FROM request_log r LEFT JOIN accounts a ON a.id=r.account_id "
+                "LEFT JOIN account_identities ai ON ai.id=COALESCE(r.account_identity_id,r.account_id) "
+                "WHERE COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent') "
                 "AND r.requested_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')"
             ).fetchone()
             daily = conn.execute(
                 "SELECT COUNT(*) today_requests,COALESCE(SUM(equivalent_cost),0) "
                 "today_theoretical_cost,COALESCE(SUM(r.billed_usage_cost),0) "
                 "today_billed_usage_cost FROM request_log r "
-                "JOIN accounts a ON a.id=r.account_id "
-                "WHERE a.account_kind IN ('proxy','agent') AND date(r.requested_at)=?",
+                "LEFT JOIN accounts a ON a.id=r.account_id "
+                "LEFT JOIN account_identities ai ON ai.id=COALESCE(r.account_identity_id,r.account_id) "
+                "WHERE COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent') AND date(r.requested_at)=?",
                 (today,),
             ).fetchone()
             recurring_proxy = conn.execute(
                 "SELECT COALESCE(SUM(c.normalized_recurring_cost),0) "
-                "FROM billing_period_charges c JOIN billing_contracts bc "
-                "ON bc.id=c.contract_id JOIN accounts a ON a.id=bc.account_id "
-                "WHERE a.account_kind='proxy' "
+                "FROM billing_period_charges c LEFT JOIN billing_contracts bc "
+                "ON bc.id=c.contract_id JOIN account_identities ai "
+                "ON ai.id=COALESCE(c.account_identity_id,bc.account_id) "
+                "WHERE ai.account_kind='proxy' "
                 "AND c.period_start<=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "AND c.period_end>strftime('%Y-%m-%dT%H:%M:%SZ','now')"
             ).fetchone()[0]
@@ -131,9 +135,10 @@ class ProxyDatabase(
             recurring = recurring_proxy + recurring_agent
             today_recurring = conn.execute(
                 "SELECT COALESCE(SUM(c.normalized_recurring_cost),0) "
-                "FROM billing_period_charges c JOIN billing_contracts bc "
-                "ON bc.id=c.contract_id JOIN accounts a ON a.id=bc.account_id "
-                "WHERE a.account_kind='proxy' "
+                "FROM billing_period_charges c LEFT JOIN billing_contracts bc "
+                "ON bc.id=c.contract_id JOIN account_identities ai "
+                "ON ai.id=COALESCE(c.account_identity_id,bc.account_id) "
+                "WHERE ai.account_kind='proxy' "
                 "AND c.period_start<=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "AND c.period_end>strftime('%Y-%m-%dT%H:%M:%SZ','now')"
             ).fetchone()[0] + conn.execute(
@@ -159,8 +164,9 @@ class ProxyDatabase(
             ).fetchone()[0]
             theoretical = conn.execute(
                 "SELECT COALESCE(SUM(r.equivalent_cost),0) FROM request_log r "
-                "JOIN accounts a ON a.id=r.account_id "
-                "WHERE a.account_kind IN ('proxy','agent') "
+                "LEFT JOIN accounts a ON a.id=r.account_id "
+                "LEFT JOIN account_identities ai ON ai.id=COALESCE(r.account_identity_id,r.account_id) "
+                "WHERE COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent') "
                 "AND r.requested_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')"
             ).fetchone()[0]
             active_upstreams = conn.execute(
@@ -171,9 +177,9 @@ class ProxyDatabase(
             ).fetchone()[0]
             billing_incomplete = conn.execute(
                 "SELECT COUNT(*) FROM billing_period_charges c "
-                "JOIN billing_contracts bc ON bc.id=c.contract_id "
-                "JOIN accounts a ON a.id=bc.account_id "
-                "WHERE a.account_kind='proxy' "
+                "LEFT JOIN billing_contracts bc ON bc.id=c.contract_id "
+                "JOIN account_identities ai ON ai.id=COALESCE(c.account_identity_id,bc.account_id) "
+                "WHERE ai.account_kind='proxy' "
                 "AND c.period_start<=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "AND c.period_end>strftime('%Y-%m-%dT%H:%M:%SZ','now') "
                 "AND c.finalized_at IS NULL "

@@ -44,11 +44,10 @@ def merge_config_tables(remote_path: str, local_path: str) -> None:
 def _merge_v1_config(remote_path: str, local_path: str) -> None:
     """Merge normalized V1 configuration without importing local secrets.
 
-    Stable UUIDs are authoritative. Missing proxy rows become lifecycle
-    tombstones rather than being deleted, preserving request/attempt foreign
-    keys and historical pricing; agent software rows use the same lifecycle
-    tombstone model and are retained with their account identity. ``runtime_id``
-    and importer cursors remain local.
+    Stable UUIDs are authoritative. Missing live child rows are hard-deleted;
+    proxy accounts and agent software retain their separate account identity
+    and historical ledgers while their live configuration is removed.
+    ``runtime_id`` and importer cursors remain local.
     """
     remote = sqlite_runtime.connect(remote_path, "shadow_copy")
     local = sqlite_runtime.connect(local_path, "proxy_runtime")
@@ -81,7 +80,7 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
 
         # Parent-first upsert. Historical rows not present remotely remain as
         # inactive/local history instead of violating live request FKs.
-        for table in ("accounts", "upstreams", "route_sets", "route_rules",
+        for table in ("account_identities", "accounts", "upstreams", "route_sets", "route_rules",
                       "client_keys"):
             merge_table(table)
 
@@ -163,10 +162,41 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
             for table in ("accounts", "upstreams", "route_sets", "route_rules",
                           "client_keys", "account_importers",
                           "agent_subscriptions", "agent_software",
-                          "agent_subscription_instances", "agent_subscription_bindings")
+                          "agent_subscription_instances", "agent_subscription_bindings",
+                          "agent_subscription_rate_events")
             if table_exists(remote, table)
         }
         now = format_utc(utc_now())
+        # These are live configuration rows with no historical ownership.
+        # A cloud snapshot that omits them means the operator removed them;
+        # purge them locally in dependency order instead of accumulating a
+        # second tombstone copy.  Parent accounts remain tombstoned when
+        # request/financial history still references their identity.
+        hard_delete_tables = {
+            "route_rules", "client_keys", "agent_subscription_bindings",
+            "agent_subscription_rate_events", "agent_software",
+        }
+        for table in hard_delete_tables:
+            if not table_exists(remote, table) or not table_exists(local, table):
+                continue
+            info = table_info(local, table)
+            primary = [row[1] for row in sorted(info, key=lambda value: value[5]) if row[5]]
+            if not primary:
+                continue
+            identities = remote_ids.get(table, set())
+            for row in local.execute(f"SELECT {','.join(primary)} FROM {table}").fetchall():
+                identity = tuple(row)
+                if identity in identities:
+                    continue
+                where = " AND ".join(f"{column}=?" for column in primary)
+                if table == "client_keys":
+                    from app.db.proxy.deletion import purge_client_keys
+                    purge_client_keys(local, [identity[0]])
+                elif table == "agent_software":
+                    local.execute("DELETE FROM agent_software_runtime WHERE software_id=?", identity)
+                    local.execute(f"DELETE FROM {table} WHERE {where}", identity)
+                else:
+                    local.execute(f"DELETE FROM {table} WHERE {where}", identity)
         tombstones = {
             "accounts": (
                 "lifecycle_state=CASE WHEN account_kind='agent' THEN 'deleted' "
@@ -187,11 +217,21 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                 "lifecycle_state='deleted',valid_until=?,updated_at=?", (now, now)),
         }
         for table, identities in remote_ids.items():
+            if table in hard_delete_tables:
+                continue
             info = table_info(local, table)
             primary = [row[1] for row in sorted(info, key=lambda value: value[5]) if row[5]]
             for row in local.execute(f"SELECT {','.join(primary)} FROM {table}").fetchall():
                 identity = tuple(row)
                 if identity not in identities:
+                    if table == "accounts":
+                        kind = local.execute(
+                            "SELECT account_kind FROM accounts WHERE id=?",
+                            identity).fetchone()
+                        if kind is not None and kind[0] == "proxy":
+                            from app.db.proxy.deletion import purge_proxy_account
+                            purge_proxy_account(local, int(identity[0]))
+                            continue
                     clause, params = tombstones[table]
                     where = " AND ".join(f"{column}=?" for column in primary)
                     local.execute(f"UPDATE {table} SET {clause} WHERE {where}",
