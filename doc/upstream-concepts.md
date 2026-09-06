@@ -161,7 +161,8 @@
 
 ### 高水位与云同步
 
-- 导出只取 `id > mark` 的行；`mark`（`last_exported_log_id`）在**整个 pull-export-upload 事务成功后才推进**，失败则丢弃 shadow、分毫不动（[app/services/sync.py:736-815](app/services/sync.py#L736-L815)）。
+- 用量导出只取 `request_log.id > last_exported_log_id` 的行，账单导出只取
+  `billing_export_events.id > last_exported_billing_event_id` 的事件；两个水位线都在**整个 pull-export-upload 事务成功后才推进**，失败则丢弃 shadow、分毫不动（见 [doc/sync.md](sync.md)）。
 - 30 天后清理已归档(`id <= mark`)的 `request_log` 行；未导出的行永不清理。
 
 ## 八、常见误区速查

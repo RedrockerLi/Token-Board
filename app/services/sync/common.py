@@ -46,6 +46,7 @@ CONFIG_TABLE_ALLOWLIST = frozenset(V1_CONFIG_TABLES)
 RUNTIME_TABLE_DELETE_ORDER = (
     "request_attempts",
     "request_log",
+    "billing_export_events",
     "agent_subscription_charge_allocations",
     "billing_period_charges",
     "agent_subscription_period_charges",

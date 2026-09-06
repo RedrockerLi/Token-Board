@@ -98,9 +98,15 @@ SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 
   在 shadow/事务中执行，业务 facade、
   reconcile 和 C++ 请求路径不补迁移逻辑。规则见
   [database-migrations.md](database-migrations.md)。
+- **C++ schema 版本必须同步。** 每次 Token Board V1 Minor tip 增加时，同时更新
+  `proxy/src/store/database_lifecycle.cpp` 的
+  `kRequiredRuntimeSchemaMinor`，重新编译代理并运行
+  `PYTHONPATH=. python3 proxy/tests/schema_version_test.py schema .`。
+  Python 已升级数据库而 C++ 仍要求旧 Minor 时，代理会拒绝启动，表现为
+  `start.sh --all` 的 `proxy health check failed`。
 - **时间存 UTC,显示浏览器当地时间。** 库内 `datetime('now')` 和请求时间存 UTC;前端通过 `Date` 的本机时区显示时间戳,并把当地日期筛选转换为 UTC 范围。峰谷档位边界按 UTC+0 分钟存储,电脑时区变化只改变显示。订阅起始日是 UTC 日期锚点,前端使用可逆的当地日期映射,避免换时区后原样保存改动账期。
 - **计费写时固化。** 改价、换序不回溯 `request_log.api_cost`,见 [billing-pricing.md](billing-pricing.md)。
-- **request_log 明细不上传。** 普通用户配置和本地代理密钥上传到配置云端文件；上游 API Key 明文与 WebDAV 密码只保存在本机。同步进度用 `sync_state.last_exported_log_id` 单值检查点,拉取-导出-上传是完整事务(失败回滚),见 [sync.md](sync.md)。
+- **request_log 明细不上传。** 普通用户配置和本地代理密钥上传到配置云端文件；上游 API Key 明文与 WebDAV 密码只保存在本机。用量和账单分别使用 `sync_state.last_exported_log_id` 与 `sync_state.last_exported_billing_event_id`，拉取-导出-上传是完整事务(失败回滚),见 [sync.md](sync.md)。
 - **Python 无依赖清单。** 只有 flask、requests 两个第三方包,启动脚本在缺 flask 时自动 pip 安装。
 - **数据库路径与 schema 目录的推导约定**:`data/token-board.db` /
   `data/dashboard.db` → `<仓库>/schema/`；Python coordinator 再选择

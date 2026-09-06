@@ -1,11 +1,30 @@
 """ProxyDatabase methods for ProxyExportMixin."""
 
+import hashlib
+import json
+
 from app.core.time import parse_runtime_timestamp, utc_now
 from app.db.proxy.common import _billing_period_month
 
 
+def _billing_event_payload_hash(event) -> str:
+    payload = {
+        key: event[key] for key in (
+            "event_key", "event_kind", "account_id", "account_uuid",
+            "account_kind",
+            "month", "billing_unit_id", "recurring_charge",
+            "normalized_recurring_cost", "currency", "base_currency",
+            "fx_rate_date",
+        )
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 class ProxyExportMixin:
-    def export_to_dashboard(self, target_path: str, mark: int, max_id: int) -> dict:
+    def export_to_dashboard(self, target_path: str, mark: int, max_id: int,
+                            billing_mark: int | None = None,
+                            billing_max_id: int | None = None) -> dict:
         """Export request_log rows (id in (mark, max_id]) into a dashboard archive.
 
         Writes into *target_path* (the shadow archive built by sync_dashboard —
@@ -14,8 +33,9 @@ class ProxyExportMixin:
         pull-export-upload transaction succeeds, so nothing here marks rows.
 
         plan subscription fees are persisted per (account, month) only after
-        the source period charge is frozen. Request-derived virtual costs stay
-        additive and are protected by the request-log high-water mark.
+        the source period charge is frozen. Billing events have their own
+        high-water mark and are acknowledged by the caller only after the
+        dashboard candidate is committed.
         """
         from app.db.dashboard_db import DashboardDatabase
         from app.db.proxy.billing import (
@@ -26,6 +46,10 @@ class ProxyExportMixin:
         # materializer synchronously so a first sync cannot omit the current
         # recurring period while the 60-second background worker is asleep.
         materialize_all_period_charges(self.db_path)
+        if billing_mark is None:
+            billing_mark = self.get_billing_export_mark()
+        if billing_max_id is None:
+            billing_max_id = self.get_max_billing_event_id()
         conn = self._connect()
         try:
             # The shadow may live outside data/ (e.g. data/tmp_dash/); use the
@@ -104,64 +128,19 @@ class ProxyExportMixin:
                 for r in rows
             ])
 
-            # B) Export only immutable, already-finalized subscription charges.
-            # The source ledger is idempotent; the dashboard row becomes
-            # immutable once its first frozen value is accepted.
-            frozen_plan_rows = conn.execute(
-                "SELECT c.period_start,c.recurring_charge,"
-                "c.normalized_recurring_cost,c.currency,c.base_currency,"
-                "c.fx_rate_date,c.finalized_at,c.credential_uuid,"
-                "c.account_identity_id,c.billing_unit_id,c.contract_uuid_snapshot,"
-                "bc.uuid contract_uuid,COALESCE(c.account_identity_id,bc.account_id) account_id,"
-                "bc.billing_scope "
-                "FROM billing_period_charges c "
-                "LEFT JOIN billing_contracts bc ON bc.id=c.contract_id "
-                "LEFT JOIN account_identities ai ON ai.id=COALESCE(c.account_identity_id,bc.account_id) "
-                "WHERE c.finalized_at IS NOT NULL AND ai.account_kind='proxy' "
-                "ORDER BY c.period_start,COALESCE(c.account_identity_id,bc.account_id),c.credential_uuid"
+            # B) Export each immutable billing event at most once per shared
+            # dashboard archive. The source event stream is separate from the
+            # request-log stream and its mark is acknowledged by the caller.
+            events = conn.execute(
+                "SELECT * FROM billing_export_events "
+                "WHERE id>? AND id<=? ORDER BY id",
+                (billing_mark, billing_max_id),
             ).fetchall()
             frozen_charge_count = 0
-            for charge in frozen_plan_rows:
-                billing_unit_id = (charge["billing_unit_id"] or
-                                   charge["credential_uuid"] or
-                                   f"contract:{charge['contract_uuid_snapshot'] or charge['contract_uuid']}")
-                frozen_charge_count += dash_db.upsert_frozen_plan_charge(
-                    month=str(charge["period_start"])[:7],
-                    account_id=int(charge["account_id"]),
-                    billing_unit_id=billing_unit_id,
-                    recurring_charge=float(charge["recurring_charge"] or 0),
-                    normalized_recurring_cost=charge["normalized_recurring_cost"],
-                    currency=charge["currency"] or "CNY",
-                    base_currency=charge["base_currency"] or "CNY",
-                    fx_rate_date=charge["fx_rate_date"],
-                    frozen_at=charge["finalized_at"],
-                )
-
-            frozen_agent_rows = conn.execute(
-                "SELECT c.period_start,a.software_id,a.recurring_charge,"
-                "a.normalized_recurring_cost,a.currency,a.base_currency,"
-                "a.fx_rate_date,a.finalized_at,"
-                "COALESCE(c.subscription_uuid_snapshot,s.uuid) subscription_uuid "
-                "FROM agent_subscription_charge_allocations a "
-                "JOIN agent_subscription_period_charges c "
-                "ON c.id=a.period_charge_id "
-                "LEFT JOIN agent_subscription_instances i ON i.id=c.instance_id "
-                "LEFT JOIN agent_subscriptions s ON s.id=COALESCE(c.subscription_id,i.subscription_id) "
-                "WHERE c.finalized_at IS NOT NULL AND a.finalized_at IS NOT NULL "
-                "ORDER BY c.period_start,a.software_id"
-            ).fetchall()
-            for allocation in frozen_agent_rows:
-                frozen_charge_count += dash_db.upsert_frozen_agent_allocation(
-                    month=str(allocation["period_start"])[:7],
-                    account_id=int(allocation["software_id"]),
-                    billing_unit_id=f"agent-subscription:{allocation['subscription_uuid']}",
-                    recurring_charge=float(allocation["recurring_charge"] or 0),
-                    normalized_recurring_cost=allocation["normalized_recurring_cost"],
-                    currency=allocation["currency"] or "CNY",
-                    base_currency=allocation["base_currency"] or "CNY",
-                    fx_rate_date=allocation["fx_rate_date"],
-                    frozen_at=allocation["finalized_at"],
-                )
+            for event in events:
+                event_dict = dict(event)
+                frozen_charge_count += dash_db.record_billing_export_event(
+                    event_dict, _billing_event_payload_hash(event_dict))
 
             # C) Request-log plan costs remain additive and are still protected
             # by the request high-water mark. They are separate from frozen
@@ -213,6 +192,8 @@ class ProxyExportMixin:
             return {
                 "record_count": len(rows),
                 "dashboard_records": dash_count + frozen_charge_count,
+                "billing_event_count": len(events),
+                "billing_max_id": billing_max_id,
             }
         finally:
             conn.close()
@@ -260,6 +241,57 @@ class ProxyExportMixin:
                 "INSERT OR REPLACE INTO sync_state (key, value) "
                 "VALUES ('last_exported_log_id', ?)",
                 (str(max_id),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_billing_export_mark(self) -> int:
+        """Read the independent immutable-billing export high-water mark."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM sync_state "
+                "WHERE key='last_exported_billing_event_id'"
+            ).fetchone()
+            return int(row["value"]) if row else 0
+        finally:
+            conn.close()
+
+    def get_max_billing_event_id(self) -> int:
+        """Return the export upper bound after materialization."""
+        conn = self._connect()
+        try:
+            return int(conn.execute(
+                "SELECT COALESCE(MAX(id),0) FROM billing_export_events"
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
+    def set_billing_export_mark(self, max_id: int) -> None:
+        """Advance the billing export mark after dashboard commit."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_state(key,value) VALUES(?,?)",
+                ("last_exported_billing_event_id", str(max_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def set_export_marks(self, max_log_id: int,
+                         max_billing_event_id: int | None = None) -> None:
+        """Atomically acknowledge request and billing export streams."""
+        conn = self._connect()
+        try:
+            values = [("last_exported_log_id", str(max_log_id))]
+            if max_billing_event_id is not None:
+                values.append(("last_exported_billing_event_id",
+                               str(max_billing_event_id)))
+            conn.executemany(
+                "INSERT OR REPLACE INTO sync_state(key,value) VALUES(?,?)",
+                values,
             )
             conn.commit()
         finally:

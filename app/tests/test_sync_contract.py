@@ -242,7 +242,7 @@ class SyncContractTest(unittest.TestCase):
                 ).fetchone())
                 self.assertEqual(conn.execute(
                     "SELECT major,minor FROM schema_version WHERE id=1"
-                ).fetchone(), (1, 17))
+                    ).fetchone(), (1, 18))
             return state["artifact"]
 
         try:
@@ -346,6 +346,13 @@ class SyncContractTest(unittest.TestCase):
                 conn.execute(
                     "INSERT INTO agent_subscription_charge_allocations "
                     "(period_charge_id,software_id) VALUES(1,1)")
+                conn.execute(
+                    "INSERT INTO billing_export_events"
+                    "(event_key,event_kind,source_table,source_key,account_id,"
+                    "account_name,account_kind,month,billing_unit_id,"
+                    "recurring_charge,currency,frozen_at) "
+                    "VALUES('event-1','agent','source','1:1',1,'agent',"
+                    "'agent','2026-01','unit-1',1,'CNY','2026-01-01T00:00:00Z')")
                 conn.commit()
             snapshot_config(proxy)
 
@@ -435,6 +442,9 @@ class SyncContractTest(unittest.TestCase):
                     "PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(conn.execute(
                     "SELECT count(*) FROM agent_subscription_charge_allocations"
+                ).fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM billing_export_events"
                 ).fetchone()[0], 0)
         finally:
             shutil.rmtree(temp, ignore_errors=True)

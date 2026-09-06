@@ -54,6 +54,16 @@ class DashboardWriterMixin:
         conn = self._connect()
         try:
             deleted = 0
+            conn.execute(
+                """INSERT OR IGNORE INTO billing_export_receipts
+                   (event_key,account_id,month,billing_unit_id,payload_hash)
+                   SELECT 'legacy:' || account_id || ':' || month || ':' || billing_unit_id,
+                          account_id,month,billing_unit_id,''
+                   FROM monthly_recurring_costs
+                   WHERE account_id IN ({}) AND charge_frozen_at IS NOT NULL""".format(
+                       placeholders),
+                ids,
+            )
             for table in ("monthly_recurring_costs", "daily_usage"):
                 deleted += conn.execute(
                     f"DELETE FROM {table} WHERE account_id IN ({placeholders})",
@@ -273,6 +283,70 @@ class DashboardWriterMixin:
                 normalized_recurring_cost=float(cost or 0),
                 currency="CNY", base_currency="CNY", fx_rate_date=None,
                 frozen_at=frozen_at)
+
+    def record_billing_export_event(self, event: dict,
+                                    payload_hash: str) -> int:
+        """Apply one immutable billing event and retain its delivery receipt.
+
+        The receipt is deliberately separate from the visible monthly row.
+        Dashboard deletion removes the latter but keeps the receipt, so a
+        later export from another machine cannot resurrect an old charge.
+        """
+        conn = self._connect()
+        try:
+            existing = conn.execute(
+                "SELECT payload_hash FROM billing_export_receipts "
+                "WHERE event_key=?", (event["event_key"],)
+            ).fetchone()
+            if existing is not None:
+                if existing[0] == "":
+                    return 0
+                if existing[0] != payload_hash:
+                    raise ValueError(
+                        f"billing event payload changed: {event['event_key']}")
+                return 0
+
+            legacy = conn.execute(
+                """SELECT payload_hash FROM billing_export_receipts
+                   WHERE event_key=?""",
+                (f"legacy:{event['account_id']}:{event['month']}:{event['billing_unit_id']}",),
+            ).fetchone()
+            if legacy is not None:
+                return 0
+
+            if not (float(event["recurring_charge"] or 0) == 0 and
+                    float(event["normalized_recurring_cost"] or 0) == 0):
+                conn.execute(
+                    """INSERT INTO monthly_recurring_costs
+                       (month,account_id,billing_unit_id,recurring_charge,
+                        equivalent_cost,currency,normalized_recurring_cost,
+                        base_currency,fx_rate_date,charge_frozen_at)
+                       VALUES(?,?,?,?,0,?,?,?,?,?)
+                       ON CONFLICT(month,account_id,billing_unit_id) DO UPDATE SET
+                         recurring_charge=excluded.recurring_charge,
+                         currency=excluded.currency,
+                         normalized_recurring_cost=excluded.normalized_recurring_cost,
+                         base_currency=excluded.base_currency,
+                         fx_rate_date=excluded.fx_rate_date,
+                         charge_frozen_at=excluded.charge_frozen_at
+                       WHERE monthly_recurring_costs.charge_frozen_at IS NULL""",
+                    (event["month"], event["account_id"],
+                     event["billing_unit_id"], event["recurring_charge"],
+                     event["currency"], event["normalized_recurring_cost"],
+                     event["base_currency"], event["fx_rate_date"],
+                     event["frozen_at"]),
+                )
+            conn.execute(
+                """INSERT INTO billing_export_receipts
+                   (event_key,account_id,month,billing_unit_id,payload_hash)
+                   VALUES(?,?,?,?,?)""",
+                (event["event_key"], event["account_id"],
+                 event["month"], event["billing_unit_id"], payload_hash),
+            )
+            conn.commit()
+            return 1
+        finally:
+            conn.close()
 
     def cleanup_stale_subscription_units(self, account_id: int,
                                          active_unit_ids: set[str]) -> None:

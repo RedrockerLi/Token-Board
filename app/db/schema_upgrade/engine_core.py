@@ -198,6 +198,7 @@ def rebuild_snapshot(proxy_path: Path,
     try:
         for table in ("request_attempts", "request_log",
                       "billing_period_charges",
+                      "billing_export_events",
                       "agent_subscription_period_charges",
                       "agent_subscription_charge_allocations", "fx_rates"):
             if table_exists(conn, table):

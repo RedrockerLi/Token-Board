@@ -68,7 +68,7 @@ app/db/schema_upgrade/
 └── engine_core.py          # shadow、manifest、备份、校验、发布
 ```
 
-当前仓库的 V1 tip 是 Token Board V1.17、Dashboard V1.6。V0 文件保留用于历史库和
+当前仓库的 V1 tip 是 Token Board V1.18、Dashboard V1.7。V0 文件保留用于历史库和
 转换测试；新安装只创建当前 V1 baseline，不重放 V0 历史。
 
 ## 版本与元数据
@@ -82,6 +82,26 @@ app/db/schema_upgrade/
   已完成的 transition，避免重复执行并保证两个数据库使用同一个 generation。
 - 运行时要求数据库处于当前 V1 tip。未知的更高版本不能当作已验证的运行时版本；
   应使用匹配版本的 Python schema-upgrade 工具处理。
+
+### C++ runtime schema contract
+
+Token Board 的 C++ runtime 只接受一个精确的 Proxy V1 Minor 版本。新增或修改
+`schema/token-board/v1/*.sql` 后，必须同步检查
+`proxy/src/store/database_lifecycle.cpp` 中的
+`kRequiredRuntimeSchemaMinor`，使它等于当前 Token Board V1 tip；否则 Python
+会先把数据库升级成功，但 `token-proxy` 随后会拒绝打开数据库，日志会出现
+“database is V1.N; run ... to V1.M”，最终 `start.sh --all` 报告
+`proxy health check failed`。
+
+发布前至少运行：
+
+```bash
+PYTHONPATH=. python3 proxy/tests/schema_version_test.py schema .
+cmake --build proxy/build -j$(nproc)
+ctest --test-dir proxy/build -R '^schema_version$' --output-on-failure
+```
+
+Python migration tip、C++ 常量和已编译代理必须作为一个版本一起发布。
 
 ## 同 Major 的 SQL 升级
 

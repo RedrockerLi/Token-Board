@@ -58,11 +58,84 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         apply_sql_migrations(str(dashboard), str(self.root / "schema"), "dashboard")
 
         with sqlite3.connect(dashboard) as conn:
-            self.assertEqual(self._version(dashboard), (1, 6))
+            self.assertEqual(self._version(dashboard), (1, 7))
             self.assertIsNone(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='account_exclusions'"
             ).fetchone())
+
+    def test_v17_frozen_charge_becomes_delivered_event_baseline(self) -> None:
+        proxy = self.root / "data/token-board.db"
+        dashboard = self.root / "data/dashboard.db"
+        apply_sql_migrations(
+            str(proxy), str(self.root / "schema"), "token-board",
+            target=SchemaVersion(1, 17),
+        )
+        apply_sql_migrations(
+            str(dashboard), str(self.root / "schema"), "dashboard",
+            target=SchemaVersion(1, 6),
+        )
+        with sqlite3.connect(proxy) as conn:
+            conn.execute(
+                "INSERT INTO accounts(id,uuid,name,account_kind) "
+                "VALUES(7,'account-7','legacy-plan','proxy')"
+            )
+            conn.execute(
+                "INSERT INTO billing_contracts"
+                "(id,uuid,account_id,charge_type,billing_scope,currency,"
+                "billing_anchor_day,valid_from) "
+                "VALUES(3,'contract-3',7,'recurring','account','CNY',1,?)",
+                ("2026-01-01T00:00:00Z",),
+            )
+            conn.execute(
+                "INSERT INTO billing_period_charges"
+                "(id,contract_id,period_start,period_end,recurring_charge,"
+                "currency,normalized_recurring_cost,base_currency,finalized_at,"
+                "account_identity_id,contract_uuid_snapshot,billing_unit_id) "
+                "VALUES(9,3,'2026-08-01T00:00:00Z','2026-09-01T00:00:00Z',"
+                "12,'CNY',12,'CNY','2026-08-01T00:00:01Z',7,'contract-3',"
+                "'contract:contract-3')"
+            )
+            conn.commit()
+        with sqlite3.connect(dashboard) as conn:
+            conn.execute(
+                "INSERT INTO accounts(account_id,name,account_kind) "
+                "VALUES(7,'legacy-plan','proxy')"
+            )
+            conn.execute(
+                "INSERT INTO monthly_recurring_costs"
+                "(month,account_id,billing_unit_id,recurring_charge,"
+                "normalized_recurring_cost,charge_frozen_at) "
+                "VALUES('2026-08',7,'contract:contract-3',12,12,"
+                "'2026-08-01T00:00:01Z')"
+            )
+            conn.commit()
+
+        apply_sql_migrations(str(proxy), str(self.root / "schema"), "token-board")
+        apply_sql_migrations(str(dashboard), str(self.root / "schema"), "dashboard")
+
+        with sqlite3.connect(proxy) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT event_key,event_kind,source_key FROM billing_export_events"
+            ).fetchall(), [
+                ("proxy:contract:contract-3:2026-08-01T00:00:00Z",
+                 "proxy", "9")
+            ])
+            self.assertEqual(conn.execute(
+                "SELECT value FROM sync_state "
+                "WHERE key='last_exported_billing_event_id'"
+            ).fetchone()[0], "1")
+        with sqlite3.connect(dashboard) as conn:
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='billing_export_receipts'"
+            ).fetchone())
+            self.assertEqual(conn.execute(
+                "SELECT event_key,billing_unit_id,payload_hash "
+                "FROM billing_export_receipts"
+            ).fetchone(),
+                ("legacy:7:2026-08:contract:contract-3",
+                 "contract:contract-3", ""))
 
     def test_v0_pair_is_upgraded_without_manual_transition(self) -> None:
         proxy = self.root / "data/token-board.db"

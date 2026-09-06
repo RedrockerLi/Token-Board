@@ -68,16 +68,22 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 1. 拉取最新 `dashboard_sync_*.db.gz` 或旧 `dashboard_sync_*.db` 到本地 shadow；首次同步则以本地 dashboard 为种子。
 2. 通过同一个 Python schema-upgrade 边界对 shadow 应用 dashboard SQL/transition，
    再同步账户/软件名称镜像。
-3. 取 `request_log` 的 `(last_exported_log_id, max_id]`，按日×账户/软件×模型聚合到 shadow；同时物化并归档 Plan 与智能体订阅费用。
+3. 先物化周期费用，再分别取 `request_log` 的
+   `(last_exported_log_id, max_id]` 和账单事件的
+   `(last_exported_billing_event_id, billing_max_id]`，写入 shadow。账单事件
+   只包含已经按周期开始日固化的 Plan/智能体订阅费用，并在 shadow 中写入
+   不可见的 `billing_export_receipts`。
 4. 压缩并上传已经升级和导出的 shadow 为新的 `dashboard_sync_*.db.gz`；云端旧
    artifact 不原地修改、不删除。
-5. 只有上传成功后才推进 `sync_state.last_exported_log_id`、替换本地 dashboard，并清理已归档且超过 30 天的明细。
+5. 只有上传成功并替换本地 dashboard 后，才在同一确认步骤推进
+   `sync_state.last_exported_log_id` 与
+   `sync_state.last_exported_billing_event_id`，随后清理已归档且超过 30 天的明细。
 
 任一步失败都会删除 shadow，不推进高水位，不替换本地 dashboard，也不清理未确认上传的明细。多机器同时上传时仍要求避免并发，后完成的完整文件可能覆盖先完成的文件。
 
 ### 删除看板用户
 
-`DELETE /api/proxy/dashboard/users` 接收 `{"names":["用户名称"]}`，只删除目标账号在 dashboard 存档中的历史用量和费用行。删除不会在账号身份上留下排除标记；后续产生的 `request_log` 用量仍会按正常的增量导出流程写回 dashboard，源库中已经冻结的周期账单也会在导出时重新 upsert。由于导出使用高水位标记，已删除的旧请求不会自动重放；如需恢复旧历史，应从旧的 dashboard 存档恢复。
+`DELETE /api/proxy/dashboard/users` 接收 `{"names":["用户名称"]}`，只删除目标账号在 dashboard 存档中的可见用量和费用行；不可见的账单导出回执不会删除。后续产生的 `request_log` 用量仍会按正常的增量导出流程写回 dashboard，但已经成功导出的旧周期账单不会再次写回。由于导出使用独立高水位线，已删除的旧请求也不会自动重放；如需恢复旧历史，应从旧的 dashboard 存档恢复。
 
 ## 运行时同步健康
 

@@ -8,7 +8,7 @@
 
 Proxy V1 将历史身份、实时转发与计费拆开：`account_identities` 保存不可删除的历史 ID/UUID/名称，`accounts` 只表示当前实时资源；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，配置的明文位于 `upstream_secrets`；智能体订阅和软件来源分别位于 `agent_subscriptions` / `agent_software`，不再作为上游账户。
 
-计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
+计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；冻结后的周期账单会产生一条不可变的 `billing_export_events`，供 dashboard 独立增量导出；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
 
 Dashboard V1 统一使用历史身份、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存订阅分摊后的实际周期费用。实时软件配置可以物理删除，历史 identity、请求归属和冻结账务继续保留。
 
@@ -98,13 +98,16 @@ api_cost = (miss/1e6) × input_price
 
 模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY priority,id`,即第一条匹配生效,`reorder_pricing` 修改 `priority` 来改变匹配优先级。所有账户统一记 `equivalent_cost`(api = 真实账单,plan/agent = 虚拟口径)。`prompt_tokens + completion_tokens = 0` 的行只记日志、不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
 
-清理规则:同步进度由 `sync_state.last_exported_log_id` 单值提交检查点记录(无逐行 exported 标记)。
+清理规则:用量同步进度由 `sync_state.last_exported_log_id`、账单同步进度由
+`sync_state.last_exported_billing_event_id` 分别记录；账单事件本身不可变，不在财务事实表上写逐行 exported 标记。
 `cleanup_exported_logs` 只删 `id ≤ 检查点 且 请求时间超过 30 天` 的行;未计入存档的行永久保留。
 检查点只在上传成功后推进,失败即回滚——见 [sync.md](sync.md)。
 
 ### sync_state — 同步检查点
 
-key/value 表,存 `last_exported_log_id`:最近一次**完整成功**的拉取-导出-上传事务导出的最大 `request_log.id`。
+key/value 表。`last_exported_log_id` 是最近一次**完整成功**事务导出的最大
+`request_log.id`；`last_exported_billing_event_id` 是同一事务确认的最大账单事件 ID。
+两个水位线都在 dashboard shadow 成功提交后推进。
 
 ### pricing_rules 与 pricing_slots — 定价
 
@@ -132,9 +135,9 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 ## dashboard.db
 
-可视化**存档**库,表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.6),`user_version` 当前为 10006。**纯存档**:只有用量与总价,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
+可视化**存档**库,表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.7),`user_version` 当前为 10007。**纯存档**:只有用量与总价及不可见的账单导出回执,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
-存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `account_identities` 镜像；实时 `accounts` 删除后仍可继续导出历史请求和冻结费用。看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 V1 ledger 行。
+存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `account_identities` 镜像；实时 `accounts` 删除后仍可继续导出历史请求和冻结费用。账单回执在删除可见账单时保留，避免多机再次导出复活旧账单。看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 V1 ledger 行。
 
 ### token_usage / request_usage
 
