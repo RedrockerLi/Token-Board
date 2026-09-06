@@ -2,19 +2,15 @@
 
 from app.core.time import billing_period, parse_runtime_timestamp, utc_now
 from app.db.proxy.common import (
-    _billing_period_month, _next_month, _parse_iso_date,
+    _billing_period_month, _next_month, _parse_iso_date, _subscription_date,
     _period_start, datetime, json,
     sqlite3, timedelta, uuid,
 )
 
 
 def _iso_start(value: object | None) -> str:
-    if value in (None, ""):
-        return utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
-    if isinstance(value, str) and "T" in value:
-        return parse_runtime_timestamp(value).strftime("%Y-%m-%dT%H:%M:%SZ")
-    parsed = _parse_iso_date(value)
-    return parsed.isoformat() + "T00:00:00Z"
+    """Normalize a user-selected subscription date to a date-only value."""
+    return _subscription_date(value)
 
 
 def _json_object(value: object | None) -> str:
@@ -154,14 +150,11 @@ class ProxySubscriptionMixin:
                     or parent_start, "monthly_price": data.get("monthly_price", 0)}]
         if not isinstance(raw, list) or not raw:
             raise ValueError("至少需要一个订阅实例")
-        instances, labels = [], set()
+        instances = []
         for item in raw:
             if not isinstance(item, dict):
                 raise ValueError("订阅实例格式错误")
             label = str(item.get("label") or "实例 1").strip() or "实例 1"
-            if label in labels:
-                raise ValueError("同一订阅下的实例名称不能重复")
-            labels.add(label)
             instances.append({
                 "id": item.get("id"), "label": label,
                 "valid_from": _iso_start(item.get("valid_from") or
@@ -189,7 +182,7 @@ class ProxySubscriptionMixin:
             ).lastrowid
             self._insert_instances(conn, int(sid), instances, now)
             creation_moment = utc_now()
-            creation_start = parse_runtime_timestamp(parent_start).date()
+            creation_start = _parse_iso_date(parent_start)
             boundary = billing_period(creation_moment, creation_start.day).start.date()
             if creation_start == boundary:
                 from app.db.proxy.billing import materialize_agent_subscription_charges_conn
@@ -199,13 +192,14 @@ class ProxySubscriptionMixin:
             return int(sid)
         except sqlite3.IntegrityError as exc:
             conn.rollback()
-            raise ValueError("订阅名称或实例名称已存在") from exc
+            raise ValueError("订阅或实例数据冲突") from exc
         finally:
             conn.close()
 
     @staticmethod
     def _insert_instances(conn: sqlite3.Connection, subscription_id: int,
-                          instances: list[dict], now: str) -> None:
+                          instances: list[dict], now: str) -> list[int]:
+        inserted_ids = []
         for instance in instances:
             iid = conn.execute(
                 "INSERT INTO agent_subscription_instances"
@@ -219,6 +213,8 @@ class ProxySubscriptionMixin:
                 "(instance_id,recurring_price,effective_at) VALUES(?,?,?)",
                 (iid, instance["monthly_price"], instance["valid_from"]),
             )
+            inserted_ids.append(int(iid))
+        return inserted_ids
 
     def get_agent_subscription_instances(self, subscription_id: int) -> list[dict]:
         conn = self._connect()
@@ -245,15 +241,12 @@ class ProxySubscriptionMixin:
             parsed = self._validate_instances(
                 {"instances": [data]}, parent["currency"], parent["valid_from"])[0]
             now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
-            self._insert_instances(conn, subscription_id, [parsed], now)
+            inserted_ids = self._insert_instances(conn, subscription_id, [parsed], now)
             conn.execute("UPDATE agent_subscriptions SET updated_at=? WHERE id=?",
                          (now, subscription_id))
-            iid = conn.execute(
-                "SELECT id FROM agent_subscription_instances "
-                "WHERE subscription_id=? AND label=?", (subscription_id, parsed["label"])
-            ).fetchone()[0]
+            iid = inserted_ids[0]
             creation_moment = utc_now()
-            creation_start = parse_runtime_timestamp(parsed["valid_from"]).date()
+            creation_start = _parse_iso_date(parsed["valid_from"])
             boundary = billing_period(creation_moment, creation_start.day).start.date()
             if creation_start == boundary:
                 from app.db.proxy.billing import materialize_agent_subscription_charges_conn
@@ -263,7 +256,7 @@ class ProxySubscriptionMixin:
             return int(iid)
         except sqlite3.IntegrityError as exc:
             conn.rollback()
-            raise ValueError("实例名称已存在") from exc
+            raise ValueError("实例数据冲突") from exc
         finally:
             conn.close()
 
@@ -291,7 +284,7 @@ class ProxySubscriptionMixin:
             return changed
         except sqlite3.IntegrityError as exc:
             conn.rollback()
-            raise ValueError("实例名称已存在") from exc
+            raise ValueError("实例数据冲突") from exc
         finally:
             conn.close()
 
@@ -317,18 +310,22 @@ class ProxySubscriptionMixin:
                 "SELECT 1 FROM agent_subscription_period_charges "
                 "WHERE instance_id=? LIMIT 1", (instance_id,)).fetchone()
             if has_charge is None:
-                conn.execute(
-                    "DELETE FROM agent_subscription_rate_events WHERE instance_id=?",
-                    (instance_id,))
-                conn.execute(
-                    "DELETE FROM agent_subscription_instances WHERE id=?",
-                    (instance_id,))
+                from app.db.proxy.deletion import purge_agent_subscription_instance
+                purge_agent_subscription_instance(conn, instance_id)
                 conn.execute("UPDATE agent_subscriptions SET updated_at=? WHERE id=?",
                              (now, row["subscription_id"]))
                 conn.commit()
                 return {"ok": True, "deferred": False,
                         "effective_deleted_at": now}
             effective = self._subscription_end(conn, row["valid_from"], now_dt)
+            if effective <= now_dt:
+                from app.db.proxy.deletion import purge_agent_subscription_instance
+                purge_agent_subscription_instance(conn, instance_id)
+                conn.execute("UPDATE agent_subscriptions SET updated_at=? WHERE id=?",
+                             (now, row["subscription_id"]))
+                conn.commit()
+                return {"ok": True, "deferred": False,
+                        "effective_deleted_at": now}
             self._delete_instance_row(conn, row, now_dt)
             conn.execute("UPDATE agent_subscriptions SET updated_at=? WHERE id=?",
                          (now, row["subscription_id"]))
@@ -420,7 +417,7 @@ class ProxySubscriptionMixin:
             return bool(fields or "monthly_price" in data or "instances" in data)
         except sqlite3.IntegrityError as exc:
             conn.rollback()
-            raise ValueError("订阅名称或实例名称已存在") from exc
+            raise ValueError("订阅或实例数据冲突") from exc
         finally:
             conn.close()
 
@@ -448,18 +445,8 @@ class ProxySubscriptionMixin:
                 "WHERE subscription_id=? AND lifecycle_state!='deleted'",
                 (subscription_id,)).fetchall()
             if has_charge is None:
-                conn.execute(
-                    "DELETE FROM agent_subscription_bindings WHERE subscription_id=?",
-                    (subscription_id,))
-                conn.execute(
-                    "DELETE FROM agent_subscription_rate_events WHERE instance_id IN "
-                    "(SELECT id FROM agent_subscription_instances WHERE subscription_id=?)",
-                    (subscription_id,))
-                conn.execute(
-                    "DELETE FROM agent_subscription_instances WHERE subscription_id=?",
-                    (subscription_id,))
-                conn.execute("DELETE FROM agent_subscriptions WHERE id=?",
-                             (subscription_id,))
+                from app.db.proxy.deletion import purge_agent_subscription
+                purge_agent_subscription(conn, subscription_id)
                 conn.commit()
                 return {"ok": True, "deferred": False,
                         "effective_deleted_at": now}
@@ -470,17 +457,23 @@ class ProxySubscriptionMixin:
                 end = max([end, *ends])
             end_text = end.strftime("%Y-%m-%dT%H:%M:%SZ")
             deferred = end > now_dt
+            if not deferred:
+                from app.db.proxy.deletion import purge_agent_subscription
+                purge_agent_subscription(conn, subscription_id)
+                conn.commit()
+                return {"ok": True, "deferred": False,
+                        "effective_deleted_at": end_text}
             conn.execute(
                 "UPDATE agent_subscriptions SET lifecycle_state=?,valid_until=?,"
                 "updated_at=? WHERE id=?",
-                ("active" if deferred else "deleted", end_text, now, subscription_id))
+                ("active", end_text, now, subscription_id))
             for instance in instances:
                 self._delete_instance_row(conn, instance, now_dt)
             conn.execute(
                 "UPDATE agent_subscription_bindings SET lifecycle_state=?,"
                 "valid_until=COALESCE(valid_until,?),updated_at=? "
                 "WHERE subscription_id=? AND lifecycle_state='active'",
-                ("active" if deferred else "deleted", end_text, now, subscription_id))
+                ("active", end_text, now, subscription_id))
             conn.commit()
             return {"ok": True, "deferred": deferred,
                     "effective_deleted_at": end_text}
@@ -505,7 +498,9 @@ class ProxySubscriptionMixin:
             ).fetchone()[0]
             if count != len(cleaned):
                 raise ValueError("绑定的订阅不存在")
-        now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_dt = utc_now()
+        now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        effective_date = now_dt.date().isoformat()
         active = {row[0] for row in conn.execute(
             "SELECT subscription_id FROM agent_subscription_bindings "
             "WHERE software_id=? AND lifecycle_state='active'", (software_id,))}
@@ -520,4 +515,4 @@ class ProxySubscriptionMixin:
                 "(subscription_id,software_id,valid_from,valid_until,lifecycle_state,updated_at) "
                 "VALUES(?,?,?,NULL,'active',?) ON CONFLICT(subscription_id,software_id) "
                 "DO UPDATE SET valid_until=NULL,lifecycle_state='active',"
-                "updated_at=excluded.updated_at", (sid, software_id, now, now))
+                "updated_at=excluded.updated_at", (sid, software_id, effective_date, now))

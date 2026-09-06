@@ -144,6 +144,50 @@ class SyncContractTest(unittest.TestCase):
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
+    def test_cloud_merge_purges_missing_agent_subscription_but_keeps_identity(self) -> None:
+        temp = tempfile.mkdtemp()
+        try:
+            shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
+            local = str(Path(temp) / "local.db")
+            remote = str(Path(temp) / "remote.db")
+            schema = str(Path(temp) / "schema")
+            migrate(local, schema, "token-board")
+            migrate(remote, schema, "token-board")
+
+            local_db = ProxyDatabase(local, schema)
+            subscription_id = local_db.create_agent_subscription({
+                "name": "cloud-removed-subscription", "monthly_price": 5,
+                "currency": "CNY",
+            })
+            with sqlite3.connect(local) as conn:
+                charge_count = conn.execute(
+                    "SELECT count(*) FROM agent_subscription_period_charges "
+                    "WHERE subscription_id=?", (subscription_id,)
+                ).fetchone()[0]
+            self.assertGreater(charge_count, 0)
+
+            merge_config_tables(remote, local)
+
+            with sqlite3.connect(local) as conn:
+                self.assertIsNone(conn.execute(
+                    "SELECT 1 FROM agent_subscriptions WHERE id=?",
+                    (subscription_id,)).fetchone())
+                self.assertGreater(conn.execute(
+                    "SELECT count(*) FROM agent_subscription_period_charges "
+                    "WHERE subscription_id=?", (subscription_id,)
+                ).fetchone()[0], 0)
+                self.assertIsNotNone(conn.execute(
+                    "SELECT 1 FROM agent_subscription_identities WHERE id=?",
+                    (subscription_id,)).fetchone())
+
+            recreated = local_db.create_agent_subscription({
+                "name": "cloud-removed-subscription", "monthly_price": 6,
+                "currency": "CNY",
+            })
+            self.assertNotEqual(recreated, subscription_id)
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+
     def test_pricing_current_only_artifact_migration_preserves_costs(self) -> None:
         temp = tempfile.mkdtemp()
         try:
@@ -242,7 +286,7 @@ class SyncContractTest(unittest.TestCase):
                 ).fetchone())
                 self.assertEqual(conn.execute(
                     "SELECT major,minor FROM schema_version WHERE id=1"
-                    ).fetchone(), (1, 18))
+                    ).fetchone(), (1, 21))
             return state["artifact"]
 
         try:

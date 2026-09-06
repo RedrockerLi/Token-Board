@@ -45,8 +45,9 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
     """Merge normalized V1 configuration without importing local secrets.
 
     Stable UUIDs are authoritative. Missing live child rows are hard-deleted;
-    proxy accounts and agent software retain their separate account identity
-    and historical ledgers while their live configuration is removed.
+    proxy accounts, Agent subscriptions and Agent software retain their
+    separate historical identities and ledgers while live configuration is
+    removed.
     ``runtime_id`` and importer cursors remain local.
     """
     remote = sqlite_runtime.connect(remote_path, "shadow_copy")
@@ -80,8 +81,9 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
 
         # Parent-first upsert. Historical rows not present remotely remain as
         # inactive/local history instead of violating live request FKs.
-        for table in ("account_identities", "accounts", "upstreams", "route_sets", "route_rules",
-                      "client_keys"):
+        for table in ("account_identities", "agent_subscription_identities",
+                      "agent_subscription_instance_identities", "accounts",
+                      "upstreams", "route_sets", "route_rules", "client_keys"):
             merge_table(table)
 
         remote_credential_ids: set[str] = set()
@@ -170,13 +172,16 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
         # These are live configuration rows with no historical ownership.
         # A cloud snapshot that omits them means the operator removed them;
         # purge them locally in dependency order instead of accumulating a
-        # second tombstone copy.  Parent accounts remain tombstoned when
-        # request/financial history still references their identity.
-        hard_delete_tables = {
+        # second tombstone copy.  Proxy account rows remain tombstoned when
+        # request/financial history still references their identity; Agent
+        # subscriptions use the separate identity tables instead.
+        hard_delete_order = (
             "route_rules", "client_keys", "agent_subscription_bindings",
-            "agent_subscription_rate_events", "agent_software",
-        }
-        for table in hard_delete_tables:
+            "agent_subscription_rate_events", "agent_subscription_instances",
+            "agent_subscriptions", "agent_software",
+        )
+        hard_delete_tables = frozenset(hard_delete_order)
+        for table in hard_delete_order:
             if not table_exists(remote, table) or not table_exists(local, table):
                 continue
             info = table_info(local, table)
@@ -192,6 +197,12 @@ def _merge_v1_config(remote_path: str, local_path: str) -> None:
                 if table == "client_keys":
                     from app.db.proxy.deletion import purge_client_keys
                     purge_client_keys(local, [identity[0]])
+                elif table == "agent_subscription_instances":
+                    from app.db.proxy.deletion import purge_agent_subscription_instance
+                    purge_agent_subscription_instance(local, int(identity[0]))
+                elif table == "agent_subscriptions":
+                    from app.db.proxy.deletion import purge_agent_subscription
+                    purge_agent_subscription(local, int(identity[0]))
                 elif table == "agent_software":
                     local.execute("DELETE FROM agent_software_runtime WHERE software_id=?", identity)
                     local.execute(f"DELETE FROM {table} WHERE {where}", identity)

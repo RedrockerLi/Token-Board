@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from app.core.time import utc_now
 from app.db.proxy.billing import materialize_period_charges
 from app.services.cost_allocator import (
     compute_proportional_cost,
@@ -15,6 +16,56 @@ from app.tests.support import AppDatabaseTestCase
 
 
 class BillingTest(AppDatabaseTestCase):
+    def test_subscription_effective_dates_are_utc_calendar_dates(self) -> None:
+        db = self.proxy_database()
+        start_with_time = "2099-09-06T06:56:13Z"
+        subscription_id = db.create_agent_subscription({
+            "name": "date-only-agent-subscription",
+            "valid_from": start_with_time,
+            "monthly_price": 10,
+            "currency": "CNY",
+        })
+        software_id = db.create_agent_software({
+            "name": "date-only-agent",
+            "agent_kind": "codex",
+            "subscription_ids": [subscription_id],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM agent_subscriptions WHERE id=?",
+                (subscription_id,)).fetchone()[0], "2099-09-06")
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM agent_subscription_instances "
+                "WHERE subscription_id=?", (subscription_id,)).fetchone()[0],
+                "2099-09-06")
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM agent_subscription_bindings "
+                "WHERE subscription_id=? AND software_id=?",
+                (subscription_id, software_id)).fetchone()[0],
+                utc_now().strftime("%Y-%m-%d"))
+            self.assertEqual(conn.execute(
+                "SELECT effective_at FROM agent_subscription_rate_events "
+                "WHERE instance_id=(SELECT id FROM agent_subscription_instances "
+                "WHERE subscription_id=?)", (subscription_id,)).fetchone()[0],
+                "2099-09-06")
+
+    def test_plan_subscription_effective_date_is_stored_without_time(self) -> None:
+        db = self.proxy_database()
+        account_id = db.create_account({
+            "name": "date-only-plan",
+            "account_type": "plan",
+            "valid_from": "2099-09-06T06:56:13Z",
+            "monthly_price": 12,
+            "currency": "CNY",
+            "base_url": "http://example.test",
+            "upstream_keys": ["sk-date-only-plan"],
+            "new_valid_froms": ["2099-09-06T06:56:13Z"],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM billing_contracts WHERE account_id=?",
+                (account_id,)).fetchone()[0], "2099-09-06")
+
     def test_unbilled_api_account_hard_deletes_live_row_keeps_identity(self) -> None:
         db = self.proxy_database()
         account_id = db.create_account({
@@ -83,6 +134,171 @@ class BillingTest(AppDatabaseTestCase):
                    side_effect=AssertionError("delete must not materialize")):
             result = db.delete_agent_subscription(subscription_id)
         self.assertTrue(result["ok"], result)
+
+    def test_agent_subscription_delete_keeps_history_and_allows_name_reuse(self) -> None:
+        db = self.proxy_database()
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("billing.cancellation_mode", "immediate"),
+            )
+            conn.commit()
+
+        subscription_id = db.create_agent_subscription({
+            "name": "reusable-agent-subscription", "monthly_price": 5,
+            "currency": "CNY",
+        })
+        software_id = db.create_agent_software({
+            "name": "reusable-agent-source", "agent_kind": "codex",
+            "subscription_ids": [subscription_id],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "UPDATE agent_subscription_bindings SET valid_from=? "
+                "WHERE subscription_id=? AND software_id=?",
+                ("2000-01-01T00:00:00Z", subscription_id, software_id),
+            )
+            conn.commit()
+        from app.db.proxy.billing import materialize_agent_subscription_charges
+        materialize_agent_subscription_charges(self.proxy_path)
+
+        result = db.delete_agent_subscription(subscription_id)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["deferred"], result)
+
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM agent_subscriptions WHERE id=?",
+                (subscription_id,)).fetchone())
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM agent_subscription_instances "
+                "WHERE subscription_id=?", (subscription_id,)).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM agent_subscription_rate_events "
+                "WHERE instance_id NOT IN (SELECT id FROM agent_subscription_instances)"
+            ).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM agent_subscription_bindings "
+                "WHERE subscription_id=?", (subscription_id,)).fetchone()[0], 0)
+            self.assertGreater(conn.execute(
+                "SELECT count(*) FROM agent_subscription_period_charges "
+                "WHERE subscription_id=?", (subscription_id,)).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT name FROM agent_subscription_identities WHERE id=?",
+                (subscription_id,)).fetchone()[0], "reusable-agent-subscription")
+            self.assertEqual(conn.execute(
+                "SELECT name FROM account_identities WHERE id=?",
+                (software_id,)).fetchone()[0], "reusable-agent-source")
+            conn.execute(
+                "DELETE FROM billing_export_events "
+                "WHERE source_table='agent_subscription_charge_allocations' "
+                "AND source_key LIKE '%:' || ?", (software_id,))
+            conn.commit()
+
+        # Rebuilding an export event after the live subscription is gone must
+        # resolve the stable identity tables, not the deleted parent rows.
+        from app.db.proxy.billing import materialize_agent_subscription_charges
+        materialize_agent_subscription_charges(self.proxy_path)
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertGreater(conn.execute(
+                "SELECT count(*) FROM billing_export_events "
+                "WHERE source_table='agent_subscription_charge_allocations'"
+            ).fetchone()[0], 0)
+
+        recreated = db.create_agent_subscription({
+            "name": "reusable-agent-subscription", "monthly_price": 7,
+            "currency": "CNY",
+        })
+        self.assertNotEqual(recreated, subscription_id)
+
+    def test_expired_agent_subscription_purges_live_shell_but_keeps_identity(self) -> None:
+        db = self.proxy_database()
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO sync_settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("billing.cancellation_mode", "end_of_period"),
+            )
+            conn.commit()
+
+        subscription_id = db.create_agent_subscription({
+            "name": "deferred-agent-subscription", "monthly_price": 5,
+            "currency": "CNY",
+        })
+        result = db.delete_agent_subscription(subscription_id)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["deferred"], result)
+
+        with sqlite3.connect(self.proxy_path) as conn:
+            instance_id = conn.execute(
+                "SELECT id FROM agent_subscription_instances "
+                "WHERE subscription_id=?", (subscription_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE agent_subscriptions SET valid_until=? WHERE id=?",
+                ("2000-01-01T00:00:00Z", subscription_id),
+            )
+            conn.execute(
+                "UPDATE agent_subscription_instances SET valid_until=? WHERE id=?",
+                ("2000-01-01T00:00:00Z", instance_id),
+            )
+            conn.commit()
+
+        db.finalize_deferred_deletions()
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM agent_subscriptions WHERE id=?",
+                (subscription_id,)).fetchone())
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM agent_subscription_instances WHERE id=?",
+                (instance_id,)).fetchone())
+            self.assertGreater(conn.execute(
+                "SELECT count(*) FROM agent_subscription_period_charges "
+                "WHERE subscription_id=?", (subscription_id,)).fetchone()[0], 0)
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM agent_subscription_identities WHERE id=?",
+                (subscription_id,)).fetchone())
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM agent_subscription_instance_identities WHERE id=?",
+                (instance_id,)).fetchone())
+
+    def test_agent_instance_labels_are_display_attributes(self) -> None:
+        db = self.proxy_database()
+        subscription_id = db.create_agent_subscription({
+            "name": "duplicate-instance-labels", "currency": "CNY",
+            "instances": [
+                {"label": "default", "monthly_price": 1},
+                {"label": "default", "monthly_price": 2},
+            ],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM agent_subscription_instances "
+                "WHERE subscription_id=? AND label='default'",
+                (subscription_id,),
+            ).fetchone()[0], 2)
+
+    def test_all_proxy_and_agent_names_are_display_attributes(self) -> None:
+        db = self.proxy_database()
+        first = db.create_account({
+            "name": "repeated-display-name", "account_type": "api",
+            "base_url": "http://first.example", "upstream_keys": ["sk-first"],
+        })
+        second = db.create_account({
+            "name": "repeated-display-name", "account_type": "api",
+            "base_url": "http://second.example", "upstream_keys": ["sk-second"],
+        })
+        self.assertNotEqual(first, second)
+
+        software = db.create_agent_software({
+            "name": "repeated-agent-name", "agent_kind": "codex",
+        })
+        self.assertTrue(db.delete_agent_software(software))
+        recreated = db.create_agent_software({
+            "name": "repeated-agent-name", "agent_kind": "codex",
+        })
+        self.assertNotEqual(software, recreated)
 
     def test_client_key_delete_detaches_history_and_removes_key(self) -> None:
         db = self.proxy_database()

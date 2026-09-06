@@ -22,6 +22,8 @@ from app.core.time import (
     as_utc,
     billing_period,
     format_utc,
+    parse_runtime_timestamp,
+    utc_now,
 )
 
 from app.domain.account_types import (
@@ -60,6 +62,26 @@ def _parse_iso_date(value: object) -> date | None:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise ValueError("订阅起始日必须是 YYYY-MM-DD") from exc
+
+
+def _subscription_date(value: object | None = None) -> str:
+    """Return a subscription effective date; UTC midnight is implicit.
+
+    The public form submits a calendar date.  Accepting an ISO timestamp here
+    keeps older integrations compatible, but deliberately discards its clock
+    portion: subscription starts are date-grained and always mean 00:00Z.
+    """
+    if value in (None, ""):
+        return utc_now().date().isoformat()
+    if isinstance(value, str) and "T" in value:
+        parsed = parse_runtime_timestamp(value)
+        if parsed is None:
+            raise ValueError("订阅起始日必须是 YYYY-MM-DD")
+        return parsed.date().isoformat()
+    parsed = _parse_iso_date(value)
+    if parsed is None:
+        raise ValueError("订阅起始日必须是 YYYY-MM-DD")
+    return parsed.isoformat()
 
 
 def _period_start(month: str, anchor_day: int) -> datetime:

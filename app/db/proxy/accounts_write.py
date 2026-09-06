@@ -2,7 +2,7 @@
 
 from app.core.time import billing_period, utc_now
 from app.db.proxy.common import (
-    ACCOUNT_TYPES, _parse_iso_date, is_subscription, json,
+    ACCOUNT_TYPES, _parse_iso_date, _subscription_date, is_subscription, json,
     spec, sqlite3, uuid,
 )
 
@@ -17,17 +17,21 @@ class ProxyAccountWriteMixin:
             raise ValueError("币种必须是 CNY / USD")
         keys = self._normalize_keys(data)
         type_spec = spec(account_type)
-        valid_from = _parse_iso_date(data.get("valid_from"))
+        raw_valid_from = data.get("valid_from")
+        valid_from = (_parse_iso_date(_subscription_date(raw_valid_from))
+                      if raw_valid_from not in (None, "") else None)
         conn = self._connect()
         try:
             shared_id = self._next_shared_id(conn)
             now = utc_now()
             start_date = (valid_from or now.date()).isoformat()
-            effective_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-            contract_start = (f"{start_date}T00:00:00Z"
-                              if valid_from else effective_at)
-            rate_start = (contract_start if valid_from else
-                          f"{now.year:04d}-{now.month:02d}-01T00:00:00Z")
+            if is_subscription(account_type):
+                contract_start = _subscription_date(data.get("valid_from"))
+            elif valid_from:
+                contract_start = f"{start_date}T00:00:00Z"
+            else:
+                contract_start = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            rate_start = contract_start
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,valid_from) VALUES(?,?,?,?)",
                 (shared_id, str(uuid.uuid4()), data["name"], start_date),
@@ -45,7 +49,7 @@ class ProxyAccountWriteMixin:
                 (str(uuid.uuid4()), shared_id,
                  "recurring" if is_subscription(account_type) else "metered",
                  "credential" if type_spec.subscription_unit == "per_key" else "account",
-                 currency, valid_from.day if valid_from else 1,
+                 currency, (valid_from or now.date()).day,
                  json.dumps({"kind": type_spec.cooldown or "none"}), contract_start),
             ).lastrowid
             if is_subscription(account_type):
@@ -125,12 +129,19 @@ class ProxyAccountWriteMixin:
             raise ValueError("币种必须是 CNY / USD")
         name = data.get("name", original["name"])
         if "valid_from" in data:
-            parsed_start = _parse_iso_date(data["valid_from"])
+            raw_start = data["valid_from"]
+            parsed_start = (_parse_iso_date(_subscription_date(raw_start))
+                            if raw_start not in (None, "") else None)
             start = parsed_start.isoformat() if parsed_start else None
         else:
             start = original["valid_from"]
-        contract_start = (f"{start}T00:00:00Z" if start
-                          else original["contract_valid_from"])
+        if is_subscription(final_type):
+            contract_start = (_subscription_date(data.get("valid_from"))
+                              if "valid_from" in data else
+                              (start or original["contract_valid_from"]))
+        else:
+            contract_start = (f"{start}T00:00:00Z" if start
+                              else original["contract_valid_from"])
         anchor_day = None
         if "valid_from" in data and parsed_start is not None:
             anchor_day = parsed_start.day

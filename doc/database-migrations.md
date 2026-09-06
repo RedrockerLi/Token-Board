@@ -40,7 +40,7 @@ fixture、测试和 V0 历史转换，不是业务代码的升级入口。
 schema/
 ├── token-board/
 │   ├── v0/0-1_initial.sql … 0-19_drop_monthly_price.sql
-│   └── v1/1-0_baseline.sql … 1-17_decouple_frozen_ledgers.sql
+│   └── v1/1-0_baseline.sql … 1-21_subscription_effective_dates.sql
 ├── dashboard/
 │   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
 │   └── v1/1-0_baseline.sql … 1-6_remove_account_exclusions.sql
@@ -68,7 +68,7 @@ app/db/schema_upgrade/
 └── engine_core.py          # shadow、manifest、备份、校验、发布
 ```
 
-当前仓库的 V1 tip 是 Token Board V1.18、Dashboard V1.7。V0 文件保留用于历史库和
+当前仓库的 V1 tip 是 Token Board V1.21、Dashboard V1.7。V0 文件保留用于历史库和
 转换测试；新安装只创建当前 V1 baseline，不重放 V0 历史。
 
 ## 版本与元数据
@@ -102,6 +102,34 @@ ctest --test-dir proxy/build -R '^schema_version$' --output-on-failure
 ```
 
 Python migration tip、C++ 常量和已编译代理必须作为一个版本一起发布。
+
+### Agent 订阅身份迁移
+
+Token Board V1.19 新增 `agent_subscription_identities` 与
+`agent_subscription_instance_identities`。`agent_subscriptions`、实例、价格事件和
+软件绑定是可删除的实时配置；周期费用、分摊和导出事件只保存稳定身份及账单快照，
+不再把实时订阅行作为历史账单的父对象。删除已有账单的订阅时，实时图会在本期边界
+后物理清理，历史身份和账单保留，因此可以立即重新创建同名订阅。
+
+订阅名和实例标签都是显示属性，不是身份键；SQL 约束和业务逻辑必须使用 `id`/`uuid`
+关联，不能用名称建立历史引用或阻止同名重建。
+
+Token Board V1.20 将同一约束扩展到全局实时配置：`accounts`、`route_sets` 和
+`agent_software` 的 `name` 都不再有唯一约束。所有业务关联仍使用 `id`/`uuid`；名称
+允许重复，只用于显示、排序和用户筛选。
+
+V1.0/V1.6/V1.8 的历史 SQL 仍保留当时的 `UNIQUE(name)` 文本，这是已发布迁移的审计
+记录，不能回改；V1.20 会在最终数据库中重建这些表并移除约束。V1.14 的
+`pricing_v114_sequence.name` 是迁移期间镜像 SQLite 序列元数据的临时表字段，不是业务
+对象名称，也不参与任何运行时身份关联。
+
+### 订阅日期迁移
+
+Token Board V1.21 将所有订阅起始值统一为 UTC 日粒度：`valid_from` 只保存
+`YYYY-MM-DD`，其含义固定为该日 `00:00Z`。Agent 订阅、实例、软件绑定、实例历史身份和
+Plan recurring 合同都遵守这一规则；数据库不再保存创建操作时刻作为订阅生效时刻。
+`created_at`、`updated_at`、`deleted_at` 以及价格事件的 `effective_at` 仍是审计/事件时间戳，
+不属于订阅起始日。
 
 ## 同 Major 的 SQL 升级
 

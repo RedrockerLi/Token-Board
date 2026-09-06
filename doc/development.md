@@ -79,6 +79,14 @@ SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 
 - `proxy_manager.js`:账户/聚合/密钥/定价管理页,含模型定价拖放排序、按浏览器当地时间输入的峰谷时段编辑器;档位以 UTC+0 分钟存储。
 - `proxy_billing.js`:消费报告 + 请求日志页。
 - `agent_manager.js`:智能体订阅与软件来源管理页。
+
+Agent 订阅的实时配置（订阅、实例、价格事件、绑定）与历史身份分离：账单只能通过
+`agent_subscription_identities` / `agent_subscription_instance_identities` 的 `id`/`uuid`
+归属，不能依赖订阅名或实例标签。删除已有账单的订阅会清理实时图但保留身份和冻结账单，
+同名订阅可重新创建；新增字段或引用时要保持这个解耦约束。
+
+全局名称约束：账户、路由、软件、订阅和实例标签的名称都是展示属性，不得新增
+`UNIQUE(name)`、名称主键/外键或按名称保存历史关联；业务代码必须使用 `id`/`uuid`。
 - `proxy_perf.js`:性能监控页(15s 自动刷新)。
 - `proxy_settings.js`:代理设置页(超时三档配置、WebDAV 同步设置)。
 

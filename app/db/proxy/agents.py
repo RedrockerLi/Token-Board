@@ -85,7 +85,7 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             return int(software_id)
         except sqlite3.IntegrityError as exc:
             conn.rollback()
-            raise ValueError("软件名称已存在") from exc
+            raise ValueError("软件数据冲突") from exc
         finally:
             conn.close()
 
@@ -136,7 +136,7 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             return bool(fields or "subscription_ids" in data)
         except sqlite3.IntegrityError as exc:
             conn.rollback()
-            raise ValueError("软件名称已存在") from exc
+            raise ValueError("软件数据冲突") from exc
         finally:
             conn.close()
 

@@ -225,37 +225,32 @@ class ProxyLifecycleMixin:
                     "(SELECT id FROM upstreams WHERE account_id=?)", (real_id,))
                 from app.db.proxy.deletion import purge_proxy_account
                 purge_proxy_account(conn, real_id)
-            # Agent bindings and rate events are live configuration.  Their
-            # frozen charges/allocations do not reference the binding rows, so
-            # expired rows can be removed safely; parent subscription and
-            # instance rows remain when financial FKs still point at them.
+            # Agent bindings and subscription pricing are live configuration.
+            # Frozen charges/allocations refer to stable identity values and
+            # no longer own these rows, so the entire expired live graph can
+            # be purged without touching historical financial facts.
             conn.execute(
                 "DELETE FROM agent_subscription_bindings "
                 "WHERE valid_until IS NOT NULL AND valid_until<=?", (now,)
             )
-            conn.execute(
-                "DELETE FROM agent_subscription_rate_events "
-                "WHERE instance_id IN (SELECT id FROM agent_subscription_instances "
-                "WHERE valid_until IS NOT NULL AND valid_until<=?)", (now,)
+            from app.db.proxy.deletion import (
+                purge_agent_subscription,
+                purge_agent_subscription_instance,
             )
-            # A subscription with no issued financial fact is pure live
-            # configuration and can be removed completely once expired.  Any
-            # parent/instance referenced by a charge remains as an immutable
-            # historical shell.
-            conn.execute(
-                "DELETE FROM agent_subscription_instances WHERE "
-                "valid_until IS NOT NULL AND valid_until<=? AND NOT EXISTS ("
-                "SELECT 1 FROM agent_subscription_period_charges c "
-                "WHERE c.instance_id=agent_subscription_instances.id)", (now,)
-            )
-            conn.execute(
-                "DELETE FROM agent_subscriptions WHERE "
-                "valid_until IS NOT NULL AND valid_until<=? AND NOT EXISTS ("
-                "SELECT 1 FROM agent_subscription_period_charges c "
-                "WHERE c.subscription_id=agent_subscriptions.id) AND NOT EXISTS ("
-                "SELECT 1 FROM agent_subscription_instances i "
-                "WHERE i.subscription_id=agent_subscriptions.id)", (now,)
-            )
+            expired_instances = conn.execute(
+                "SELECT id FROM agent_subscription_instances "
+                "WHERE valid_until IS NOT NULL AND valid_until<=?", (now,)
+            ).fetchall()
+            for row in expired_instances:
+                purge_agent_subscription_instance(conn, int(row["id"]))
+            expired_subscriptions = conn.execute(
+                "SELECT s.id FROM agent_subscriptions s "
+                "WHERE s.valid_until IS NOT NULL AND s.valid_until<=? "
+                "AND NOT EXISTS (SELECT 1 FROM agent_subscription_instances i "
+                "WHERE i.subscription_id=s.id)", (now,)
+            ).fetchall()
+            for row in expired_subscriptions:
+                purge_agent_subscription(conn, int(row["id"]))
             # Software parser configuration has no financial FK of its own;
             # request_log.agent_software_id is intentionally a historical
             # scalar.  Keep the shared account identity, but remove the live

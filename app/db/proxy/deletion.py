@@ -121,3 +121,64 @@ def purge_proxy_account(conn: sqlite3.Connection,
     conn.execute("DELETE FROM upstreams WHERE account_id=?", (account_id,))
     conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
     return True
+
+
+def purge_agent_subscription_instance(conn: sqlite3.Connection,
+                                      instance_id: int) -> bool:
+    """Remove one live Agent instance while retaining its identity/charges.
+
+    ``agent_subscription_period_charges`` stores the instance id as a scalar
+    historical identity after V1.17; it deliberately has no FK to this live
+    row.  Rate events are live pricing configuration and can therefore be
+    removed before the instance itself.
+    """
+    row = conn.execute(
+        "SELECT id FROM agent_subscription_instances WHERE id=?",
+        (instance_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute(
+        "DELETE FROM agent_subscription_rate_events WHERE instance_id=?",
+        (instance_id,),
+    )
+    conn.execute(
+        "DELETE FROM agent_subscription_instances WHERE id=?",
+        (instance_id,),
+    )
+    return True
+
+
+def purge_agent_subscription(conn: sqlite3.Connection,
+                              subscription_id: int) -> bool:
+    """Remove an Agent subscription's live graph, retaining history.
+
+    The identity tables are intentionally not touched.  Frozen period charges,
+    charge allocations and immutable export events refer to those identities
+    and remain valid after the live subscription, instances, rates and
+    software bindings are physically removed.
+    """
+    row = conn.execute(
+        "SELECT id FROM agent_subscriptions WHERE id=?",
+        (subscription_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute(
+        "DELETE FROM agent_subscription_bindings WHERE subscription_id=?",
+        (subscription_id,),
+    )
+    conn.execute(
+        "DELETE FROM agent_subscription_rate_events WHERE instance_id IN "
+        "(SELECT id FROM agent_subscription_instances WHERE subscription_id=?)",
+        (subscription_id,),
+    )
+    conn.execute(
+        "DELETE FROM agent_subscription_instances WHERE subscription_id=?",
+        (subscription_id,),
+    )
+    conn.execute(
+        "DELETE FROM agent_subscriptions WHERE id=?",
+        (subscription_id,),
+    )
+    return True

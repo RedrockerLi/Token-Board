@@ -35,6 +35,7 @@ V1_CONFIG_TABLES = [
     "billing_rate_events", "pricing_rules", "pricing_slots",
     "pricing_length_tiers",
     "proxy_timeout_config", "upstream_model_catalog", "sync_settings",
+    "agent_subscription_identities", "agent_subscription_instance_identities",
     "agent_subscriptions", "agent_subscription_instances",
     "agent_subscription_rate_events", "agent_subscription_bindings",
     "agent_software",

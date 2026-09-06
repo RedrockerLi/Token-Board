@@ -59,7 +59,7 @@ V1.14 删除了模型定价历史和改价回溯路径,所以:
 `account_type = 'plan'` 的账户代表订阅套餐,调用本身不按量收费。计费规则:
 
 - `api_cost` 就是虚拟口径——即"这笔流量不买套餐的话要花多少钱"。真实成本不计入 `api_cost` 聚合(见下)。
-- 每把上游密钥独立拥有 `valid_from` 起的行政月周期。锚点日为起始日的日号，短月取月末；密钥不需要产生用量也会产生每周期一次的订阅费。
+- 每把上游密钥独立拥有 `valid_from` 起的行政月周期。`valid_from` 只保存 UTC 日期，默认含义是该日 `00:00Z`；锚点日为起始日的日号，短月取月末；密钥不需要产生用量也会产生每周期一次的订阅费。
 - 所有边界使用 UTC+0。删除 plan 密钥或账户时按「删除默认操作」(`plan_billing_config.cancellation_mode`，默认 `immediate`)执行：**本期立即删除**(`immediate`，本期计费)把 `deleted_at` 设为删除时刻，即刻停用但本期照收月费；**到期立即删除**(`end_of_period`，本期计费、下期不计费)把 `deleted_at` 设为本期期末，订阅可继续使用至本期最后一天，到期后路由自动停止，本期照收、下期不再计费。api 账户无订阅生命周期，始终立即删除。智能体订阅只记录订阅事实，删除后不再生成未来费用。
 - 月费修改会写入价格历史。设置页可选择默认从本期或下一期生效；不同锚点日的密钥会在各自对应的周期边界切换价格。
 - plan 单把上游密钥收到 HTTP 429 后冷却 5 小时，同账户其他密钥仍可回退接管(见 [proxy-internals.md](proxy-internals.md))。冷却期内代理每 1 小时探测一次上游 `GET /models`,2xx 即提前解除冷却,不必等满 5 小时;探测不写 request_log、不占并发(见 [proxy-internals.md](proxy-internals.md) 冷却探测小节)。
@@ -82,11 +82,11 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 
 ## 智能体订阅与软件用量
 
-智能体已从上游账户模型中独立出来。**订阅**记录名称、开始时间和币种，并可包含多个独立计费实例；实例记录自己的开始日期和价格，价格历史与周期物化存于 `agent_subscription_rate_events` / `agent_subscription_period_charges`。**软件**记录名称、类型和数据目录，类型由 Python agent adapter registry 提供（当前包含 27 种本地 agent）。订阅和软件通过绑定表多对多关联：一个软件可以使用多个订阅，一个订阅也可以覆盖多个软件。
+智能体已从上游账户模型中独立出来。**订阅**记录名称、开始日期和币种，开始日期固定按 UTC `00:00Z` 生效，并可包含多个独立计费实例；实例记录自己的开始日期和价格，价格历史与周期物化存于 `agent_subscription_rate_events` / `agent_subscription_period_charges`。**软件**记录名称、类型和数据目录，类型由 Python agent adapter registry 提供（当前包含 27 种本地 agent）。订阅和软件通过绑定表多对多关联：一个软件可以使用多个订阅，一个订阅也可以覆盖多个软件。数据库不保存订阅起始日的时分秒，绑定的 `valid_from` 也只保存 UTC 日期。
 
 - 用量由**token-maintenance 进程内的单一 worker** 导入:维护服务启动时立即运行一次,之后每 30 分钟运行一次;浏览器每次打开仪表板还会通过本地 Unix datagram socket 异步唤醒同一个 worker。启动、定时和浏览器触发串行执行,不会并发争抢 SQLite 游标。
 - 各 agent adapter 读取自己的本地 JSONL、SQLite、JSON 或云端导出源，统一输出 `UsageEvent`；通用 importer 按 `event_id` 幂等，把用量写入 `request_log` 的统一智能体身份，`project` 与 `session_id` 保存在本机，不展示在请求日志 API。
-- 智能体用量和代理用量统一进入 dashboard 的 `daily_usage`；订阅周期费用按“绑定订阅实例 ÷ 同一实例当前绑定的启用软件数”分摊到 `monthly_recurring_costs`。dashboard 条目仍以软件为单位：实际消费来自绑定订阅，理论消费来自软件用量；没有绑定时实际消费为 0。
+- 智能体用量和代理用量统一进入 dashboard 的 `daily_usage`；订阅周期费用按“绑定订阅实例 ÷ 同一实例当前绑定的启用软件数”分摊到 `monthly_recurring_costs`。dashboard 条目仍以软件为单位：实际消费来自绑定订阅，理论消费来自软件用量；没有绑定时实际消费为 0。订阅与实例的历史身份独立保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`，删除实时订阅不会删除已冻结账单；名称只是展示属性，同名订阅可以重建。
 
 ## 币种与汇率(CNY / USD)
 

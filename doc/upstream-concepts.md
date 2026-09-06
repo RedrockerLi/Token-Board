@@ -48,7 +48,8 @@
 
 ### 智能体管理（统一 IR + 可扩展 adapter registry）
 
-- 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，可有多个 `agent_subscription_instances`，软件与订阅通过 `agent_subscription_bindings` 多对多绑定。
+- 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`，软件与订阅通过 `agent_subscription_bindings` 多对多绑定。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名和实例标签只是用户记忆用的属性，不是主键或历史关联键，同名订阅可以重建。
+- 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`，软件与订阅通过 `agent_subscription_bindings` 多对多绑定。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名、实例标签、软件名、账户名和路由名都只是用户记忆用的属性，不是主键、外键、唯一生命周期键或历史关联键，同名资源可以重建。
 - 用量来自**token-maintenance 导入服务**：[maintenance.py](../maintenance.py) 管理唯一 worker，在维护服务启动时立即运行、每 30 分钟运行，浏览器打开看板时通过 Unix datagram socket 异步唤醒；[agent_usage](../app/services/agent_usage/) 按 `agent_kind` 选择独立 adapter，把各来源归一为 Python Usage IR，再写成 `request_log` 行。`event_id` 幂等，`project` 与 `session_id` 只保存在本机。
 - dashboard 的条目以软件/智能体为单位：理论消费来自导入用量，实际消费来自绑定订阅；未绑定时实际消费为 0，一个订阅绑定多个启用软件时按绑定软件数平分。没有绑定关系不会自动推断。
 
@@ -63,7 +64,7 @@
 - **固定填充顺序**：`upstream_keys.position` 决定优先顺序，会话亲和与溢流都按 `(position, id)` 走（[proxy/src/core/proxy_server.cpp:462-496](proxy/src/core/proxy_server.cpp#L462-L496)）。
 - **会话亲和(session affinity)**：同一会话（`x-session-id` / OpenAI `user` / Anthropic `metadata.user_id` / Responses `previous_response_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/proxy_server.h:42-138](proxy/src/core/proxy_server.h#L42-L138)）。
 - **冷启动成本平衡**：新会话没有绑定记录时，优先选**累计消费最少**的 Key（进程内 `KeyCostLedger`，由记账线程异步喂数据），让多把 Key 按花费磨损得更均匀（[proxy/src/core/key_cost_ledger.h](proxy/src/core/key_cost_ledger.h)）。
-- **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `deleted_at`，月费按「锚点日」各自切周期。删除密钥/账户按设置页「删除默认操作」执行：`immediate`（本期立即删除，本期计费）或 `end_of_period`（到期立即删除，本期计费、下期不计费——每把 Key 的 `deleted_at` 设为自己的本期期末，到期前仍保持可路由；账户的 `deleted_at` 取所有仍有效 Key 到期时间的最大值）。api 始终立即删除。
+- **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `deleted_at`，其中 `valid_from` 只保存 UTC 日期并固定从 `00:00Z` 生效，月费按「锚点日」各自切周期。删除密钥/账户按设置页「删除默认操作」执行：`immediate`（本期立即删除，本期计费）或 `end_of_period`（到期立即删除，本期计费、下期不计费——每把 Key 的 `deleted_at` 设为自己的本期期末，到期前仍保持可路由；账户的 `deleted_at` 取所有仍有效 Key 到期时间的最大值）。api 始终立即删除。
 - **观测**：会话→密钥分配记在本地 `session_key_log`（7 天滚动，不上云）。
 
 ### 兼容旧形态

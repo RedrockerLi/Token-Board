@@ -3,7 +3,7 @@
 from app.core.time import parse_runtime_timestamp, utc_now
 from app.db.proxy.common import (
     ACCOUNT_TYPES, UTC, _billing_period_month, _cancellation_end,
-    _parse_iso_date, _period_start,
+    _parse_iso_date, _period_start, _subscription_date,
     billing_period, datetime, json, mask_key, sqlite3, uuid,
 )
 from app.domain.account_template import AccountTemplate, AccountTemplateAdapter
@@ -176,7 +176,9 @@ class ProxyAccountReadMixin:
         active_values = []
         position = 0
         for key_id in retained:
-            valid = _parse_iso_date(keep_valid_froms.get(str(key_id)))
+            raw_valid = keep_valid_froms.get(str(key_id))
+            valid = (_parse_iso_date(_subscription_date(raw_valid))
+                     if raw_valid not in (None, "") else None)
             conn.execute(
                 "UPDATE upstream_credentials SET position=?,valid_from=? WHERE runtime_id=?",
                 (position, valid.isoformat() if valid else None, key_id),
@@ -192,8 +194,10 @@ class ProxyAccountReadMixin:
             key = raw_key.strip()
             if not key or key in seen:
                 continue
-            valid = _parse_iso_date(
-                new_valid_froms[index] if index < len(new_valid_froms) else None)
+            raw_valid = (new_valid_froms[index]
+                         if index < len(new_valid_froms) else None)
+            valid = (_parse_iso_date(_subscription_date(raw_valid))
+                     if raw_valid not in (None, "") else None)
             credential_uuid = str(uuid.uuid4())
             conn.execute(
                 "INSERT INTO upstream_credentials"

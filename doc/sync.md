@@ -12,7 +12,7 @@ Token Board 使用两条 WebDAV 数据链路：`token-board.db` 的配置镜像�
 - 本地代理客户端密钥 (`client_keys.key_value`)；
 - 上游账户的地址、名称、密钥掩码和生命周期（不含上游 API Key 明文）；
 - WebDAV 地址、目录和用户名 (`sync_settings`，不含密码)；
-- 智能体订阅、订阅实例、价格历史、软件来源和订阅绑定配置。
+- 智能体订阅及其不可删除的历史身份、订阅实例及其历史身份、价格历史、软件来源和订阅绑定配置。
 
 上游 API Key 明文 (`upstream_secrets.secret_value`) 与 WebDAV 密码
 (`sync_settings.password`) 只保存在本机，不进入上传副本，也不会被云端配置覆盖。

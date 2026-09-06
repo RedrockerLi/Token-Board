@@ -44,6 +44,194 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertEqual(self._version(proxy), self._latest("token-board"))
         self.assertEqual(self._version(dashboard), self._latest("dashboard"))
 
+    def test_current_proxy_schema_treats_every_business_name_as_display_data(self) -> None:
+        proxy = self.root / "data/token-board.db"
+        dashboard = self.root / "data/dashboard.db"
+        ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
+        for database in (proxy, dashboard):
+            with sqlite3.connect(database) as conn:
+                tables = [row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )]
+                for table in tables:
+                    columns = conn.execute(f"PRAGMA table_info({table})").fetchall()
+                    name_columns = [row for row in columns if row[1] == "name"]
+                    if not name_columns:
+                        continue
+                    self.assertEqual(name_columns[0][5], 0, f"{database}: {table}")
+                    for index in conn.execute(f"PRAGMA index_list({table})"):
+                        if not index[2]:
+                            continue
+                        indexed_columns = [row[2] for row in conn.execute(
+                            f"PRAGMA index_info({index[1]})")]
+                        self.assertNotEqual(indexed_columns, ["name"],
+                                            f"{database}: {table}: {index[1]}")
+
+    def test_agent_subscription_identity_migration_preserves_frozen_charge(self) -> None:
+        proxy = self.root / "data/token-board.db"
+        apply_sql_migrations(
+            str(proxy), str(self.root / "schema"), "token-board",
+            target=SchemaVersion(1, 18),
+        )
+        with sqlite3.connect(proxy) as conn:
+            conn.execute(
+                "INSERT INTO accounts(id,uuid,name,account_kind) "
+                "VALUES(1,'agent-account','date-agent','agent')"
+            )
+            conn.execute(
+                "INSERT INTO agent_software"
+                "(id,uuid,name,agent_kind) VALUES(1,'software-date','date-agent','codex')"
+            )
+            conn.execute(
+                "INSERT INTO agent_subscriptions"
+                "(id,uuid,name,currency,valid_from,created_at,updated_at) "
+                "VALUES(7,'subscription-7','same-name','CNY','2026-07-01',"
+                "'2026-07-01T00:00:00Z','2026-07-01T00:00:00Z')"
+            )
+            conn.execute(
+                "INSERT INTO agent_subscription_instances"
+                "(id,uuid,subscription_id,label,valid_from,created_at,updated_at) "
+                "VALUES(8,'instance-8',7,'default','2026-07-01',"
+                "'2026-07-01T00:00:00Z','2026-07-01T00:00:00Z')"
+            )
+            conn.execute(
+                "INSERT INTO agent_subscription_period_charges"
+                "(id,instance_id,subscription_id,period_start,period_end,"
+                "recurring_charge,currency,normalized_recurring_cost,"
+                "subscription_uuid_snapshot,instance_uuid_snapshot,"
+                "subscription_name_snapshot,instance_label_snapshot,finalized_at) "
+                "VALUES(9,8,7,'2026-07-01T00:00:00Z','2026-08-01T00:00:00Z',"
+                "10,'CNY',10,'subscription-7','instance-8','same-name','default',"
+                "'2026-07-01T00:00:01Z')"
+            )
+            conn.commit()
+
+        apply_sql_migrations(str(proxy), str(self.root / "schema"), "token-board")
+
+        with sqlite3.connect(proxy) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT uuid,name,currency FROM agent_subscription_identities "
+                "WHERE id=7").fetchone(),
+                ("subscription-7", "same-name", "CNY"))
+            self.assertEqual(conn.execute(
+                "SELECT uuid,subscription_id,label FROM "
+                "agent_subscription_instance_identities WHERE id=8"
+            ).fetchone(), ("instance-8", 7, "default"))
+            self.assertEqual(conn.execute(
+                "SELECT subscription_id,instance_id,recurring_charge "
+                "FROM agent_subscription_period_charges WHERE id=9"
+            ).fetchone(), (7, 8, 10.0))
+            self.assertEqual(conn.execute(
+                "PRAGMA foreign_key_list(agent_subscription_period_charges)"
+            ).fetchall(), [])
+            conn.execute(
+                "INSERT INTO agent_subscriptions"
+                "(uuid,name,currency,valid_from,created_at,updated_at) "
+                "VALUES('subscription-9','same-name','CNY','2026-07-01',"
+                "'2026-07-01T00:00:00Z','2026-07-01T00:00:00Z')"
+            )
+            conn.rollback()
+
+    def test_v120_removes_name_unique_indexes_without_losing_live_rows(self) -> None:
+        proxy = self.root / "data/token-board.db"
+        apply_sql_migrations(
+            str(proxy), str(self.root / "schema"), "token-board",
+            target=SchemaVersion(1, 19),
+        )
+        with sqlite3.connect(proxy) as conn:
+            conn.execute(
+                "INSERT INTO accounts(id,uuid,name,account_kind) "
+                "VALUES(7,'account-7','same-display-name','proxy')"
+            )
+            conn.execute(
+                "INSERT INTO route_sets(id,uuid,account_id,name) "
+                "VALUES(8,'route-8',7,'same-display-name')"
+            )
+            conn.execute(
+                "INSERT INTO agent_software"
+                "(id,uuid,name,agent_kind) VALUES(9,'software-9',"
+                "'same-display-name','codex')"
+            )
+            conn.commit()
+
+        apply_sql_migrations(str(proxy), str(self.root / "schema"), "token-board")
+
+        with sqlite3.connect(proxy) as conn:
+            for table in ("accounts", "route_sets", "agent_software"):
+                unique_name_indexes = []
+                for index in conn.execute(f"PRAGMA index_list({table})"):
+                    if not index[2]:
+                        continue
+                    columns = [row[2] for row in conn.execute(
+                        f"PRAGMA index_info({index[1]})")]
+                    if columns == ["name"]:
+                        unique_name_indexes.append(index[1])
+                self.assertEqual(unique_name_indexes, [], table)
+            self.assertEqual(conn.execute(
+                "SELECT name FROM accounts WHERE id=7").fetchone()[0],
+                "same-display-name")
+            self.assertEqual(conn.execute(
+                "SELECT name FROM route_sets WHERE id=8").fetchone()[0],
+                "same-display-name")
+            self.assertEqual(conn.execute(
+                "SELECT name FROM agent_software WHERE id=9").fetchone()[0],
+                "same-display-name")
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_v121_normalizes_subscription_effective_values_to_utc_dates(self) -> None:
+        proxy = self.root / "data/token-board.db"
+        apply_sql_migrations(
+            str(proxy), str(self.root / "schema"), "token-board",
+            target=SchemaVersion(1, 20),
+        )
+        with sqlite3.connect(proxy) as conn:
+            conn.execute(
+                "INSERT INTO agent_subscriptions"
+                "(id,uuid,name,currency,valid_from,created_at,updated_at) "
+                "VALUES(7,'subscription-date','date-sub','CNY',"
+                "'2026-09-06T06:56:13Z','2026-09-06T06:56:13Z',"
+                "'2026-09-06T06:56:13Z')"
+            )
+            conn.execute(
+                "INSERT INTO agent_subscription_instances"
+                "(id,uuid,subscription_id,label,valid_from,created_at,updated_at) "
+                "VALUES(8,'instance-date',7,'default','2026-09-06T06:56:13Z',"
+                "'2026-09-06T06:56:13Z','2026-09-06T06:56:13Z')"
+            )
+            conn.execute(
+                "INSERT INTO agent_subscription_bindings"
+                "(id,subscription_id,software_id,valid_from,updated_at) "
+                "VALUES(9,7,1,'2026-09-06T06:56:13Z','2026-09-06T06:56:13Z')"
+            )
+            conn.execute(
+                "INSERT INTO billing_contracts"
+                "(id,uuid,account_id,charge_type,billing_scope,valid_from) "
+                "VALUES(7,'contract-date',1,'recurring','account',"
+                "'2026-09-06T06:56:13Z')"
+            )
+            conn.commit()
+
+        apply_sql_migrations(str(proxy), str(self.root / "schema"), "token-board")
+
+        with sqlite3.connect(proxy) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM agent_subscriptions WHERE id=7"
+            ).fetchone()[0], "2026-09-06")
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM agent_subscription_instances WHERE id=8"
+            ).fetchone()[0], "2026-09-06")
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM agent_subscription_bindings WHERE id=9"
+            ).fetchone()[0], "2026-09-06")
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM agent_subscription_instance_identities "
+                "WHERE id=8"
+            ).fetchone()[0], "2026-09-06")
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM billing_contracts WHERE id=7"
+            ).fetchone()[0], "2026-09-06")
+
     def test_dashboard_v15_upgrade_removes_account_exclusions(self) -> None:
         dashboard = self.root / "data/dashboard.db"
         apply_sql_migrations(

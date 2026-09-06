@@ -2,15 +2,15 @@
 
 两个 SQLite 库都开在 WAL 模式，统一 `busy_timeout=5000`、`foreign_keys=ON`；V1 新库启用 `auto_vacuum=INCREMENTAL`。schema 位于 `schema/<库>/v<major>/<major>-<minor>_*.sql`。
 
-时间字段统一存 UTC(`datetime('now')`),前端按浏览器当地时区显示,峰谷档位边界按 UTC+0 分钟存储(见 [billing-pricing.md](billing-pricing.md))。
+时间字段统一存 UTC(`datetime('now')`),前端按浏览器当地时区显示,峰谷档位边界按 UTC+0 分钟存储(见 [billing-pricing.md](billing-pricing.md))。订阅起始日是例外：所有 `valid_from` 订阅字段只存 `YYYY-MM-DD`，默认含义固定为该日 `00:00Z`；审计时间和删除截止时间仍保留时间戳。
 
 ## V1 当前结构
 
-Proxy V1 将历史身份、实时转发与计费拆开：`account_identities` 保存不可删除的历史 ID/UUID/名称，`accounts` 只表示当前实时资源；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，配置的明文位于 `upstream_secrets`；智能体订阅和软件来源分别位于 `agent_subscriptions` / `agent_software`，不再作为上游账户。
+Proxy V1 将历史身份、实时转发与计费拆开：`account_identities` 保存不可删除的历史 ID/UUID/名称，`accounts` 只表示当前实时资源；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，配置的明文位于 `upstream_secrets`。智能体订阅和软件来源分别位于 `agent_subscriptions` / `agent_software`，不再作为上游账户；订阅与实例另有不可删除的 `agent_subscription_identities` / `agent_subscription_instance_identities`，实时订阅图可以物理删除而不影响历史账单。
 
 计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；冻结后的周期账单会产生一条不可变的 `billing_export_events`，供 dashboard 独立增量导出；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
 
-Dashboard V1 统一使用历史身份、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存订阅分摊后的实际周期费用。实时软件配置可以物理删除，历史 identity、请求归属和冻结账务继续保留。
+Dashboard V1 统一使用历史身份、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存订阅分摊后的实际周期费用。实时软件配置和 Agent 订阅配置可以物理删除，历史 identity、请求归属和冻结账务继续保留。所有名称字段（账户、路由、软件、订阅、实例标签）都只是展示属性，不能作为关联键、主键、外键或唯一生命周期键。
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
@@ -36,7 +36,7 @@ Dashboard V1 统一使用历史身份、`daily_usage` 和 `monthly_recurring_cos
 | `account_type` | `api`(按量计费)或 `plan`(订阅套餐,调用免费)。智能体不再是上游账户类型 |
 | `currency` | 订阅价原生币种 `CNY` / `USD`,默认 CNY |
 | `max_concurrency` | 并发限额,NULL=不限;达到限额的请求返回 429(聚合链内自动切下一个) |
-| `valid_from` | UTC 日期,plan 订阅的订阅起始日;NULL 回落 `created_at` 的日期 |
+| `valid_from` | UTC 日期,plan 订阅的订阅起始日，`00:00Z` 隐含；NULL 回落 `created_at` 的日期 |
 
 `upstream_key` 列保留作为"legacy 单密钥"的退路(0007 起密钥改为存 `upstream_keys` 子表,见下)。
 

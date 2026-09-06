@@ -200,7 +200,9 @@ function addKeyRow(value, validFrom) {
     date.style.display = keyDateDisplay();
     date.name = 'upstream_valid_froms[]';
     date.title = '订阅起始日（留空=创建日期）';
-    date.value = validFrom ? utcDateToLocalDate(validFrom) : '';
+    // Subscription dates are UTC calendar dates, not local-midnight
+    // instants.  Keep the selected YYYY-MM-DD unchanged in the form.
+    date.value = validFrom ? String(validFrom).slice(0, 10) : '';
     date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
     del.type = 'button';
@@ -230,7 +232,7 @@ function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion) {
     date.className = 'existing-key-valid-from key-valid-from';
     date.style.display = keyDateDisplay();
     date.title = '订阅起始日（留空=创建日期）';
-    date.value = validFrom ? utcDateToLocalDate(validFrom) : '';
+    date.value = validFrom ? String(validFrom).slice(0, 10) : '';
     date.addEventListener('change', () => { _keyRowsEdited = true; });
     const del = document.createElement('button');
     del.type = 'button';
@@ -315,7 +317,7 @@ function collectKeyRows(form) {
         if (!input.value.trim()) return;
         upstream_keys.push(input.value.trim());
         new_valid_froms.push(useKeyDates
-            ? (localDateToUtcDate(input.parentElement.querySelector('[name="upstream_valid_froms[]"]').value) || null)
+            ? (input.parentElement.querySelector('[name="upstream_valid_froms[]"]').value || null)
             : null);
     });
     const keepRows = [...form.querySelectorAll('#keyList .existing-key')];
@@ -323,7 +325,7 @@ function collectKeyRows(form) {
     const keep_valid_froms = Object.fromEntries(keepRows.map(r => [
         r.dataset.keepId,
         useKeyDates
-            ? (localDateToUtcDate(r.querySelector('.existing-key-valid-from').value) || null)
+            ? (r.querySelector('.existing-key-valid-from').value || null)
             : null,
     ]));
     return { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms };

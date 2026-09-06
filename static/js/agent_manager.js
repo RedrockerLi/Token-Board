@@ -268,7 +268,7 @@ function initAgentSubscriptionsPage() {
         </div>
         <div class="table-scroll">
             <table class="mgmt-table" id="agentSubscriptionsTable">
-                <thead><tr><th>名称</th><th>实例与月费</th><th>开始时间</th><th>更新时间</th><th>操作</th></tr></thead>
+                <thead><tr><th>名称</th><th>实例与月费</th><th>开始日期</th><th>更新时间</th><th>操作</th></tr></thead>
                 <tbody></tbody>
             </table>
         </div>
@@ -277,7 +277,7 @@ function initAgentSubscriptionsPage() {
                 <div class="modal__header"><h3 id="agentSubscriptionModalTitle">添加订阅</h3><button class="modal__close" onclick="closeModal('agentSubscriptionModal')">&times;</button></div>
                 <form id="agentSubscriptionForm" onsubmit="saveAgentSubscription(event)" data-edit-id="">
                     <label>名称 <input name="name" required></label>
-                    <label>开始时间 <input name="valid_from" type="date" required></label>
+                    <label>开始日期（UTC 当日 00:00 生效） <input name="valid_from" type="date" required></label>
                     <label>币种 <select name="currency"><option value="CNY">CNY</option><option value="USD">USD</option></select></label>
                     <div class="agent-instance-list"><div class="form-label">订阅实例</div><div id="agentInstanceRows"></div><button type="button" class="btn btn--sm" onclick="addAgentInstanceRow()">+ 添加实例</button></div>
                     <button id="agentSubscriptionSubmit" class="btn btn--primary" type="submit">添加订阅</button>

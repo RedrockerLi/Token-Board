@@ -29,6 +29,12 @@ def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
     credential, or subscription.
     """
     created = 0
+    existing_agent_sources = {
+        row["source_key"] for row in conn.execute(
+            "SELECT source_key FROM billing_export_events "
+            "WHERE source_table='agent_subscription_charge_allocations'"
+        ).fetchall()
+    }
     for row in conn.execute(
         """SELECT c.id,c.period_start,c.billing_unit_id,c.credential_uuid,
                       c.contract_uuid_snapshot,c.recurring_charge,
@@ -71,8 +77,11 @@ def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
         """SELECT a.period_charge_id,a.software_id,a.recurring_charge,
                       a.normalized_recurring_cost,a.currency,a.base_currency,
                       a.fx_rate_date,a.finalized_at,
-                      c.period_start,c.subscription_uuid_snapshot,
-                      c.subscription_id,s.uuid subscription_uuid,
+                      c.period_start,c.instance_id,c.subscription_id,
+                      c.subscription_uuid_snapshot,c.instance_uuid_snapshot,
+                      si.uuid subscription_identity_uuid,
+                      ii.uuid instance_identity_uuid,
+                      s.uuid subscription_uuid,i.uuid instance_uuid,
                       ai.id account_id,ai.uuid account_uuid,ai.name account_name,
                       ai.account_kind
                FROM agent_subscription_charge_allocations a
@@ -82,22 +91,40 @@ def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
                  ON i.id=c.instance_id
                LEFT JOIN agent_subscriptions s
                  ON s.id=COALESCE(c.subscription_id,i.subscription_id)
+               LEFT JOIN agent_subscription_instance_identities ii
+                 ON ii.id=c.instance_id
+               LEFT JOIN agent_subscription_identities si
+                 ON si.id=COALESCE(c.subscription_id,i.subscription_id)
                JOIN account_identities ai ON ai.id=a.software_id
                WHERE c.finalized_at IS NOT NULL
                  AND a.finalized_at IS NOT NULL
                  AND ai.account_kind='agent'
                ORDER BY a.period_charge_id,a.software_id"""):
         subscription_uuid = (row["subscription_uuid_snapshot"] or
+                             row["subscription_identity_uuid"] or
                              row["subscription_uuid"] or
                              f"subscription:{row['subscription_id']}")
+        instance_uuid = (row["instance_uuid_snapshot"] or
+                         row["instance_identity_uuid"] or
+                         row["instance_uuid"] or
+                         f"instance:{row['instance_id']}")
         software_uuid = row["account_uuid"] or str(row["software_id"])
         period_start = row["period_start"]
-        unit_id = f"agent-subscription:{subscription_uuid}"
+        source_key = f"{row['period_charge_id']}:{row['software_id']}"
+        # V1.18 seeded legacy event keys without the instance identity.  The
+        # source key is the immutable allocation identity, so reuse that
+        # event instead of creating a second row after V1.19.
+        if source_key in existing_agent_sources:
+            continue
+        unit_id = f"agent-subscription-instance:{instance_uuid}"
         created += _insert_event(conn, {
-            "event_key": f"agent:{subscription_uuid}:{software_uuid}:{period_start}",
+            "event_key": (
+                f"agent:{subscription_uuid}:{instance_uuid}:"
+                f"{software_uuid}:{period_start}"
+            ),
             "event_kind": "agent",
             "source_table": "agent_subscription_charge_allocations",
-            "source_key": f"{row['period_charge_id']}:{row['software_id']}",
+            "source_key": source_key,
             "account_id": row["account_id"],
             "account_uuid": row["account_uuid"],
             "account_name": row["account_name"],
@@ -111,4 +138,5 @@ def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
             "fx_rate_date": row["fx_rate_date"],
             "frozen_at": row["finalized_at"],
         })
+        existing_agent_sources.add(source_key)
     return created

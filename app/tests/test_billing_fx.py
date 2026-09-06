@@ -15,6 +15,7 @@ import sqlite3
 from datetime import datetime, timezone
 from unittest import mock
 
+from app.core.time import utc_now
 from app.db.proxy.billing import (
     materialize_agent_subscription_charges,
     materialize_period_charges,
@@ -401,6 +402,37 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 "SELECT recurring_charge FROM monthly_recurring_costs "
                 "WHERE account_id=?", (software_id,)
             ).fetchone()[0], 10.0)
+
+    def test_today_subscription_binding_exports_from_utc_day_start(self) -> None:
+        db = self.proxy_database()
+        today = utc_now().date().isoformat()
+        subscription_id = db.create_agent_subscription({
+            "name": "today-date-subscription", "valid_from": today,
+            "monthly_price": 10, "currency": "CNY",
+        })
+        software_id = db.create_agent_software({
+            "name": "today-date-agent", "agent_kind": "codex",
+            "subscription_ids": [subscription_id],
+        })
+        proxy = ProxyDatabase(str(self.proxy_path),
+                             schema_dir=str(self.root / "schema"))
+        result = proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
+        self.assertEqual(result["billing_event_count"], 1)
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT valid_from FROM agent_subscription_bindings "
+                "WHERE subscription_id=? AND software_id=?",
+                (subscription_id, software_id)).fetchone()[0], today)
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM agent_subscription_charge_allocations a "
+                "JOIN agent_subscription_period_charges c "
+                "ON c.id=a.period_charge_id WHERE a.software_id=? "
+                "AND c.period_start=date(?) || 'T00:00:00Z'",
+                (software_id, today)).fetchone()[0], 1)
+        with sqlite3.connect(self.dashboard_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT recurring_charge FROM monthly_recurring_costs "
+                "WHERE account_id=?", (software_id,)).fetchone()[0], 10.0)
 
     def test_ensure_rate_historical_fetch_and_guards(self) -> None:
         self.proxy_database()  # initialize the schema

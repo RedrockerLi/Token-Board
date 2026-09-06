@@ -131,7 +131,7 @@ class BillingUnitResolver:
         moment = utc_now() if at is None else at
         now = format_utc(moment)
         rows = conn.execute(
-            "SELECT i.id,i.subscription_id,i.valid_from,i.valid_until,s.currency "
+            "SELECT i.id,i.uuid,i.subscription_id,i.valid_from,i.valid_until,s.currency "
             "FROM agent_subscription_instances i "
             "JOIN agent_subscriptions s ON s.id=i.subscription_id "
             "WHERE (s.lifecycle_state='active' OR "
@@ -141,7 +141,7 @@ class BillingUnitResolver:
             "AND i.valid_from<=?", (now, now, now),
         ).fetchall()
         return [BillingUnit(
-            billing_unit_id=f"agent-subscription:{row['id']}",
+            billing_unit_id=f"agent-subscription-instance:{row['uuid']}",
             owner_id=int(row["id"]),
             account_id=None,
             owner_kind="agent",
