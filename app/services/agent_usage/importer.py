@@ -139,7 +139,7 @@ def _import_software(pdb, software: dict, stop_event=None,
                             event.total_tokens, event.requested_at, event.event_id,
                             event.project, event.session_id):
                         file_inserted += 1
-                if stable:
+                if stable and not parsed.skipped:
                     states[state_key] = {
                         "size": after.st_size,
                         "mtime": int(after.st_mtime),
@@ -150,6 +150,11 @@ def _import_software(pdb, software: dict, stop_event=None,
                     conn.execute(
                         "UPDATE agent_software_runtime SET cursor_json=?,last_scan_at=?,last_error=NULL WHERE software_id=?",
                         (json.dumps(states, ensure_ascii=False, separators=(",", ":")), format_utc(utc_now()), software_id),
+                    )
+                elif parsed.skipped and parsed.warnings:
+                    conn.execute(
+                        "UPDATE agent_software_runtime SET last_error=? WHERE software_id=?",
+                        ("; ".join(parsed.warnings)[:500], software_id),
                     )
                 conn.commit()
             except Exception:

@@ -112,7 +112,24 @@ class ParseBatch:
 
     events: tuple[UsageEvent, ...] = ()
     record_count: int = 0
+    # A skipped batch may contain partial events, but its source state must not
+    # advance.  This is used when an external application is changing a
+    # database or a source read fails after yielding usable records.
+    skipped: bool = False
+    warnings: tuple[str, ...] = ()
 
     @classmethod
-    def from_events(cls, events: list[UsageEvent], record_count: int) -> "ParseBatch":
-        return cls(tuple(events), max(0, int(record_count or 0)))
+    def from_events(
+        cls,
+        events: list[UsageEvent],
+        record_count: int,
+        *,
+        skipped: bool = False,
+        warnings: tuple[str, ...] | list[str] = (),
+    ) -> "ParseBatch":
+        return cls(
+            tuple(events),
+            max(0, int(record_count or 0)),
+            bool(skipped),
+            tuple(str(value) for value in warnings if value),
+        )

@@ -7,6 +7,7 @@ from pathlib import Path
 from .adapters import alma, amp, antigravity, claude_code, cline, codex
 from .adapters import copilot_cli, craft_agent, cursor, dimagent, droid, dsh
 from .adapters import gemini_cli, grok, hermes, kimi_code, kiro, mimocode
+from .adapters import mcode
 from .adapters import omp, openclaw, opencode, pi_coding_agent, qwen_code
 from .adapters import roo_code, trae_cli, workbuddy, zcode
 from .skeleton import AdapterSpec
@@ -17,6 +18,7 @@ ADAPTERS = {
         gemini_cli, opencode, openclaw, omp, pi_coding_agent, qwen_code,
         kimi_code, amp, alma, droid, dsh, antigravity, trae_cli, hermes,
         kiro, mimocode, cline, roo_code, workbuddy, zcode,
+        mcode,
     )
 }
 

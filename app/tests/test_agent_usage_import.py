@@ -17,6 +17,7 @@ from unittest.mock import patch
 from app.tests.support import AppDatabaseTestCase
 from app.services.agent_usage.adapters import codex as codex_adapter
 from app.services.agent_usage.importer import import_once
+from app.services.agent_usage.ir import ParseBatch, UsageEvent
 
 
 SESSION_ID = "11111111-2222-3333-4444-555555555555"
@@ -93,6 +94,32 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                 "ORDER BY requested_at LIMIT 1").fetchone()
         self.assertEqual(tuple(row), (
             "gpt-5.1-codex", 10, 20, 5, 35, "2026-08-13T01:00:00Z"))
+
+    def test_skipped_batch_inserts_partial_events_but_preserves_cursor(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        self._create_software(database)
+        path = self._write_session("rollout-skipped.jsonl", ["placeholder"])
+        event = UsageEvent.from_buckets(
+            model="gpt-partial", input_tokens=10, output_tokens=2,
+            requested_at="2026-08-13T01:00:00Z", event_id="adapter:partial",
+        )
+
+        def parser(source_path, stop_event=None):
+            self.assertEqual(source_path, path)
+            return ParseBatch.from_events(
+                [event], 1, skipped=True,
+                warnings=("source is still being written",),
+            )
+
+        self.assertEqual(import_once(database, parser_overrides={"codex": parser}), 1)
+        with sqlite3.connect(self.proxy_path) as conn:
+            cursor = conn.execute(
+                "SELECT cursor_json,last_error FROM agent_software_runtime"
+            ).fetchone()
+        self.assertEqual(json.loads(cursor[0]), {})
+        self.assertEqual(cursor[1], "source is still being written")
 
     def test_opencode_custom_sqlite_filename_uses_native_adapter(self) -> None:
         from app.db.proxy_db import ProxyDatabase

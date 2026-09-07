@@ -66,6 +66,15 @@ class ContractAssetTest(unittest.TestCase):
         self.assertEqual([event.event_id for event in batch.events],
                          ["adapter:stable"])
 
+    def test_importer_does_not_treat_reference_buckets_as_local_events(self):
+        with self.assertRaises(TypeError):
+            _coerce_batch(
+                {"buckets": [{"source": "pilot", "inputTokens": 10}],
+                 "sessions": []},
+                kind="pilot",
+                source_item=UsageSource(Path("source.jsonl")),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

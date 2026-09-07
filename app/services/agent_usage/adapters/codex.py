@@ -14,7 +14,16 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..common import batch, config_value, make_event, project_name, safe_int, source, timestamp
+from ..common import (
+    batch,
+    config_value,
+    configured_extra_roots,
+    make_event,
+    project_name,
+    safe_int,
+    source,
+    timestamp,
+)
 from ..ir import ParseBatch, UsageSource
 from ..cindy_ledger import discover as discover_cindy, parse as parse_cindy
 from app.services.codex_replay import replay_skip_counts
@@ -25,24 +34,108 @@ DESCRIPTION = "Codex CLI 会话用量"
 DEFAULT_PATH_DISPLAY = "~/.codex"
 CODEX_HOME = Path.home() / ".codex"
 DEFAULT_PATH = CODEX_HOME
+SERVICE_TIER_ATTRIBUTION_START = datetime(2026, 8, 31, tzinfo=timezone.utc)
+
+
+def _service_tier(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    return value if value in {"fast", "priority", "flex", "batch"} else None
+
+
+def _decorate_model(model: str, service_tier: str | None,
+                    requested_at: str | None) -> str:
+    if not service_tier or not requested_at or model == "unknown":
+        return model
+    try:
+        parsed = datetime.fromisoformat(requested_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return model
+    if parsed < SERVICE_TIER_ATTRIBUTION_START:
+        return model
+    return f"{model}-{service_tier}"
+
+
+def _is_codex_home(path: Path) -> bool:
+    return path.is_dir() and any(
+        (path / name).is_dir() for name in ("sessions", "archived_sessions")
+    )
+
+
+def _discover_codex_homes(root: Path, max_depth: int = 3) -> list[Path]:
+    """Resolve a Codex home or bounded Multica container into Codex homes."""
+    root = root.expanduser()
+    if _is_codex_home(root):
+        return [root]
+    if not root.is_dir():
+        return []
+    homes = []
+    queue = [(root, 0)]
+    while queue:
+        current, depth = queue.pop(0)
+        try:
+            children = list(current.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            try:
+                if child.is_symlink() or not child.is_dir():
+                    continue
+            except OSError:
+                continue
+            child_depth = depth + 1
+            if child.name == "codex-home" and _is_codex_home(child):
+                homes.append(child)
+                continue
+            if child_depth < max_depth:
+                queue.append((child, child_depth))
+    result = []
+    seen = set()
+    for home in homes:
+        try:
+            key = home.resolve()
+        except OSError:
+            key = home
+        if key not in seen:
+            seen.add(key)
+            result.append(home)
+    return result
+
+
+def _homes_for_root(root: Path) -> list[Path]:
+    root = root.expanduser()
+    if root.name in {"sessions", "archived_sessions"}:
+        return [root.parent]
+    return _discover_codex_homes(root)
 
 
 def _roots(software: dict) -> list[Path]:
     configured = config_value(software, "data_root", "path")
     if configured:
         root = Path(configured).expanduser()
-        if root.name in {"sessions", "archived_sessions"}:
-            return [root]
-        return [root / "sessions", root / "archived_sessions"]
-    homes = [Path(os.environ.get("CODEX_HOME", str(CODEX_HOME))).expanduser()]
+        homes = [root.parent if root.name in {"sessions", "archived_sessions"}
+                 else root]
+    else:
+        homes = [Path(os.environ.get("CODEX_HOME", str(CODEX_HOME))).expanduser()]
     extra = config_value(
         software, "codex_extra_home", "extra_codex_home", "extra_data_root",
     ) or os.environ.get("VIBE_USAGE_CODEX_EXTRA_HOME") or os.environ.get("CODEX_EXTRA_HOME")
     if extra:
-        extra_home = Path(extra).expanduser()
-        if extra_home not in homes:
-            homes.append(extra_home)
-    return [home / directory for home in homes
+        homes.extend(_homes_for_root(Path(extra)))
+    for root in configured_extra_roots(software, KIND):
+        homes.extend(_homes_for_root(root))
+    unique_homes = []
+    seen = set()
+    for home in homes:
+        try:
+            key = home.resolve()
+        except OSError:
+            key = home
+        if key not in seen:
+            seen.add(key)
+            unique_homes.append(home)
+    return [home / directory for home in unique_homes
             for directory in ("sessions", "archived_sessions")]
 
 
@@ -103,6 +196,7 @@ def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_)
     session_id = None
     project = None
     model = "codex"
+    service_tier = None
     previous_cumulative = None
     raw_token_seen = 0
     line_count = 0
@@ -131,7 +225,16 @@ def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_)
                 elif obj.get("type") == "turn_context":
                     if isinstance(payload.get("model"), str) and payload["model"].strip():
                         model = payload["model"].strip()
+                    if "service_tier" in payload:
+                        service_tier = _service_tier(payload.get("service_tier"))
                     project = payload.get("project") or payload.get("cwd") or payload.get("workdir") or project
+                elif obj.get("type") == "event_msg" and payload.get("type") == "thread_settings_applied":
+                    settings = payload.get("thread_settings")
+                    if isinstance(settings, dict):
+                        if isinstance(settings.get("model"), str) and settings["model"].strip():
+                            model = settings["model"].strip()
+                        if "service_tier" in settings:
+                            service_tier = _service_tier(settings.get("service_tier"))
                 if obj.get("type") != "event_msg" or payload.get("type") != "token_count":
                     continue
                 raw_token_seen += 1
@@ -170,7 +273,9 @@ def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_)
                     kind=KIND,
                     source_key=f"session:{session_id or _session_id_from_path(item.path)}",
                     ordinal=line_count,
-                    model=model, requested_at=timestamp(obj.get("timestamp")),
+                    model=_decorate_model(model, service_tier,
+                                           timestamp(obj.get("timestamp"))),
+                    requested_at=timestamp(obj.get("timestamp")),
                     input_tokens=usage.get("input_tokens", 0),
                     # Codex's output_tokens includes reasoning_output_tokens;
                     # keep the IR's output bucket exclusive and let
@@ -186,7 +291,10 @@ def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_)
                 if event:
                     events.append(event)
     except (OSError, EOFError, gzip.BadGzipFile):
-        return batch([], line_count)
+        return batch(
+            events, line_count, skipped=True,
+            warnings=("codex: 会话文件读取不完整，已保留上次同步状态。",),
+        )
     return batch(events, line_count)
 
 

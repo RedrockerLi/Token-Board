@@ -11,8 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.services.agent_usage.adapters import (
-    cline, codex, craft_agent, dsh, grok, hermes, kiro, kimi_code, opencode,
-    pi_common, workbuddy,
+    antigravity, cline, codex, craft_agent, dsh, grok, hermes, kiro, kimi_code, mcode,
+    opencode, pi_common, workbuddy,
 )
 from app.services.agent_usage import cindy_ledger
 from app.services.agent_usage.ir import UsageEvent
@@ -21,14 +21,85 @@ from app.services.agent_usage.registry import ADAPTERS
 
 class AgentUsageAdapterTestCase(unittest.TestCase):
     def test_registry_matches_reference_agent_set(self) -> None:
-        self.assertEqual(len(ADAPTERS), 27)
+        self.assertEqual(len(ADAPTERS), 28)
         self.assertEqual(set(ADAPTERS), {
             "claude-code", "codex", "grok", "copilot-cli", "craft-agent",
             "cursor", "dimagent", "gemini-cli", "opencode", "openclaw",
             "omp", "pi-coding-agent", "qwen-code", "kimi-code", "amp",
             "alma", "droid", "dsh", "antigravity", "trae-cli", "hermes",
             "kiro", "mimocode", "cline", "roo-code", "workbuddy", "zcode",
+            "mcode",
         })
+
+    def test_antigravity_legacy_pb_uses_language_server_trajectory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            conversations = Path(directory) / "conversations"
+            conversations.mkdir()
+            legacy = conversations / "cascade-legacy.pb"
+            legacy.write_bytes(b"opaque legacy history")
+            trajectory = {
+                "metadata": {"workspaces": [{
+                    "workspaceFolderAbsoluteUri": "file:///work/project-legacy",
+                }]},
+                "generatorMetadata": [{"chatModel": {
+                    "responseModel": "gemini-3-pro-high",
+                    "chatStartMetadata": {"createdAt": "2026-09-07T06:30:02Z"},
+                    "retryInfos": [{"usage": {
+                        "responseId": "response-legacy",
+                        "inputTokens": 100,
+                        "outputTokens": 5,
+                        "cacheReadTokens": 2,
+                        "thinkingOutputTokens": 1,
+                    }}],
+                }}],
+            }
+            with patch.dict(os.environ, {
+                    "VIBE_USAGE_ANTIGRAVITY_DIRS": str(conversations)}), \
+                    patch.object(antigravity, "_legacy_trajectory",
+                                 return_value=trajectory):
+                items = antigravity.discover({})
+                self.assertEqual(len(items), 1)
+                parsed = antigravity.parse(items[0])
+
+            event = parsed.events[0]
+            self.assertEqual((event.model, event.project,
+                              event.prompt_tokens, event.completion_tokens,
+                              event.cache_read_tokens, event.total_tokens),
+                             ("gemini-3-pro", "project-legacy", 102, 6, 2, 106))
+
+    def test_mcode_reads_allowlisted_runtime_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime-state.sqlite"
+            with sqlite3.connect(path) as connection:
+                connection.execute("""CREATE TABLE local_runtime_sessions (
+                    session_id TEXT PRIMARY KEY, workspace_dir TEXT,
+                    project_workspace_dir TEXT
+                )""")
+                connection.execute("""CREATE TABLE local_runtime_token_usage (
+                    session_id TEXT, model TEXT, ts INTEGER,
+                    input_tokens INTEGER, output_tokens INTEGER,
+                    reasoning_tokens INTEGER, cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER, raw TEXT
+                )""")
+                connection.execute(
+                    "INSERT INTO local_runtime_sessions VALUES(?,?,?)",
+                    ("session-1", "/tmp/workspace", "/work/project-a"),
+                )
+                connection.execute(
+                    "INSERT INTO local_runtime_token_usage VALUES(?,?,?,?,?,?,?,?,?)",
+                    ("session-1", "mcode-model", 1782720000000, 10, 13, 3, 5, 7,
+                     '{"message":"must not be selected"}'),
+                )
+
+            item = mcode.discover({"config": {"data_root": str(path)}})[0]
+            parsed = mcode.parse(item)
+            self.assertFalse(parsed.skipped)
+            self.assertEqual(len(parsed.events), 1)
+            event = parsed.events[0]
+            self.assertEqual((event.model, event.project, event.prompt_tokens,
+                              event.completion_tokens, event.cache_read_tokens,
+                              event.total_tokens),
+                             ("mcode-model", "project-a", 22, 16, 5, 33))
 
     def test_craft_agent_and_hermes_use_documented_home_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -82,6 +153,40 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
                     "VIBE_USAGE_GROK_SESSIONS": str(root)}):
                 self.assertEqual(dsh._sessions_root({}), root)
                 self.assertEqual(grok.discover({}), [])
+
+    def test_codex_extra_root_finds_bounded_multica_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory) / "multica"
+            session_dir = container / "workspace" / "task" / "codex-home" / "sessions"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / "rollout-20260824010000-session.jsonl"
+            rollout.write_text("{}\n", encoding="utf-8")
+
+            sources = codex.discover({"config": {
+                "data_root": str(Path(directory) / "missing-primary"),
+                "extra_roots": {"codex": [str(container)]},
+            }})
+            self.assertEqual([item.path for item in sources], [rollout])
+
+    def test_pi_honors_session_directory_environment_and_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Path(directory) / "agent"
+            default_sessions = agent / "sessions"
+            env_sessions = Path(directory) / "env-sessions"
+            settings_sessions = Path(directory) / "settings-sessions"
+            default_sessions.mkdir(parents=True)
+            env_sessions.mkdir()
+            settings_sessions.mkdir()
+            (agent / "settings.json").write_text(
+                json.dumps({"sessionDir": str(settings_sessions)}),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {
+                    "PI_CODING_AGENT_DIR": str(agent),
+                    "PI_CODING_AGENT_SESSION_DIR": str(env_sessions)}):
+                roots = pi_common.pi_roots({}, "pi-coding-agent")
+            self.assertEqual(roots, [default_sessions, env_sessions, settings_sessions])
 
     def test_ir_maps_exclusive_buckets_and_reasoning(self) -> None:
         event = UsageEvent.from_buckets(
@@ -157,6 +262,30 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual(len(events), 2)
             self.assertTrue(all(event.event_id.startswith(
                 f"codex:session:{session_id}:" ) for event in events))
+
+    def test_codex_applies_service_tier_to_post_cutover_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sessions" / "2026" / "09" / "01"
+            root.mkdir(parents=True)
+            path = root / "rollout-tier.jsonl"
+            path.write_text("\n".join([
+                json.dumps({"type": "session_meta", "payload": {"id": "tier-session"}}),
+                json.dumps({"type": "turn_context", "payload": {
+                    "model": "gpt-tier", "service_tier": "fast",
+                }}),
+                json.dumps({"type": "event_msg", "timestamp": "2026-09-01T01:00:00Z",
+                            "payload": {"type": "token_count", "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 10, "output_tokens": 2,
+                                    "total_tokens": 12,
+                                },
+                            }}}),
+            ]) + "\n", encoding="utf-8")
+
+            item = codex.discover({"config": {"data_root": str(Path(directory))}})[0]
+            events = codex.parse(item).events
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].model, "gpt-tier-fast")
 
     def test_dsh_plain_session_and_seed_replay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -406,6 +535,34 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
                               events[0].prompt_tokens,
                               events[0].cache_read_tokens),
                              ("wb-model", "project", 100, 40))
+
+    def test_workbuddy_gives_copied_record_ids_a_global_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "projects" / "encoded"
+            project.mkdir(parents=True)
+            records = []
+            for session_id, minute in (("session-a", "00"), ("session-b", "10")):
+                records.append((project / f"{session_id}.jsonl", [
+                    {
+                        "id": "shared-request", "sessionId": session_id,
+                        "type": "message", "role": "assistant",
+                        "status": "completed", "timestamp": f"2026-08-24T01:{minute}:00Z",
+                        "providerData": {
+                            "requestModelId": "wb-model",
+                            "usage": {"inputTokens": 10, "outputTokens": 2},
+                        },
+                    },
+                ]))
+            for path, values in records:
+                path.write_text("\n".join(json.dumps(value) for value in values) + "\n",
+                                encoding="utf-8")
+
+            items = workbuddy.discover({"config": {"data_root": str(directory)}})
+            events = [event for item in items for event in workbuddy.parse(item).events]
+            self.assertEqual(len(events), 2)
+            self.assertEqual({event.event_id for event in events}, {
+                "workbuddy:record:shared-request",
+            })
 
 
 if __name__ == "__main__":

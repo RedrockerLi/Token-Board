@@ -6,7 +6,9 @@ import csv
 import io
 import json
 import os
+import shutil
 import sqlite3
+import tempfile
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -35,6 +37,45 @@ def config_value(software: dict, *names: str) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def configured_extra_roots(software: dict, kind: str) -> list[Path]:
+    """Return configured additional data roots for an adapter.
+
+    Agent software config is intentionally extensible. Accept both the
+    current snake_case keys and the reference tool's ``extraRoots`` shape,
+    while keeping path parsing in one place for adapters that support more
+    than one installation.
+    """
+    config = software.get("config") or {}
+    values = []
+
+    def add(raw) -> None:
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                add(item)
+            return
+        if isinstance(raw, str):
+            values.extend(part.strip() for part in raw.split(os.pathsep) if part.strip())
+
+    for key in ("extra_roots", "extraRoots", "extra_data_roots"):
+        raw = config.get(key) if isinstance(config, dict) else None
+        if isinstance(raw, dict):
+            raw = raw.get(kind)
+        add(raw)
+    normalized_kind = kind.replace("-", "_")
+    for key in (
+        f"{normalized_kind}_extra_roots",
+        f"{normalized_kind}_extra_root",
+        f"extra_{normalized_kind}_roots",
+        f"extra_{normalized_kind}_root",
+    ):
+        add(config.get(key) if isinstance(config, dict) else None)
+
+    env_kind = normalized_kind.upper()
+    for name in (f"VIBE_USAGE_{env_kind}_EXTRA_ROOTS", f"{env_kind}_EXTRA_ROOTS"):
+        add(os.environ.get(name))
+    return [Path(value).expanduser() for value in dict.fromkeys(values)]
 
 
 def configured_root(software: dict, default: Path) -> Path:
@@ -140,6 +181,62 @@ def sqlite_rows(path: Path, sql: str, params: tuple[Any, ...] = ()) -> list[sqli
             conn.close()
 
 
+def sqlite_rows_snapshot(
+    path: Path,
+    sql: str,
+    params: tuple[Any, ...] = (),
+    *,
+    raise_on_error: bool = False,
+) -> list[sqlite3.Row]:
+    """Read an external SQLite WAL database through a disposable copy.
+
+    Some agent applications keep a write transaction open for the lifetime of
+    the process.  Opening the original file read-only can then return a lock
+    error even though its database is otherwise queryable.  Copying the main
+    file together with its WAL/SHM companions gives the reader its own stable
+    snapshot and never changes the source database.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return []
+    temp_dir = None
+    conn = None
+    try:
+        temp_dir = Path(tempfile.mkdtemp(prefix="token-board-agent-snapshot-"))
+        copied = temp_dir / path.name
+        shutil.copy2(path, copied)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(path) + suffix)
+            if sidecar.is_file():
+                shutil.copy2(sidecar, Path(str(copied) + suffix))
+        # Open the disposable copy in writable mode so SQLite can initialize
+        # WAL shared-memory metadata when necessary.  query_only keeps the
+        # snapshot connection from mutating even this temporary copy.
+        conn = sqlite_runtime.connect(
+            copied,
+            sqlite_runtime.SQLiteProfile(
+                "agent_external_snapshot",
+                timeout=2.0,
+                busy_timeout_ms=2000,
+                journal_mode=None,
+                foreign_keys=False,
+                read_only=False,
+                isolation_level=None,
+            ),
+        )
+        conn.execute("PRAGMA query_only=ON")
+        return conn.execute(sql, params).fetchall()
+    except (OSError, sqlite3.Error):
+        if raise_on_error:
+            raise
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def sqlite_scalar(path: Path, sql: str, params: tuple[Any, ...] = ()) -> Any:
     rows = sqlite_rows(path, sql, params)
     return rows[0][0] if rows else None
@@ -189,7 +286,7 @@ def make_event(
         cached_input_tokens=cache_count,
         reasoning_output_tokens=reasoning_count,
         requested_at=requested_at,
-            event_id=event_id_for(kind, source_key, ordinal),
+        event_id=event_id_for(kind, source_key, ordinal),
         project=project,
         session_id=session_id,
         input_includes_cache=input_includes_cache,
@@ -197,5 +294,13 @@ def make_event(
     )
 
 
-def batch(events: list[UsageEvent], record_count: int) -> ParseBatch:
-    return ParseBatch.from_events(events, record_count)
+def batch(
+    events: list[UsageEvent],
+    record_count: int,
+    *,
+    skipped: bool = False,
+    warnings: tuple[str, ...] | list[str] = (),
+) -> ParseBatch:
+    return ParseBatch.from_events(
+        events, record_count, skipped=skipped, warnings=warnings,
+    )

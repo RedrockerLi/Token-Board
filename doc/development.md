@@ -68,6 +68,15 @@ python3 scripts/mock_upstream.py --port 9100
 按 日×账户/软件(id)×模型 增量聚合写进 `dashboard.db`(纯存档,写时固化的费用直接入库,改价不回溯)。
 Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由 `token-maintenance` 的通用 importer 负责游标、幂等和写入 `request_log`；仪表板打开时通过本地 socket 异步唤醒导入。`project`、`session_id` 只写本机 proxy 请求日志,不作为 API 字段。
 
+### Agent 用量 ref 基准
+
+当前移植基准是 `ref/vibe-usage` 的 commit `02ed3b52679cbd269639ef808476a74b062093f8`（短 hash：`02ed3b5`，提交信息：`chore: release v0.10.22`，记录日期：2026-09-07）。下次升级 ref 后，可用下面的命令查看新增提交和代码差异：
+
+```bash
+git -C ref/vibe-usage log 02ed3b52679cbd269639ef808476a74b062093f8..HEAD --oneline
+git -C ref/vibe-usage diff 02ed3b52679cbd269639ef808476a74b062093f8..HEAD -- src/parsers
+```
+
 ## 前端
 
 SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 维护页面注册表。ECharts 5.5.0 走 CDN。

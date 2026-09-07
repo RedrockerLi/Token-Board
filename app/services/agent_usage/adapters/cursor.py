@@ -6,15 +6,27 @@ dashboard has no extra dependency.
 """
 
 import base64
+import errno as errno_codes
 import json
 import logging
 import os
+import socket
+import sqlite3
 import sys
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ..common import batch, config_value, csv_rows, make_event, source, sqlite_rows, safe_int, timestamp
+from ..common import (
+    batch,
+    config_value,
+    csv_rows,
+    make_event,
+    safe_int,
+    source,
+    sqlite_rows_snapshot,
+    timestamp,
+)
 from ..ir import ParseBatch, UsageSource
 
 log = logging.getLogger(__name__)
@@ -51,7 +63,10 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
 
 
 def _token(db: Path) -> str | None:
-    rows = sqlite_rows(db, "SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken' LIMIT 1")
+    rows = sqlite_rows_snapshot(
+        db, "SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken' LIMIT 1",
+        raise_on_error=True,
+    )
     value = rows[0][0] if rows else None
     return str(value).strip() if isinstance(value, str) and value.strip() else None
 
@@ -83,8 +98,87 @@ def _cookie_values(token: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+DEFAULT_FETCH_TIMEOUT_MS = 30_000
+MAX_FETCH_TIMEOUT_MS = 2_147_483_647
+
+
+def resolve_cursor_fetch_timeout(value) -> int:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_FETCH_TIMEOUT_MS
+    if not parsed.is_integer() or not 0 < parsed <= MAX_FETCH_TIMEOUT_MS:
+        return DEFAULT_FETCH_TIMEOUT_MS
+    return int(parsed)
+
+
+def _network_warning(exc: BaseException, timeout_ms: int) -> str:
+    codes = []
+    seen = set()
+    timed_out = False
+
+    def visit(value) -> None:
+        nonlocal timed_out
+        if value is None or id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, TimeoutError):
+            timed_out = True
+        code = getattr(value, "errno", None) or getattr(value, "code", None)
+        if isinstance(code, int):
+            code = errno_codes.errorcode.get(code) or next(
+                (name for name in ("EAI_AGAIN", "EAI_NONAME", "EAI_FAIL")
+                 if getattr(socket, name, None) == code),
+                None,
+            )
+            if code == "EAI_NONAME":
+                code = "ENOTFOUND"
+        if isinstance(code, str) and code not in codes:
+            codes.append(code)
+        reason = getattr(value, "reason", None)
+        if isinstance(reason, BaseException):
+            visit(reason)
+        elif isinstance(reason, str) and "timed out" in reason.lower():
+            timed_out = True
+        cause = getattr(value, "__cause__", None)
+        if isinstance(cause, BaseException):
+            visit(cause)
+
+    visit(exc)
+    code = codes[0] if codes else None
+    if isinstance(exc, HTTPError):
+        detail = f"HTTP {exc.code}"
+    elif timed_out or any(value in {"ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"}
+                          for value in codes):
+        detail = f"timeout after {timeout_ms}ms"
+    elif isinstance(code, str):
+        detail = ", ".join(codes)
+    else:
+        detail = "network error"
+    if "timeout" in detail.lower():
+        hint = "Cursor 用量导出超时，请稍后重试；可通过 VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS 增大等待时间。"
+    elif any(value in {"ENOTFOUND", "EAI_AGAIN"} for value in codes):
+        hint = "请检查 DNS 和终端代理配置。"
+    elif any("CERT" in value or value in {
+            "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+            "ERR_TLS_CERT_ALTNAME_INVALID",
+    } for value in codes):
+        hint = "请检查系统时间及代理或公司网络的 CA 证书配置。"
+    else:
+        hint = "请检查终端网络和代理配置。"
+    return f"cursor: 用量导入暂跳过（{detail}）。{hint}"
+
+
+def _csv_int(value) -> int:
+    return safe_int(str(value).replace(",", ""))
+
+
 def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
-    token = _token(item.path)
+    try:
+        token = _token(item.path)
+    except (OSError, sqlite3.Error):
+        return batch([], 0, skipped=True,
+                     warnings=("cursor: 无法读取本地会话数据库，已跳过本次用量导入。",))
     if not token:
         return batch([], 0)
     base = os.environ.get("CURSOR_WEB_BASE_URL", "https://cursor.com").rstrip("/")
@@ -95,6 +189,9 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         "User-Agent": "Mozilla/5.0",
     }
     text = None
+    timeout_ms = resolve_cursor_fetch_timeout(
+        os.environ.get("VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS")
+    )
     attempts = [
         {"Cookie": f"WorkosCursorSessionToken={value}"}
         for value in _cookie_values(token)
@@ -102,17 +199,21 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
     for auth_headers in attempts:
         request = Request(url, headers={**base_headers, **auth_headers})
         try:
-            with urlopen(request, timeout=10) as response:
+            with urlopen(request, timeout=timeout_ms / 1000) as response:
                 text = response.read().decode("utf-8", errors="replace")
             break
         except HTTPError as exc:
             if exc.code in {401, 403}:
                 continue
-            return batch([], 0)
-        except OSError:
-            return batch([], 0)
+            return batch([], 0, skipped=True,
+                         warnings=(_network_warning(exc, timeout_ms),))
+        except (OSError, URLError, TimeoutError) as exc:
+            return batch([], 0, skipped=True,
+                         warnings=(_network_warning(exc, timeout_ms),))
     if text is None:
-        return batch([], 0)
+        raise RuntimeError(
+            "cursor: 会话凭据已被拒绝，请在 Cursor 中重新登录后重试。"
+        )
     events = []
     rows = list(csv_rows(text))
     for index, row in enumerate(rows):
@@ -122,9 +223,14 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             continue
         event = make_event(
             kind=KIND, source_key=item.state_key, ordinal=f"{index}:{row.get('Date')}:{model}", model=model,
-            requested_at=ts, input_tokens=safe_int(row.get("Input (w/ Cache Write)")) + safe_int(row.get("Input (w/o Cache Write)")),
-            output_tokens=safe_int(row.get("Output Tokens")), cached_input_tokens=safe_int(row.get("Cache Read")),
+            requested_at=ts, input_tokens=_csv_int(row.get("Input (w/ Cache Write)")) + _csv_int(row.get("Input (w/o Cache Write)")),
+            output_tokens=_csv_int(row.get("Output Tokens")), cached_input_tokens=_csv_int(row.get("Cache Read")),
             project="unknown", input_includes_cache=False,
+            total_tokens=(
+                _csv_int(row.get("Input (w/ Cache Write)"))
+                + _csv_int(row.get("Input (w/o Cache Write)"))
+                + _csv_int(row.get("Output Tokens"))
+            ),
         )
         if event:
             events.append(event)

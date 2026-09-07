@@ -67,6 +67,16 @@ def _completed_assistant(record: dict) -> bool:
     return status in {"completed", "complete", "success"}
 
 
+def _record_id(record: dict) -> str | None:
+    value = record.get("id")
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (str, int, float)):
+        return None
+    value = str(value).strip()
+    return value or None
+
+
 def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
     events = []
     count = 0
@@ -95,10 +105,14 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         inclusive_input = _number((primary or {}).get("inputTokens") or (primary or {}).get("input_tokens") or raw.get("prompt_tokens"))
         inclusive_output = _number((primary or {}).get("outputTokens") or (primary or {}).get("output_tokens") or raw.get("completion_tokens"))
         cache_miss = _number(raw.get("prompt_cache_miss_tokens"))
-        ident = record.get("id")
+        ident = _record_id(record)
         session_id = str(record.get("sessionId") or record.get("session_id") or item.path.stem)
         ordinal = ident if ident is not None else f"{item.path}:{line_no}"
-        stable_source = session_id if ident is not None else item.state_key
+        # WorkBuddy copies a top-level usage record into more than one project
+        # session during migration. Its id is globally unique, so keep that
+        # identity independent of the physical session/file path and let the
+        # request_log UNIQUE constraint collapse the copies.
+        stable_source = "record" if ident is not None else item.state_key
         model = provider.get("requestModelId") or record.get("requestModelName") or provider.get("requestModelName") or provider.get("model") or "unknown"
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         raw_timestamp = (
@@ -112,6 +126,11 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             requested_at=timestamp(raw_timestamp),
             input_tokens=cache_miss or max(0, inclusive_input - cache), output_tokens=max(0, inclusive_output - reasoning),
             cached_input_tokens=cache, reasoning_output_tokens=reasoning,
+            total_tokens=(
+                (cache_miss or max(0, inclusive_input - cache))
+                + max(0, inclusive_output - reasoning)
+                + reasoning
+            ),
             project=project_name(record.get("cwd") or project), session_id=session_id,
         )
         if event:

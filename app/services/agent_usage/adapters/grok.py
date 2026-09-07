@@ -6,7 +6,18 @@ import os
 from pathlib import Path
 from urllib.parse import unquote
 
-from ..common import batch, config_value, iter_jsonl, make_event, project_name, read_json, source, timestamp
+from ..common import (
+    batch,
+    config_value,
+    configured_extra_roots,
+    iter_jsonl,
+    make_event,
+    project_name,
+    read_json,
+    safe_float,
+    source,
+    timestamp,
+)
 from ..ir import ParseBatch, UsageSource
 
 KIND = "grok"
@@ -15,43 +26,77 @@ DEFAULT_PATH = Path.home() / ".grok" / "sessions"
 log = logging.getLogger(__name__)
 
 
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
     configured = config_value(software, "data_root", "path")
     direct_sessions = os.environ.get("VIBE_USAGE_GROK_SESSIONS", "").strip()
     if not configured and direct_sessions:
-        sessions = Path(direct_sessions).expanduser()
+        sessions_roots = [Path(direct_sessions).expanduser()]
     else:
         root = configured or os.environ.get("GROK_HOME")
         sessions = Path(root).expanduser() if root else Path.home() / ".grok"
         if sessions.name != "sessions":
             sessions = sessions / "sessions"
-    out = []
-    try:
-        for group in sessions.iterdir():
+        sessions_roots = [sessions]
+    sessions_roots.extend(
+        root if root.name == "sessions" else root / "sessions"
+        for root in configured_extra_roots(software, KIND)
+    )
+    candidates = {}
+    for sessions in sessions_roots:
+        try:
+            groups = list(sessions.iterdir())
+        except OSError:
+            log.debug("Grok discovery root is unavailable", exc_info=True)
+            continue
+        for group in groups:
             if not group.is_dir():
                 continue
-            for session in group.iterdir():
-                if session.is_dir() and (session.joinpath("updates.jsonl").is_file() or session.joinpath("summary.json").is_file()):
-                    out.append(source(session / "updates.jsonl", session_path=session,
-                                      group=group.name, group_path=group))
-    except OSError:
-        log.debug("Grok discovery root is unavailable", exc_info=True)
-    return out
+            try:
+                session_dirs = list(group.iterdir())
+            except OSError:
+                continue
+            for session in session_dirs:
+                path = session / "updates.jsonl"
+                if not session.is_dir() or not path.is_file():
+                    continue
+                score = (_file_size(path), _file_size(session / "events.jsonl"),
+                         _file_size(session / "summary.json"))
+                session_id = session.name
+                current = candidates.get(session_id)
+                if current is None or score > current[0]:
+                    candidates[session_id] = (score, path, session, group)
+    return [source(path, session_path=session, session_id=session_id,
+                   group=group.name, group_path=group)
+            for session_id, (_, path, session, group) in candidates.items()]
 
 
 def _usage_event(item, ordinal, model, project, ts, usage, session_id):
     if not isinstance(usage, dict):
         return None
-    total_input = float(usage.get("inputTokens", 0) or 0)
-    cache = float(usage.get("cachedReadTokens", 0) or 0)
-    output = float(usage.get("outputTokens", 0) or 0)
-    reasoning = float(usage.get("reasoningTokens", 0) or 0)
+    total_input = max(0.0, safe_float(usage.get("inputTokens")))
+    cache = max(0.0, safe_float(usage.get("cachedReadTokens")))
+    output = max(0.0, safe_float(usage.get("outputTokens")))
+    reasoning = max(0.0, safe_float(usage.get("reasoningTokens")))
     model_value = model or "unknown"
+    input_tokens = max(0, total_input - cache)
+    output_tokens = max(0, output - reasoning)
     return make_event(
-        kind=KIND, source_key=item.state_key, ordinal=ordinal, model=model_value,
-        requested_at=ts, input_tokens=max(0, total_input - cache),
-        output_tokens=max(0, output - reasoning), cached_input_tokens=cache,
-        reasoning_output_tokens=reasoning, project=project, session_id=session_id,
+        # A session can be copied between Grok homes. Keep its logical id in
+        # the event identity so the selected copy and any overlapping scan
+        # remain idempotent across roots.
+        kind=KIND, source_key=f"session:{session_id}", ordinal=ordinal, model=model_value,
+        requested_at=ts, input_tokens=input_tokens,
+        output_tokens=output_tokens, cached_input_tokens=cache,
+        reasoning_output_tokens=reasoning,
+        total_tokens=input_tokens + output_tokens + reasoning,
+        project=project, session_id=session_id,
     )
 
 
@@ -90,11 +135,17 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         model_usage = usage.get("modelUsage") if isinstance(usage, dict) else None
         if isinstance(model_usage, dict) and model_usage:
             for model, values in model_usage.items():
-                event = _usage_event(item, f"{line_no}:{model}", model, project, ts, values, item.path.parent.name)
+                event = _usage_event(
+                    item, f"{line_no}:{model}", model, project, ts, values,
+                    item.context.get("session_id") or item.path.parent.name,
+                )
                 if event:
                     events.append(event)
         else:
-            event = _usage_event(item, line_no, fallback_model, project, ts, usage, item.path.parent.name)
+            event = _usage_event(
+                item, line_no, fallback_model, project, ts, usage,
+                item.context.get("session_id") or item.path.parent.name,
+            )
             if event:
                 events.append(event)
     return batch(events, count)
