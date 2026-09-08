@@ -18,10 +18,25 @@ from app.tests.support import AppDatabaseTestCase
 class BillingTest(AppDatabaseTestCase):
     def test_subscription_effective_dates_are_utc_calendar_dates(self) -> None:
         db = self.proxy_database()
-        start_with_time = "2099-09-06T06:56:13Z"
+        for legacy_field in ("start_time", "effective_at", "ends_at"):
+            with self.subTest(legacy_field=legacy_field), self.assertRaises(ValueError):
+                db.create_agent_subscription({
+                    "name": f"legacy-{legacy_field}",
+                    legacy_field: "2099-09-06T06:56:13Z",
+                    "monthly_price": 10,
+                    "currency": "CNY",
+                })
+        with self.assertRaises(ValueError):
+            db.create_agent_subscription({
+                "name": "timestamp-agent-subscription",
+                "valid_from": "2099-09-06T06:56:13Z",
+                "monthly_price": 10,
+                "currency": "CNY",
+            })
+        start_date = "2099-09-06"
         subscription_id = db.create_agent_subscription({
             "name": "date-only-agent-subscription",
-            "valid_from": start_with_time,
+            "valid_from": start_date,
             "monthly_price": 10,
             "currency": "CNY",
         })
@@ -44,7 +59,7 @@ class BillingTest(AppDatabaseTestCase):
                 (subscription_id, software_id)).fetchone()[0],
                 utc_now().strftime("%Y-%m-%d"))
             self.assertEqual(conn.execute(
-                "SELECT effective_at FROM agent_subscription_rate_events "
+                "SELECT effective_on FROM agent_subscription_rate_events "
                 "WHERE instance_id=(SELECT id FROM agent_subscription_instances "
                 "WHERE subscription_id=?)", (subscription_id,)).fetchone()[0],
                 "2099-09-06")
@@ -157,15 +172,17 @@ class BillingTest(AppDatabaseTestCase):
             conn.execute(
                 "UPDATE agent_subscription_bindings SET valid_from=? "
                 "WHERE subscription_id=? AND software_id=?",
-                ("2000-01-01T00:00:00Z", subscription_id, software_id),
+                ("2000-01-01", subscription_id, software_id),
             )
             conn.commit()
         from app.db.proxy.billing import materialize_agent_subscription_charges
-        materialize_agent_subscription_charges(self.proxy_path)
+        materialize_agent_subscription_charges(
+            self.proxy_path, utc_now() + timedelta(days=1))
 
         result = db.delete_agent_subscription(subscription_id)
         self.assertTrue(result["ok"], result)
         self.assertFalse(result["deferred"], result)
+        self.assertIsNone(result["effective_ends_on"])
 
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
@@ -174,13 +191,9 @@ class BillingTest(AppDatabaseTestCase):
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM agent_subscription_instances "
                 "WHERE subscription_id=?", (subscription_id,)).fetchone()[0], 0)
-            self.assertEqual(conn.execute(
-                "SELECT count(*) FROM agent_subscription_rate_events "
-                "WHERE instance_id NOT IN (SELECT id FROM agent_subscription_instances)"
-            ).fetchone()[0], 0)
-            self.assertEqual(conn.execute(
-                "SELECT count(*) FROM agent_subscription_bindings "
-                "WHERE subscription_id=?", (subscription_id,)).fetchone()[0], 0)
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM agent_subscription_bindings "
+                "WHERE subscription_id=?", (subscription_id,)).fetchone())
             self.assertGreater(conn.execute(
                 "SELECT count(*) FROM agent_subscription_period_charges "
                 "WHERE subscription_id=?", (subscription_id,)).fetchone()[0], 0)
@@ -201,10 +214,28 @@ class BillingTest(AppDatabaseTestCase):
         from app.db.proxy.billing import materialize_agent_subscription_charges
         materialize_agent_subscription_charges(self.proxy_path)
         with sqlite3.connect(self.proxy_path) as conn:
-            self.assertGreater(conn.execute(
-                "SELECT count(*) FROM billing_export_events "
+            source = conn.execute(
+                "SELECT a.period_charge_id,a.software_id "
+                "FROM agent_subscription_charge_allocations a "
+                "WHERE a.software_id=?", (software_id,)
+            ).fetchone()
+            self.assertIsNotNone(source)
+            expected_source_key = f"{source[0]}:{source[1]}"
+            self.assertEqual(conn.execute(
+                "SELECT source_key FROM billing_export_events "
                 "WHERE source_table='agent_subscription_charge_allocations'"
-            ).fetchone()[0], 0)
+            ).fetchall(), [(expected_source_key,)])
+
+        # A replay scans the immutable allocation key, not the date on which
+        # this materialization happens, and therefore cannot create a second
+        # Dashboard event.
+        materialize_agent_subscription_charges(self.proxy_path)
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM billing_export_events "
+                "WHERE source_table='agent_subscription_charge_allocations' "
+                "AND source_key=?", (expected_source_key,)
+            ).fetchone()[0], 1)
 
         recreated = db.create_agent_subscription({
             "name": "reusable-agent-subscription", "monthly_price": 7,
@@ -236,12 +267,12 @@ class BillingTest(AppDatabaseTestCase):
                 "WHERE subscription_id=?", (subscription_id,)
             ).fetchone()[0]
             conn.execute(
-                "UPDATE agent_subscriptions SET ends_at=? WHERE id=?",
-                ("2000-01-01T00:00:00Z", subscription_id),
+                "UPDATE agent_subscriptions SET ends_on=? WHERE id=?",
+                ("2000-01-01", subscription_id),
             )
             conn.execute(
-                "UPDATE agent_subscription_instances SET ends_at=? WHERE id=?",
-                ("2000-01-01T00:00:00Z", instance_id),
+                "UPDATE agent_subscription_instances SET ends_on=? WHERE id=?",
+                ("2000-01-01", instance_id),
             )
             conn.commit()
 

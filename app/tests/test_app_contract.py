@@ -61,7 +61,7 @@ class AppContractTest(AppDatabaseTestCase):
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT major,minor FROM schema_version WHERE id=1"
-            ).fetchone(), (2, 0))
+            ).fetchone(), (2, 1))
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM accounts WHERE id=?", (account_id,)
             ).fetchone()[0], 1)
@@ -507,7 +507,7 @@ class AppContractTest(AppDatabaseTestCase):
                 "SELECT software_id FROM agent_software_runtime WHERE software_id=?",
                 (software_id,)).fetchone())
             self.assertIsNone(conn.execute(
-                "SELECT software_id FROM agent_subscription_bindings "
+                "SELECT 1 FROM agent_subscription_bindings "
                 "WHERE software_id=? AND subscription_id=?",
                 (software_id, subscription_id),
             ).fetchone())

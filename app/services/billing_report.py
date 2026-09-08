@@ -100,19 +100,19 @@ def _agent_allocation_sql() -> str:
         JOIN accounts live_agent_account
           ON live_agent_account.id=live_software.id
          AND live_agent_account.account_kind='agent'
-        WHERE allocation.finalized_at IS NOT NULL
+        WHERE allocation.is_finalized=1
           AND allocation.normalized_recurring_cost IS NOT NULL
-          AND charge.finalized_at IS NOT NULL
-          AND (live_subscription.ends_at IS NULL
-               OR live_subscription.ends_at>:now)
-          AND (live_instance.ends_at IS NULL OR live_instance.ends_at>:now)
+          AND charge.is_finalized=1
+          AND (live_subscription.ends_on IS NULL
+               OR live_subscription.ends_on>date(:now))
+          AND (live_instance.ends_on IS NULL OR live_instance.ends_on>date(:now))
           AND EXISTS(
                 SELECT 1 FROM agent_subscription_bindings live_binding
                 WHERE live_binding.subscription_id=live_subscription.id
                   AND live_binding.software_id=allocation.software_id
-                  AND live_binding.valid_from<=:now
-                  AND (live_binding.ends_at IS NULL
-                       OR live_binding.ends_at>:now)
+                  AND live_binding.valid_from<=date(:now)
+                  AND (live_binding.ends_on IS NULL
+                       OR live_binding.ends_on>date(:now))
               )
           AND charge.period_start>=:start AND charge.period_start<=:end
     """

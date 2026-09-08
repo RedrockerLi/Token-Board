@@ -131,7 +131,8 @@ class ProxyLifecycleMixin:
         """Physically delete ended Plan units and empty parent graphs."""
         conn = self._connect()
         try:
-            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now_dt = utc_now()
+            now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             from app.db.proxy.deletion import purge_credential, purge_proxy_account
             expired = conn.execute(
                 "SELECT c.uuid FROM upstream_credentials c "
@@ -150,22 +151,29 @@ class ProxyLifecycleMixin:
             for row in pending:
                 purge_proxy_account(conn, int(row["id"]))
 
+            # Agent allocations use the final date interval. Reconcile ended
+            # instances before removing their live rows, otherwise a charge
+            # finalized earlier than its allocation could never be exported.
+            from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+            materialize_agent_subscription_charges_conn(
+                conn, now_dt, current_only=True, include_ended=True)
+            today = now_dt.date().isoformat()
             conn.execute("DELETE FROM agent_subscription_bindings "
-                         "WHERE ends_at IS NOT NULL AND ends_at<=?", (now,))
+                         "WHERE ends_on IS NOT NULL AND ends_on<?", (today,))
             from app.db.proxy.deletion import (
                 purge_agent_subscription, purge_agent_subscription_instance,
             )
             instances = conn.execute(
                 "SELECT id FROM agent_subscription_instances "
-                "WHERE ends_at IS NOT NULL AND ends_at<=?", (now,),
+                "WHERE ends_on IS NOT NULL AND ends_on<?", (today,),
             ).fetchall()
             for row in instances:
                 purge_agent_subscription_instance(conn, int(row["id"]))
             subscriptions = conn.execute(
                 "SELECT s.id FROM agent_subscriptions s "
-                "WHERE s.ends_at IS NOT NULL AND s.ends_at<=? "
+                "WHERE s.ends_on IS NOT NULL AND s.ends_on<? "
                 "AND NOT EXISTS (SELECT 1 FROM agent_subscription_instances i "
-                "WHERE i.subscription_id=s.id)", (now,),
+                "WHERE i.subscription_id=s.id)", (today,),
             ).fetchall()
             for row in subscriptions:
                 purge_agent_subscription(conn, int(row["id"]))

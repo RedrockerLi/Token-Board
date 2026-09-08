@@ -219,7 +219,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             month="2026-08", account_id=7, billing_unit_id="unit-7",
             recurring_charge=20, normalized_recurring_cost=20,
             currency="CNY", base_currency="CNY", fx_rate_date=None,
-            frozen_at="2026-08-01T00:00:00Z"), 1)
+            frozen_on="2026-08-01"), 1)
         self.assertCountEqual(self._names(), ["keep-me", "remove-me"])
 
     def test_deleted_account_can_accept_later_usage_export(self) -> None:
@@ -260,10 +260,10 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             conn.executemany(
                 "INSERT INTO monthly_recurring_costs"
                 "(period_start,account_id,billing_unit_id,recurring_charge,"
-                "equivalent_cost,normalized_recurring_cost,charge_frozen_at) "
-                "VALUES('2026-08-01T00:00:00Z',?,?,0,0,0,?)",
-                [(14, "zen-unit", "2026-08-15T00:00:00Z"),
-                 (17, "lm-unit", "2026-08-18T00:00:00Z")],
+                "equivalent_cost,normalized_recurring_cost,is_frozen,frozen_on) "
+                "VALUES('2026-08-01T00:00:00Z',?,?,0,0,0,?,?)",
+                [(14, "zen-unit", 1, "2026-08-15"),
+                 (17, "lm-unit", 1, "2026-08-18")],
             )
             conn.commit()
         result = delete_dashboard_users(
@@ -285,12 +285,12 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             month="2026-08", account_id=8, billing_unit_id="unit-8",
             recurring_charge=10, normalized_recurring_cost=10,
             currency="CNY", base_currency="CNY", fx_rate_date=None,
-            frozen_at="2026-08-01T00:00:00Z"), 1)
+            frozen_on="2026-08-01"), 1)
         self.assertEqual(dashboard.upsert_frozen_plan_charge(
             month="2026-08", account_id=8, billing_unit_id="unit-8",
             recurring_charge=20, normalized_recurring_cost=20,
             currency="CNY", base_currency="CNY", fx_rate_date=None,
-            frozen_at="2026-08-02T00:00:00Z"), 0)
+            frozen_on="2026-08-02"), 0)
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT recurring_charge,normalized_recurring_cost "

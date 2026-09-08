@@ -29,10 +29,10 @@ Token Board 由三个进程边界组成，共享同一份版本化数据库 sche
 ```
 
 schema 的单一来源是 `schema/` 目录下的版本化 SQL 与 transition，见
-[database-migrations.md](database-migrations.md)。当前 V1 tip 是 Token Board V1.21、
-Dashboard V1.7；baseline 位于各自 `v1/1-0_baseline.sql`，V0 文件按原内容归档
-在各自 `v0/`。所有生产升级由 Python 的 `app.db.schema_upgrade` 负责；C++
-只校验已准备好的 Proxy V1 数据库，不读取 SQL、不执行迁移。
+[database-migrations.md](database-migrations.md)。历史 V1 tip 是 Token Board V1.21、
+Dashboard V1.7；当前运行 tip 是 Token Board/Dashboard V2.1，baseline 位于各自
+`v1/1-0_baseline.sql`，V0 文件按原内容归档在各自 `v0/`。所有生产升级由 Python 的
+`app.db.schema_upgrade` 负责；C++ 只校验已准备好的 Proxy V2 数据库，不读取 SQL、不执行迁移。
 
 两个库各管一件事：
 
@@ -82,15 +82,15 @@ Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查�
 
 请求进来先走代理。客户端密钥经 `Router::route` 找到上游账户，请求按客户端 URL 路径识别格式，与上游格式不同时经 IR 编解码转换，随后由 `UpstreamClient` 转发。每次请求的结果写进 `token-board.db` 的 `request_log`（计费与性能指标）和 `request_attempts`（每次上游尝试），流式响应实时透传。
 
-看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。代理和智能体用量都按日×统一身份×模型批量导出到 Dashboard V1 的 `daily_usage`，订阅周期费用按绑定关系分摊到 `monthly_recurring_costs`，再以云端权威模型同步到 WebDAV。
+看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。代理和智能体用量都按日×统一身份×模型批量导出到 Dashboard V2.1 的 `daily_usage`，订阅周期费用按 UTC 日终绑定关系分摊到 `monthly_recurring_costs`，再以云端权威模型同步到 WebDAV。
 
 智能体用量由 `token-maintenance` 内的 importer worker 采集。服务启动立即执行一次，之后每 1800 秒执行一次；前端页面加载时通过 Unix datagram socket 异步唤醒同一个 worker。worker 串行扫描已登记的软件日志并写入 `token-board.db/request_log`，因此不会因定时任务和浏览器刷新并发扫描而重复计量。`project` 与 `session_id` 仅作为本机数据库字段保存。
 
-`dashboard.db` 是纯存档，V1 使用统一的 `accounts`、`daily_usage` 和 `monthly_recurring_costs`；`accounts.account_kind` 区分代理上游与智能体软件。它不保存价格表，也不承担重算配置价格的职责。
+`dashboard.db` 是纯存档，V2.1 使用统一的 `accounts`、`daily_usage` 和 `monthly_recurring_costs`；`accounts.account_kind` 区分代理上游与智能体软件。它不保存价格表，也不承担重算配置价格的职责。Agent 周期费用的导出事件按不可变分摊源键补发，不按物化时间筛选。
 
 ## 关键设计决策
 
-**数据库是唯一事实来源。** V1 在请求写入时按当前 `pricing_rules → pricing_slots → fx_rates` 计算并固化 `equivalent_cost` 与 `billed_usage_cost`；周期费用来自 `billing_period_charges`，冻结后生成不可变的 `billing_export_events`。看板直接归档这两个口径与 recurring charge，改价不回溯。
+**数据库是唯一事实来源。** V2.1 在请求写入时按当前 `pricing_rules → pricing_slots → fx_rates` 计算并固化 `equivalent_cost` 与 `billed_usage_cost`；周期费用来自 Proxy/Agent 的周期费用及分摊事实，冻结后生成不可变的 `billing_export_events`。Agent 只按日期和日终状态处理绑定，事件按分摊源键补发；看板直接归档这两个口径与 recurring charge，改价不回溯。
 
 **格式转换收敛到 IR。** 三种线格式的编解码统一到 `ir.h` 的中间表示：`parse → IR → serialize`。同格式走透传快速路径，不经过 IR。
 

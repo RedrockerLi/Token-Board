@@ -94,7 +94,7 @@ class ProxyDatabase(
                 (now.strftime("%Y-%m-%dT%H:%M:%SZ"),) * 2,
             ).fetchone()[0] + conn.execute(
                 "SELECT COUNT(*) FROM agent_subscription_period_charges "
-                "WHERE finalized_at IS NULL AND period_start<=? AND period_end>?",
+                "WHERE is_finalized=0 AND period_start<=? AND period_end>?",
                 (now.strftime("%Y-%m-%dT%H:%M:%SZ"),) * 2,
             ).fetchone()[0]
             return {

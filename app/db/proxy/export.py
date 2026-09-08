@@ -10,11 +10,12 @@ from app.db.proxy.common import _billing_period_month, _period_start
 def _billing_event_payload_hash(event) -> str:
     payload = {
         key: event[key] for key in (
-            "event_key", "event_kind", "account_id", "account_uuid",
+            "event_key", "event_kind", "source_table", "source_key",
+            "account_id", "account_uuid",
             "account_kind",
             "month", "period_start", "billing_unit_id", "recurring_charge",
             "normalized_recurring_cost", "currency", "base_currency",
-            "fx_rate_date",
+            "fx_rate_date", "frozen_on",
         )
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))

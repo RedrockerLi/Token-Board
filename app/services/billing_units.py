@@ -28,6 +28,7 @@ class BillingUnit:
     valid_from: date
     ends_at: datetime | None
     currency: str
+    ends_on: date | None = None
     credential_uuid: str | None = None
     credential_identity: str | None = None
     credential_runtime_id: int | None = None
@@ -119,16 +120,24 @@ class BillingUnitResolver:
         return units
 
     @staticmethod
-    def agent_units(conn, *, at: datetime | None = None) -> list[BillingUnit]:
+    def agent_units(conn, *, at: datetime | None = None,
+                    include_ended: bool = False) -> list[BillingUnit]:
         moment = utc_now() if at is None else at
-        now = format_utc(moment)
+        today = moment.date().isoformat()
+        visibility = ""
+        params: list[object] = [today]
+        if not include_ended:
+            visibility = (
+                " AND (s.ends_on IS NULL OR s.ends_on>?)"
+                " AND (i.ends_on IS NULL OR i.ends_on>?)"
+            )
+            params.extend((today, today))
         rows = conn.execute(
-            "SELECT i.id,i.uuid,i.subscription_id,i.valid_from,i.ends_at,s.currency "
+            "SELECT i.id,i.uuid,i.subscription_id,i.valid_from,i.ends_on,s.currency "
             "FROM agent_subscription_instances i "
             "JOIN agent_subscriptions s ON s.id=i.subscription_id "
-            "WHERE (s.ends_at IS NULL OR s.ends_at>=?) "
-            "AND (i.ends_at IS NULL OR i.ends_at>=?) "
-            "AND i.valid_from<=?", (now, now, now),
+            "WHERE i.valid_from<=?" + visibility,
+            tuple(params),
         ).fetchall()
         return [BillingUnit(
             billing_unit_id=f"agent-subscription-instance:{row['uuid']}",
@@ -137,8 +146,10 @@ class BillingUnitResolver:
             owner_kind="agent",
             charge_domain="agent_subscription",
             valid_from=_parse_iso_date(str(row["valid_from"])[:10]),
-            ends_at=_parsed_ends_at(row["ends_at"]),
+            ends_at=None,
             currency=str(row["currency"]),
+            ends_on=_parse_iso_date(str(row["ends_on"])[:10])
+            if row["ends_on"] else None,
             subscription_id=int(row["subscription_id"]),
         ) for row in rows]
 

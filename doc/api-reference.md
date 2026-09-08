@@ -50,11 +50,11 @@
 |------|------|------|
 | `/api/proxy/agent-types` | GET | 当前可用的软件解析类型（由 Python adapter registry 提供，包含 28 种本地 agent） |
 | `/api/proxy/agent-subscriptions` | GET/POST | 查询/添加独立订阅（名称、开始日期，按 UTC `00:00Z` 生效；币种、一个或多个价格/开始日期实例） |
-| `/api/proxy/agent-subscriptions/<id>` | PUT/DELETE | 修改或删除订阅；已有账单时只把实时订阅图保留到本期边界，历史身份/账单保留，名称可重建 |
+| `/api/proxy/agent-subscriptions/<id>` | PUT/DELETE | 修改或删除订阅；立即模式物理删除实时订阅图，`end_of_period` 保留到本期边界，历史身份/账单保留，名称可重建 |
 | `/api/proxy/agent-subscriptions/<id>/instances` | GET/POST | 查询或添加订阅实例（每个实例独立计费） |
 | `/api/proxy/agent-subscription-instances/<id>` | PUT/DELETE | 修改或删除订阅实例 |
 | `/api/proxy/agent-software` | GET/POST | 查询/添加软件来源（名称、类型、数据目录） |
-| `/api/proxy/agent-software/<id>` | PUT/DELETE | 修改/软删除软件来源，并用 `subscription_ids` 替换订阅绑定；删除后保留身份和历史归属 |
+| `/api/proxy/agent-software/<id>` | PUT/DELETE | 修改/物理删除软件来源，并用 `subscription_ids` 替换订阅绑定；删除后保留身份和历史归属 |
 
 ### 账户与密钥
 

@@ -40,10 +40,12 @@ fixture、测试和 V0 历史转换，不是业务代码的升级入口。
 schema/
 ├── token-board/
 │   ├── v0/0-1_initial.sql … 0-19_drop_monthly_price.sql
-│   └── v1/1-0_baseline.sql … 1-21_subscription_effective_dates.sql
+│   ├── v1/1-0_baseline.sql … 1-21_subscription_effective_dates.sql
+│   └── v2/2-1_agent_billing_dates_and_export_keys.sql
 ├── dashboard/
 │   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
-│   └── v1/1-0_baseline.sql … 1-6_remove_account_exclusions.sql
+│   ├── v1/1-0_baseline.sql … 1-6_remove_account_exclusions.sql
+│   └── v2/2-1_day_grained_recurring_costs.sql
 └── transitions/
     ├── 0-to-1/                    # V0 → V1 历史转换插件
     │   ├── transition.json
@@ -68,8 +70,9 @@ app/db/schema_upgrade/
 └── engine_core.py          # shadow、manifest、备份、校验、发布
 ```
 
-当前仓库的 V1 tip 是 Token Board V1.21、Dashboard V1.7。V0 文件保留用于历史库和
-转换测试；新安装只创建当前 V1 baseline，不重放 V0 历史。
+当前仓库的历史 V1 tip 是 Token Board V1.21、Dashboard V1.7；运行时当前 tip 是
+Token Board V2.1、Dashboard V2.1。V0/V1 文件保留用于历史库和转换测试；新安装只创建
+当前 baseline，不重放旧版本历史。
 
 ## 版本与元数据
 
@@ -80,15 +83,15 @@ app/db/schema_upgrade/
 - `schema_transitions` 保存数据 transition 的 ID、源码 checksum、配对
   `generation_id` 和应用时间。版本 route 决定 transition 是否适用；该表只记录
   已完成的 transition，避免重复执行并保证两个数据库使用同一个 generation。
-- 运行时要求数据库处于当前 V1 tip。未知的更高版本不能当作已验证的运行时版本；
+- 运行时要求数据库处于当前 V2.1 tip。未知的更高版本不能当作已验证的运行时版本；
   应使用匹配版本的 Python schema-upgrade 工具处理。
 
 ### C++ runtime schema contract
 
-Token Board 的 C++ runtime 只接受一个精确的 Proxy V1 Minor 版本。新增或修改
-`schema/token-board/v1/*.sql` 后，必须同步检查
+Token Board 的 C++ runtime 只接受一个精确的 Proxy V2 Minor 版本。新增或修改
+`schema/token-board/v2/*.sql` 后，必须同步检查
 `proxy/src/store/database_lifecycle.cpp` 中的
-`kRequiredRuntimeSchemaMinor`，使它等于当前 Token Board V1 tip；否则 Python
+`kRequiredRuntimeSchemaMinor`，使它等于当前 Token Board V2 tip；否则 Python
 会先把数据库升级成功，但 `token-proxy` 随后会拒绝打开数据库，日志会出现
 “database is V1.N; run ... to V1.M”，最终 `start.sh --all` 报告
 `proxy health check failed`。
@@ -127,9 +130,22 @@ V1.0/V1.6/V1.8 的历史 SQL 仍保留当时的 `UNIQUE(name)` 文本，这是�
 
 Token Board V1.21 将所有订阅起始值统一为 UTC 日粒度：`valid_from` 只保存
 `YYYY-MM-DD`，其含义固定为该日 `00:00Z`。Agent 订阅、实例、软件绑定、实例历史身份和
-Plan recurring 合同都遵守这一规则；数据库不再保存创建操作时刻作为订阅生效时刻。
-`created_at`、`updated_at`、`deleted_at` 以及价格事件的 `effective_at` 仍是审计/事件时间戳，
-不属于订阅起始日。
+Plan recurring 合同都遵守这一规则；V1 仍保留部分审计列，作为历史迁移输入。V2.1
+进一步把 Agent 价格事件改为 `effective_on`，把订阅/实例/绑定结束改为 `ends_on`，并删除
+Agent 计费链上的操作具体时刻；Proxy 请求、合同审计和性能日志的时间戳不在本次范围内。
+
+### V2.1 Agent 日粒度与导出修复
+
+V2.1 的 Agent 计费字段只表达日粒度业务状态：`valid_from`、`effective_on` 和 `ends_on`
+都是 UTC 日期，结束边界为独占的 `[valid_from, ends_on)`；周期费用和分摊使用
+`is_finalized`/`finalized_on`。同一 UTC 日内多次添加、删除或改价不做时分秒切分，按日终
+状态计算；当天新建的周期分摊延迟到下一 UTC 日再物化。
+
+Agent 导出事件的唯一补发边界是 `(source_table, source_key)`，其中分摊源键为
+`period_charge_id:software_id`。导出扫描所有已 finalized 的分摊，重复执行是幂等的，
+不再按本次物化时间筛选，因此跨日绑定、删除或延迟物化不会漏导出。Token Board 与
+Dashboard 的 V2.0→V2.1 本地升级采用成对 shadow barrier；任一库迁移失败或发现非法日期，
+两库都不发布。
 
 ## 同 Major 的 SQL 升级
 
@@ -221,17 +237,17 @@ python3 schema/transitions/0-to-1/migrate.py \
 
 云端没有远程 migration service。云端 artifact 被下载到本地临时文件后，才由
 Python runner 按版本 route 升级；原云端文件保持不变。配置 V0 artifact 合并后
-可以上传新的 V1 artifact，Dashboard artifact 则在导出事务中升级、导出并在
+可以上传新的 V2.1 artifact，Dashboard artifact 则在导出事务中升级、导出并在
 上传成功后提交本地状态。
 
 ## 新增升级的规则
 
 ### 只有结构变化
 
-只追加对应数据库 V1 目录中的 SQL 文件，例如：
+只追加对应数据库当前 major 目录中的 SQL 文件，例如：
 
 ```text
-schema/token-board/v1/1-11_add_request_queue.sql
+schema/token-board/v2/2-2_add_request_queue.sql
 ```
 
 SQL 不得包含 `BEGIN`、`COMMIT` 或 `PRAGMA user_version`，也不得修改已经写入

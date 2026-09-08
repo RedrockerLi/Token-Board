@@ -25,7 +25,7 @@ async function loadAgentSubscriptions() {
                     `${esc(instance.label)}：${esc(instance.currency || item.currency || 'CNY')} ${(Number(instance.monthly_price || 0)).toFixed(2)} / 月`
                 ).join('<br>') || '—'}</td>
                 <td>${esc(agentDate(item.valid_from))}</td>
-                <td>${esc(fmtLocal(item.updated_at || item.created_at))}</td>
+                <td>${item.ends_on ? `结束于 ${esc(agentDate(item.ends_on))}` : '有效'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAgentSubscription(${item.id})">编辑</button>
                     <button class="btn btn--sm" style="color:var(--color-danger);" onclick="deleteAgentSubscription(${item.id}, '${esc(item.name)}')">删除</button>
@@ -268,7 +268,7 @@ function initAgentSubscriptionsPage() {
         </div>
         <div class="table-scroll">
             <table class="mgmt-table" id="agentSubscriptionsTable">
-                <thead><tr><th>名称</th><th>实例与月费</th><th>开始日期</th><th>更新时间</th><th>操作</th></tr></thead>
+                <thead><tr><th>名称</th><th>实例与月费</th><th>开始日期</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody></tbody>
             </table>
         </div>

@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -147,7 +148,7 @@ class SyncContractTest(unittest.TestCase):
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
-    def test_cloud_merge_purges_missing_agent_subscription_but_keeps_identity(self) -> None:
+    def test_cloud_merge_deletes_missing_agent_subscription_but_keeps_identity(self) -> None:
         temp = tempfile.mkdtemp()
         try:
             shutil.copytree(str(_REPO_ROOT / "schema"), Path(temp) / "schema")
@@ -175,6 +176,12 @@ class SyncContractTest(unittest.TestCase):
                 self.assertIsNone(conn.execute(
                     "SELECT 1 FROM agent_subscriptions WHERE id=?",
                     (subscription_id,)).fetchone())
+                self.assertIsNone(conn.execute(
+                    "SELECT 1 FROM agent_subscription_instances "
+                    "WHERE subscription_id=?", (subscription_id,)).fetchone())
+                self.assertIsNone(conn.execute(
+                    "SELECT 1 FROM agent_subscription_bindings "
+                    "WHERE subscription_id=?", (subscription_id,)).fetchone())
                 self.assertGreater(conn.execute(
                     "SELECT count(*) FROM agent_subscription_period_charges "
                     "WHERE subscription_id=?", (subscription_id,)
@@ -289,7 +296,7 @@ class SyncContractTest(unittest.TestCase):
                 ).fetchone())
                 self.assertEqual(conn.execute(
                     "SELECT major,minor FROM schema_version WHERE id=1"
-                    ).fetchone(), (2, 0))
+                    ).fetchone(), (2, 1))
             return state["artifact"]
 
         try:
@@ -388,19 +395,20 @@ class SyncContractTest(unittest.TestCase):
                 conn.execute(
                     "INSERT INTO agent_subscription_period_charges "
                     "(id,instance_id,subscription_id,period_start,period_end,"
-                    "recurring_charge,currency) "
-                    "VALUES(1,1,1,'2026-01-01','2026-02-01',1,'CNY')")
+                    "recurring_charge,currency,is_finalized,finalized_on) "
+                    "VALUES(1,1,1,'2026-01-01','2026-02-01',1,'CNY',1,'2026-01-02')")
                 conn.execute(
                     "INSERT INTO agent_subscription_charge_allocations "
-                    "(period_charge_id,software_id) VALUES(1,1)")
+                    "(period_charge_id,software_id,is_finalized,finalized_on) "
+                    "VALUES(1,1,1,'2026-01-02')")
                 conn.execute(
                     "INSERT INTO billing_export_events"
                     "(event_key,event_kind,source_table,source_key,account_id,"
                     "account_name,account_kind,month,period_start,billing_unit_id,"
-                    "recurring_charge,currency,frozen_at) "
+                    "recurring_charge,currency,frozen_on) "
                     "VALUES('event-1','agent','source','1:1',1,'agent',"
                     "'agent','2026-01','2026-01-01T00:00:00Z','unit-1',1,'CNY',"
-                    "'2026-01-01T00:00:00Z')")
+                    "'2026-01-02')")
                 conn.commit()
             snapshot_config(proxy)
 

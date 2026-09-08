@@ -3,7 +3,7 @@
 import sqlite3
 
 from app.core import sqlite_runtime
-from app.core.time import format_utc, utc_now
+from app.core.time import utc_now
 from app.services.sync.state import table_exists
 
 import logging
@@ -44,10 +44,10 @@ def merge_config_tables(remote_path: str, local_path: str) -> None:
 def _merge_v2_config(remote_path: str, local_path: str) -> None:
     """Merge normalized V2 configuration without importing local secrets.
 
-    Stable UUIDs are authoritative. Missing live child rows are hard-deleted;
-    proxy accounts, Agent subscriptions and Agent software retain their
-    separate historical identities and ledgers while live configuration is
-    removed.
+    Stable UUIDs are authoritative. Missing proxy and Agent live rows are
+    hard-deleted after the current Agent charge is materialized. Proxy
+    accounts, Agent subscriptions and Agent software retain their separate
+    historical identities and ledgers while live configuration is removed.
     ``runtime_id`` and importer cursors remain local.
     """
     remote = sqlite_runtime.connect(remote_path, "shadow_copy")
@@ -78,6 +78,47 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
                          f"ON CONFLICT({conflict}){suffix}")
             for row in remote.execute(f"SELECT {','.join(columns)} FROM {table}"):
                 local.execute(statement, tuple(row))
+
+        def merge_natural_table(table: str,
+                                natural_columns: tuple[str, ...]) -> None:
+            """Merge Agent interval configuration by its date identity.
+
+            ``id`` is a local surrogate for these two tables.  A price/binding
+            row created on another machine can therefore have a different id
+            while still describing the same date interval.  Cloud values win
+            for that natural key, but the local surrogate is retained so no
+            historical reference is rewritten.
+            """
+            if not table_exists(remote, table) or not table_exists(local, table):
+                return
+            remote_info = table_info(remote, table)
+            local_columns = {row[1] for row in table_info(local, table)}
+            columns = [row[1] for row in remote_info if row[1] in local_columns]
+            updates = [column for column in columns
+                       if column not in natural_columns and column != "id"]
+            insert_columns = [column for column in columns if column != "id"]
+            insert_sql = (
+                f"INSERT INTO {table}({','.join(insert_columns)}) "
+                f"VALUES({','.join('?' for _ in insert_columns)})"
+            )
+            for row in remote.execute(f"SELECT {','.join(columns)} FROM {table}"):
+                natural = tuple(row[column] for column in natural_columns)
+                existing = local.execute(
+                    f"SELECT id FROM {table} WHERE " +
+                    " AND ".join(f"{column}=?" for column in natural_columns) +
+                    " ORDER BY id LIMIT 1", natural,
+                ).fetchone()
+                if existing is None:
+                    local.execute(insert_sql,
+                                  tuple(row[column] for column in insert_columns))
+                    continue
+                if updates:
+                    local.execute(
+                        f"UPDATE {table} SET " +
+                        ",".join(f"{column}=?" for column in updates) +
+                        " WHERE id=?",
+                        tuple(row[column] for column in updates) + (existing[0],),
+                    )
 
         # Parent-first upsert. Historical rows not present remotely remain as
         # inactive/local history instead of violating live request FKs.
@@ -116,10 +157,13 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
         for table in ("billing_contracts", "billing_rate_events", "pricing_rules",
                       "upstream_model_catalog",
                       "proxy_timeout_config", "agent_subscriptions", "agent_software",
-                      "agent_subscription_instances",
-                      "agent_subscription_rate_events",
-                      "agent_subscription_bindings"):
+                      "agent_subscription_instances"):
             merge_table(table)
+        merge_natural_table(
+            "agent_subscription_rate_events", ("instance_id", "effective_on"))
+        merge_natural_table(
+            "agent_subscription_bindings",
+            ("subscription_id", "software_id", "valid_from"))
         for table in ("pricing_slots", "pricing_length_tiers"):
             merge_table(table)
 
@@ -156,8 +200,23 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
                     tuple(row),
                 )
 
+        natural_keys = {
+            "agent_subscription_bindings":
+                ("subscription_id", "software_id", "valid_from"),
+            "agent_subscription_rate_events": ("instance_id", "effective_on"),
+        }
+        now = utc_now()
+        # A remote artifact may remove an Agent row while its current period
+        # charge still needs to be retained. Materialize before physically
+        # deleting the live row; export recovery is keyed by the immutable
+        # allocation source key and does not depend on that row remaining.
+        from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+        materialize_agent_subscription_charges_conn(
+            local, now, current_only=True)
         remote_ids = {
             table: {tuple(row) for row in remote.execute(
+                "SELECT " + ",".join(natural_keys[table]) + f" FROM {table}")}
+            if table in natural_keys else {tuple(row) for row in remote.execute(
                 "SELECT " + ",".join(
                     info[1] for info in sorted(table_info(remote, table), key=lambda value: value[5])
                     if info[5]) + f" FROM {table}")}
@@ -168,13 +227,11 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
                           "agent_subscription_rate_events")
             if table_exists(remote, table)
         }
-        now = format_utc(utc_now())
         # These are live configuration rows with no historical ownership.
         # A cloud snapshot that omits them means the operator removed them;
         # purge them locally in dependency order instead of accumulating a
-        # second tombstone copy.  Proxy account rows remain tombstoned when
-        # request/financial history still references their identity; Agent
-        # subscriptions use the separate identity tables instead.
+        # second tombstone copy.  Request and financial history is detached
+        # from the live graph before the physical delete.
         hard_delete_order = (
             "route_rules", "client_keys", "agent_subscription_bindings",
             "upstream_model_catalog", "upstreams", "route_sets",
@@ -190,9 +247,16 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
             if not primary:
                 continue
             identities = remote_ids.get(table, set())
-            for row in local.execute(f"SELECT {','.join(primary)} FROM {table}").fetchall():
-                identity = tuple(row)
-                if identity in identities:
+            selected_columns = primary + [
+                column for column in natural_keys.get(table, ())
+                if column not in primary
+            ]
+            for row in local.execute(
+                    f"SELECT {','.join(selected_columns)} FROM {table}").fetchall():
+                identity = tuple(row[column] for column in primary)
+                comparison = (tuple(row[column] for column in natural_keys[table])
+                              if table in natural_keys else identity)
+                if comparison in identities:
                     continue
                 where = " AND ".join(f"{column}=?" for column in primary)
                 if table == "client_keys":
@@ -201,6 +265,9 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
                 elif table == "agent_subscription_instances":
                     from app.db.proxy.deletion import purge_agent_subscription_instance
                     purge_agent_subscription_instance(local, int(identity[0]))
+                elif table == "agent_subscription_bindings":
+                    local.execute("DELETE FROM agent_subscription_bindings WHERE id=?",
+                                  identity)
                 elif table == "agent_subscriptions":
                     from app.db.proxy.deletion import purge_agent_subscription
                     purge_agent_subscription(local, int(identity[0]))
@@ -250,7 +317,10 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
                                           "WHERE account_id=?", (identity[0], identity[0]))
                             local.execute("UPDATE request_attempts SET account_id=NULL "
                                           "WHERE account_id=?", (identity[0],))
-                            local.execute("DELETE FROM agent_subscription_bindings WHERE software_id=?", identity)
+                            local.execute(
+                                "DELETE FROM agent_subscription_bindings WHERE software_id=?",
+                                identity,
+                            )
                             local.execute("DELETE FROM agent_software_runtime WHERE software_id=?", identity)
                             local.execute("DELETE FROM agent_software WHERE id=?", identity)
                             local.execute("DELETE FROM accounts WHERE id=?", identity)

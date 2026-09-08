@@ -157,6 +157,61 @@ class BillingExportTest(AppDatabaseTestCase):
                 "AND name='billing_export_receipts'"
             ).fetchone())
 
+    def test_legacy_agent_event_unit_remains_idempotent_by_source_key(self) -> None:
+        """A V1 event must not block V2.1 allocation-key recovery."""
+        from app.db.proxy.billing import materialize_agent_subscription_charges
+        from app.db.proxy.billing_export import ensure_billing_export_events_conn
+
+        db = self.proxy_database()
+        subscription_id = db.create_agent_subscription({
+            "name": "legacy-event-subscription", "valid_from": "2026-07-01",
+            "monthly_price": 10, "currency": "CNY",
+        })
+        software_id = db.create_agent_software({
+            "name": "legacy-event-agent", "agent_kind": "codex",
+            "subscription_ids": [subscription_id],
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "UPDATE agent_subscription_bindings SET valid_from=? "
+                "WHERE subscription_id=? AND software_id=?",
+                ("2026-07-01", subscription_id, software_id),
+            )
+            conn.commit()
+
+        materialize_agent_subscription_charges(
+            self.proxy_path,
+            datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.row_factory = sqlite3.Row
+            event = conn.execute(
+                "SELECT id,source_key,billing_unit_id FROM billing_export_events "
+                "WHERE source_table='agent_subscription_charge_allocations'"
+            ).fetchone()
+            subscription_uuid = conn.execute(
+                "SELECT uuid FROM agent_subscriptions WHERE id=?",
+                (subscription_id,),
+            ).fetchone()[0]
+            legacy_unit_id = f"agent-subscription:{subscription_uuid}"
+            conn.execute(
+                "UPDATE billing_export_events SET billing_unit_id=? WHERE id=?",
+                (legacy_unit_id, event["id"]),
+            )
+            conn.commit()
+
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.row_factory = sqlite3.Row
+            created = ensure_billing_export_events_conn(conn)
+            self.assertEqual(created, 0)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT billing_unit_id FROM billing_export_events WHERE id=?",
+                    (event["id"],),
+                ).fetchone()[0],
+                legacy_unit_id,
+            )
+
 
 if __name__ == "__main__":
     import unittest

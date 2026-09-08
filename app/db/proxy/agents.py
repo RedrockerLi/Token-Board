@@ -38,7 +38,7 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                 item["subscription_ids"] = [r[0] for r in conn.execute(
                     "SELECT subscription_id FROM agent_subscription_bindings "
                     "WHERE software_id=? "
-                "AND (ends_at IS NULL OR ends_at>strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
+                "AND (ends_on IS NULL OR ends_on>date('now')) "
                     "ORDER BY subscription_id", (row["id"],)).fetchall()]
                 result.append(item)
             return result
@@ -80,7 +80,8 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                 (software_id,),
             )
             self._replace_bindings(conn, software_id,
-                                   data.get("subscription_ids") or [])
+                                   data.get("subscription_ids") or [],
+                                   today=now[:10])
             conn.commit()
             return int(software_id)
         except sqlite3.IntegrityError as exc:
@@ -131,7 +132,8 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                              + " WHERE id=?", values)
             if "subscription_ids" in data:
                 self._replace_bindings(conn, software_id,
-                                       data.get("subscription_ids") or [])
+                                       data.get("subscription_ids") or [],
+                                       today=now[:10])
             conn.commit()
             return bool(fields or "subscription_ids" in data)
         except sqlite3.IntegrityError as exc:
@@ -150,7 +152,10 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             ).fetchone()
             if row is None:
                 return False
-            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            now_dt = utc_now()
+            from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+            materialize_agent_subscription_charges_conn(
+                conn, now_dt, current_only=True)
             conn.execute(
                 "UPDATE request_log SET account_identity_id=COALESCE(account_identity_id,account_id),"
                 "account_id=NULL,agent_software_id=NULL WHERE account_id=?",

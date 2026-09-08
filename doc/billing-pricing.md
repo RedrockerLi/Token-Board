@@ -82,11 +82,11 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 
 ## 智能体订阅与软件用量
 
-智能体已从上游账户模型中独立出来。**订阅**记录名称、开始日期和币种，开始日期固定按 UTC `00:00Z` 生效，并可包含多个独立计费实例；实例记录自己的开始日期和价格，价格历史与周期物化存于 `agent_subscription_rate_events` / `agent_subscription_period_charges`。**软件**记录名称、类型和数据目录，类型由 Python agent adapter registry 提供（当前包含 28 种本地 agent）。订阅和软件通过绑定表多对多关联：一个软件可以使用多个订阅，一个订阅也可以覆盖多个软件。数据库不保存订阅起始日的时分秒，绑定的 `valid_from` 也只保存 UTC 日期。
+智能体已从上游账户模型中独立出来。**订阅**记录名称、开始日期和币种，开始日期固定按 UTC `00:00Z` 生效，并可包含多个独立计费实例；实例记录自己的开始日期和价格，价格历史与周期物化存于 `agent_subscription_rate_events` / `agent_subscription_period_charges`。**软件**记录名称、类型和数据目录，类型由 Python agent adapter registry 提供（当前包含 28 种本地 agent）。订阅和软件通过绑定表多对多关联：一个软件可以使用多个订阅，一个订阅也可以覆盖多个软件。V2.1 不保存 Agent 订阅计费链的操作时分秒：`valid_from`、`effective_on`、`ends_on` 只保存 UTC 日期，绑定有效区间为 `[valid_from, ends_on)`。
 
 - 用量由**token-maintenance 进程内的单一 worker** 导入:维护服务启动时立即运行一次,之后每 30 分钟运行一次;浏览器每次打开仪表板还会通过本地 Unix datagram socket 异步唤醒同一个 worker。启动、定时和浏览器触发串行执行,不会并发争抢 SQLite 游标。
 - 各 agent adapter 读取自己的本地 JSONL、SQLite、JSON 或云端导出源，统一输出 `UsageEvent`；通用 importer 按 `event_id` 幂等，把用量写入 `request_log` 的统一智能体身份，`project` 与 `session_id` 保存在本机，不展示在请求日志 API。
-- 智能体用量和代理用量统一进入 dashboard 的 `daily_usage`；订阅周期费用按“绑定订阅实例 ÷ 同一实例当前绑定的启用软件数”分摊到 `monthly_recurring_costs`。dashboard 条目仍以软件为单位：实际消费来自绑定订阅，理论消费来自软件用量；没有绑定时实际消费为 0。订阅与实例的历史身份独立保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`，删除实时订阅不会删除已冻结账单；名称只是展示属性，同名订阅可以重建。
+- 智能体用量和代理用量统一进入 dashboard 的 `daily_usage`；订阅周期费用按周期开始日读取日终有效绑定，在同一实例的有效软件数中分摊到 `monthly_recurring_costs`。当天新建的当前周期分摊延迟到下一个 UTC 日，因此同日多次添加/删除按最终日状态处理，不做 intraday/proration。Dashboard 条目仍以软件为单位：实际消费来自绑定订阅，理论消费来自软件用量；没有绑定时实际消费为 0。订阅与实例的历史身份独立保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`，删除实时订阅不会删除已冻结账单；名称只是展示属性，同名订阅可以重建。导出事件用 `period_charge_id:software_id` 分摊源键补发，重复导出幂等。
 
 ## 币种与汇率(CNY / USD)
 

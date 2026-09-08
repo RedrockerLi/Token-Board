@@ -36,7 +36,7 @@ class V2MigrationTest(unittest.TestCase):
             self.assertFalse(second["dashboard"].upgraded)
 
             with sqlite3.connect(proxy) as conn:
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_000)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_001)
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
                 self.assertNotIn("lifecycle_state", columns)
                 self.assertNotIn("deleted_at", columns)
@@ -44,7 +44,68 @@ class V2MigrationTest(unittest.TestCase):
                 self.assertNotIn("valid_until", {
                     row[1] for row in conn.execute("PRAGMA table_info(billing_contracts)")
                 })
+                for table, removed in {
+                    "agent_subscriptions": {"created_at", "updated_at", "ends_at"},
+                    "agent_subscription_instances": {"created_at", "updated_at", "ends_at"},
+                    "agent_subscription_bindings": {"ends_at"},
+                    "agent_subscription_rate_events": {"effective_at"},
+                    "agent_subscription_period_charges": {"finalized_at"},
+                    "agent_subscription_charge_allocations": {"finalized_at"},
+                    "billing_export_events": {"frozen_at"},
+                }.items():
+                    current_columns = {
+                        row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+                    }
+                    self.assertTrue(removed.isdisjoint(current_columns), table)
+                self.assertIn("ends_on", {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(agent_subscription_bindings)")
+                })
+                self.assertIn("effective_on", {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(agent_subscription_rate_events)")
+                })
+                source_key_unique = False
+                for index in conn.execute(
+                        "PRAGMA index_list(billing_export_events)"):
+                    if not index[2]:
+                        continue
+                    index_columns = [row[2] for row in conn.execute(
+                        f"PRAGMA index_info({index[1]})")]
+                    source_key_unique |= index_columns == [
+                        "source_table", "source_key"]
+                self.assertTrue(source_key_unique)
                 self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_v21_rejects_invalid_agent_date_without_publishing_half_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(Path(__file__).resolve().parents[2] / "schema",
+                            root / "schema")
+            (root / "data").mkdir()
+            proxy = root / "data/token-board.db"
+            dashboard = root / "data/dashboard.db"
+            apply_sql_migrations(str(proxy), str(root / "schema"),
+                                 "token-board", SchemaVersion(1, 21))
+            apply_sql_migrations(str(dashboard), str(root / "schema"),
+                                 "dashboard", SchemaVersion(1, 7))
+            apply_sql_migrations(str(proxy), str(root / "schema"),
+                                 "token-board", SchemaVersion(2, 0))
+            apply_sql_migrations(str(dashboard), str(root / "schema"),
+                                 "dashboard", SchemaVersion(2, 0))
+            with sqlite3.connect(proxy) as conn:
+                conn.execute(
+                    "INSERT INTO agent_subscriptions(uuid,name,valid_from) "
+                    "VALUES('invalid-agent','invalid','not-a-date')"
+                )
+                conn.commit()
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                ensure_local_databases(str(proxy), str(dashboard), root / "schema")
+            with sqlite3.connect(proxy) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_000)
+            with sqlite3.connect(dashboard) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_000)
 
     def test_terminal_v1_graph_is_deleted_while_history_is_detached(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -126,7 +187,7 @@ class V2MigrationTest(unittest.TestCase):
                 ).fetchone()[0], 1)
                 self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             with sqlite3.connect(dashboard) as conn:
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_000)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_001)
                 self.assertIsNone(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='billing_export_receipts'"
@@ -233,7 +294,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
             period_start=timestamp[:10] + "T00:00:00Z", account_id=account_id,
             billing_unit_id="report-key", recurring_charge=10,
             normalized_recurring_cost=10, currency="CNY", base_currency="CNY",
-            fx_rate_date=None, frozen_at=timestamp)
+            fx_rate_date=None, frozen_on=timestamp[:10])
         self.assertGreaterEqual(dashboard.purge_accounts({account_id}), 3)
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(

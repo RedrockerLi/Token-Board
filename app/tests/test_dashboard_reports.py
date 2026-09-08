@@ -52,8 +52,8 @@ class DashboardReportsTest(AppDatabaseTestCase):
             conn.execute(
                 "INSERT INTO monthly_recurring_costs(period_start,account_id,"
                 "billing_unit_id,recurring_charge,equivalent_cost,currency,"
-                "normalized_recurring_cost,charge_frozen_at) "
-                "VALUES('2026-08-01T00:00:00Z',?,?,12,9,'CNY',12,'2026-08-01T00:00:00Z')",
+                "normalized_recurring_cost,is_frozen,frozen_on) "
+                "VALUES('2026-08-01T00:00:00Z',?,?,12,9,'CNY',12,1,'2026-08-01')",
                 (self.plan_account_id, "unit-1"))
             # FX normalization pending: NULL normalized cost must surface as
             # billing_incomplete instead of counting as zero.

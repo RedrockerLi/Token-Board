@@ -142,6 +142,82 @@ def _upgrade_v2_pair(proxy: Path, dashboard: Path, root: Path,
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _upgrade_v2_minor_pair(proxy: Path, dashboard: Path, root: Path,
+                           proxy_version: SchemaVersion,
+                           dashboard_version: SchemaVersion) -> dict[str, UpgradeResult]:
+    """Upgrade a V2 pair through one atomic same-major shadow barrier."""
+    proxy_target = latest_version(root, TOKEN_BOARD_DATABASE_NAME, 2)
+    dashboard_target = latest_version(root, DASHBOARD_DATABASE_NAME, 2)
+    if (proxy_version > proxy_target or dashboard_version > dashboard_target):
+        raise UpgradeError(
+            "local V2 schema is newer than the published V2 migrations: "
+            f"token-board={proxy_version}, dashboard={dashboard_version}")
+    if (proxy_version == proxy_target and dashboard_version == dashboard_target):
+        return {
+            TOKEN_BOARD_DATABASE_NAME: _result(
+                proxy, TOKEN_BOARD_DATABASE_NAME, proxy_version, False),
+            DASHBOARD_DATABASE_NAME: _result(
+                dashboard, DASHBOARD_DATABASE_NAME, dashboard_version, False),
+        }
+
+    work = proxy.parent / f"auto-v2-minor-{uuid.uuid4().hex}.work"
+    backup = proxy.parent / f"auto-v2-minor-{uuid.uuid4().hex}.backup"
+    manifest_path = proxy.parent / f"auto-v2-minor-{uuid.uuid4().hex}.manifest.json"
+    work.mkdir(mode=0o700, exist_ok=False)
+    try:
+        manifest = {
+            "kind": "v2-minor-pair",
+            "stage": "prepared",
+            "work_dir": str(work),
+            "backup_dir": str(backup),
+            "sources": {"token-board": str(proxy), "dashboard": str(dashboard)},
+            "targets": {"token-board": str(proxy_target),
+                        "dashboard": str(dashboard_target)},
+        }
+        write_manifest(manifest_path, manifest)
+        manifest["backups"] = backup_files([proxy, dashboard], backup)
+        manifest["stage"] = "backed_up"
+        write_manifest(manifest_path, manifest)
+
+        proxy_shadow = work / "token-board.v2-shadow.db"
+        dashboard_shadow = work / "dashboard.v2-shadow.db"
+        copy_sqlite(proxy, proxy_shadow)
+        copy_sqlite(dashboard, dashboard_shadow)
+        apply_sql_migrations(str(proxy_shadow), str(root),
+                             TOKEN_BOARD_DATABASE_NAME, target=proxy_target)
+        apply_sql_migrations(str(dashboard_shadow), str(root),
+                             DASHBOARD_DATABASE_NAME, target=dashboard_target)
+        verify(proxy_shadow, TOKEN_BOARD_DATABASE_NAME, proxy_target)
+        verify(dashboard_shadow, DASHBOARD_DATABASE_NAME, dashboard_target)
+        manifest["shadows"] = {"token-board": str(proxy_shadow),
+                                "dashboard": str(dashboard_shadow)}
+        manifest["stage"] = "verified"
+        write_manifest(manifest_path, manifest)
+        replace(proxy, proxy_shadow)
+        manifest["stage"] = "token_board_replaced"
+        write_manifest(manifest_path, manifest)
+        replace(dashboard, dashboard_shadow)
+        manifest["stage"] = "dashboard_replaced"
+        write_manifest(manifest_path, manifest)
+        snapshot = proxy.parent / "token-board_config_snapshot.db"
+        if snapshot.exists():
+            rebuild_snapshot(proxy)
+            manifest["stage"] = "snapshot_rebuilt"
+            write_manifest(manifest_path, manifest)
+        manifest["stage"] = "complete"
+        write_manifest(manifest_path, manifest)
+        return {
+            TOKEN_BOARD_DATABASE_NAME: _result(
+                proxy, TOKEN_BOARD_DATABASE_NAME, proxy_version, True,
+                str(manifest_path)),
+            DASHBOARD_DATABASE_NAME: _result(
+                dashboard, DASHBOARD_DATABASE_NAME, dashboard_version, True,
+                str(manifest_path)),
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _result(path: Path, database_name: str, previous: SchemaVersion | None,
             upgraded: bool, manifest: str | None = None) -> UpgradeResult:
     current = inspect_version(path, database_name)
@@ -256,6 +332,14 @@ def ensure_local_databases(proxy_path: str, dashboard_path: str,
                 raise UpgradeError(
                     f"unsupported local database versions: "
                     f"token-board={proxy_version}, dashboard={dashboard_version}")
+
+            if proxy_version.major == dashboard_version.major == 2:
+                proxy_target = latest_version(root, TOKEN_BOARD_DATABASE_NAME, 2)
+                dashboard_target = latest_version(root, DASHBOARD_DATABASE_NAME, 2)
+                if (proxy_version != proxy_target or
+                        dashboard_version != dashboard_target):
+                    return _upgrade_v2_minor_pair(
+                        proxy, dashboard, root, proxy_version, dashboard_version)
 
             # A pending Dashboard export is a V1 transaction boundary.  It
             # must be recovered by the sync protocol before the pair is

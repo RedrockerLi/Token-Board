@@ -80,7 +80,7 @@ class DashboardReaderMixin:
         for row in conn.execute(
             "SELECT p.period_start,p.account_id,COALESCE(a.name,'unknown') account_name,"
             "COALESCE(a.account_kind,'proxy') account_kind,"
-            "SUM(CASE WHEN p.charge_frozen_at IS NOT NULL "
+            "SUM(CASE WHEN p.is_frozen=1 "
             "AND p.normalized_recurring_cost IS NOT NULL "
             "THEN p.normalized_recurring_cost ELSE 0 END) subscription_cost,"
             "SUM(p.equivalent_cost) virtual_cost,"
@@ -90,7 +90,7 @@ class DashboardReaderMixin:
             "WHERE COALESCE(a.account_kind,'proxy')!='legacy' "
             "AND (p.equivalent_cost<>0 OR p.recurring_charge<>0 "
             "OR COALESCE(p.normalized_recurring_cost,0)<>0 "
-            "OR p.charge_frozen_at IS NOT NULL) "
+            "OR p.is_frozen=1) "
             "GROUP BY p.period_start,p.account_id,a.name ORDER BY p.period_start,p.account_id"):
             item = dict(row)
             item["month"] = str(item["period_start"])[:7]

@@ -189,8 +189,10 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
             if database_name == DASHBOARD_DATABASE_NAME and local_token_board_path:
                 proxy_version = inspect_version(
                     local_token_board_path, TOKEN_BOARD_DATABASE_NAME)
-                if proxy_version is None or proxy_version.major != 2:
-                    raise UpgradeError("dashboard V2 upgrade requires a current V2 proxy")
+                expected_proxy = latest_version(schema_root, TOKEN_BOARD_DATABASE_NAME, 2)
+                if proxy_version != expected_proxy:
+                    raise UpgradeError(
+                        "dashboard V2 artifact requires a current V2.1 proxy")
             apply_sql_migrations(
                 str(artifact_shadow), str(schema_root), database_name,
                 target=latest_version(schema_root, database_name, 2))

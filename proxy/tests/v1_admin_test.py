@@ -85,7 +85,7 @@ def main() -> None:
         conn.execute(
             "UPDATE agent_subscription_bindings SET valid_from=? "
             "WHERE subscription_id=? AND software_id=?",
-            ("2026-08-01T00:00:00Z", subscription_id, software_id),
+            ("2026-08-01", subscription_id, software_id),
         )
     inserted = database.insert_agent_usage(
         software_id, "gpt-test", 1_000_000, 100_000, 0, 1_100_000,

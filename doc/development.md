@@ -128,3 +128,4 @@ Agent 订阅的实时配置（订阅、实例、价格事件、绑定）与历�
 - **数据库路径与 schema 目录的推导约定**:`data/token-board.db` /
   `data/dashboard.db` → `<仓库>/schema/`；Python coordinator 再选择
   `token-board|dashboard/v<major>`。C++ 只校验已准备好的 Proxy V1 数据库。
+- **代码修改期间防御**：在修改代码时，需要提前停止开机自启动的服务，避免代码修改到一半时开关机导致未完工代码上线运行。
