@@ -140,6 +140,7 @@ def _materialize_period_stream(
         charge_owner_column: str, credential_uuid: str | None,
         attempted: set[tuple[str, str]],
         charge_subscription_id: int | None = None,
+        charge_software_id: int | None = None,
         current_only: bool = False) -> int:
     """Materialize one recurring stream using the shared Plan algorithm."""
     ended = None
@@ -170,7 +171,7 @@ def _materialize_period_stream(
             ).fetchone()
         else:
             existing = conn.execute(
-                f"SELECT id,is_finalized,finalized_on,recurring_charge,currency,"
+                f"SELECT id,software_id,is_finalized,finalized_on,recurring_charge,currency,"
                 f"normalized_recurring_cost,fx_rate_date FROM {charge_table} "
                 f"WHERE {charge_owner_column}=? AND period_start=?",
                 (owner_id, start),
@@ -226,10 +227,11 @@ def _materialize_period_stream(
             else:
                 conn.execute(
                     f"INSERT INTO {charge_table}"
-                    f"({charge_owner_column},subscription_id,period_start,period_end,recurring_charge,currency,"
+                    f"({charge_owner_column},subscription_id,software_id,period_start,period_end,recurring_charge,currency,"
                     "normalized_recurring_cost,base_currency,fx_rate_date,is_finalized,finalized_on) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                     (owner_id, charge_subscription_id, start, end, *values,
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (owner_id, charge_subscription_id, charge_software_id,
+                      start, end, *values,
                      1 if can_finalize else 0,
                      now if can_finalize else None),
                 )
@@ -334,10 +336,10 @@ def materialize_period_charges(db_path: str,
 
 
 def materialize_agent_subscription_charges_conn(
-    conn: sqlite3.Connection, at: datetime | None = None,
+        conn: sqlite3.Connection, at: datetime | None = None,
         *, current_only: bool = True,
         include_ended: bool = False) -> int:
-    """Materialize Agent charges on a caller-owned transaction."""
+    """Materialize directly-owned Agent charges on a caller-owned transaction."""
     moment = as_utc(at or utc_now()).replace(microsecond=0)
     now = moment.date().isoformat()
     changed = 0
@@ -345,7 +347,10 @@ def materialize_agent_subscription_charges_conn(
     period_starts: set[str] = set()
     for unit in BillingUnitResolver.agent_units(
             conn, at=moment, include_ended=include_ended):
-        period_starts.add(_current_period_start(moment, unit.anchor_day))
+        current_start = _current_period_start(moment, unit.anchor_day)
+        period_starts.add(current_start)
+        changed += _attach_agent_charge_owner(
+            conn, unit.owner_id, unit.account_id, current_start)
         changed += _materialize_period_stream(
             conn, owner_id=unit.owner_id, anchor=unit.valid_from,
             currency=unit.currency, ends_at=None, ends_on=unit.ends_on,
@@ -355,10 +360,8 @@ def materialize_agent_subscription_charges_conn(
             charge_table="agent_subscription_period_charges",
             charge_owner_column="instance_id", credential_uuid=None,
             charge_subscription_id=unit.subscription_id,
+            charge_software_id=unit.account_id,
             attempted=attempted, current_only=current_only)
-        changed += _materialize_agent_charge_allocations(
-            conn, unit.owner_id, unit.account_id, unit.valid_from,
-            unit.subscription_id, now, moment=moment)
     changed += _finalize_period_stream(
         conn, "agent_subscription_period_charges", now, period_starts)
     changed += ensure_billing_export_events_conn(conn)
@@ -383,58 +386,25 @@ def materialize_all_period_charges(db_path: str,
             + materialize_agent_subscription_charges(db_path, at))
 
 
-def _materialize_agent_charge_allocations(
-        conn: sqlite3.Connection, instance_id: int, account_id: int | None,
-        valid_from: date, subscription_id: int | None, now: str,
-        *, moment: datetime | None = None) -> int:
-    """Snapshot active software bindings for finalized instance charges."""
-    if subscription_id is None:
+def _attach_agent_charge_owner(conn: sqlite3.Connection, instance_id: int,
+                               software_id: int | None,
+                               period_start: str) -> int:
+    """Attach the current binding to an existing unowned current charge.
+
+    V2.1 could create a finalized period charge before its allocation. Once a
+    billing run sees an effective binding, that charge can be assigned
+    directly unless a legacy allocation already owns it; the latter remains
+    historical and is intentionally left untouched.
+    """
+    if software_id is None:
         return 0
-    moment = as_utc(moment or utc_now()).replace(microsecond=0)
-    current_start = _current_period_start(moment, valid_from.day)
-    # A same-day add/delete sequence is one daily configuration state.  Do not
-    # freeze today's allocation before the day has closed; the next UTC day
-    # will read the final date interval and create the immutable allocation.
-    if date.fromisoformat(current_start[:10]) >= moment.date():
-        return 0
-    charge_sql = (
-        "SELECT id,period_start,recurring_charge,normalized_recurring_cost,"
-        "currency,base_currency,fx_rate_date,finalized_on "
-        "FROM agent_subscription_period_charges "
-        "WHERE instance_id=? AND is_finalized=1 "
-        "AND period_start=?")
-    charge_params: tuple[object, ...] = (instance_id, current_start)
-    charges = conn.execute(charge_sql, charge_params).fetchall()
-    changed = 0
-    for charge in charges:
-        existing = conn.execute(
-            "SELECT 1 FROM agent_subscription_charge_allocations "
-            "WHERE period_charge_id=? LIMIT 1", (charge["id"],)
-        ).fetchone()
-        if existing is not None:
-            continue
-        bindings = conn.execute(
-            "SELECT software_id FROM agent_subscription_bindings "
-            "WHERE subscription_id=? AND valid_from<=? "
-            "AND (ends_on IS NULL OR ?<ends_on) "
-            "ORDER BY software_id",
-            (subscription_id, charge["period_start"][:10],
-             charge["period_start"][:10]),
-        ).fetchall()
-        if not bindings:
-            continue
-        denominator = len(bindings)
-        recurring = float(charge["recurring_charge"] or 0) / denominator
-        normalized = (float(charge["normalized_recurring_cost"] or 0) / denominator
-                      if charge["normalized_recurring_cost"] is not None else None)
-        conn.executemany(
-            "INSERT OR IGNORE INTO agent_subscription_charge_allocations"
-            "(period_charge_id,software_id,recurring_charge,normalized_recurring_cost,"
-            "currency,base_currency,fx_rate_date,is_finalized,finalized_on) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            [(charge["id"], row["software_id"], recurring, normalized,
-              charge["currency"], charge["base_currency"], charge["fx_rate_date"],
-              1, charge["finalized_on"]) for row in bindings],
-        )
-        changed += denominator
-    return changed
+    cursor = conn.execute(
+        "UPDATE agent_subscription_period_charges SET software_id=? "
+        "WHERE instance_id=? AND period_start=? AND software_id IS NULL "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM agent_subscription_charge_allocations a "
+        "  WHERE a.period_charge_id=agent_subscription_period_charges.id"
+        ")",
+        (software_id, instance_id, period_start),
+    )
+    return max(cursor.rowcount, 0)

@@ -199,16 +199,25 @@ function renderAgentSubscriptionBindings(selected) {
 function addAgentSubscriptionBindingRow(subscriptionId = '') {
     const target = document.getElementById('agentSubscriptionBindings');
     if (!target || !agentSubscriptions.length) return;
+    const currentSoftwareId = Number(
+        document.getElementById('agentSoftwareForm')?.dataset.editId || 0);
     const row = document.createElement('div');
     row.className = 'agent-binding-row';
+    const selectedId = Number(subscriptionId || 0);
     row.innerHTML = `
         <select name="subscription_ids" required>
             <option value="">选择订阅</option>
-            ${agentSubscriptions.map((item) => `<option value="${item.id}">${esc(item.name)}</option>`).join('')}
+            ${agentSubscriptions.map((item) => {
+                const ownerId = Number((item.software_ids || [])[0] || 0);
+                const selected = selectedId === Number(item.id) ? ' selected' : '';
+                const ownedByOther = ownerId && ownerId !== currentSoftwareId;
+                const suffix = ownedByOther ? '（保存后改绑）' : '';
+                return `<option value="${item.id}"${selected}>${esc(item.name)}${suffix}</option>`;
+            }).join('')}
         </select>
         <button type="button" class="btn btn--sm" style="color:var(--color-danger);">删除</button>`;
-    row.querySelector('select').value = subscriptionId || '';
-    row.querySelector('button').onclick = () => row.remove();
+    const button = row.querySelector('button');
+    button.onclick = () => row.remove();
     target.appendChild(row);
 }
 
@@ -263,7 +272,7 @@ function initAgentSubscriptionsPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">订阅管理</h1>
-            <p class="page-subtitle">记录智能体相关订阅。订阅与软件分别维护，可在软件编辑中进行多对多绑定。</p>
+            <p class="page-subtitle">记录智能体相关订阅。费用按每个计费周期物化时的有效 Agent 归属；解绑或改绑不会改写已生成的账单。</p>
             <button class="btn btn--primary" onclick="openAgentSubscriptionModal()">+ 添加订阅</button>
         </div>
         <div class="table-scroll">
@@ -295,7 +304,7 @@ function initAgentSoftwarePage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">软件管理</h1>
-            <p class="page-subtitle">配置智能体软件来源。用量类型由后端 adapter registry 提供，支持多种本地 agent。</p>
+            <p class="page-subtitle">配置智能体软件来源。一个订阅同一时点只绑定一个 Agent；解绑或改绑会从后续计费周期生效。</p>
             <button class="btn btn--primary" onclick="openAgentSoftwareModal()">+ 添加软件</button>
         </div>
         <div class="table-scroll">

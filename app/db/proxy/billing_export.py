@@ -23,7 +23,7 @@ def _same_payload_with_legacy_agent_unit(existing: sqlite3.Row,
 
     V1 events used the subscription identity as their display unit, while
     V2.1 derives the unit from the subscription-instance identity.  The
-    allocation source key is unchanged across that migration.  Keep the
+    historical allocation source key is unchanged across that migration. Keep the
     already-exported V1 payload authoritative, but continue to reject every
     other payload mutation.
     """
@@ -117,6 +117,7 @@ def _proxy_event_row(row: sqlite3.Row) -> dict:
 
 
 def _agent_event_row(row: sqlite3.Row) -> dict:
+    """Build an export event for a legacy allocation row."""
     subscription_uuid = (row["subscription_uuid_snapshot"] or
                          row["subscription_identity_uuid"] or
                          row["subscription_uuid"] or
@@ -138,6 +139,40 @@ def _agent_event_row(row: sqlite3.Row) -> dict:
         "account_uuid": row["account_uuid"], "account_name": row["account_name"],
         "account_kind": row["account_kind"], "month": str(period_start)[:7],
         "period_start": period_start, "billing_unit_id": unit_id,
+        "recurring_charge": float(row["recurring_charge"] or 0),
+        "normalized_recurring_cost": row["normalized_recurring_cost"],
+        "currency": row["currency"] or "CNY",
+        "base_currency": row["base_currency"] or "CNY",
+        "fx_rate_date": row["fx_rate_date"],
+        "frozen_on": _date_value(row["finalized_on"]),
+    }
+
+
+def _direct_agent_event_row(row: sqlite3.Row) -> dict:
+    """Build an export event directly from one owned period charge."""
+    subscription_uuid = (row["subscription_uuid_snapshot"] or
+                         row["subscription_identity_uuid"] or
+                         row["subscription_uuid"] or
+                         f"subscription:{row['subscription_id']}")
+    instance_uuid = (row["instance_uuid_snapshot"] or
+                     row["instance_identity_uuid"] or row["instance_uuid"] or
+                     f"instance:{row['instance_id']}")
+    period_start = row["period_start"]
+    return {
+        "event_key": (
+            f"agent:{subscription_uuid}:{instance_uuid}:"
+            f"{row['account_uuid'] or row['software_id']}:{period_start}"
+        ),
+        "event_kind": "agent",
+        "source_table": "agent_subscription_period_charges",
+        "source_key": str(row["period_charge_id"]),
+        "account_id": row["account_id"],
+        "account_uuid": row["account_uuid"],
+        "account_name": row["account_name"],
+        "account_kind": row["account_kind"],
+        "month": str(period_start)[:7],
+        "period_start": period_start,
+        "billing_unit_id": f"agent-subscription-instance:{instance_uuid}",
         "recurring_charge": float(row["recurring_charge"] or 0),
         "normalized_recurring_cost": row["normalized_recurring_cost"],
         "currency": row["currency"] or "CNY",
@@ -194,12 +229,39 @@ def append_agent_billing_export_event(conn: sqlite3.Connection,
     return _insert_event(conn, _agent_event_row(row))
 
 
+def append_direct_agent_billing_export_event(conn: sqlite3.Connection,
+                                             period_charge_id: int) -> int:
+    """Append the event for a directly-owned finalized period charge."""
+    row = conn.execute(
+        """SELECT c.id period_charge_id,c.software_id,c.recurring_charge,
+                      c.normalized_recurring_cost,c.currency,c.base_currency,
+                      c.fx_rate_date,c.finalized_on,c.period_start,c.instance_id,
+                      c.subscription_id,c.subscription_uuid_snapshot,
+                      c.instance_uuid_snapshot,si.uuid subscription_identity_uuid,
+                      ii.uuid instance_identity_uuid,s.uuid subscription_uuid,
+                      i.uuid instance_uuid,ai.id account_id,ai.uuid account_uuid,
+                      ai.name account_name,ai.account_kind
+               FROM agent_subscription_period_charges c
+               LEFT JOIN agent_subscription_instances i ON i.id=c.instance_id
+               LEFT JOIN agent_subscriptions s ON s.id=COALESCE(c.subscription_id,i.subscription_id)
+               LEFT JOIN agent_subscription_instance_identities ii ON ii.id=c.instance_id
+               LEFT JOIN agent_subscription_identities si ON si.id=COALESCE(c.subscription_id,i.subscription_id)
+               JOIN account_identities ai ON ai.id=c.software_id
+               WHERE c.id=? AND c.software_id IS NOT NULL
+                 AND c.is_finalized=1 AND ai.account_kind='agent'""",
+        (period_charge_id,),
+    ).fetchone()
+    if row is None:
+        return 0
+    return _insert_event(conn, _direct_agent_event_row(row))
+
+
 def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
     """Ensure every finalized billing fact has exactly one export event.
 
-    The query intentionally has no finalization-time predicate.  A charge may
-    be finalized before its allocation exists; the allocation's immutable
-    primary key is the repair boundary on the next materialization/export.
+    New Agent events use the period charge itself as the immutable source. The
+    allocation scan remains only for historical V2.1 rows and never receives
+    new records.
     """
     created = 0
     for row in conn.execute(
@@ -222,6 +284,27 @@ def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
         created += _insert_event(conn, _proxy_event_row(row))
 
     for row in conn.execute(
+        """SELECT c.id period_charge_id,c.software_id,c.recurring_charge,
+                      c.normalized_recurring_cost,c.currency,c.base_currency,
+                      c.fx_rate_date,c.finalized_on,c.period_start,c.instance_id,
+                      c.subscription_id,c.subscription_uuid_snapshot,
+                      c.instance_uuid_snapshot,si.uuid subscription_identity_uuid,
+                      ii.uuid instance_identity_uuid,s.uuid subscription_uuid,
+                      i.uuid instance_uuid,ai.id account_id,ai.uuid account_uuid,
+                      ai.name account_name,ai.account_kind
+               FROM agent_subscription_period_charges c
+               LEFT JOIN agent_subscription_instances i ON i.id=c.instance_id
+               LEFT JOIN agent_subscriptions s ON s.id=COALESCE(c.subscription_id,i.subscription_id)
+               LEFT JOIN agent_subscription_instance_identities ii ON ii.id=c.instance_id
+               LEFT JOIN agent_subscription_identities si ON si.id=COALESCE(c.subscription_id,i.subscription_id)
+               JOIN account_identities ai ON ai.id=c.software_id
+               WHERE c.software_id IS NOT NULL AND c.is_finalized=1
+                 AND ai.account_kind='agent'
+               ORDER BY c.id"""
+    ):
+        created += _insert_event(conn, _direct_agent_event_row(row))
+
+    for row in conn.execute(
         """SELECT a.period_charge_id,a.software_id,a.recurring_charge,
                       a.normalized_recurring_cost,a.currency,a.base_currency,
                       a.fx_rate_date,a.finalized_on,
@@ -239,7 +322,8 @@ def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
                LEFT JOIN agent_subscription_instance_identities ii ON ii.id=c.instance_id
                LEFT JOIN agent_subscription_identities si ON si.id=COALESCE(c.subscription_id,i.subscription_id)
                JOIN account_identities ai ON ai.id=a.software_id
-               WHERE c.is_finalized=1 AND a.is_finalized=1
+               WHERE c.software_id IS NULL
+                 AND c.is_finalized=1 AND a.is_finalized=1
                  AND ai.account_kind='agent'
                ORDER BY a.period_charge_id,a.software_id"""
     ):

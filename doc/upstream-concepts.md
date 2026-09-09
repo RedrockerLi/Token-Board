@@ -48,10 +48,10 @@
 
 ### 智能体管理（统一 IR + 可扩展 adapter registry）
 
-- 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`，软件与订阅通过 `agent_subscription_bindings` 多对多绑定。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名和实例标签只是用户记忆用的属性，不是主键或历史关联键，同名订阅可以重建。
-- 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`，软件与订阅通过 `agent_subscription_bindings` 多对多绑定。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名、实例标签、软件名、账户名和路由名都只是用户记忆用的属性，不是主键、外键、唯一生命周期键或历史关联键，同名资源可以重建。
+- 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`。软件与订阅通过 `agent_subscription_bindings` 保存日期粒度的有效关系：同一有效日期至多归属一个 Agent，但绑定可以解绑或改绑；账单物化时按当时有效状态直接把费用归属到 Agent。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名和实例标签只是用户记忆用的属性，不是主键或历史关联键，同名订阅可以重建。
+- 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`。软件与订阅通过 `agent_subscription_bindings` 保存日期粒度的有效关系：同一有效日期至多归属一个 Agent，但绑定可以解绑或改绑；账单物化时按当时有效状态直接把费用归属到 Agent。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名、实例标签、软件名、账户名和路由名都只是用户记忆用的属性，不是主键、外键、唯一生命周期键或历史关联键，同名资源可以重建。
 - 用量来自**token-maintenance 导入服务**：[maintenance.py](../maintenance.py) 管理唯一 worker，在维护服务启动时立即运行、每 30 分钟运行，浏览器打开看板时通过 Unix datagram socket 异步唤醒；[agent_usage](../app/services/agent_usage/) 按 `agent_kind` 选择独立 adapter，把各来源归一为 Python Usage IR，再写成 `request_log` 行。`event_id` 幂等，`project` 与 `session_id` 只保存在本机。
-- dashboard 的条目以软件/智能体为单位：理论消费来自导入用量，实际消费来自绑定订阅；未绑定时实际消费为 0，一个订阅绑定多个启用软件时按绑定软件数平分。没有绑定关系不会自动推断。
+- dashboard 的条目以软件/智能体为单位：理论消费来自导入用量，实际消费来自周期物化时直接归属该软件的订阅费用；未绑定时不生成新的实际费用。没有绑定关系不会自动推断。
 
 ## 三、单上游多密钥
 

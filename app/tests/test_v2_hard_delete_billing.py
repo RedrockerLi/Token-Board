@@ -36,7 +36,7 @@ class V2MigrationTest(unittest.TestCase):
             self.assertFalse(second["dashboard"].upgraded)
 
             with sqlite3.connect(proxy) as conn:
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_001)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_002)
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
                 self.assertNotIn("lifecycle_state", columns)
                 self.assertNotIn("deleted_at", columns)

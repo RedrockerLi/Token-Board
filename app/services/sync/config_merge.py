@@ -209,7 +209,7 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
         # A remote artifact may remove an Agent row while its current period
         # charge still needs to be retained. Materialize before physically
         # deleting the live row; export recovery is keyed by the immutable
-        # allocation source key and does not depend on that row remaining.
+        # direct period-charge source keys do not depend on that row remaining.
         from app.db.proxy.billing import materialize_agent_subscription_charges_conn
         materialize_agent_subscription_charges_conn(
             local, now, current_only=True)

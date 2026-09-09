@@ -163,6 +163,10 @@ class SyncContractTest(unittest.TestCase):
                 "name": "cloud-removed-subscription", "monthly_price": 5,
                 "currency": "CNY",
             })
+            local_db.create_agent_software({
+                "name": "cloud-removed-agent", "agent_kind": "codex",
+                "subscription_ids": [subscription_id],
+            })
             with sqlite3.connect(local) as conn:
                 charge_count = conn.execute(
                     "SELECT count(*) FROM agent_subscription_period_charges "
@@ -296,7 +300,7 @@ class SyncContractTest(unittest.TestCase):
                 ).fetchone())
                 self.assertEqual(conn.execute(
                     "SELECT major,minor FROM schema_version WHERE id=1"
-                    ).fetchone(), (2, 1))
+                    ).fetchone(), (2, 2))
             return state["artifact"]
 
         try:

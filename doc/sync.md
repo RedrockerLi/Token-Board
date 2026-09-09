@@ -71,8 +71,9 @@ dashboard 导出文件只包含聚合存档及必要的名称镜像：
 3. 先物化周期费用，再分别取 `request_log` 的
    `(last_exported_log_id, max_id]` 和账单事件的
    `(last_exported_billing_event_id, billing_max_id]`，写入 shadow。账单事件
-   只包含已经按周期开始日固化的 Plan/智能体订阅费用；Agent 事件通过
-   `(source_table,source_key)` 对所有已 finalized 分摊补发，重复扫描不重复写入。
+   只包含已经按周期开始日固化的 Plan/智能体订阅费用；V2.2 Agent 事件通过
+   `(source_table,source_key)` 对所有已 finalized 周期费用主键补发，V2.1 历史分摊
+   仍按旧源键兼容读取，重复扫描不重复写入。
 4. 压缩并上传已经升级和导出的 shadow 为新的 `dashboard_sync_*.db.gz`；云端旧
    artifact 不原地修改、不删除。
 5. 只有上传成功并替换本地 dashboard 后，才在同一确认步骤推进

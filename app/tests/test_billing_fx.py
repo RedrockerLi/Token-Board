@@ -12,7 +12,7 @@ Covers the period_start-lock contract:
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest import mock
 
 from app.core.time import utc_now
@@ -316,27 +316,43 @@ class BillingFxLockTest(AppDatabaseTestCase):
             "monthly_price": 10, "currency": "USD",
         })
         self._seed_rate("2026-07-15", 7.0)
+        with mock.patch("app.services.fx.requests.get",
+                        side_effect=RuntimeError("offline")):
+            software_id = db.create_agent_software({
+                "name": "codex-agent", "agent_kind": "codex",
+                "subscription_ids": [subscription_id],
+            })
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "UPDATE agent_subscription_bindings SET valid_from=? "
+                "WHERE subscription_id=? AND software_id=?",
+                ("2026-07-15", subscription_id, software_id),
+            )
+            conn.commit()
         materialize_agent_subscription_charges(str(self.proxy_path), _at())
         with sqlite3.connect(self.proxy_path) as conn:
             row = conn.execute(
-                "SELECT subscription_id,recurring_charge,currency,"
+                "SELECT subscription_id,software_id,recurring_charge,currency,"
                 "normalized_recurring_cost,fx_rate_date,is_finalized,finalized_on "
-                "FROM agent_subscription_period_charges"
+                "FROM agent_subscription_period_charges "
+                "WHERE subscription_id=? AND period_start=?",
+                (subscription_id, "2026-07-15T00:00:00Z"),
             ).fetchone()
             self.assertEqual(row[0], subscription_id)
-            self.assertEqual(row[1:4], (10.0, "USD", 70.0))
-            self.assertEqual(row[4], "2026-07-15")
-            self.assertEqual(row[5], 1)
-            self.assertIsNotNone(row[6])
+            self.assertEqual(row[1], software_id)
+            self.assertEqual(row[2:5], (10.0, "USD", 70.0))
+            self.assertEqual(row[5], "2026-07-15")
+            self.assertEqual(row[6], 1)
+            self.assertIsNotNone(row[7])
 
-    def test_agent_allocation_freezes_period_start_bindings(self) -> None:
+    def test_agent_first_binding_freezes_direct_period_charge(self) -> None:
         db = self.proxy_database()
         subscription_id = db.create_agent_subscription({
-            "name": "allocation-sub", "valid_from": "2026-07-15",
+            "name": "direct-sub", "valid_from": "2026-07-15",
             "monthly_price": 10, "currency": "CNY",
         })
         software_id = db.create_agent_software({
-            "name": "allocation-agent", "agent_kind": "codex",
+            "name": "direct-agent", "agent_kind": "codex",
             "subscription_ids": [subscription_id],
         })
         with sqlite3.connect(self.proxy_path) as conn:
@@ -349,32 +365,47 @@ class BillingFxLockTest(AppDatabaseTestCase):
         materialize_agent_subscription_charges(str(self.proxy_path), _at())
         with sqlite3.connect(self.proxy_path) as conn:
             row = conn.execute(
-                "SELECT a.software_id,a.recurring_charge,a.is_finalized,a.finalized_on "
-                "FROM agent_subscription_charge_allocations a"
+                "SELECT software_id,recurring_charge,is_finalized,finalized_on "
+                "FROM agent_subscription_period_charges "
+                "WHERE subscription_id=? AND period_start=?",
+                (subscription_id, "2026-07-15T00:00:00Z"),
             ).fetchone()
         self.assertEqual(row[0], software_id)
         self.assertEqual(row[1], 10.0)
         self.assertEqual(row[2], 1)
         self.assertIsNotNone(row[3])
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM agent_subscription_charge_allocations "
+                "WHERE period_charge_id=(SELECT id FROM agent_subscription_period_charges "
+                "WHERE subscription_id=? AND period_start=?)",
+                (subscription_id, "2026-07-15T00:00:00Z"),
+            ).fetchone()[0], 0)
 
         self.assertTrue(db.update_agent_software(
             software_id, {"subscription_ids": []}))
-        materialize_agent_subscription_charges(str(self.proxy_path), _at())
         with sqlite3.connect(self.proxy_path) as conn:
-            allocations = conn.execute(
-                "SELECT software_id,recurring_charge FROM "
-                "agent_subscription_charge_allocations"
-            ).fetchall()
-        self.assertEqual(allocations, [(software_id, 10.0)])
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM agent_subscription_bindings "
+                "WHERE subscription_id=? AND software_id=? "
+                "AND valid_from<=date('now') "
+                "AND (ends_on IS NULL OR ends_on>date('now'))",
+                (subscription_id, software_id),
+            ).fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT software_id FROM agent_subscription_period_charges "
+                "WHERE subscription_id=? AND period_start=?",
+                (subscription_id, "2026-07-15T00:00:00Z"),
+            ).fetchone()[0], software_id)
 
-    def test_agent_allocation_exports_as_an_immutable_dashboard_charge(self) -> None:
+    def test_agent_direct_charge_exports_as_an_immutable_dashboard_charge(self) -> None:
         db = self.proxy_database()
         subscription_id = db.create_agent_subscription({
-            "name": "export-allocation-sub", "valid_from": "2026-07-15",
+            "name": "export-direct-sub", "valid_from": "2026-07-15",
             "monthly_price": 10, "currency": "CNY",
         })
         software_id = db.create_agent_software({
-            "name": "export-allocation-agent", "agent_kind": "codex",
+            "name": "export-direct-agent", "agent_kind": "codex",
             "subscription_ids": [subscription_id],
         })
         with sqlite3.connect(self.proxy_path) as conn:
@@ -418,34 +449,25 @@ class BillingFxLockTest(AppDatabaseTestCase):
         proxy = ProxyDatabase(str(self.proxy_path),
                              schema_dir=str(self.root / "schema"))
         result = proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
-        self.assertEqual(result["billing_event_count"], 0)
+        self.assertEqual(result["billing_event_count"], 1)
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT valid_from FROM agent_subscription_bindings "
                 "WHERE subscription_id=? AND software_id=?",
                 (subscription_id, software_id)).fetchone()[0], today)
-            self.assertEqual(conn.execute(
-                "SELECT count(*) FROM agent_subscription_charge_allocations a "
-                "JOIN agent_subscription_period_charges c "
-                "ON c.id=a.period_charge_id WHERE a.software_id=? "
-                "AND c.period_start=date(?) || 'T00:00:00Z'",
-                (software_id, today)).fetchone()[0], 0)
+            direct = conn.execute(
+                "SELECT software_id,recurring_charge,is_finalized FROM "
+                "agent_subscription_period_charges "
+                "WHERE subscription_id=? AND period_start=date(?) || 'T00:00:00Z'",
+                (subscription_id, today)).fetchone()
+            self.assertEqual(direct, (software_id, 10.0, 1))
         with sqlite3.connect(self.dashboard_path) as conn:
-            self.assertIsNone(conn.execute(
-                "SELECT recurring_charge FROM monthly_recurring_costs "
-                "WHERE account_id=?", (software_id,)).fetchone())
-
-        # The same date is materialized after the UTC day closes.  The final
-        # binding interval is then snapshotted and exported exactly once.
-        materialize_agent_subscription_charges(
-            str(self.proxy_path), utc_now() + timedelta(days=1))
-        with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT count(*) FROM agent_subscription_charge_allocations a "
-                "JOIN agent_subscription_period_charges c "
-                "ON c.id=a.period_charge_id WHERE a.software_id=? "
-                "AND c.period_start=date(?) || 'T00:00:00Z'",
-                (software_id, today)).fetchone()[0], 1)
+                "SELECT recurring_charge FROM monthly_recurring_costs "
+                "WHERE account_id=?", (software_id,)).fetchone()[0], 10.0)
+
+        # Repeating export immediately sees the same direct source fact; no
+        # UTC-day boundary or materialization-time filter is involved.
         result = proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
         self.assertEqual(result["billing_event_count"], 1)
         with sqlite3.connect(self.dashboard_path) as conn:

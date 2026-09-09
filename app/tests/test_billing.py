@@ -150,6 +150,47 @@ class BillingTest(AppDatabaseTestCase):
             result = db.delete_agent_subscription(subscription_id)
         self.assertTrue(result["ok"], result)
 
+    def test_agent_subscription_can_rebind_and_unbind_without_rewriting_charges(self) -> None:
+        db = self.proxy_database()
+        subscription_id = db.create_agent_subscription({
+            "name": "single-owner-subscription", "valid_from": utc_now().date().isoformat(),
+            "monthly_price": 6, "currency": "CNY",
+        })
+        first_agent = db.create_agent_software({
+            "name": "first-owner-agent", "agent_kind": "codex",
+            "subscription_ids": [subscription_id],
+        })
+        second_agent = db.create_agent_software({
+            "name": "second-owner-agent", "agent_kind": "codex",
+        })
+        with sqlite3.connect(self.proxy_path) as conn:
+            first_charge = conn.execute(
+                "SELECT software_id FROM agent_subscription_period_charges "
+                "WHERE subscription_id=? ORDER BY period_start LIMIT 1",
+                (subscription_id,)).fetchone()
+            self.assertEqual(first_charge, (first_agent,))
+
+        # Rebinding changes the live binding state. The already-materialized
+        # current period remains owned by the first Agent; the next period
+        # reads the new state and is charged to the second Agent.
+        self.assertTrue(db.update_agent_software(
+            second_agent, {"subscription_ids": [subscription_id]}))
+        from app.db.proxy.billing import materialize_agent_subscription_charges
+        materialize_agent_subscription_charges(
+            self.proxy_path, utc_now() + timedelta(days=31))
+        self.assertTrue(db.update_agent_software(
+            second_agent, {"subscription_ids": []}))
+        with sqlite3.connect(self.proxy_path) as conn:
+            owners = [row[0] for row in conn.execute(
+                "SELECT software_id FROM agent_subscription_period_charges "
+                "WHERE subscription_id=? ORDER BY period_start",
+                (subscription_id,)).fetchall()]
+            self.assertEqual(owners, [first_agent, second_agent])
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM agent_subscription_charge_allocations "
+                "WHERE period_charge_id IN (SELECT id FROM agent_subscription_period_charges "
+                "WHERE subscription_id=?)", (subscription_id,)).fetchone()[0], 0)
+
     def test_agent_subscription_delete_keeps_history_and_allows_name_reuse(self) -> None:
         db = self.proxy_database()
         with sqlite3.connect(self.proxy_path) as conn:
@@ -205,8 +246,10 @@ class BillingTest(AppDatabaseTestCase):
                 (software_id,)).fetchone()[0], "reusable-agent-source")
             conn.execute(
                 "DELETE FROM billing_export_events "
-                "WHERE source_table='agent_subscription_charge_allocations' "
-                "AND source_key LIKE '%:' || ?", (software_id,))
+                "WHERE source_table='agent_subscription_period_charges' "
+                "AND source_key IN (SELECT CAST(id AS TEXT) "
+                "FROM agent_subscription_period_charges WHERE subscription_id=?)",
+                (subscription_id,))
             conn.commit()
 
         # Rebuilding an export event after the live subscription is gone must
@@ -214,28 +257,28 @@ class BillingTest(AppDatabaseTestCase):
         from app.db.proxy.billing import materialize_agent_subscription_charges
         materialize_agent_subscription_charges(self.proxy_path)
         with sqlite3.connect(self.proxy_path) as conn:
-            source = conn.execute(
-                "SELECT a.period_charge_id,a.software_id "
-                "FROM agent_subscription_charge_allocations a "
-                "WHERE a.software_id=?", (software_id,)
-            ).fetchone()
-            self.assertIsNotNone(source)
-            expected_source_key = f"{source[0]}:{source[1]}"
+            source_keys = [row[0] for row in conn.execute(
+                "SELECT CAST(id AS TEXT) FROM agent_subscription_period_charges "
+                "WHERE subscription_id=?", (subscription_id,)
+            ).fetchall()]
+            self.assertTrue(source_keys)
             self.assertEqual(conn.execute(
                 "SELECT source_key FROM billing_export_events "
-                "WHERE source_table='agent_subscription_charge_allocations'"
-            ).fetchall(), [(expected_source_key,)])
+                "WHERE source_table='agent_subscription_period_charges' "
+                "ORDER BY source_key"
+            ).fetchall(), [(key,) for key in sorted(source_keys)])
 
-        # A replay scans the immutable allocation key, not the date on which
+        # A replay scans the immutable period-charge key, not the date on which
         # this materialization happens, and therefore cannot create a second
         # Dashboard event.
         materialize_agent_subscription_charges(self.proxy_path)
         with sqlite3.connect(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM billing_export_events "
-                "WHERE source_table='agent_subscription_charge_allocations' "
-                "AND source_key=?", (expected_source_key,)
-            ).fetchone()[0], 1)
+                "WHERE source_table='agent_subscription_period_charges' "
+                "AND source_key IN (SELECT CAST(id AS TEXT) "
+                "FROM agent_subscription_period_charges WHERE subscription_id=?)",
+                (subscription_id,)).fetchone()[0], len(source_keys))
 
         recreated = db.create_agent_subscription({
             "name": "reusable-agent-subscription", "monthly_price": 7,
@@ -256,6 +299,10 @@ class BillingTest(AppDatabaseTestCase):
         subscription_id = db.create_agent_subscription({
             "name": "deferred-agent-subscription", "monthly_price": 5,
             "currency": "CNY",
+        })
+        db.create_agent_software({
+            "name": "deferred-agent-source", "agent_kind": "codex",
+            "subscription_ids": [subscription_id],
         })
         result = db.delete_agent_subscription(subscription_id)
         self.assertTrue(result["ok"], result)

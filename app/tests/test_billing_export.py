@@ -157,8 +157,8 @@ class BillingExportTest(AppDatabaseTestCase):
                 "AND name='billing_export_receipts'"
             ).fetchone())
 
-    def test_legacy_agent_event_unit_remains_idempotent_by_source_key(self) -> None:
-        """A V1 event must not block V2.1 allocation-key recovery."""
+    def test_direct_agent_event_remains_idempotent_by_source_key(self) -> None:
+        """A direct period-charge event stays idempotent after unit recovery."""
         from app.db.proxy.billing import materialize_agent_subscription_charges
         from app.db.proxy.billing_export import ensure_billing_export_events_conn
 
@@ -187,7 +187,8 @@ class BillingExportTest(AppDatabaseTestCase):
             conn.row_factory = sqlite3.Row
             event = conn.execute(
                 "SELECT id,source_key,billing_unit_id FROM billing_export_events "
-                "WHERE source_table='agent_subscription_charge_allocations'"
+                "WHERE source_table='agent_subscription_period_charges' "
+                "ORDER BY id LIMIT 1"
             ).fetchone()
             subscription_uuid = conn.execute(
                 "SELECT uuid FROM agent_subscriptions WHERE id=?",

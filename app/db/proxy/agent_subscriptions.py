@@ -158,11 +158,15 @@ class ProxySubscriptionMixin:
                 item = dict(row)
                 item["instances"] = self._subscription_instances(
                     conn, row["id"], row["currency"])
-                item["software_ids"] = [r[0] for r in conn.execute(
+                binding = conn.execute(
                     "SELECT software_id FROM agent_subscription_bindings "
-                    "WHERE subscription_id=? AND (ends_on IS NULL OR ends_on>date('now')) "
-                    "ORDER BY software_id", (row["id"],)
-                ).fetchall()]
+                    "WHERE subscription_id=? AND valid_from<=date('now') "
+                    "AND (ends_on IS NULL OR ends_on>date('now')) "
+                    "ORDER BY valid_from DESC,id DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                item["software_ids"] = ([int(binding["software_id"])]
+                                          if binding else [])
                 item["monthly_price"] = (item["instances"][0]["monthly_price"]
                                          if item["instances"] else 0)
                 result.append(item)
@@ -214,10 +218,6 @@ class ProxySubscriptionMixin:
                 (str(uuid.uuid4()), name, currency, parent_start),
             ).lastrowid
             self._insert_instances(conn, int(sid), instances)
-            if _parse_iso_date(parent_start) == billing_period(
-                    moment, _parse_iso_date(parent_start).day).start.date():
-                from app.db.proxy.billing import materialize_agent_subscription_charges_conn
-                materialize_agent_subscription_charges_conn(conn, moment, current_only=True)
             conn.commit()
             return int(sid)
         except sqlite3.IntegrityError as exc:
@@ -263,7 +263,8 @@ class ProxySubscriptionMixin:
         conn = self._connect()
         try:
             parent = conn.execute(
-                "SELECT currency,valid_from,ends_on FROM agent_subscriptions WHERE id=?",
+                "SELECT currency,valid_from,ends_on "
+                "FROM agent_subscriptions WHERE id=?",
                 (subscription_id,),
             ).fetchone()
             if parent is None:
@@ -273,6 +274,9 @@ class ProxySubscriptionMixin:
             parsed = self._validate_instances(
                 {"instances": [data]}, parent["currency"], parent["valid_from"])[0]
             iid = self._insert_instances(conn, subscription_id, [parsed])[0]
+            from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+            materialize_agent_subscription_charges_conn(
+                conn, utc_now(), current_only=True)
             conn.commit()
             return iid
         except sqlite3.IntegrityError as exc:
@@ -303,6 +307,10 @@ class ProxySubscriptionMixin:
             effective_on = billing_period(now_dt, anchor.day).end.date().isoformat()
             changed = self._update_instance_row(
                 conn, row, data, effective_on)
+            if changed:
+                from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+                materialize_agent_subscription_charges_conn(
+                    conn, now_dt, current_only=True)
             conn.commit()
             return changed
         except sqlite3.IntegrityError as exc:
@@ -429,6 +437,9 @@ class ProxySubscriptionMixin:
                             purge_agent_subscription_instance(conn, iid)
                         else:
                             self._delete_instance_row(conn, row, now_dt)
+                from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+                materialize_agent_subscription_charges_conn(
+                    conn, now_dt, current_only=True)
             conn.commit()
             return bool(fields or "monthly_price" in data or "instances" in data)
         except sqlite3.IntegrityError as exc:
@@ -480,6 +491,13 @@ class ProxySubscriptionMixin:
     def _replace_bindings(self, conn: sqlite3.Connection, software_id: int,
                           subscription_ids: list[object], *,
                           today: str | None = None) -> None:
+        """Make this Agent's effective subscription bindings match the form.
+
+        A binding is a date-grained live state.  Removing it ends the current
+        interval on ``today``; adding it to another Agent ends the previous
+        Agent's interval and starts the new one on the same date.  Existing
+        period charges keep the owner captured when they were materialized.
+        """
         today = today or utc_now().date().isoformat()
         cleaned = []
         for value in subscription_ids:
@@ -498,38 +516,45 @@ class ProxySubscriptionMixin:
             ).fetchall()
             if len(rows) != len(cleaned):
                 raise ValueError("绑定的订阅不存在或已进入结束流程")
-        existing_rows = {row[0]: row for row in conn.execute(
-            "SELECT subscription_id FROM agent_subscription_bindings "
-            "WHERE software_id=?", (software_id,),
-        ).fetchall()}
-        for sid in set(existing_rows) - set(cleaned):
-            conn.execute("DELETE FROM agent_subscription_bindings "
-                         "WHERE subscription_id=? AND software_id=?",
-                         (sid, software_id))
+        existing = {
+            int(row["subscription_id"]): row["id"] for row in conn.execute(
+                "SELECT id,subscription_id FROM agent_subscription_bindings "
+                "WHERE software_id=? AND valid_from<=? "
+                "AND (ends_on IS NULL OR ends_on>?)",
+                (software_id, today, today),
+            ).fetchall()
+        }
+        for sid in set(existing) - set(cleaned):
+            conn.execute(
+                "UPDATE agent_subscription_bindings SET ends_on=? "
+                "WHERE software_id=? AND subscription_id=? "
+                "AND valid_from<=? AND (ends_on IS NULL OR ends_on>?)",
+                (today, software_id, sid, today, today),
+            )
+
         for sid in cleaned:
-            existing = conn.execute(
+            # A subscription has only one effective Agent.  Rebinding ends
+            # every other currently-effective interval before adding ours.
+            conn.execute(
+                "UPDATE agent_subscription_bindings SET ends_on=? "
+                "WHERE subscription_id=? AND software_id<>? "
+                "AND valid_from<=? AND (ends_on IS NULL OR ends_on>?)",
+                (today, sid, software_id, today, today),
+            )
+            compatibility = conn.execute(
                 "SELECT id FROM agent_subscription_bindings "
                 "WHERE subscription_id=? AND software_id=? "
-                "AND (ends_on IS NULL OR ends_on>?) "
-                "ORDER BY valid_from DESC,id DESC LIMIT 1",
+                "AND valid_from=? LIMIT 1",
                 (sid, software_id, today),
             ).fetchone()
-            if existing is not None:
-                continue
-            reopened = conn.execute(
-                "SELECT id FROM agent_subscription_bindings "
-                "WHERE subscription_id=? AND software_id=? AND ends_on=? "
-                "ORDER BY valid_from DESC,id DESC LIMIT 1",
-                (sid, software_id, today),
-            ).fetchone()
-            if reopened is not None:
+            if compatibility is None:
                 conn.execute(
-                    "UPDATE agent_subscription_bindings SET ends_on=NULL WHERE id=?",
-                    (reopened["id"],),
+                    "INSERT INTO agent_subscription_bindings"
+                    "(subscription_id,software_id,valid_from,ends_on) "
+                    "VALUES(?,?,?,NULL)", (sid, software_id, today),
                 )
-                continue
-            conn.execute(
-                "INSERT INTO agent_subscription_bindings"
-                "(subscription_id,software_id,valid_from,ends_on) "
-                "VALUES(?,?,?,NULL)", (sid, software_id, today),
-            )
+            else:
+                conn.execute(
+                    "UPDATE agent_subscription_bindings SET ends_on=NULL "
+                    "WHERE id=?", (compatibility["id"],),
+                )

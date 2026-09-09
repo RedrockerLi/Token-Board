@@ -125,7 +125,7 @@ class BillingUnitResolver:
         moment = utc_now() if at is None else at
         today = moment.date().isoformat()
         visibility = ""
-        params: list[object] = [today]
+        params: list[object] = [today, today, today]
         if not include_ended:
             visibility = (
                 " AND (s.ends_on IS NULL OR s.ends_on>?)"
@@ -133,16 +133,27 @@ class BillingUnitResolver:
             )
             params.extend((today, today))
         rows = conn.execute(
-            "SELECT i.id,i.uuid,i.subscription_id,i.valid_from,i.ends_on,s.currency "
+            "SELECT i.id,i.uuid,i.subscription_id,i.valid_from,i.ends_on,s.currency,"
+            "live_binding.software_id "
             "FROM agent_subscription_instances i "
             "JOIN agent_subscriptions s ON s.id=i.subscription_id "
+            "JOIN agent_subscription_bindings live_binding "
+            "ON live_binding.id=("
+            "SELECT b.id FROM agent_subscription_bindings b "
+            "WHERE b.subscription_id=s.id AND b.valid_from<=? "
+            "AND (b.ends_on IS NULL OR b.ends_on>?) "
+            "ORDER BY b.valid_from DESC,b.id DESC LIMIT 1) "
+            "JOIN agent_software live_software ON live_software.id=live_binding.software_id "
+            "JOIN accounts live_agent_account "
+            "ON live_agent_account.id=live_software.id "
+            "AND live_agent_account.account_kind='agent' "
             "WHERE i.valid_from<=?" + visibility,
             tuple(params),
         ).fetchall()
         return [BillingUnit(
             billing_unit_id=f"agent-subscription-instance:{row['uuid']}",
             owner_id=int(row["id"]),
-            account_id=None,
+            account_id=int(row["software_id"]),
             owner_kind="agent",
             charge_domain="agent_subscription",
             valid_from=_parse_iso_date(str(row["valid_from"])[:10]),

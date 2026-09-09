@@ -36,10 +36,10 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                     item["config"] = {}
                 item.pop("status_json", None)
                 item["subscription_ids"] = [r[0] for r in conn.execute(
-                    "SELECT subscription_id FROM agent_subscription_bindings "
-                    "WHERE software_id=? "
-                "AND (ends_on IS NULL OR ends_on>date('now')) "
-                    "ORDER BY subscription_id", (row["id"],)).fetchall()]
+                    "SELECT DISTINCT subscription_id FROM agent_subscription_bindings "
+                    "WHERE software_id=? AND valid_from<=date('now') "
+                    "AND (ends_on IS NULL OR ends_on>date('now')) "
+                    "ORDER BY valid_from DESC,id DESC", (row["id"],)).fetchall()]
                 result.append(item)
             return result
         finally:
@@ -82,6 +82,9 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             self._replace_bindings(conn, software_id,
                                    data.get("subscription_ids") or [],
                                    today=now[:10])
+            from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+            materialize_agent_subscription_charges_conn(
+                conn, utc_now(), current_only=True)
             conn.commit()
             return int(software_id)
         except sqlite3.IntegrityError as exc:
@@ -134,6 +137,9 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
                 self._replace_bindings(conn, software_id,
                                        data.get("subscription_ids") or [],
                                        today=now[:10])
+                from app.db.proxy.billing import materialize_agent_subscription_charges_conn
+                materialize_agent_subscription_charges_conn(
+                    conn, utc_now(), current_only=True)
             conn.commit()
             return bool(fields or "subscription_ids" in data)
         except sqlite3.IntegrityError as exc:

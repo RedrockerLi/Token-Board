@@ -41,7 +41,7 @@ schema/
 ├── token-board/
 │   ├── v0/0-1_initial.sql … 0-19_drop_monthly_price.sql
 │   ├── v1/1-0_baseline.sql … 1-21_subscription_effective_dates.sql
-│   └── v2/2-1_agent_billing_dates_and_export_keys.sql
+│   └── v2/2-1_agent_billing_dates_and_export_keys.sql … 2-2_single_agent_subscription_billing.sql
 ├── dashboard/
 │   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
 │   ├── v1/1-0_baseline.sql … 1-6_remove_account_exclusions.sql
@@ -71,7 +71,7 @@ app/db/schema_upgrade/
 ```
 
 当前仓库的历史 V1 tip 是 Token Board V1.21、Dashboard V1.7；运行时当前 tip 是
-Token Board V2.1、Dashboard V2.1。V0/V1 文件保留用于历史库和转换测试；新安装只创建
+Token Board V2.2、Dashboard V2.1。V0/V1 文件保留用于历史库和转换测试；新安装只创建
 当前 baseline，不重放旧版本历史。
 
 ## 版本与元数据
@@ -83,7 +83,7 @@ Token Board V2.1、Dashboard V2.1。V0/V1 文件保留用于历史库和转换�
 - `schema_transitions` 保存数据 transition 的 ID、源码 checksum、配对
   `generation_id` 和应用时间。版本 route 决定 transition 是否适用；该表只记录
   已完成的 transition，避免重复执行并保证两个数据库使用同一个 generation。
-- 运行时要求数据库处于当前 V2.1 tip。未知的更高版本不能当作已验证的运行时版本；
+- 运行时要求数据库处于当前 V2.2/V2.1 tip（Token Board/Dashboard）。未知的更高版本不能当作已验证的运行时版本；
   应使用匹配版本的 Python schema-upgrade 工具处理。
 
 ### C++ runtime schema contract
@@ -134,18 +134,34 @@ Plan recurring 合同都遵守这一规则；V1 仍保留部分审计列，作�
 进一步把 Agent 价格事件改为 `effective_on`，把订阅/实例/绑定结束改为 `ends_on`，并删除
 Agent 计费链上的操作具体时刻；Proxy 请求、合同审计和性能日志的时间戳不在本次范围内。
 
-### V2.1 Agent 日粒度与导出修复
+### 历史 V2.1 Agent 日粒度与导出修复
 
-V2.1 的 Agent 计费字段只表达日粒度业务状态：`valid_from`、`effective_on` 和 `ends_on`
+V2.1 的历史 Agent 计费字段只表达日粒度业务状态：`valid_from`、`effective_on` 和 `ends_on`
 都是 UTC 日期，结束边界为独占的 `[valid_from, ends_on)`；周期费用和分摊使用
 `is_finalized`/`finalized_on`。同一 UTC 日内多次添加、删除或改价不做时分秒切分，按日终
-状态计算；当天新建的周期分摊延迟到下一 UTC 日再物化。
+状态计算；当天新建的周期分摊曾延迟到下一 UTC 日再物化。
 
-Agent 导出事件的唯一补发边界是 `(source_table, source_key)`，其中分摊源键为
+历史 Agent 导出事件的唯一补发边界是 `(source_table, source_key)`，其中分摊源键为
 `period_charge_id:software_id`。导出扫描所有已 finalized 的分摊，重复执行是幂等的，
 不再按本次物化时间筛选，因此跨日绑定、删除或延迟物化不会漏导出。Token Board 与
 Dashboard 的 V2.0→V2.1 本地升级采用成对 shadow barrier；任一库迁移失败或发现非法日期，
 两库都不发布。
+
+### V2.2 Agent 直接归属周期计费
+
+V2.2 在 `agent_subscription_period_charges` 增加 `software_id`。一个订阅同一有效日期
+至多有一个当前 Agent；绑定表仍按 UTC 日期保存有效区间，解绑和改绑都允许。业务操作只
+调整有效区间：解绑结束当前区间，改绑结束旧 Agent 区间并从同一日期开始新 Agent 区间。
+
+新的周期费用在物化时读取该时点的有效绑定，把 Agent 直接写入周期费用行并立即冻结；已
+冻结的费用不会因为之后解绑或改绑而迁移。首次绑定当前周期会在同一事务中触发物化，后续
+周期则在周期物化时按当时状态归属；没有有效绑定就不生成新的 Agent 实际费用。计费链不
+保存绑定/物化操作的时分秒，只保存 UTC 日期状态和周期冻结日期。
+
+`agent_subscription_charge_allocations` 以及旧的 allocation 导出事件只保留给 V2.1
+历史行读取；V2.2 不再创建新的分摊行。新的导出事件直接以
+`agent_subscription_period_charges.id` 为 `source_key`，补发逻辑按不可变周期费用主键
+扫描所有 finalized 行，不依赖本次物化日期，因此解绑、改绑或跨日重试都不会漏导出。
 
 ## 同 Major 的 SQL 升级
 
@@ -237,7 +253,7 @@ python3 schema/transitions/0-to-1/migrate.py \
 
 云端没有远程 migration service。云端 artifact 被下载到本地临时文件后，才由
 Python runner 按版本 route 升级；原云端文件保持不变。配置 V0 artifact 合并后
-可以上传新的 V2.1 artifact，Dashboard artifact 则在导出事务中升级、导出并在
+可以上传新的 V2.2 artifact，Dashboard artifact 则在导出事务中升级、导出并在
 上传成功后提交本地状态。
 
 ## 新增升级的规则

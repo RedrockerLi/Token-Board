@@ -3,6 +3,7 @@
 from app.core.time import format_utc, utc_now
 from app.db.proxy.common import datetime, timedelta
 from app.services.billing_report import (
+    _agent_charge_sql,
     _agent_allocation_sql,
     _proxy_charge_sql,
     live_request_sql,
@@ -197,6 +198,12 @@ class ProxyBillingReadMixin:
                    GROUP BY date(c.period_start),live_account.id""",
                 """SELECT date(charge.period_start) date,live_software.id account_id,
                           live_agent_account.name account_name,
+                          COALESCE(SUM(charge.normalized_recurring_cost),0) recurring_cost,
+                          'agent' account_type
+                """ + _agent_charge_sql() + """
+                   GROUP BY date(charge.period_start),live_software.id""",
+                """SELECT date(charge.period_start) date,live_software.id account_id,
+                          live_agent_account.name account_name,
                           COALESCE(SUM(allocation.normalized_recurring_cost),0) recurring_cost,
                           'agent' account_type
                 """ + _agent_allocation_sql() + """
@@ -246,6 +253,9 @@ class ProxyBillingReadMixin:
                 "SELECT date(c.period_start) date,"
                 "COALESCE(SUM(c.normalized_recurring_cost),0) recurring_cost "
                 + _proxy_charge_sql() + "GROUP BY date(c.period_start)",
+                "SELECT date(charge.period_start) date,"
+                "COALESCE(SUM(charge.normalized_recurring_cost),0) recurring_cost "
+                + _agent_charge_sql() + "GROUP BY date(charge.period_start)",
                 "SELECT date(charge.period_start) date,"
                 "COALESCE(SUM(allocation.normalized_recurring_cost),0) recurring_cost "
                 + _agent_allocation_sql() + "GROUP BY date(charge.period_start)",
