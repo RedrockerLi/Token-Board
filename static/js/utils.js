@@ -90,9 +90,11 @@ function localDateToUtcRange(localDate) {
 
 function fmtNum(n) {
     if (n == null || isNaN(n)) return '--';
-    if (n >= 100_000_000_000) return (n / 1_000_000_000).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' B';
-    if (n >= 100_000_000) return (n / 1_000_000).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' M';
-    if (n >= 100_000) return (n / 1_000).toLocaleString('en-US', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + ' K';
+    var compactOptions = { minimumSignificantDigits: 5, maximumSignificantDigits: 5 };
+    if (n >= 10_000_000_000_000) return (n / 1_000_000_000_000).toLocaleString('en-US', compactOptions) + ' T';
+    if (n >= 10_000_000_000) return (n / 1_000_000_000).toLocaleString('en-US', compactOptions) + ' B';
+    if (n >= 10_000_000) return (n / 1_000_000).toLocaleString('en-US', compactOptions) + ' M';
+    if (n >= 10_000) return (n / 1_000).toLocaleString('en-US', compactOptions) + ' K';
     return n.toLocaleString('en-US');
 }
 
