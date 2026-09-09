@@ -11,11 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.services.agent_usage.adapters import (
-    antigravity, cline, codex, craft_agent, dsh, grok, hermes, kiro, kimi_code, mcode,
-    opencode, pi_common, workbuddy,
+    antigravity, cline, codex, craft_agent, cursor, dsh, grok, hermes, kiro,
+    kimi_code, mcode, opencode, pi_common, workbuddy,
 )
 from app.services.agent_usage import cindy_ledger
-from app.services.agent_usage.ir import UsageEvent
+from app.services.agent_usage.ir import UsageEvent, UsageSource
 from app.services.agent_usage.registry import ADAPTERS
 
 
@@ -65,7 +65,45 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual((event.model, event.project,
                               event.prompt_tokens, event.completion_tokens,
                               event.cache_read_tokens, event.total_tokens),
-                             ("gemini-3-pro", "project-legacy", 102, 6, 2, 106))
+                             ("gemini-3-pro", "project-legacy", 102, 6, 2, 108))
+
+    def test_antigravity_sqlite_total_includes_cached_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "conversation.db"
+            with sqlite3.connect(path) as connection:
+                connection.execute(
+                    "CREATE TABLE gen_metadata (idx INTEGER, data BLOB)"
+                )
+                connection.execute(
+                    "CREATE TABLE steps (idx INTEGER, metadata BLOB)"
+                )
+                connection.execute(
+                    "CREATE TABLE trajectory_metadata_blob (data BLOB)"
+                )
+                connection.execute(
+                    "INSERT INTO gen_metadata VALUES(?,?)", (0, b"fixture")
+                )
+
+            record = {
+                "input": 100,
+                "output": 5,
+                "cache": 2,
+                "reasoning": 1,
+                "response_id": "response-current",
+                "display_name": "gemini-model",
+                "response_model": "",
+                "timestamp": "2026-09-07T06:30:02Z",
+            }
+            with patch.object(antigravity, "_metadata", return_value=record), \
+                    patch.object(antigravity, "_workspace", return_value=None):
+                parsed = antigravity.parse(UsageSource(path=path))
+
+            self.assertFalse(parsed.skipped)
+            self.assertEqual(len(parsed.events), 1)
+            event = parsed.events[0]
+            self.assertEqual((event.prompt_tokens, event.completion_tokens,
+                              event.cache_read_tokens, event.total_tokens),
+                             (102, 6, 2, 108))
 
     def test_mcode_reads_allowlisted_runtime_usage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -99,7 +137,84 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual((event.model, event.project, event.prompt_tokens,
                               event.completion_tokens, event.cache_read_tokens,
                               event.total_tokens),
-                             ("mcode-model", "project-a", 22, 16, 5, 33))
+                             ("mcode-model", "project-a", 22, 16, 5, 38))
+
+    def test_hermes_total_includes_cached_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.db"
+            with sqlite3.connect(path) as connection:
+                connection.execute("""CREATE TABLE sessions (
+                    id TEXT, model TEXT, started_at TEXT, input_tokens INTEGER,
+                    output_tokens INTEGER, cache_read_tokens INTEGER,
+                    reasoning_tokens INTEGER, cache_write_tokens INTEGER
+                )""")
+                connection.execute(
+                    "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)",
+                    ("session-1", "hermes-model", "2026-08-24T00:00:00Z",
+                     60, 20, 40, 5, 0),
+                )
+
+            event = hermes.parse(UsageSource(path=path)).events[0]
+            self.assertEqual((event.prompt_tokens, event.completion_tokens,
+                              event.cache_read_tokens, event.total_tokens),
+                             (100, 20, 40, 120))
+
+    def test_grok_total_includes_cached_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = root / "session"
+            session.mkdir()
+            (session / "summary.json").write_text(
+                json.dumps({"current_model_id": "grok-model"}),
+                encoding="utf-8",
+            )
+            path = session / "updates.jsonl"
+            path.write_text(json.dumps({
+                "timestamp": "2026-08-24T00:00:00Z",
+                "params": {"update": {
+                    "sessionUpdate": "turn_completed",
+                    "usage": {"inputTokens": 100, "cachedReadTokens": 40,
+                               "outputTokens": 20, "reasoningTokens": 5},
+                }},
+            }) + "\n", encoding="utf-8")
+
+            event = grok.parse(UsageSource(
+                path=path,
+                context={"session_path": session, "session_id": "session-1"},
+            )).events[0]
+            self.assertEqual((event.prompt_tokens, event.completion_tokens,
+                              event.cache_read_tokens, event.total_tokens),
+                             (100, 20, 40, 120))
+
+    def test_cursor_total_includes_cached_tokens(self) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return (
+                    "Model,Date,Input (w/ Cache Write),Input (w/o Cache Write),"
+                    "Output Tokens,Cache Read\n"
+                    "cursor-model,2026-08-24T00:00:00Z,10,10,20,40\n"
+                ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.vscdb"
+            with sqlite3.connect(path) as connection:
+                connection.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+                connection.execute(
+                    "INSERT INTO ItemTable VALUES(?, ?)",
+                    ("cursorAuth/accessToken", "token"),
+                )
+
+            with patch.object(cursor, "urlopen", return_value=Response()):
+                event = cursor.parse(UsageSource(path=path)).events[0]
+            self.assertEqual((event.prompt_tokens, event.completion_tokens,
+                              event.cache_read_tokens, event.total_tokens),
+                             (60, 20, 40, 80))
 
     def test_craft_agent_and_hermes_use_documented_home_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -197,6 +312,33 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
         self.assertEqual((event.prompt_tokens, event.completion_tokens,
                           event.cache_read_tokens, event.total_tokens),
                          (15, 5, 5, 20))
+
+    def test_pi_family_total_includes_cached_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "session.jsonl"
+            path.write_text("\n".join([
+                json.dumps({
+                    "type": "session", "version": 1, "id": "pi-session",
+                    "timestamp": "2026-08-24T00:00:00Z", "cwd": "/work/project",
+                }),
+                json.dumps({
+                    "type": "message", "id": "message-1",
+                    "timestamp": "2026-08-24T00:00:01Z",
+                    "message": {
+                        "role": "assistant", "model": "pi-model",
+                        "usage": {"input": 60, "cacheRead": 40,
+                                   "output": 20, "reasoning": 5},
+                    },
+                }),
+            ]) + "\n", encoding="utf-8")
+
+            event = pi_common.parse_pi(UsageSource(
+                path=path, context={"sessions_root": root},
+            ), "pi-coding-agent").events[0]
+            self.assertEqual((event.prompt_tokens, event.completion_tokens,
+                              event.cache_read_tokens, event.total_tokens),
+                             (100, 20, 40, 120))
 
     def test_opencode_accepts_custom_sqlite_filename(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -474,7 +616,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             event = cindy_ledger.parse(items[0], "codex").events[0]
             self.assertEqual((event.prompt_tokens, event.completion_tokens,
                               event.cache_read_tokens, event.total_tokens),
-                             (31, 2, 10, 23))
+                             (31, 2, 10, 33))
 
     def test_cline_prefers_the_larger_migrated_task_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -533,8 +675,10 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual((events[0].model, events[0].project,
                               events[0].prompt_tokens,
-                              events[0].cache_read_tokens),
-                             ("wb-model", "project", 100, 40))
+                              events[0].completion_tokens,
+                              events[0].cache_read_tokens,
+                              events[0].total_tokens),
+                             ("wb-model", "project", 100, 20, 40, 120))
 
     def test_workbuddy_gives_copied_record_ids_a_global_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

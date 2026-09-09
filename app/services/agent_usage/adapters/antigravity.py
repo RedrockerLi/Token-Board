@@ -441,11 +441,6 @@ def _parse_legacy(item: UsageSource, stop_event=None) -> ParseBatch:
                 output_tokens=safe_float(usage.get("outputTokens")),
                 cached_input_tokens=safe_float(usage.get("cacheReadTokens")),
                 reasoning_output_tokens=safe_float(usage.get("thinkingOutputTokens")),
-                total_tokens=(
-                    safe_float(usage.get("inputTokens"))
-                    + safe_float(usage.get("outputTokens"))
-                    + safe_float(usage.get("thinkingOutputTokens"))
-                ),
                 project=project,
                 session_id=item.path.stem,
             )
@@ -492,7 +487,6 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             model=record.get("display_name") or record.get("response_model") or "unknown", requested_at=requested_at,
             input_tokens=record["input"], output_tokens=record["output"], cached_input_tokens=record["cache"],
             reasoning_output_tokens=record["reasoning"],
-            total_tokens=record["input"] + record["output"] + record["reasoning"],
             project=project_name(workspace), session_id=db.stem,
         )
         if event:

@@ -128,9 +128,6 @@ def parse(item: UsageSource, kind: str) -> ParseBatch:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_input_tokens=cached,
-            # Cindy's aggregate total follows the reference bucket model:
-            # cache reads are priced separately and are not part of total.
-            total_tokens=input_tokens + output_tokens,
             project="unknown",
         )
         if event:

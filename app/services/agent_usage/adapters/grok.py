@@ -95,7 +95,6 @@ def _usage_event(item, ordinal, model, project, ts, usage, session_id):
         requested_at=ts, input_tokens=input_tokens,
         output_tokens=output_tokens, cached_input_tokens=cache,
         reasoning_output_tokens=reasoning,
-        total_tokens=input_tokens + output_tokens + reasoning,
         project=project, session_id=session_id,
     )
 

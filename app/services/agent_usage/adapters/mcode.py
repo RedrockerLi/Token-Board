@@ -131,9 +131,6 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             output_tokens=output_tokens,
             cached_input_tokens=cache_read,
             reasoning_output_tokens=reasoning_tokens,
-            # Keep the database's native total convention: cache reads are a
-            # priced subset of prompt tokens, not an additional total token.
-            total_tokens=input_tokens + output_tokens + reasoning_tokens,
             project=project_name(workspace),
             session_id=session_id,
         )

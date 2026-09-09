@@ -126,11 +126,6 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             requested_at=timestamp(raw_timestamp),
             input_tokens=cache_miss or max(0, inclusive_input - cache), output_tokens=max(0, inclusive_output - reasoning),
             cached_input_tokens=cache, reasoning_output_tokens=reasoning,
-            total_tokens=(
-                (cache_miss or max(0, inclusive_input - cache))
-                + max(0, inclusive_output - reasoning)
-                + reasoning
-            ),
             project=project_name(record.get("cwd") or project), session_id=session_id,
         )
         if event:

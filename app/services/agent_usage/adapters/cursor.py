@@ -226,11 +226,6 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             requested_at=ts, input_tokens=_csv_int(row.get("Input (w/ Cache Write)")) + _csv_int(row.get("Input (w/o Cache Write)")),
             output_tokens=_csv_int(row.get("Output Tokens")), cached_input_tokens=_csv_int(row.get("Cache Read")),
             project="unknown", input_includes_cache=False,
-            total_tokens=(
-                _csv_int(row.get("Input (w/ Cache Write)"))
-                + _csv_int(row.get("Input (w/o Cache Write)"))
-                + _csv_int(row.get("Output Tokens"))
-            ),
         )
         if event:
             events.append(event)

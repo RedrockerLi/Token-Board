@@ -85,7 +85,6 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             output_tokens=output - reasoning,
             cached_input_tokens=row["cache_read_tokens"],
             reasoning_output_tokens=reasoning,
-            total_tokens=input_tokens + output,
             project=str(item.context.get("profile") or "default"), session_id=str(row["id"] or "unknown"),
         )
         if event:

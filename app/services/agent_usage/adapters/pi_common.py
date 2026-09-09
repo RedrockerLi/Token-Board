@@ -331,16 +331,6 @@ def parse_pi(item: UsageSource, kind: str, stop_event=None) -> ParseBatch:
             ),
             cached_input_tokens=safe_float(cache),
             reasoning_output_tokens=safe_float(reasoning),
-            total_tokens=(
-                safe_float(usage.get("input", usage.get("inputTokens", usage.get("input_tokens", 0))))
-                + safe_float(cache_write)
-                + max(
-                    0,
-                    safe_float(usage.get("output", usage.get("outputTokens", usage.get("output_tokens", 0))))
-                    - safe_float(reasoning),
-                )
-                + safe_float(reasoning)
-            ),
             project=project, session_id=session_id,
         )
         if event:
