@@ -83,8 +83,8 @@ SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 
 
 - `utils.js`:UTC 时间戳到浏览器当地时间的显示、当地日期筛选、UTC/当地分钟换算、`fmtNum`、`esc`,最先加载。
 - `api.js`:fetch 封装 + 各 API 包装。
-- `charts.js`:ECharts 渲染层(SVG)。
-- `dashboard.js`:用量仪表板(弃用模型过滤、模型别名分组)。弃用判定:全局(所有用户、全历史)token 占比 <1% **且**最新有数据月份内 0 用量(含调用失败 0 token)的模型/别名组;该集合计算一次后固定,不随月份/用户选择变化,「刷新数据」时重算。
+- `charts.js`:ECharts 渲染层(SVG 2D + 可选 WebGL 3D 日历)。
+- `dashboard.js`:用量仪表板(模型别名分组与 3D 日历)。模型显示条件:当前用户跨月份 Token 占比 >=1%，或浏览器当前自然月累计 Token >50,000,000;该集合随用户、刷新和重新进入仪表板重算。
 - `proxy_manager.js`:账户/聚合/密钥/定价管理页,含模型定价拖放排序、按浏览器当地时间输入的峰谷时段编辑器;档位以 UTC+0 分钟存储。
 - `proxy_billing.js`:消费报告 + 请求日志页。
 - `agent_manager.js`:智能体订阅与软件来源管理页。

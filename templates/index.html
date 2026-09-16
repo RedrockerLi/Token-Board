@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI API 用量可视化</title>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts-gl@2.0.8/dist/echarts-gl.min.js"
+            onload="window.__tokenBoardEchartsGLLoaded = true;"
+            onerror="window.__tokenBoardEchartsGLFailed = true;"></script>
     <link rel="stylesheet" href="/static/css/dashboard.css">
 </head>
 <body>
@@ -144,6 +147,10 @@
                         <option value="">总览 (所有用户)</option>
                     </select>
                     <button class="btn btn--sm" id="moreUsersBtn" type="button">更多用户</button>
+                    <button class="btn btn--sm" onclick="refreshData()" title="重新扫描 data/ 目录">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+                        刷新数据
+                    </button>
                 </div>
             </div>
 
@@ -203,33 +210,38 @@
                 </div>
             </div>
 
-            <!-- Month Selector + Refresh -->
-            <div class="section section--trend-toolbar">
-                <div class="section-header">
+            <!-- Daily usage calendar (WebGL 3D) -->
+            <div class="section calendar-section" id="dailyUsageCalendarSection">
+                <div class="section-header calendar-section__header">
                     <div>
-                        <span class="section-title">用量趋势</span>
-                        <span class="section-subtitle" id="currentMonthLabel"></span>
+                        <span class="section-title">每日用量日历</span>
+                        <span class="section-subtitle" id="calendarScopeLabel">按 Token 堆叠</span>
                     </div>
-                    <div class="controls-group">
-                        <select class="select-styled" id="monthSelector">
-                            <option value="">-- 选择月份 --</option>
-                        </select>
-                        <button class="btn btn--sm" onclick="refreshData()" title="重新扫描 data/ 目录">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
-                            刷新数据
-                        </button>
+                    <div class="calendar-toolbar" aria-label="日历视图控制">
+                        <div class="calendar-view-toggle" role="group" aria-label="日历范围">
+                            <button type="button" class="calendar-view-toggle__button calendar-view-toggle__button--active" id="calendarMonthView" aria-pressed="true">月视图</button>
+                            <button type="button" class="calendar-view-toggle__button" id="calendarYearView" aria-pressed="false">年视图</button>
+                        </div>
+                        <div class="calendar-period-controls" id="calendarMonthControls">
+                            <label class="calendar-period-field">年份
+                                <select class="select-styled" id="calendarMonthYear" aria-label="月视图年份"></select>
+                            </label>
+                            <label class="calendar-period-field">月份
+                                <select class="select-styled" id="calendarMonthMonth" aria-label="月视图月份"></select>
+                            </label>
+                        </div>
+                        <div class="calendar-period-controls" id="calendarYearControls" hidden>
+                            <label class="calendar-period-field">年份
+                                <select class="select-styled" id="calendarYearSelect" aria-label="年视图年份"></select>
+                            </label>
+                        </div>
                     </div>
                 </div>
-            </div>
-
-            <!-- Daily Charts (dynamic) -->
-            <div class="section">
-                <div class="charts-grid" id="dailyCharts"></div>
-            </div>
-
-            <!-- Monthly Trend Charts (dynamic) -->
-            <div class="section">
-                <div class="charts-grid" id="monthlyCharts"></div>
+                <div class="chart-card chart-card--wide calendar-card">
+                    <div class="chart-container calendar-chart-container" id="chartCalendar3D" style="display:none"></div>
+                    <div class="loading calendar-loading" id="loadingCalendar3D">加载中</div>
+                    <div class="calendar-compatibility" id="calendarCompatibility" role="status" style="display:none"></div>
+                </div>
             </div>
 
             <p class="last-updated" id="lastUpdated"></p>

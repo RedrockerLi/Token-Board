@@ -124,12 +124,9 @@ async function fetchSummary() {
     return requestJSON(buildParams('/api/summary'));
 }
 
+/** Fetch one calendar month, optionally narrowed to a backend model name. */
 async function fetchDaily(year, month, model) {
     return requestJSON(buildParams('/api/daily', { year, month, model }));
-}
-
-async function fetchMonthly(model) {
-    return requestJSON(buildParams('/api/monthly', { model }));
 }
 
 async function fetchTokenTypes() {
@@ -140,10 +137,6 @@ async function fetchTokenTypes() {
 // used to determine the deprecated-model set, which is a global concept.
 async function fetchModelBreakdownAllUsers(year, month) {
     return requestJSON('/api/model_breakdown?year=' + year + '&month=' + month);
-}
-
-async function fetchModels() {
-    return requestJSON('/api/models');
 }
 
 async function fetchRefresh() {
