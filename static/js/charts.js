@@ -34,21 +34,22 @@ function _chartHslToHex(h, s, l) {
 /**
  * Return the deterministic model color for a zero-based rank.
  *
- * The five base hues echo the dashboard's brown, sage, olive, ochre and
- * purple-gray accents.  Each subsequent group makes a deterministic hue
- * shift, so this is not a repeating palette even though the color families
- * remain recognizable.  Both the input and the formula are independent of
- * the number of models present, so the same rank always has the same color.
+ * A warm terracotta hue anchors the palette.  Following ranks advance by the
+ * golden angle, keeping neighbouring models visually distinct without using
+ * a repeating color array.  Small, deterministic saturation/lightness shifts
+ * retain the dashboard's muted character while improving stacked-bar
+ * separation.  The result depends only on rank, never on the model count.
  */
 function generateChartColor(rank) {
     var value = Number(rank);
     if (!isFinite(value)) value = 0;
     value = Math.max(0, Math.floor(value));
-    var baseHues = [14, 145, 88, 38, 276];
-    var group = Math.floor(value / baseHues.length);
-    var hue = (baseHues[value % baseHues.length] + group * 23.61803398875) % 360;
-    var saturation = 28 + ((value * 7) % 9);
-    var lightness = 46 + ((value * 11) % 13);
+    var goldenAngle = 137.50776405003785;
+    var hue = (18 + value * goldenAngle) % 360;
+    var saturationSteps = [46, 40, 44, 38, 48];
+    var lightnessSteps = [49, 45, 53, 47, 51, 43];
+    var saturation = saturationSteps[value % saturationSteps.length];
+    var lightness = lightnessSteps[Math.floor(value / saturationSteps.length) % lightnessSteps.length];
     return _chartHslToHex(hue, saturation, lightness);
 }
 
