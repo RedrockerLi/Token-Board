@@ -136,8 +136,7 @@ def _import_software(pdb, software: dict, stop_event=None,
                     if pdb._insert_agent_usage_row(
                             conn, software_id, event.model, event.prompt_tokens,
                             event.completion_tokens, event.cache_read_tokens,
-                            event.total_tokens, event.requested_at, event.event_id,
-                            event.project, event.session_id):
+                            event.total_tokens, event.requested_at, event.event_id):
                         file_inserted += 1
                 if stable and not parsed.skipped:
                     states[state_key] = {

@@ -116,17 +116,19 @@ class ProxyRoutingMixin:
 
         A pending V1 event lets SQLite select the current write-time price and FX.  The
         event_id UNIQUE constraint makes INSERT OR IGNORE idempotent across
-        idempotent across crashes/restarts.  `requested_at` must be a SQLite UTC
-        timestamp "YYYY-MM-DD HH:MM:SS".  Returns True when a row was inserted.
+        crashes/restarts.  `requested_at` must be a SQLite UTC timestamp
+        "YYYY-MM-DD HH:MM:SS".  The legacy ``project`` and ``session_id`` arguments
+        are accepted for caller compatibility but are intentionally not persisted.
+        Returns True when a row was inserted.
         """
         cur = conn.execute(
             "INSERT OR IGNORE INTO request_log"
             "(event_id,source_kind,account_id,agent_software_id,model,prompt_tokens,completion_tokens,"
             "cache_read_tokens,total_tokens,equivalent_cost,billed_usage_cost,"
-            "is_streaming,status_code,duration_ms,requested_at,pricing_status,project,session_id) "
-            "VALUES(?,'import',?,?,?, ?,?,?,?,0,0,0,200,0,?,'pending',?,?)",
+            "is_streaming,status_code,duration_ms,requested_at,pricing_status) "
+            "VALUES(?,'import',?,?,?, ?,?,?,?,0,0,0,200,0,?,'pending')",
             (event_id, software_id, software_id, model, int(prompt_tokens), int(completion_tokens),
-             int(cache_read_tokens), int(total_tokens), requested_at, project, session_id),
+             int(cache_read_tokens), int(total_tokens), requested_at),
         )
         return cur.rowcount > 0
 

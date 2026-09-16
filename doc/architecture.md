@@ -30,7 +30,7 @@ Token Board 由三个进程边界组成，共享同一份版本化数据库 sche
 
 schema 的单一来源是 `schema/` 目录下的版本化 SQL 与 transition，见
 [database-migrations.md](database-migrations.md)。历史 V1 tip 是 Token Board V1.21、
-Dashboard V1.7；当前运行 tip 是 Token Board V2.2、Dashboard V2.1，baseline 位于各自
+Dashboard V1.7；当前运行 tip 是 Token Board V2.3、Dashboard V2.1，baseline 位于各自
 `v1/1-0_baseline.sql`，V0 文件按原内容归档在各自 `v0/`。所有生产升级由 Python 的
 `app.db.schema_upgrade` 负责；C++ 只校验已准备好的 Proxy V2 数据库，不读取 SQL、不执行迁移。
 
@@ -75,7 +75,7 @@ Dashboard V1.7；当前运行 tip 是 Token Board V2.2、Dashboard V2.1，baseli
 
 Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查。C++ 代理打开
 数据库时只验证 `schema_version` 与 `PRAGMA user_version` 一致，并要求 Proxy
-运行时使用的精确 schema 为当前 Token Board V2.2；不满足时直接退出并提示先运行匹配版本的 Python
+运行时使用的精确 schema 为当前 Token Board V2.3；不满足时直接退出并提示先运行匹配版本的 Python
 升级边界。C++ 的 `--schema-dir` 仅为旧启动器保留，不参与升级。
 
 ## 数据流
@@ -84,7 +84,7 @@ Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查�
 
 看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。代理和智能体用量都按日×统一身份×模型批量导出到 Dashboard V2.1 的 `daily_usage`；智能体订阅周期费用在物化时按当日有效绑定直接归属 Agent，写入 `monthly_recurring_costs`，再以云端权威模型同步到 WebDAV。
 
-智能体用量由 `token-maintenance` 内的 importer worker 采集。服务启动立即执行一次，之后每 1800 秒执行一次；前端页面加载时通过 Unix datagram socket 异步唤醒同一个 worker。worker 串行扫描已登记的软件日志并写入 `token-board.db/request_log`，因此不会因定时任务和浏览器刷新并发扫描而重复计量。`project` 与 `session_id` 仅作为本机数据库字段保存。
+智能体用量由 `token-maintenance` 内的 importer worker 采集。服务启动立即执行一次，之后每 1800 秒执行一次；前端页面加载时通过 Unix datagram socket 异步唤醒同一个 worker。worker 串行扫描已登记的软件日志并写入 `token-board.db/request_log`，因此不会因定时任务和浏览器刷新并发扫描而重复计量。`project` 与 `session_id` 可在 adapter 解析期间短暂存在，但不再作为数据库字段保存。
 
 `dashboard.db` 是纯存档，V2.1 使用统一的 `accounts`、`daily_usage` 和 `monthly_recurring_costs`；`accounts.account_kind` 区分代理上游与智能体软件。它不保存价格表，也不承担重算配置价格的职责。V2.2 Agent 周期费用的导出事件按不可变的周期费用主键补发；V2.1 历史分摊仍按旧源键兼容读取，不按物化时间筛选。
 

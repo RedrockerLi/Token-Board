@@ -14,7 +14,12 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V2.2 当前增量
+## V2.3 当前增量
+
+V2.3 删除 `request_log.project` 与 `request_log.session_id`。Agent adapter 仍可在导入时
+读取这些值并用于内存中的事件解析和去重，但它们不再写入本机数据库，也不会进入导出数据。
+
+## V2.2 历史增量
 
 V2.2 保留 V1/V2.1 的身份、请求和高水位结构，并将 Agent 计费链固定为日粒度：订阅、实例和绑定
 使用 `valid_from`/`ends_on` 日期区间，价格使用 `(instance_id,effective_on)`，周期费用使用

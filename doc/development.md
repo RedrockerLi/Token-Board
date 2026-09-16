@@ -66,7 +66,7 @@ python3 scripts/mock_upstream.py --port 9100
 
 用量数据来自代理转发和已注册智能体软件:消费报告页点「导出数据」触发 `sync_dashboard`(见 [sync.md](sync.md)),把 `request_log`
 按 日×账户/软件(id)×模型 增量聚合写进 `dashboard.db`(纯存档,写时固化的费用直接入库,改价不回溯)。
-Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由 `token-maintenance` 的通用 importer 负责游标、幂等和写入 `request_log`；仪表板打开时通过本地 socket 异步唤醒导入。`project`、`session_id` 只写本机 proxy 请求日志,不作为 API 字段。
+Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由 `token-maintenance` 的通用 importer 负责游标、幂等和写入 `request_log`；仪表板打开时通过本地 socket 异步唤醒导入。`project`、`session_id` 只在导入过程的内存中使用,不作为数据库或 API 字段。
 
 ### Agent 用量 ref 基准
 

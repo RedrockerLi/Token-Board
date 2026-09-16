@@ -110,7 +110,7 @@
 | `/api/proxy/billing/daily-by-model` | GET | 近 `days` 天每日所有非聚合上游的输入/输出/缓存命中 Token 分解(堆叠柱状图用);`cost` 仅统计 `api` 类型实际费用 |
 | `/api/proxy/billing/recent-days` | GET | 近 `days` 天有数据的日期列表 |
 | `/api/proxy/billing/today-upstreams` | GET | 今日各真实上游的 真实/理论费用、token、请求数 |
-| `/api/proxy/logs` | GET | 简单分页请求日志(仅参数 `page`、`per_page`；`project` 与 `session_id` 不返回) |
+| `/api/proxy/logs` | GET | 简单分页请求日志(仅参数 `page`、`per_page`；不包含 `project` 与 `session_id`) |
 
 ### 导出与同步
 

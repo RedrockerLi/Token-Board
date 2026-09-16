@@ -46,6 +46,39 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertEqual(self._version(proxy), self._latest("token-board"))
         self.assertEqual(self._version(dashboard), self._latest("dashboard"))
 
+    def test_v23_removes_agent_request_context(self) -> None:
+        proxy = self.root / "data/token-board.db"
+        dashboard = self.root / "data/dashboard.db"
+        legacy_schema = self.root / "schema-v22"
+        shutil.copytree(self.root / "schema", legacy_schema)
+        (legacy_schema / "token-board/v2/2-3_remove_agent_request_context.sql").unlink()
+
+        ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
+        with sqlite3.connect(proxy) as conn:
+            columns = {row[1] for row in conn.execute(
+                "PRAGMA table_info(request_log)")}
+            self.assertIn("project", columns)
+            self.assertIn("session_id", columns)
+            conn.execute(
+                "INSERT INTO request_log"
+                "(event_id,source_kind,model,total_tokens,status_code,requested_at,"
+                "project,session_id) VALUES(?,?,?, ?,?,?,?,?)",
+                ("v23-context", "import", "context-model", 12, 200,
+                 "2026-08-13T01:00:00Z", "private-project", "private-session"),
+            )
+
+        ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
+        with sqlite3.connect(proxy) as conn:
+            columns = {row[1] for row in conn.execute(
+                "PRAGMA table_info(request_log)")}
+            self.assertNotIn("project", columns)
+            self.assertNotIn("session_id", columns)
+            self.assertEqual(conn.execute(
+                "SELECT model,total_tokens,status_code FROM request_log "
+                "WHERE event_id='v23-context'"
+            ).fetchone(), ("context-model", 12, 200))
+        self.assertEqual(self._version(proxy), (2, 3))
+
     def test_current_proxy_schema_treats_every_business_name_as_display_data(self) -> None:
         proxy = self.root / "data/token-board.db"
         dashboard = self.root / "data/dashboard.db"

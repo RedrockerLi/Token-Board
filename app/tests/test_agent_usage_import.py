@@ -95,6 +95,39 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         self.assertEqual(tuple(row), (
             "gpt-5.1-codex", 10, 20, 5, 35, "2026-08-13T01:00:00Z"))
 
+    def test_agent_context_is_not_persisted(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        software_id = self._create_software(database)
+        path = self._write_session("context.jsonl", ["placeholder"])
+        event = UsageEvent.from_buckets(
+            model="context-model", input_tokens=10, output_tokens=2,
+            requested_at="2026-08-13T01:00:00Z", event_id="codex:context",
+            project="private-project", session_id="private-session",
+        )
+
+        def parser(source_path, stop_event=None):
+            self.assertEqual(source_path, path)
+            return ParseBatch.from_events([event], 1)
+
+        self.assertEqual(import_once(
+            database, parser_overrides={"codex": parser}), 1)
+        self.assertTrue(database.insert_agent_usage(
+            software_id, "legacy-context", 1, 1, 0, 2,
+            "2026-08-13T01:01:00Z", "codex:legacy-context",
+            project="private-project", session_id="private-session"))
+        with sqlite3.connect(self.proxy_path) as conn:
+            columns = {row[1] for row in conn.execute(
+                "PRAGMA table_info(request_log)")}
+            row = conn.execute(
+                "SELECT model,prompt_tokens,completion_tokens,total_tokens "
+                "FROM request_log WHERE event_id='codex:context'"
+            ).fetchone()
+        self.assertNotIn("project", columns)
+        self.assertNotIn("session_id", columns)
+        self.assertEqual(row, ("context-model", 10, 2, 12))
+
     def test_skipped_batch_inserts_partial_events_but_preserves_cursor(self) -> None:
         from app.db.proxy_db import ProxyDatabase
 
@@ -149,11 +182,11 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
             with sqlite3.connect(self.proxy_path) as connection:
                 row = connection.execute(
                     "SELECT model,prompt_tokens,completion_tokens,"
-                    "cache_read_tokens,total_tokens,project "
+                    "cache_read_tokens,total_tokens "
                     "FROM request_log WHERE event_id LIKE 'opencode:%'"
                 ).fetchone()
             self.assertEqual(tuple(row),
-                             ("opencode-model", 10, 3, 5, 13, "project"))
+                             ("opencode-model", 10, 3, 5, 13))
 
     def test_fork_replay_history_is_not_counted_twice(self) -> None:
         from app.db.proxy_db import ProxyDatabase
