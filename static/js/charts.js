@@ -87,7 +87,14 @@ function initChart(domId) {
     if (!dom) return null;
     const existing = echarts.getInstanceByDom(dom);
     if (existing) existing.dispose();
-    const chart = echarts.init(dom, null, { renderer: 'svg' });
+    // ECharts-GL installs a global painter lifecycle hook that expects the
+    // canvas painter's `eachOtherLayer()` method.  It also runs for ordinary
+    // charts, so an SVG chart would fail during dispose() after echarts-gl is
+    // loaded.  Keep SVG when GL is unavailable, but use the compatible canvas
+    // painter whenever the optional 3D extension is active.
+    const renderer = typeof window !== 'undefined' &&
+        window.__tokenBoardEchartsGLLoaded ? 'canvas' : 'svg';
+    const chart = echarts.init(dom, null, { renderer: renderer });
     const ro = new ResizeObserver(function () { chart.resize(); });
     ro.observe(dom);
     // ECharts does not own external observers. Tie the observer to the chart's

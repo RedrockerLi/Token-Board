@@ -368,7 +368,15 @@ const Router = {
 
     /** Navigate to a hash. Called on page load and hashchange. */
     navigate(hash) {
-        this.navigation = this.navigation.then(() => this._navigate(hash));
+        // A page cleanup/init failure must not poison every future navigation.
+        // Recover the serialized queue before appending the next transition;
+        // the transition that failed still reports its own error to the
+        // console, while a later click gets a chance to run normally.
+        this.navigation = this.navigation
+            .catch((error) => {
+                console.error('Previous navigation failed:', error);
+            })
+            .then(() => this._navigate(hash));
         return this.navigation;
     },
 
@@ -392,7 +400,15 @@ const Router = {
         // Destroy previous page if needed
         if (this.currentPage && this.currentPage.destroyFn) {
             const fn = resolveFn(this.currentPage.destroyFn);
-            if (fn) fn();
+            if (fn) {
+                try {
+                    fn();
+                } catch (error) {
+                    // Teardown is best-effort. A broken cleanup callback must
+                    // not prevent the target page from becoming visible.
+                    console.error('Failed to destroy page:', error);
+                }
+            }
         }
 
         // Hide all containers

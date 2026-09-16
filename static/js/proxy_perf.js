@@ -460,7 +460,15 @@ function destroyPerfPage() {
     }
     // Dispose chart instances to avoid memory leaks
     [chartLatency, chartSpeed, chartRPM, chartUpstreamSuccess, chartModelLatency, chartModelSpeed].forEach(function(c) {
-        if (c) { c.dispose(); }
+        if (!c) return;
+        try {
+            c.dispose();
+        } catch (error) {
+            // Page teardown must not reject the router queue because a third-
+            // party chart extension has a cleanup incompatibility. The chart
+            // DOM is removed below and the failure is retained for diagnosis.
+            console.warn('Failed to dispose performance chart:', error);
+        }
     });
     chartLatency = chartSpeed = chartRPM = chartUpstreamSuccess = chartModelLatency = chartModelSpeed = null;
 
