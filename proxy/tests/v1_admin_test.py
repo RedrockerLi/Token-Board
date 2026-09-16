@@ -130,7 +130,9 @@ def main() -> None:
     second_materialize = billing_module.materialize_period_charges(str(db_path))
     first_agent_materialize = billing_module.materialize_agent_subscription_charges(str(db_path))
     assert first_materialize >= 0
-    assert first_agent_materialize >= 1
+    # Agent creation materializes the current charge in the same transaction;
+    # a later worker pass must therefore be idempotent.
+    assert first_agent_materialize == 0
     assert second_materialize >= 0
     with sqlite3.connect(db_path) as conn:
         charge = conn.execute(

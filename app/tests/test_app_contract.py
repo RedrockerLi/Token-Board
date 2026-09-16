@@ -8,6 +8,7 @@ from unittest.mock import patch
 from app import create_app
 from app.db.dashboard_db import DashboardDatabase
 from app.db.proxy_db import ProxyDatabase
+from app.db.schema_upgrade.engine_core import latest_version
 from app.core.time import parse_runtime_timestamp
 
 from app.tests.support import AppDatabaseTestCase
@@ -59,9 +60,10 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertEqual(account["is_aggregate"], 0)
 
         with sqlite3.connect(self.proxy_path) as conn:
+            expected = latest_version(self.root / "schema", "token-board", 2)
             self.assertEqual(conn.execute(
                 "SELECT major,minor FROM schema_version WHERE id=1"
-            ).fetchone(), (2, 2))
+            ).fetchone(), (expected.major, expected.minor))
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM accounts WHERE id=?", (account_id,)
             ).fetchone()[0], 1)

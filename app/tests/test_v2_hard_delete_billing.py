@@ -11,6 +11,7 @@ from app.db.dashboard_db import DashboardDatabase
 from app.db.migrations import SchemaVersion, apply_sql_migrations
 from app.db.proxy.billing import materialize_period_charges
 from app.db.schema_upgrade import ensure_local_databases
+from app.db.schema_upgrade.engine_core import latest_version
 from app.services.billing_report import actual_cost
 
 from app.tests.support import AppDatabaseTestCase
@@ -36,7 +37,9 @@ class V2MigrationTest(unittest.TestCase):
             self.assertFalse(second["dashboard"].upgraded)
 
             with sqlite3.connect(proxy) as conn:
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_002)
+                expected = latest_version(root / "schema", "token-board", 2)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                                 expected.user_version)
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
                 self.assertNotIn("lifecycle_state", columns)
                 self.assertNotIn("deleted_at", columns)

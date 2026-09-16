@@ -12,6 +12,7 @@ from app.db.migrations import SchemaVersion, apply_sql_migrations, migrate
 from app.db.proxy_db import ProxyDatabase
 from app.db.schema_upgrade import ensure_local_databases
 from app.db.schema_upgrade.coordinator import inspect_version
+from app.db.schema_upgrade.engine_core import latest_version
 from app.services.sync.settings import SyncConfig, save_sync_config
 from app.services.sync.webdav import (
     ArtifactTransaction,
@@ -298,9 +299,10 @@ class SyncContractTest(unittest.TestCase):
                 self.assertFalse(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='pricing_rates'"
                 ).fetchone())
+                expected = latest_version(Path(schema), "token-board", 2)
                 self.assertEqual(conn.execute(
                     "SELECT major,minor FROM schema_version WHERE id=1"
-                    ).fetchone(), (2, 2))
+                    ).fetchone(), (expected.major, expected.minor))
             return state["artifact"]
 
         try:

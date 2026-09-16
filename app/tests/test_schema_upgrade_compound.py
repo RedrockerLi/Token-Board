@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from app.db.migrations import SchemaVersion, apply_sql_migrations
 from app.db.schema_upgrade import ensure_local_databases
+from app.db.schema_upgrade.engine_core import latest_version
 
 
 class CompoundSchemaUpgradeTest(unittest.TestCase):
@@ -56,7 +57,9 @@ class CompoundSchemaUpgradeTest(unittest.TestCase):
                 "WHERE transition_id='v1-agent-identity'"
             ).fetchone()
         with sqlite3.connect(self.proxy) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20002)
+            expected = latest_version(self.root / "schema", "token-board", 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                             expected.user_version)
             proxy_marker = conn.execute(
                 "SELECT checksum,generation_id FROM schema_transitions "
                 "WHERE transition_id='v1-agent-identity'"
