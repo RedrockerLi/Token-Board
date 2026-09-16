@@ -3,7 +3,7 @@
 from collections import defaultdict
 
 from app.routes.dashboard.common import (
-    _store, api_error, bp, current_app, jsonify, request,
+    _store, api_error, bp, jsonify, request,
 )
 
 @bp.route("/api/daily")

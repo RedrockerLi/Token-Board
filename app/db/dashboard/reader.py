@@ -104,8 +104,8 @@ class DashboardReaderMixin:
             if visible and account_name and account_name != "unknown":
                 names.add(account_name)
             # A recurring charge may exist in a month with no metered
-            # traffic. Keep that month visible to /api/monthly instead of
-            # deriving the calendar solely from daily_usage rows.
+            # traffic. Keep that month visible in the dashboard selectors
+            # instead of deriving available months solely from daily_usage.
             year, month = _parse_date(str(row["period_start"])[:10])
             if year:
                 months_set.add((year, month))

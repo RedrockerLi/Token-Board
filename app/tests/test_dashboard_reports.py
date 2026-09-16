@@ -105,7 +105,7 @@ class DashboardReportsTest(AppDatabaseTestCase):
         self.app.config["DATA_STORE"].load()
         self.client = self.app.test_client()
 
-    def test_summary_and_monthly_use_canonical_ledger(self) -> None:
+    def test_summary_uses_canonical_ledger(self) -> None:
         summary = self.client.get("/api/summary").get_json()
         # V2 total_cost is the actual ledger: metered usage (3.0 + 2.0) plus
         # the finalized recurring charge (12.0). Virtual plan usage remains
@@ -126,14 +126,6 @@ class DashboardReportsTest(AppDatabaseTestCase):
         self.assertAlmostEqual(
             summary["model_breakdown"]["plan-model"]["theoretical_cost"], 9.0)
         self.assertAlmostEqual(summary["model_breakdown"]["plan-model"]["cost"], 0.0)
-
-        monthly = self.client.get("/api/monthly").get_json()
-        aug = next(m for m in monthly if m["year"] == 2026 and m["month"] == 8)
-        # `cost` keeps the historical api-equivalent meaning (7+4+9), while the
-        # metered bill plus recurring subscription is `actual_cost`.
-        self.assertAlmostEqual(aug["cost"], 20.0)
-        self.assertAlmostEqual(aug["theoretical_cost"], 20.0)
-        self.assertAlmostEqual(aug["actual_cost"], 17.0)
 
     def test_daily_and_breakdown_keep_costs_separate(self) -> None:
         daily = self.client.get("/api/daily?year=2026&month=8").get_json()
@@ -173,10 +165,6 @@ class DashboardReportsTest(AppDatabaseTestCase):
 
     def test_frozen_dashboard_cost_does_not_change_after_live_delete(self) -> None:
         before = self.client.get("/api/summary").get_json()
-        before_month = next(
-            row for row in self.client.get("/api/monthly").get_json()
-            if row["year"] == 2026 and row["month"] == 8
-        )
 
         database = self.proxy_database()
         database.update_plan_billing_config({"cancellation_mode": "immediate"})
@@ -187,13 +175,8 @@ class DashboardReportsTest(AppDatabaseTestCase):
         # frozen amount remains the same immutable historical fact.
         self.app.config["DATA_STORE"].load()
         after = self.client.get("/api/summary").get_json()
-        after_month = next(
-            row for row in self.client.get("/api/monthly").get_json()
-            if row["year"] == 2026 and row["month"] == 8
-        )
         self.assertAlmostEqual(after["recurring_cost"], before["recurring_cost"])
         self.assertAlmostEqual(after["actual_cost"], before["actual_cost"])
-        self.assertAlmostEqual(after_month["actual_cost"], before_month["actual_cost"])
 
     def test_all_public_facades_import(self) -> None:
         from app.db.dashboard_db import DashboardDatabase

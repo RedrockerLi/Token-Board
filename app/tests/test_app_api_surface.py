@@ -28,15 +28,24 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
             "/api/proxy/perf/latency", "/api/proxy/perf/speed",
             "/api/proxy/perf/throughput", "/api/proxy/perf/models",
             "/api/proxy/perf/realtime", "/api/proxy/sync/config",
-            "/api/summary", "/api/monthly", "/api/daily?year=2026&month=8",
-            "/api/model_breakdown", "/api/token_types_by_month?year=2026&month=8",
-            "/api/api_key_names", "/api/models", "/api/token_types",
+            "/api/summary", "/api/daily?year=2026&month=8",
+            "/api/token_types",
         ]
         for path in paths:
             response = self.client.get(path)
             self.assertEqual(response.status_code, 200,
                              f"{path}: {response.get_data(as_text=True)}")
             self.assertIsNotNone(response.get_json(), path)
+
+    def test_removed_dashboard_reports_are_not_registered(self) -> None:
+        for path in (
+            "/api/monthly",
+            "/api/model_breakdown",
+            "/api/token_types_by_month?year=2026&month=8",
+            "/api/api_key_names",
+            "/api/models",
+        ):
+            self.assertEqual(self.client.get(path).status_code, 404, path)
 
     def test_realtime_exposes_runtime_health_without_proxy_process(self) -> None:
         response = self.client.get("/api/proxy/perf/realtime")

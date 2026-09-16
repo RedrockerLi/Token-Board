@@ -25,14 +25,9 @@
 |------|------|------|
 | `/` | GET | 渲染 `templates/index.html`(SPA) |
 | `/api/refresh` | GET | 重新扫描数据目录/重载数据库 |
-| `/api/api_key_names` | GET | 用户(api_key_name)列表,按最近使用月份与当月用量排序 |
-| `/api/models` | GET | 模型列表 |
 | `/api/summary` | GET | 全量汇总:各 token 类型总量、请求数、费用、模型分解、plan 经济账 |
-| `/api/monthly` | GET | 按月聚合(token、请求、费用、按模型) |
 | `/api/daily` | GET | 指定月份的每日明细(含按模型) |
 | `/api/token_types` | GET | Token 类型分布(输出/缓存命中/缓存未命中) |
-| `/api/model_breakdown` | GET | 按模型分解 |
-| `/api/token_types_by_month` | GET | 指定月份的 Token 类型分布 |
 
 公共查询参数:`api_key_name`(按用户筛选,费用按 token 占比分摊)、`model`、`platform`、`year`、`month`。
 
