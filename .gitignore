@@ -1,5 +1,6 @@
 .vscode
 __pycache__
+AGENTS.md
 
 # Runtime data — databases, imported CSVs, migration lock files, backups
 data/
