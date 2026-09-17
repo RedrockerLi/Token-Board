@@ -464,6 +464,110 @@ function _calendarTooltip(day, modelEntries) {
     return html;
 }
 
+var CALENDAR_FRAME_STYLE = {
+    // The requested 85%–90% range is represented by its midpoint so the
+    // calendar keeps one deterministic size in both month and year views.
+    barSizeRatio: 0.88,
+    outerColor: 'rgba(20,20,20,0.45)',
+    outerWidth: 0.8,
+    innerColor: 'rgba(20,20,20,0.22)',
+    innerWidth: 0.4,
+};
+
+function _calendarFrameLoop(x, y, halfWidth, halfDepth, height) {
+    var points = [
+        [x - halfWidth, y - halfDepth, height],
+        [x + halfWidth, y - halfDepth, height],
+        [x + halfWidth, y + halfDepth, height],
+        [x - halfWidth, y + halfDepth, height],
+    ];
+    points.push(points[0].slice());
+    return points;
+}
+
+function _calendarCubeOutline(x, y, halfWidth, halfDepth, height) {
+    var bottom = _calendarFrameLoop(x, y, halfWidth, halfDepth, 0);
+    var top = _calendarFrameLoop(x, y, halfWidth, halfDepth, height);
+
+    // One polyline draws both face perimeters and all four vertical edges.
+    // Repeated perimeter points are intentional: they let line3D move from
+    // one edge to the next without introducing diagonal connector lines.
+    return [
+        top[0], top[1], top[2], top[3], top[4],
+        bottom[0], bottom[1], bottom[2], bottom[3], bottom[4],
+        bottom[1], top[1], top[2], bottom[2],
+        bottom[3], top[3], top[4], bottom[0],
+    ];
+}
+
+function _buildCalendarFrameSeries(days, entries, layout, barSize, gridWidth, gridDepth) {
+    var xCategorySize = gridWidth / Math.max(layout.xLabels.length, 1);
+    var yCategorySize = gridDepth / Math.max(layout.zLabels.length, 1);
+    // barSize is expressed in grid coordinates while line3D data uses the
+    // category index, so convert the frame's half-size back to data units.
+    var halfWidth = barSize[0] / xCategorySize / 2;
+    var halfDepth = barSize[1] / yCategorySize / 2;
+    var series = [];
+
+    (days || []).forEach(function (day) {
+        var coordinate = layout.coordinates[day.date];
+        if (!coordinate) return;
+
+        var boundaries = [];
+        var total = 0;
+        (entries || []).forEach(function (entry) {
+            var tokens = _calendarModelTokens(day, entry);
+            if (tokens <= 0) return;
+            total += tokens;
+            boundaries.push(total);
+        });
+        if (total <= 0) return;
+
+        series.push({
+            type: 'line3D',
+            data: _calendarCubeOutline(
+                coordinate.x, coordinate.y, halfWidth, halfDepth, total),
+            lineStyle: {
+                color: CALENDAR_FRAME_STYLE.outerColor,
+                width: CALENDAR_FRAME_STYLE.outerWidth,
+                opacity: 1,
+            },
+            silent: true,
+            label: { show: false },
+            tooltip: { show: false },
+        });
+
+        // The top of the last segment is already part of the outer contour;
+        // only the intermediate stack heights receive the lighter boundary.
+        // Keep all of a day's internal loops in one polyline. The short
+        // corner-to-corner connectors are vertical and stay on the outer
+        // edge, avoiding thousands of one-line series in year view.
+        var innerData = [];
+        boundaries.slice(0, -1).forEach(function (height, index) {
+            var loop = _calendarFrameLoop(
+                coordinate.x, coordinate.y, halfWidth, halfDepth, height);
+            if (index > 0) innerData.push(loop[0].slice());
+            innerData = innerData.concat(loop);
+        });
+        if (innerData.length) {
+            series.push({
+                type: 'line3D',
+                data: innerData,
+                lineStyle: {
+                    color: CALENDAR_FRAME_STYLE.innerColor,
+                    width: CALENDAR_FRAME_STYLE.innerWidth,
+                    opacity: 1,
+                },
+                silent: true,
+                label: { show: false },
+                tooltip: { show: false },
+            });
+        }
+    });
+
+    return series;
+}
+
 /**
  * Render the interactive stacked WebGL calendar.
  *
@@ -503,11 +607,11 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
     var gridWidth = options.mode === 'year' ? 270 : 150;
     var gridDepth = options.mode === 'year' ? 80 : 112;
     // bar3D's barSize is expressed in grid coordinates, not as a fraction of
-    // a category band. Slightly overlap the calculated cell to eliminate
-    // sub-pixel seams between adjacent calendar bars.
+    // a category band. Keep the bars within the cell so the frame has room to
+    // read around each column.
     var barSize = [
-        gridWidth / Math.max(layout.xLabels.length, 1) * 1.02,
-        gridDepth / Math.max(layout.zLabels.length, 1) * 1.02,
+        gridWidth / Math.max(layout.xLabels.length, 1) * CALENDAR_FRAME_STYLE.barSizeRatio,
+        gridDepth / Math.max(layout.zLabels.length, 1) * CALENDAR_FRAME_STYLE.barSizeRatio,
     ];
     var chart;
 
@@ -531,8 +635,6 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
                     itemStyle: {
                         color: entry.color,
                         opacity: tokens > 0 ? 1 : 0,
-                        borderColor: 'rgba(255,253,249,0.35)',
-                        borderWidth: tokens > 0 ? 0.4 : 0,
                     },
                 });
             });
@@ -611,17 +713,40 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
                 },
             },
             xAxis3D: {
-                type: 'category',
+                // Use numeric axes so the line3D frames can sit on the
+                // fractional edges of each category cell. The formatter
+                // preserves the original calendar labels.
+                type: 'value',
                 name: options.mode === 'year' ? '周' : '星期',
-                data: layout.xLabels,
-                axisLabel: { color: '#716B65', fontSize: options.mode === 'year' ? 9 : 11 },
+                min: -0.5,
+                max: Math.max(layout.xLabels.length - 1, 0) + 0.5,
+                interval: 1,
+                axisLabel: {
+                    color: '#716B65',
+                    fontSize: options.mode === 'year' ? 9 : 11,
+                    formatter: function (value) {
+                        var index = Math.round(Number(value));
+                        return Math.abs(Number(value) - index) < 0.001 &&
+                            layout.xLabels[index] != null ? layout.xLabels[index] : '';
+                    },
+                },
                 nameTextStyle: { color: '#716B65', fontSize: 11 },
             },
             yAxis3D: {
-                type: 'category',
+                type: 'value',
                 name: options.mode === 'year' ? '星期' : '周',
-                data: layout.zLabels,
-                axisLabel: { color: '#716B65', fontSize: 10 },
+                min: -0.5,
+                max: Math.max(layout.zLabels.length - 1, 0) + 0.5,
+                interval: 1,
+                axisLabel: {
+                    color: '#716B65',
+                    fontSize: 10,
+                    formatter: function (value) {
+                        var index = Math.round(Number(value));
+                        return Math.abs(Number(value) - index) < 0.001 &&
+                            layout.zLabels[index] != null ? layout.zLabels[index] : '';
+                    },
+                },
                 nameTextStyle: { color: '#716B65', fontSize: 11 },
             },
             zAxis3D: {
@@ -642,7 +767,8 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
                 splitLine: { show: false },
                 axisPointer: { show: false },
             },
-            series: buildSeries(),
+            series: buildSeries().concat(_buildCalendarFrameSeries(
+                normalizedDays, activeEntries, layout, barSize, gridWidth, gridDepth)),
         });
         chart.resize();
 
