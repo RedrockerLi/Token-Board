@@ -227,17 +227,18 @@ class ProxyPerformanceMixin:
     def get_perf_realtime(self, window_seconds: int = 60) -> dict:
         """Real-time metrics: current RPM estimate and live concurrency.
 
-        RPM is estimated from request_log.  Live concurrency comes from the
-        proxy's process-local counter so request forwarding never writes an
-        observability row before contacting the upstream.  An unreachable
-        proxy is reported as unavailable rather than the misleading zero from
-        the legacy table.
+        RPM is estimated from proxy request_log rows only.  Live concurrency
+        comes from the proxy's process-local counter so request forwarding
+        never writes an observability row before contacting the upstream.  An
+        unreachable proxy is reported as unavailable rather than the
+        misleading zero from the legacy table.
         """
         conn = self._connect()
         try:
             recent_count = conn.execute(
                 "SELECT COUNT(*) FROM request_log "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' seconds')",
+                "WHERE source_kind='proxy' "
+                "  AND requested_at >= datetime('now', '-' || ? || ' seconds')",
                 (str(window_seconds),)
             ).fetchone()[0]
 

@@ -366,6 +366,27 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertTrue(finished.wait(0.1))
         self.assertFalse(thread.is_alive())
 
+    def test_perf_realtime_ignores_imported_usage(self) -> None:
+        db = self.proxy_database()
+        with sqlite3.connect(self.proxy_path) as conn:
+            for event_id, source_kind in (
+                ("rpm-proxy-1", "proxy"),
+                ("rpm-proxy-2", "proxy"),
+                ("rpm-import-1", "import"),
+                ("rpm-import-2", "import"),
+            ):
+                conn.execute(
+                    "INSERT INTO request_log(event_id,source_kind,model,status_code,"
+                    "requested_at,pricing_status) VALUES(?,?,?,200,"
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now'),'frozen')",
+                    (event_id, source_kind, "rpm-model"),
+                )
+            conn.commit()
+
+        realtime = db.get_perf_realtime()
+        self.assertEqual(realtime["recent_requests"], 2)
+        self.assertEqual(realtime["rpm"], 2.0)
+
     def test_time_conventions_are_iso_only(self) -> None:
         parsed = parse_runtime_timestamp("2026-08-04T16:37:44Z")
         self.assertEqual(parsed.year, 2026)
