@@ -230,7 +230,11 @@ class Handler(BaseHTTPRequestHandler):
         })
 
         stream = bool(req.get("stream")) and status == 200
-        model = req.get("model", "mock-model")
+        request_model = req.get("model", "mock-model")
+        response_model = (
+            None if req.get("mock_omit_model")
+            else req.get("mock_response_model", request_model)
+        )
 
         # Explicit status override (error-path testing) wins; otherwise the
         # strict chat-completions validation behaves like the real upstream.
@@ -265,10 +269,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            self._emit_stream(fmt, model, req)
+            self._emit_stream(fmt, response_model, req)
             return
 
-        body = self._nonstream_body(fmt, model, req)
+        body = self._nonstream_body(fmt, response_model, req)
         payload = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -366,22 +370,33 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def _openai_chunk(self, cid, model, delta, finish_reason=None):
-        return {
+        chunk = {
             "id": cid, "object": "chat.completion.chunk", "created": 1,
-            "model": model,
             "choices": [{
                 "index": 0, "finish_reason": finish_reason, "logprobs": None,
                 "delta": delta,
             }],
             "usage": None,
         }
+        if model is not None:
+            chunk["model"] = model
+        return chunk
 
     def _stream_chunks(self, fmt, model, req=None):
         req = req or {}
         if fmt == "anthropic":
-            usage = '{"input_tokens": 11, "output_tokens": 7, "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2}'
+            message = {
+                "id": "m1", "type": "message", "role": "assistant",
+                "content": [],
+                "usage": {"input_tokens": 11, "output_tokens": 7,
+                           "cache_read_input_tokens": 3,
+                           "cache_creation_input_tokens": 2},
+            }
+            if model is not None:
+                message["model"] = model
             return [
-                f'event: message_start\ndata: {{"type":"message_start","message":{{"id":"m1","type":"message","role":"assistant","model":"{model}","content":[],"usage":{usage}}}}}\n\n',
+                "event: message_start\ndata: " + json.dumps(
+                    {"type": "message_start", "message": message}) + "\n\n",
                 f'event: content_block_start\ndata: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}\n\n',
                 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}\n\n',
                 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}\n\n',
@@ -390,8 +405,9 @@ class Handler(BaseHTTPRequestHandler):
                 'event: message_stop\ndata: {"type":"message_stop"}\n\n',
             ]
         if fmt == "responses":
+            response_model = "" if model is None else model
             return [
-                'data: {"type":"response.created","response":{"id":"resp1","object":"response","status":"in_progress","model":"' + model + '"}}\n\n',
+                'data: {"type":"response.created","response":{"id":"resp1","object":"response","status":"in_progress","model":"' + response_model + '"}}\n\n',
                 'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"i1","type":"message","role":"assistant","content":[]}}\n\n',
                 'data: {"type":"response.content_part.added","item_id":"i1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}\n\n',
                 'data: {"type":"response.output_text.delta","item_id":"i1","output_index":0,"content_index":0,"delta":"Hel"}\n\n',
@@ -399,7 +415,7 @@ class Handler(BaseHTTPRequestHandler):
                 'data: {"type":"response.output_text.done","item_id":"i1","output_index":0,"content_index":0,"text":"Hello"}\n\n',
                 'data: {"type":"response.content_part.done","item_id":"i1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Hello","annotations":[]}}\n\n',
                 'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"i1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[]}]}}\n\n',
-                'data: {"type":"response.completed","response":{"id":"resp1","object":"response","status":"completed","model":"' + model + '","output":[{"id":"i1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18,"input_tokens_details":{"cached_tokens":3}}}}\n\n',
+                'data: {"type":"response.completed","response":{"id":"resp1","object":"response","status":"completed","model":"' + response_model + '","output":[{"id":"i1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello","annotations":[]}]}],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18,"input_tokens_details":{"cached_tokens":3}}}}\n\n',
             ]
 
         # ── OpenAI chat completions ──────────────────────────────────────
@@ -409,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
         # name "mock-tool" (survives proxy format conversion) or the
         # "mock_tool" body flag.  Prefixed with reasoning deltas, matching the
         # real DeepSeek-family backend's thinking-before-tool pattern.
-        if req.get("mock_tool") or model == "mock-tool":
+        if req.get("mock_tool") or req.get("model") == "mock-tool":
             chunks = [
                 json.dumps(self._openai_chunk(
                     cid, model,
@@ -438,12 +454,21 @@ class Handler(BaseHTTPRequestHandler):
             return ["data: " + c + "\n\n" for c in chunks] + ["data: [DONE]\n\n"]
 
         if req.get("mock_simple_stream"):
-            return [
-                'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\n\n',
-                'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}\n\n',
-                'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
-                'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"' + model + '","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n',
-                'data: [DONE]\n\n',
+            chunks = [
+                self._openai_chunk("c1", model,
+                                   {"role": "assistant", "content": "Hel"}),
+                self._openai_chunk("c1", model, {"content": "lo"}),
+                self._openai_chunk("c1", model, {}, "stop"),
+                {"id": "c1", "object": "chat.completion.chunk", "created": 1,
+                 "choices": [], "usage": {"prompt_tokens": 11,
+                                            "completion_tokens": 7,
+                                            "total_tokens": 18}},
+            ]
+            if model is not None:
+                for chunk in chunks:
+                    chunk["model"] = model
+            return ["data: " + json.dumps(c) + "\n\n" for c in chunks] + [
+                "data: [DONE]\n\n"
             ]
 
         long_frames = int(req.get("mock_long_stream_frames", 0) or 0)
@@ -487,9 +512,8 @@ class Handler(BaseHTTPRequestHandler):
     def _nonstream_body(self, fmt, model, req):
         usage_extra = req.get("mock_usage_extra", {})
         if fmt == "anthropic":
-            return {
+            body = {
                 "id": "msg_1", "type": "message", "role": "assistant",
-                "model": model,
                 "content": [{"type": "text", "text": "Hello"}],
                 "stop_reason": "end_turn", "stop_sequence": None,
                 "usage": {
@@ -498,10 +522,13 @@ class Handler(BaseHTTPRequestHandler):
                     **usage_extra,
                 },
             }
+            if model is not None:
+                body["model"] = model
+            return body
         if fmt == "responses":
-            return {
+            body = {
                 "id": "resp_1", "object": "response", "created_at": 1,
-                "status": "completed", "model": model,
+                "status": "completed",
                 "output": [
                     {"id": "i1", "type": "message", "status": "completed",
                      "role": "assistant",
@@ -512,10 +539,12 @@ class Handler(BaseHTTPRequestHandler):
                     "input_tokens_details": {"cached_tokens": 3}, **usage_extra,
                 },
             }
+            if model is not None:
+                body["model"] = model
+            return body
         # OpenAI chat completions, non-streaming.
-        return {
+        body = {
             "id": "chatcmpl-1", "object": "chat.completion", "created": 1,
-            "model": model,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": "Hello"},
@@ -524,6 +553,9 @@ class Handler(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18,
                       **usage_extra},
         }
+        if model is not None:
+            body["model"] = model
+        return body
 
     def log_message(self, fmt, *args):
         pass  # silence default stderr logging

@@ -267,6 +267,14 @@ add_test(
             ${CMAKE_SOURCE_DIR}/..
 )
 add_test(
+    NAME model_accounting
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/model_accounting_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
     NAME responses_forwarding
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/responses_forwarding_test.py
@@ -406,7 +414,7 @@ set_tests_properties(format_conversion session_affinity endpoint_policy source_s
     PROPERTIES LABELS "unit")
 set_tests_properties(upstream_client PROPERTIES LABELS "integration")
 set_tests_properties(
-    proxy_forwarding v1_routing responses_forwarding v1_admin cooldown_discrimination
+    proxy_forwarding v1_routing model_accounting responses_forwarding v1_admin cooldown_discrimination
     fallback_matrix cooldown_probe error_shape
     PROPERTIES LABELS "integration"
 )
@@ -424,7 +432,7 @@ set_tests_properties(stream_rss_100 accounting_soak_60s
 # on whichever interpreter happens to be launched from the source tree.
 set_tests_properties(
     schema_version source_size refactor_boundaries pricing_equivalence
-    proxy_forwarding v1_routing responses_forwarding v1_admin v1_sync
+    proxy_forwarding v1_routing model_accounting responses_forwarding v1_admin v1_sync
     transition_recovery queue_saturation accounting_recovery stream_rss_100
     accounting_soak_60s perf_stress perf_gate_1000_64 cooldown_discrimination
     fallback_matrix cooldown_probe error_shape

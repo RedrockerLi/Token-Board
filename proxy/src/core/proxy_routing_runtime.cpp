@@ -172,6 +172,18 @@ UsageAccounting usage_from_ir(const ir::Usage &u,
     return UsageAccounting::from_ir(u, upstream_fmt);
 }
 
+std::string model_for_success_log(const std::string &response_model,
+                                  const UpstreamCandidate &candidate) {
+    return response_model.empty() ? candidate.upstream_model() : response_model;
+}
+
+std::string model_from_stream_event(const ir::StreamEvent &event) {
+    if (event.type != ir::StreamEventType::MessageStart ||
+        !event.extra.contains("model") || !event.extra["model"].is_string())
+        return {};
+    return event.extra["model"].get<std::string>();
+}
+
 /// Check whether the client disconnected while we waited for upstream.
 bool client_disconnected(const httplib::Request &req,
                                 std::uint64_t inflight_id,

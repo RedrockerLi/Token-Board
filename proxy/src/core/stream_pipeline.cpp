@@ -40,9 +40,8 @@ void ProxyServer::handle_streaming(
             std::chrono::steady_clock::time_point first_semantic_at, last_semantic_at;
             int upstream_semantic_ttft = -1;
             bool client_write_failed = false, terminal_error_forwarded = false;
-            bool source_terminal_seen = false; ir::Usage final_stream_usage;
-            json responses_terminal; fmt::SseFrameBuffer responses_state_sse;
-            AttemptExecutor attempt_executor(gate_);
+            bool source_terminal_seen = false; ir::Usage final_stream_usage; std::string final_stream_model;
+            json responses_terminal; fmt::SseFrameBuffer responses_state_sse; AttemptExecutor attempt_executor(gate_);
             std::unordered_map<std::string, std::string> converted_bodies;
             auto write_to_sink = [&](const std::string &data) -> bool {
                 if (data.empty()) return true;
@@ -189,7 +188,7 @@ void ProxyServer::handle_streaming(
                 bool attempt_has_stream_error = false;
                 json attempt_stream_error;
                 int attempt_stream_error_status = 502;
-                ir::Usage attempt_usage;
+                ir::Usage attempt_usage; std::string attempt_stream_model;
                 if (!passthrough) {
                     emitter = out_codec.make_stream_emitter(
                         response_context.get());
@@ -236,6 +235,8 @@ void ProxyServer::handle_streaming(
                     if (event.type == ir::StreamEventType::UsageEvent ||
                         event.type == ir::StreamEventType::MessageStart)
                         ir::usage_merge(attempt_usage, event.usage);
+                    if (const auto response_model = model_from_stream_event(event);
+                        !response_model.empty()) attempt_stream_model = response_model;
                     if (event.type == ir::StreamEventType::MessageFinish)
                         attempt_terminal_seen->store(true,
                                                      std::memory_order_release);
@@ -372,6 +373,7 @@ void ProxyServer::handle_streaming(
                                 attempt_first_semantic_at - attempt_started).count());
                     }
                     final_stream_usage = attempt_usage;
+                    final_stream_model = std::move(attempt_stream_model);
                     source_terminal_seen = attempt_terminal_seen->load(
                         std::memory_order_acquire);
                     return result;
@@ -417,7 +419,7 @@ void ProxyServer::handle_streaming(
                 auto usage = usage_from_ir(
                     final_stream_usage,
                     ir::parse_api_format(used->account().api_format));
-                usage.model = resolved_model;
+                usage.model = model_for_success_log(final_stream_model, *used);
                 const int proxy_ttft = first_semantic ? -1 : static_cast<int>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         first_semantic_at - t0).count());

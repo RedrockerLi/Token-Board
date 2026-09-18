@@ -163,6 +163,13 @@ std::optional<UsageAccounting> parse_usage_for_format(
     const std::string &api_format, const std::string &body);
 UsageAccounting usage_from_ir(const ir::Usage &usage,
                               ir::ApiFormat upstream_format);
+/// Select the model identity for a successful accounting event.  Prefer the
+/// model reported by the upstream response; when that metadata is absent,
+/// use the model actually sent to the successful upstream candidate.
+std::string model_for_success_log(
+    const std::string &response_model,
+    const UpstreamCandidate &candidate);
+std::string model_from_stream_event(const ir::StreamEvent &event);
 bool client_disconnected(const httplib::Request &request,
                          std::uint64_t inflight_id,
                          const std::string &model);

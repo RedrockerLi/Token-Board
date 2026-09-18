@@ -451,9 +451,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             auto usage = parse_usage_for_format(ir::to_string(used_upstream_fmt),
                                                 fwd.body);
             if (usage.has_value()) {
-                // Log the client-requested model, not the upstream-echoed one —
-                // consistent with converted, streaming and zero-usage paths.
-                usage->model = model;
+                // Prefer the model reported by the successful upstream.  A
+                // provider may omit it, so fall back to the model actually
+                // sent to the successful candidate (including route rewrites).
+                usage->model = model_for_success_log(usage->model, *used);
                 enqueue_log(used->account().id, ar.route.local_key_id,
                                      *usage, false, fwd.status_code,
                                      fwd.duration_ms, used->key_slot_id,
@@ -463,7 +464,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                                 "from non-streaming response, model=%s\n",
                         model.c_str());
                 enqueue_zero_usage(used->account().id, ar.route.local_key_id,
-                                   model, false, fwd.status_code,
+                                   model_for_success_log("", *used), false,
+                                   fwd.status_code,
                                    fwd.duration_ms, used->key_slot_id,
                                    attempts_made, attempts);
             }
@@ -502,7 +504,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                         ? fmt::generate_response_id()
                         : request_conversion.generated_response_id;
                 auto usage_info = usage_from_ir(cResp.usage, used_upstream_fmt);
-                usage_info.model = model;
+                usage_info.model = model_for_success_log(cResp.model, *used);
                 enqueue_log(used->account().id, ar.route.local_key_id,
                                      usage_info, false,
                                      fwd.status_code, fwd.duration_ms, used->key_slot_id,
