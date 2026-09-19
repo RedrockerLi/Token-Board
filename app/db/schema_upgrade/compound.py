@@ -363,9 +363,9 @@ def _run_rebuild_pair(proxy: Path, dashboard: Path, schema_root: Path,
         _prepare_copy_shadow(source, name, target, schema_root)
     proxy_shadow = work_dir / "token-board.v1-shadow.db"
     dashboard_shadow = work_dir / "dashboard.v1-shadow.db"
-    # The historical 0-to-1 plugin writes the V1.13 pricing layout.  Land the
+    # The historical V0-update-to-V1 plugin writes the V1.13 pricing layout.  Land the
     # rebuild there first, then let the V1 pricing transition finish the
-    # destructive flattening. This keeps the published 0-to-1 plugin and its
+    # destructive flattening. This keeps the published V0-update-to-V1 plugin and its
     # checksum compatible while allowing V1 to evolve independently.
     pricing_landing = SchemaVersion(1, 13)
     apply_sql_migrations(

@@ -60,7 +60,7 @@ def main() -> None:
 
         command = [
             sys.executable,
-            str(schema / "transitions/0-to-1/migrate.py"),
+            str(schema / "transitions/V0-update-to-V1/migrate.py"),
             "--token-board-db", str(proxy),
             "--dashboard-db", str(dashboard),
             "--schema-dir", str(schema),
@@ -88,7 +88,7 @@ def main() -> None:
         assert version(snapshot) == latest_version(schema, "token-board")
 
         subprocess.run(
-            [sys.executable, str(schema / "transitions/0-to-1/migrate.py"),
+            [sys.executable, str(schema / "transitions/V0-update-to-V1/migrate.py"),
              "--rollback-manifest", str(manifest_path)],
             check=True, capture_output=True, text=True,
         )
@@ -114,7 +114,7 @@ def main() -> None:
                    == "backed_up"]
         assert len(pending) == 1
         subprocess.run(
-            [sys.executable, str(schema / "transitions/0-to-1/migrate.py"),
+            [sys.executable, str(schema / "transitions/V0-update-to-V1/migrate.py"),
              "--resume-manifest", str(pending[0])],
             check=True, capture_output=True, text=True,
         )

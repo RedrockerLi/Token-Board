@@ -121,10 +121,10 @@ class BillingTest(AppDatabaseTestCase):
         self.assertGreaterEqual(result["dashboard_records"], 1)
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertGreater(conn.execute(
-                "SELECT count(*) FROM daily_usage WHERE account_id=?",
+                "SELECT count(*) FROM daily_model_usage WHERE user_id=?",
                 (account_id,)).fetchone()[0], 0)
             self.assertGreater(conn.execute(
-                "SELECT count(*) FROM monthly_recurring_costs WHERE account_id=?",
+                "SELECT actual_cost_micro_cny FROM users WHERE id=?",
                 (account_id,)).fetchone()[0], 0)
 
     def test_account_delete_consumes_existing_freeze_without_materializing(self) -> None:

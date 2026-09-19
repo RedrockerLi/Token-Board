@@ -140,7 +140,8 @@ class AppContractTest(AppDatabaseTestCase):
             str(self.dashboard_path), str(self.root / "schema"))
         with sqlite3.connect(self.dashboard_path) as conn:
             conn.execute(
-                "INSERT INTO accounts(account_id,name) VALUES(7,'archive-account')")
+                "INSERT INTO users(id,name,actual_cost_micro_cny) "
+                "VALUES(7,'archive-account',0)")
         dashboard.upsert_proxy_batch([{
             "date": "2026-08-09", "account_id": 7, "model": "model-a",
             "prompt_tokens": 100, "cache_read_tokens": 20,
@@ -150,7 +151,7 @@ class AppContractTest(AppDatabaseTestCase):
         rows = dashboard.load_rows()
         self.assertEqual(rows[1][0]["count"], 2)
         self.assertAlmostEqual(rows[2][0]["cost"], 1.25)
-        self.assertAlmostEqual(rows[2][0]["actual_cost"], 1.0)
+        self.assertAlmostEqual(rows[9][7], 1.0)
         self.assertAlmostEqual(rows[2][0]["theoretical_cost"], 1.25)
 
     def test_account_templates_aggregate_and_credential_identity(self) -> None:

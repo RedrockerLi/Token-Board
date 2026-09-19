@@ -31,7 +31,7 @@ from transition_common import read_usage_spool  # noqa: E402
 from verify import verify_dashboard, verify_proxy  # noqa: E402
 
 
-TRANSITION_ID = "0-to-1"
+TRANSITION_ID = "V0-update-to-V1"
 
 
 def _dashboard_identity(proxy: Path) -> tuple[dict[int, str], dict[tuple[int, str], str]]:
@@ -93,7 +93,7 @@ def apply(context: TransitionContext) -> None:
         )
         return
 
-    raise RuntimeError(f"unsupported 0-to-1 transition scope: {context.scope}")
+    raise RuntimeError(f"unsupported V0-update-to-V1 transition scope: {context.scope}")
 
 
 def verify(context: TransitionContext) -> dict:
@@ -120,4 +120,4 @@ def verify(context: TransitionContext) -> dict:
             str(context.source("dashboard")),
             str(context.shadow("dashboard")),
         )
-    raise RuntimeError(f"unsupported 0-to-1 verification scope: {context.scope}")
+    raise RuntimeError(f"unsupported V0-update-to-V1 verification scope: {context.scope}")

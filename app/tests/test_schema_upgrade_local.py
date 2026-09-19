@@ -373,10 +373,10 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertTrue(list((self.root / "data").glob("auto-v0-to-v1-*.manifest.json")))
         with sqlite3.connect(proxy) as proxy_conn, sqlite3.connect(dashboard) as dash_conn:
             proxy_marker = proxy_conn.execute(
-                "SELECT generation_id FROM schema_transitions WHERE transition_id='0-to-1'"
+                "SELECT generation_id FROM schema_transitions WHERE transition_id='V0-update-to-V1'"
             ).fetchone()
             dash_marker = dash_conn.execute(
-                "SELECT generation_id FROM schema_transitions WHERE transition_id='0-to-1'"
+                "SELECT generation_id FROM schema_transitions WHERE transition_id='V0-update-to-V1'"
             ).fetchone()
         self.assertIsNotNone(proxy_marker)
         self.assertEqual(proxy_marker, dash_marker)

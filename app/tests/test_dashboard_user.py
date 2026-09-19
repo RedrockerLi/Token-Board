@@ -22,29 +22,24 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         super().setUp()
         with sqlite3.connect(self.dashboard_path) as conn:
             conn.executemany(
-                "INSERT INTO accounts(account_id,name,account_kind) VALUES(?,?,?)",
-                [(7, "remove-me", "proxy"), (8, "keep-me", "proxy")],
+                "INSERT INTO users(id,name,actual_cost_micro_cny) VALUES(?,?,?)",
+                [(7, "remove-me", 3_000_000), (8, "keep-me", 4_000_000)],
             )
             conn.executemany(
-                "INSERT INTO daily_usage"
-                "(date,account_id,model,input_tokens,output_tokens,request_count) "
-                "VALUES(?,?,?,?,?,?)",
-                [("2026-08-01", 7, "model-a", 10, 5, 1),
-                 ("2026-08-01", 8, "model-a", 20, 6, 2)],
-            )
-            conn.executemany(
-                "INSERT INTO monthly_recurring_costs"
-                "(period_start,account_id,billing_unit_id,recurring_charge,equivalent_cost) "
-                "VALUES(?,?,?,?,?)",
-                [("2026-08-01T00:00:00Z", 7, "unit-7", 3, 0),
-                 ("2026-08-01T00:00:00Z", 8, "unit-8", 4, 0)],
+                "INSERT INTO daily_model_usage"
+                "(user_id,usage_date,model,input_tokens,cache_read_tokens,"
+                "output_tokens,request_count,api_equivalent_cost_micro_cny) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                [(7, "2026-08-01", "model-a", 10, 0, 5, 1, 0),
+                 (8, "2026-08-01", "model-a", 20, 0, 6, 2, 0)],
             )
             conn.commit()
 
     def _names(self) -> list[str]:
-        return DashboardDatabase(
+        users = DashboardDatabase(
             str(self.dashboard_path), str(self.root / "schema")
-        ).load_rows()[4]
+        ).load_rows()[8]
+        return [user["name"] for user in users if user["id"] != 0]
 
     def _configure_webdav(self) -> None:
         save_sync_config(self.proxy_path, SyncConfig(
@@ -63,14 +58,14 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
     def test_batch_delete_commits_one_local_candidate_without_webdav(self) -> None:
         result = delete_dashboard_users(
             str(self.proxy_path), str(self.dashboard_path),
-            [" remove-me ", "remove-me", "missing"],
+            [7, 7, 999],
             schema_dir=str(self.root / "schema"),
         )
 
         self.assertEqual(result["status"], "ok", result)
-        self.assertEqual(result["deleted_names"], ["remove-me"])
-        self.assertEqual(result["not_found_names"], ["missing"])
-        self.assertEqual(result["deleted_rows"], 3)
+        self.assertEqual(result["archived_user_ids"], [7])
+        self.assertEqual(result["not_found_user_ids"], [999])
+        self.assertEqual(result["archived_rows"], 1)
         self.assertFalse(result["uploaded"])
         self.assertEqual(self._names(), ["keep-me"])
 
@@ -82,10 +77,10 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             with sqlite3.connect(path) as conn:
                 published_rows.append({
                     "remove": conn.execute(
-                        "SELECT count(*) FROM accounts WHERE name='remove-me'"
+                        "SELECT count(*) FROM users WHERE name='remove-me'"
                     ).fetchone()[0],
                     "keep": conn.execute(
-                        "SELECT count(*) FROM accounts WHERE name='keep-me'"
+                        "SELECT count(*) FROM users WHERE name='keep-me'"
                     ).fetchone()[0],
                 })
             return RemoteArtifact("dashboard_sync_result.db")
@@ -93,7 +88,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         patches = self._local_remote_mocks(capture=capture)
         with patches[0], patches[1], patches[2], patches[3]:
             result = delete_dashboard_users(
-                str(self.proxy_path), str(self.dashboard_path), ["remove-me"],
+                str(self.proxy_path), str(self.dashboard_path), [7],
                 schema_dir=str(self.root / "schema"),
             )
 
@@ -122,14 +117,14 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         def capture(_config, path, _base, _remote):
             with sqlite3.connect(path) as conn:
                 published_rows.append(conn.execute(
-                    "SELECT count(*) FROM accounts WHERE name='remove-me'"
+                    "SELECT count(*) FROM users WHERE name='remove-me'"
                 ).fetchone()[0])
             return RemoteArtifact(f"dashboard_sync_{len(published_rows)}.db")
 
         patches = self._local_remote_mocks(capture=capture)
         with patches[0], patches[1], patches[2], patches[3]:
             result = delete_dashboard_users(
-                str(self.proxy_path), str(self.dashboard_path), ["remove-me"],
+                str(self.proxy_path), str(self.dashboard_path), [7],
                 schema_dir=str(self.root / "schema"),
             )
 
@@ -144,7 +139,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             capture=lambda *_args: (_ for _ in ()).throw(WebDAVError("offline")))
         with patches[0], patches[1], patches[2], patches[3]:
             result = delete_dashboard_users(
-                str(self.proxy_path), str(self.dashboard_path), ["remove-me"],
+                str(self.proxy_path), str(self.dashboard_path), [7],
                 schema_dir=str(self.root / "schema"),
             )
 
@@ -164,7 +159,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         def capture(_config, path, _base, _remote):
             with sqlite3.connect(path) as conn:
                 published_rows.append(conn.execute(
-                    "SELECT count(*) FROM accounts WHERE name='remove-me'"
+                    "SELECT count(*) FROM users WHERE name='remove-me'"
                 ).fetchone()[0])
             response = responses.pop(0)
             if isinstance(response, Exception):
@@ -174,7 +169,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         patches = self._local_remote_mocks(capture=capture)
         with patches[0], patches[1], patches[2], patches[3]:
             result = delete_dashboard_users(
-                str(self.proxy_path), str(self.dashboard_path), ["remove-me"],
+                str(self.proxy_path), str(self.dashboard_path), [7],
                 schema_dir=str(self.root / "schema"),
             )
 
@@ -184,11 +179,11 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
 
     def test_all_missing_users_do_not_create_or_publish_archive(self) -> None:
         result = delete_dashboard_users(
-            str(self.proxy_path), str(self.dashboard_path), ["missing"],
+            str(self.proxy_path), str(self.dashboard_path), [999],
             schema_dir=str(self.root / "schema"),
         )
         self.assertEqual(result["status"], "not_found")
-        self.assertEqual(result["not_found_names"], ["missing"])
+        self.assertEqual(result["not_found_user_ids"], [999])
         self.assertEqual(self._names(), ["keep-me", "remove-me"])
         self.assertIsNone(get_sync_state(
             str(self.proxy_path), "dashboard_pending_path"))
@@ -196,7 +191,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
     def test_concurrent_deletes_are_serialized(self) -> None:
         def delete_once():
             return delete_dashboard_users(
-                str(self.proxy_path), str(self.dashboard_path), ["remove-me"],
+                str(self.proxy_path), str(self.dashboard_path), [7],
                 schema_dir=str(self.root / "schema"),
             )
 
@@ -230,7 +225,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             )
 
         result = delete_dashboard_users(
-            str(self.proxy_path), str(self.dashboard_path), ["remove-me"],
+            str(self.proxy_path), str(self.dashboard_path), [7],
             schema_dir=str(self.root / "schema"),
         )
         self.assertEqual(result["status"], "ok", result)
@@ -254,21 +249,13 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
     def test_opencode_zen_and_lm_studio_do_not_return_after_export(self) -> None:
         with sqlite3.connect(self.dashboard_path) as conn:
             conn.executemany(
-                "INSERT INTO accounts(account_id,name,account_kind) VALUES(?,?,?)",
-                [(14, "OpenCode Zen", "proxy"), (17, "LM studio", "proxy")],
-            )
-            conn.executemany(
-                "INSERT INTO monthly_recurring_costs"
-                "(period_start,account_id,billing_unit_id,recurring_charge,"
-                "equivalent_cost,normalized_recurring_cost,is_frozen,frozen_on) "
-                "VALUES('2026-08-01T00:00:00Z',?,?,0,0,0,?,?)",
-                [(14, "zen-unit", 1, "2026-08-15"),
-                 (17, "lm-unit", 1, "2026-08-18")],
+                "INSERT INTO users(id,name,actual_cost_micro_cny) VALUES(?,?,?)",
+                [(14, "OpenCode Zen", 0), (17, "LM studio", 0)],
             )
             conn.commit()
         result = delete_dashboard_users(
             str(self.proxy_path), str(self.dashboard_path),
-            ["OpenCode Zen", "LM studio"],
+            [14, 17],
             schema_dir=str(self.root / "schema"),
         )
         self.assertEqual(result["status"], "ok", result)
@@ -278,7 +265,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         self.assertNotIn("OpenCode Zen", self._names())
         self.assertNotIn("LM studio", self._names())
 
-    def test_frozen_dashboard_charge_cannot_be_overwritten(self) -> None:
+    def test_frozen_dashboard_charges_accumulate_on_user_identity(self) -> None:
         dashboard = DashboardDatabase(
             str(self.dashboard_path), str(self.root / "schema"))
         self.assertEqual(dashboard.upsert_frozen_plan_charge(
@@ -290,13 +277,11 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             month="2026-08", account_id=8, billing_unit_id="unit-8",
             recurring_charge=20, normalized_recurring_cost=20,
             currency="CNY", base_currency="CNY", fx_rate_date=None,
-            frozen_on="2026-08-02"), 0)
+            frozen_on="2026-08-02"), 1)
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT recurring_charge,normalized_recurring_cost "
-                "FROM monthly_recurring_costs WHERE account_id=8 "
-                "AND billing_unit_id='unit-8'"
-            ).fetchone(), (10.0, 10.0))
+                "SELECT actual_cost_micro_cny FROM users WHERE id=8"
+            ).fetchone(), (34_000_000,))
 
     def test_zero_price_period_stays_in_source_but_not_dashboard(self) -> None:
         proxy = self.proxy_database()
@@ -323,7 +308,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             ).fetchone()[0], 0)
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT count(*) FROM monthly_recurring_costs WHERE account_id=?",
+                "SELECT count(*) FROM users WHERE id=?",
                 (account_id,)
             ).fetchone()[0], 0)
         self.assertNotIn("free-plan", self._names())

@@ -49,9 +49,7 @@ class CompoundSchemaUpgradeTest(unittest.TestCase):
         self.assertIsNotNone(result["token-board"].manifest)
         with sqlite3.connect(self.dashboard) as conn:
             self.assertEqual(
-                conn.execute(
-                    "SELECT account_id FROM accounts WHERE account_kind='agent'"
-                ).fetchone()[0], 100)
+                conn.execute("SELECT id FROM users WHERE id=100").fetchone()[0], 100)
             marker = conn.execute(
                 "SELECT checksum,generation_id FROM schema_transitions "
                 "WHERE transition_id='v1-agent-identity'"

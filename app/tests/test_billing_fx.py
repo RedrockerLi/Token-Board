@@ -416,24 +416,26 @@ class BillingFxLockTest(AppDatabaseTestCase):
             )
             conn.commit()
         proxy = ProxyDatabase(str(self.proxy_path), schema_dir=str(self.root / "schema"))
-        proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
+        first_export = proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
         with sqlite3.connect(self.dashboard_path) as conn:
             first = conn.execute(
-                "SELECT recurring_charge,is_frozen,frozen_on FROM monthly_recurring_costs "
-                "WHERE account_id=?", (software_id,)
+                "SELECT actual_cost_micro_cny FROM users WHERE id=?",
+                (software_id,)
             ).fetchone()
-        self.assertEqual(first[0], 10.0)
-        self.assertEqual(first[1], 1)
-        self.assertIsNotNone(first[2])
+        self.assertEqual(first[0], 10_000_000)
 
         self.assertTrue(db.update_agent_software(
             software_id, {"subscription_ids": []}))
-        proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
+        proxy.export_to_dashboard(
+            str(self.dashboard_path), 0, 0,
+            billing_mark=first_export["billing_max_id"],
+            billing_max_id=first_export["billing_max_id"],
+        )
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT recurring_charge FROM monthly_recurring_costs "
-                "WHERE account_id=?", (software_id,)
-            ).fetchone()[0], 10.0)
+                "SELECT actual_cost_micro_cny FROM users WHERE id=?",
+                (software_id,)
+            ).fetchone()[0], 10_000_000)
 
     def test_today_subscription_binding_exports_from_utc_day_start(self) -> None:
         db = self.proxy_database()
@@ -463,17 +465,21 @@ class BillingFxLockTest(AppDatabaseTestCase):
             self.assertEqual(direct, (software_id, 10.0, 1))
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT recurring_charge FROM monthly_recurring_costs "
-                "WHERE account_id=?", (software_id,)).fetchone()[0], 10.0)
+                "SELECT actual_cost_micro_cny FROM users WHERE id=?",
+                (software_id,)).fetchone()[0], 10_000_000)
 
-        # Repeating export immediately sees the same direct source fact; no
-        # UTC-day boundary or materialization-time filter is involved.
-        result = proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
-        self.assertEqual(result["billing_event_count"], 1)
+        # Repeating export with the acknowledged billing high-water mark does
+        # not reapply the same direct source fact.
+        result = proxy.export_to_dashboard(
+            str(self.dashboard_path), 0, 0,
+            billing_mark=result["billing_max_id"],
+            billing_max_id=result["billing_max_id"],
+        )
+        self.assertEqual(result["billing_event_count"], 0)
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT recurring_charge FROM monthly_recurring_costs "
-                "WHERE account_id=?", (software_id,)).fetchone()[0], 10.0)
+                "SELECT actual_cost_micro_cny FROM users WHERE id=?",
+                (software_id,)).fetchone()[0], 10_000_000)
 
     def test_ensure_rate_historical_fetch_and_guards(self) -> None:
         self.proxy_database()  # initialize the schema

@@ -190,15 +190,17 @@ class V2MigrationTest(unittest.TestCase):
                 ).fetchone()[0], 1)
                 self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             with sqlite3.connect(dashboard) as conn:
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_001)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_002)
                 self.assertIsNone(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='billing_export_receipts'"
                 ).fetchone())
-                self.assertIn("period_start", {
-                    row[1] for row in conn.execute(
-                        "PRAGMA table_info(monthly_recurring_costs)")
-                })
+                self.assertEqual(
+                    conn.execute("SELECT id FROM users WHERE id=0").fetchone(), (0,))
+                self.assertIsNotNone(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='daily_model_usage'"
+                ).fetchone())
                 self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
 
@@ -298,18 +300,17 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
             billing_unit_id="report-key", recurring_charge=10,
             normalized_recurring_cost=10, currency="CNY", base_currency="CNY",
             fx_rate_date=None, frozen_on=timestamp[:10])
-        self.assertGreaterEqual(dashboard.purge_accounts({account_id}), 3)
+        self.assertEqual(dashboard.purge_accounts({account_id}), 1)
         with sqlite3.connect(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
-                "SELECT count(*) FROM accounts WHERE account_id=?", (account_id,)
+                "SELECT count(*) FROM users WHERE id=?", (account_id,)
             ).fetchone()[0], 0)
             self.assertEqual(conn.execute(
-                "SELECT count(*) FROM daily_usage WHERE account_id=?", (account_id,)
+                "SELECT count(*) FROM daily_model_usage WHERE user_id=?", (account_id,)
             ).fetchone()[0], 0)
             self.assertEqual(conn.execute(
-                "SELECT count(*) FROM monthly_recurring_costs WHERE account_id=?",
-                (account_id,),
-            ).fetchone()[0], 0)
+                "SELECT count(*) FROM daily_model_usage WHERE user_id=0"
+            ).fetchone()[0], 1)
 
     def test_actual_cost_excludes_frozen_charges_after_live_account_delete(self) -> None:
         db = self.proxy_database()

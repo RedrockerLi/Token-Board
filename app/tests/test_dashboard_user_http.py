@@ -12,15 +12,16 @@ class DashboardUserHttpTest(AppDatabaseTestCase):
         super().setUp()
         with sqlite3.connect(self.dashboard_path) as conn:
             conn.executemany(
-                "INSERT INTO accounts(account_id,name,account_kind) VALUES(?,?,?)",
-                [(7, "remove-me", "proxy"), (8, "keep-me", "proxy")],
+                "INSERT INTO users(id,name,actual_cost_micro_cny) VALUES(?,?,?)",
+                [(7, "remove-me", 0), (8, "keep-me", 0)],
             )
             conn.executemany(
-                "INSERT INTO daily_usage"
-                "(date,account_id,model,input_tokens,output_tokens,request_count) "
-                "VALUES(?,?,?,?,?,?)",
-                [("2026-08-01", 7, "model-a", 10, 5, 1),
-                 ("2026-08-01", 8, "model-a", 20, 6, 2)],
+                "INSERT INTO daily_model_usage"
+                "(user_id,usage_date,model,input_tokens,cache_read_tokens,"
+                "output_tokens,request_count,api_equivalent_cost_micro_cny) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                [(7, "2026-08-01", "model-a", 10, 0, 5, 1, 0),
+                 (8, "2026-08-01", "model-a", 20, 0, 6, 2, 0)],
             )
             conn.commit()
         self.app = create_app(
@@ -33,24 +34,25 @@ class DashboardUserHttpTest(AppDatabaseTestCase):
     def test_batch_delete_returns_result_and_refreshes_store(self) -> None:
         response = self.client.delete(
             "/api/proxy/dashboard/users",
-            json={"names": ["remove-me"]},
+            json={"user_ids": [7]},
         )
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["deleted_names"], ["remove-me"])
-        self.assertEqual(payload["not_found_names"], [])
+        self.assertEqual(payload["archived_user_ids"], [7])
+        self.assertEqual(payload["not_found_user_ids"], [])
         self.assertFalse(payload["uploaded"])
-        self.assertEqual(self.app.config["DATA_STORE"].api_key_names, ["keep-me"])
+        self.assertEqual(self.app.config["DATA_STORE"].api_key_names,
+                         ["keep-me", "归档"])
 
     def test_invalid_and_all_missing_requests_have_explicit_statuses(self) -> None:
         invalid = self.client.delete(
-            "/api/proxy/dashboard/users", json={"names": "remove-me"})
+            "/api/proxy/dashboard/users", json={"user_ids": "7"})
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(invalid.get_json()["status"], "invalid")
 
         missing = self.client.delete(
-            "/api/proxy/dashboard/users", json={"names": ["missing"]})
+            "/api/proxy/dashboard/users", json={"user_ids": [999]})
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(missing.get_json()["status"], "not_found")
 

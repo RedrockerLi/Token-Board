@@ -446,8 +446,8 @@ def main() -> None:
         transitions = select_pending(
             proxy, dashboard, schema_root, source_version_value(proxy),
             source_version_value(dashboard))
-        if len(transitions) != 1 or transitions[0][0].transition_id != "0-to-1":
-            parser.error("V0 database pair has no unique 0-to-1 transition route")
+        if len(transitions) != 1 or transitions[0][0].transition_id != "V0-update-to-V1":
+            parser.error("V0 database pair has no unique V0-update-to-V1 transition route")
         result = run_transitions(
             proxy, dashboard, schema_root, source_version_value(proxy),
             source_version_value(dashboard), transitions, args.timezone,

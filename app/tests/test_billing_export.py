@@ -37,7 +37,8 @@ class BillingExportTest(AppDatabaseTestCase):
     def _dashboard_charge_count(self, account_id: int) -> int:
         with sqlite3.connect(self.dashboard_path) as conn:
             return conn.execute(
-                "SELECT count(*) FROM monthly_recurring_costs WHERE account_id=?",
+                "SELECT COALESCE((SELECT 1 FROM users "
+                "WHERE id=? AND actual_cost_micro_cny > 0), 0)",
                 (account_id,),
             ).fetchone()[0]
 
@@ -60,7 +61,7 @@ class BillingExportTest(AppDatabaseTestCase):
             self.proxy_path, "last_exported_log_id"), "0")
 
         deleted = delete_dashboard_users(
-            self.proxy_path, self.dashboard_path, ["immutable-plan"],
+            self.proxy_path, self.dashboard_path, [account_id],
             schema_dir=str(self.root / "schema"),
         )
         self.assertEqual(deleted["status"], "ok", deleted)
@@ -144,7 +145,7 @@ class BillingExportTest(AppDatabaseTestCase):
         self.assertGreater(self._dashboard_charge_count(account_id), 0)
 
         deleted = delete_dashboard_users(
-            self.proxy_path, self.dashboard_path, ["immutable-plan"],
+            self.proxy_path, self.dashboard_path, [account_id],
             schema_dir=str(self.root / "schema"),
         )
         self.assertEqual(deleted["status"], "ok", deleted)

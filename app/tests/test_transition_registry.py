@@ -18,7 +18,7 @@ class TransitionRegistryTest(unittest.TestCase):
         transitions = discover(root)
         self.assertEqual(
             [item.transition_id for item in transitions],
-            ["0-to-1", "v1-legacy-agent-billing", "v1-agent-identity",
+            ["V0-update-to-V1", "v1-legacy-agent-billing", "v1-agent-identity",
              "v1-pricing-current-only", "v1-live-resource-hard-delete"],
         )
         self.assertEqual([item.order for item in transitions], [0, 1, 2, 3, 4])
@@ -37,7 +37,7 @@ class TransitionRegistryTest(unittest.TestCase):
                 root, "local-pair",
                 {"token-board": SchemaVersion(0, 19),
                  "dashboard": SchemaVersion(0, 6)}, paths)
-            self.assertEqual([item[0].transition_id for item in selected], ["0-to-1"])
+            self.assertEqual([item[0].transition_id for item in selected], ["V0-update-to-V1"])
 
             selected = select_transitions(
                 root, "local-pair",

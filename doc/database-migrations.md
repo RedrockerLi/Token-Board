@@ -47,7 +47,7 @@ schema/
 │   ├── v1/1-0_baseline.sql … 1-6_remove_account_exclusions.sql
 │   └── v2/2-1_day_grained_recurring_costs.sql
 └── transitions/
-    ├── 0-to-1/                    # V0 → V1 历史转换插件
+    ├── V0-update-to-V1/           # V0 → V1 历史转换插件
     │   ├── transition.json
     │   └── transition.py
     ├── v1-legacy-agent-billing/   # V1 配对数据修复
@@ -194,7 +194,7 @@ prepare/target 版本和 scope。插件只能修改 shadow。选择逻辑集中�
 
 当前 route 顺序为：
 
-- `order: 0` `0-to-1`：V0 source → 当前 V1，使用 `rebuild-shadow`；
+- `order: 0` `V0-update-to-V1`：V0 source → 当前 V1，使用 `rebuild-shadow`；
 - `order: 1` `v1-legacy-agent-billing`：Token Board V1.6/V1.7 billing barrier；
 - `order: 2` `v1-agent-identity`：Token Board V1.8 与 Dashboard V1.3/V1.4 identity barrier。
 - `order: 3` `v1-pricing-current-only`：模型定价历史到当前配置的扁平化。
@@ -230,14 +230,14 @@ manifest 和备份恢复保证：服务不会在未完成的数据转换状态�
 
 ## V0 → V1
 
-V0 → V1 是 `0-to-1` 插件负责的跨 Major 历史转换，不由 C++ 执行。正常本地启动
+V0 → V1 是 `V0-update-to-V1` 插件负责的跨 Major 历史转换，不由 C++ 执行。正常本地启动
 时，Python coordinator 会把 V0/V0 数据库对交给统一 runner，在服务启动前完成
 shadow 转换和发布。
 
 如需单独操作旧 V0 库，可使用历史工具：
 
 ```bash
-python3 schema/transitions/0-to-1/migrate.py \
+python3 schema/transitions/V0-update-to-V1/migrate.py \
   --token-board-db data/token-board.db \
   --dashboard-db data/dashboard.db
 ```

@@ -119,7 +119,7 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
                 # implementation still writes the pre-flattened V1 shape.
                 # Immediately run any newly applicable V1 artifact routes in
                 # the same temporary upgrade, without changing the published
-                # 0-to-1 transition plugin.
+                # V0-update-to-V1 transition plugin.
                 v1_version = inspect_version(shadow, database_name)
                 assert v1_version is not None
                 v1_paths = {database_name: shadow}

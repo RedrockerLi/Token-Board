@@ -1,5 +1,5 @@
 {
-  "id": "0-to-1",
+  "id": "V0-update-to-V1",
   "databases": ["token-board", "dashboard"],
   "strategy": "rebuild-shadow",
   "entrypoint": "transition.py",
