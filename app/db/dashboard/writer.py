@@ -1,29 +1,33 @@
-"""DashboardWriterMixin implementation."""
+"""Write operations for the two-table Dashboard archive."""
+
+from __future__ import annotations
 
 import sqlite3
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 
 from app.core import sqlite_runtime
-from app.db.dashboard.common import (
-    MODEL_ORDER, _parse_date, _sort_models, _track_recency,
-)
 
 
 def _day(value: object) -> str:
-    """Normalize a persisted billing day and reject missing values."""
     text = str(value or "")[:10]
     try:
         return date.fromisoformat(text).isoformat()
     except ValueError as exc:
-        raise ValueError("billing frozen_on must be YYYY-MM-DD") from exc
+        raise ValueError("date must be YYYY-MM-DD") from exc
+
+
+def _micro(value: object) -> int:
+    """Convert CNY to integer micro-CNY with half-up rounding."""
+    if value is None:
+        return 0
+    return int((Decimal(str(value)) * Decimal(1_000_000)).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 class DashboardWriterMixin:
     def __init__(self, db_path: str, schema_dir: str | None = None):
         self.db_path = db_path
-        # schema_dir may be passed explicitly when db_path is a shadow/temp
-        # copy outside the standard data/ layout.  This guard is read-only;
-        # Python startup is the only place allowed to mutate schema state.
         from app.db.migrations import schema_dir_for
         from app.db.schema_upgrade import verify_current_database
         self.schema_dir = schema_dir or schema_dir_for(self.db_path, "dashboard")
@@ -32,376 +36,278 @@ class DashboardWriterMixin:
     def _connect(self) -> sqlite3.Connection:
         return sqlite_runtime.connect(self.db_path, "dashboard_runtime")
 
+    @staticmethod
+    def _user_name(row: dict) -> str:
+        name = str(row.get("name", row.get("account_name", "")) or "").strip()
+        return name or f"用户 {int(row['account_id'])}"
+
+    @staticmethod
+    def _ensure_user(conn: sqlite3.Connection, user_id: int, name: str) -> None:
+        user_id = int(user_id)
+        if user_id < 1:
+            raise ValueError("real Dashboard user_id must be greater than zero")
+        conn.execute(
+            """INSERT INTO users(id,name,actual_cost_micro_cny) VALUES(?,?,0)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name""",
+            (user_id, name),
+        )
+
     def upsert_account_batch(self, rows: list[dict]) -> int:
-        """Write only identities involved in the current fact batch."""
         if not rows:
             return 0
         conn = self._connect()
         try:
-            conn.executemany(
-                """INSERT INTO accounts
-                   (account_id,name,updated_at,account_kind)
-                   VALUES(:account_id,:name,:updated_at,:account_kind)
-                   ON CONFLICT(account_id) DO UPDATE SET
-                     name=excluded.name,
-                     updated_at=excluded.updated_at,
-                     account_kind=excluded.account_kind""",
-                rows,
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            for row in rows:
+                user_id = int(row.get("user_id", row.get("account_id")))
+                self._ensure_user(
+                    conn, user_id,
+                    self._user_name({**row, "account_id": user_id}),
+                )
             conn.commit()
             return len(rows)
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
-    def purge_accounts(self, account_ids: set[int] | list[int] | tuple[int, ...]) -> int:
-        """Remove all dashboard archive rows for the given identities."""
-        ids = sorted({int(account_id) for account_id in (account_ids or [])})
+    def archive_users(self, user_ids: set[int] | list[int] | tuple[int, ...]) -> int:
+        """Merge ordinary users into id=0 and remove their source identity."""
+        raw_ids = {int(value) for value in (user_ids or [])}
+        if 0 in raw_ids:
+            raise ValueError("archive user_id=0 cannot be archived")
+        ids = sorted(raw_ids)
+        if any(value < 0 for value in ids):
+            raise ValueError("user_id must be non-negative")
         if not ids:
             return 0
-        placeholders = ",".join("?" for _ in ids)
         conn = self._connect()
         try:
-            deleted = 0
-            for table in ("monthly_recurring_costs", "daily_usage"):
-                deleted += conn.execute(
-                    f"DELETE FROM {table} WHERE account_id IN ({placeholders})",
-                    ids,
-                ).rowcount
-            deleted += conn.execute(
-                f"DELETE FROM accounts WHERE account_id IN ({placeholders})",
-                ids,
-            ).rowcount
+            conn.execute("BEGIN IMMEDIATE")
+            archived_rows = 0
+            for user_id in ids:
+                exists = conn.execute(
+                    "SELECT 1 FROM users WHERE id=? AND id<>0", (user_id,)
+                ).fetchone()
+                if exists is None:
+                    continue
+                archived_rows += conn.execute(
+                    "SELECT COUNT(*) FROM daily_model_usage WHERE user_id=?",
+                    (user_id,),
+                ).fetchone()[0]
+                conn.execute(
+                    """INSERT INTO daily_model_usage(
+                           user_id,usage_date,model,input_tokens,cache_read_tokens,
+                           output_tokens,request_count,api_equivalent_cost_micro_cny)
+                       SELECT 0,usage_date,model,SUM(input_tokens),
+                              SUM(cache_read_tokens),SUM(output_tokens),
+                              SUM(request_count),SUM(api_equivalent_cost_micro_cny)
+                         FROM daily_model_usage WHERE user_id=?
+                        GROUP BY usage_date,model
+                       ON CONFLICT(user_id,usage_date,model) DO UPDATE SET
+                           input_tokens=daily_model_usage.input_tokens+excluded.input_tokens,
+                           cache_read_tokens=daily_model_usage.cache_read_tokens+excluded.cache_read_tokens,
+                           output_tokens=daily_model_usage.output_tokens+excluded.output_tokens,
+                           request_count=daily_model_usage.request_count+excluded.request_count,
+                           api_equivalent_cost_micro_cny=
+                             daily_model_usage.api_equivalent_cost_micro_cny+
+                             excluded.api_equivalent_cost_micro_cny""",
+                    (user_id,),
+                )
+                conn.execute(
+                    """UPDATE users SET actual_cost_micro_cny=
+                           actual_cost_micro_cny +
+                           (SELECT actual_cost_micro_cny FROM users WHERE id=?)
+                       WHERE id=0""",
+                    (user_id,),
+                )
+                conn.execute("DELETE FROM daily_model_usage WHERE user_id=?", (user_id,))
+                conn.execute("DELETE FROM users WHERE id=?", (user_id,))
             conn.commit()
-            return deleted
+            return archived_rows
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
-    def upsert_proxy_data(self, date: str, model: str,
-                          account_id: int, prompt_tokens: int,
-                          completion_tokens: int, cache_read_tokens: int,
-                          request_count: int,
+    # Compatibility name used by older internal callers; it now archives.
+    def purge_accounts(self, account_ids):
+        return self.archive_users(account_ids)
+
+    def _upsert_usage_rows(self, conn: sqlite3.Connection, rows: list[dict]) -> int:
+        for row in rows:
+            user_id = int(row.get("user_id", row.get("account_id")))
+            supplied_name = row.get("name", row.get("account_name"))
+            if supplied_name is not None and str(supplied_name).strip():
+                self._ensure_user(conn, user_id, self._user_name({**row, "account_id": user_id}))
+            elif conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
+                self._ensure_user(conn, user_id, f"用户 {user_id}")
+            eq_micro = row.get("api_equivalent_cost_micro_cny")
+            if eq_micro is None:
+                eq_micro = _micro(row.get("cost", 0))
+            billed_micro = row.get("actual_cost_micro_cny")
+            if billed_micro is None:
+                billed_micro = _micro(row.get("billed_usage_cost", 0))
+            conn.execute(
+                """INSERT INTO daily_model_usage(
+                       user_id,usage_date,model,input_tokens,cache_read_tokens,
+                       output_tokens,request_count,api_equivalent_cost_micro_cny)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(user_id,usage_date,model) DO UPDATE SET
+                       input_tokens=daily_model_usage.input_tokens+excluded.input_tokens,
+                       cache_read_tokens=daily_model_usage.cache_read_tokens+excluded.cache_read_tokens,
+                       output_tokens=daily_model_usage.output_tokens+excluded.output_tokens,
+                       request_count=daily_model_usage.request_count+excluded.request_count,
+                       api_equivalent_cost_micro_cny=
+                         daily_model_usage.api_equivalent_cost_micro_cny+
+                         excluded.api_equivalent_cost_micro_cny""",
+                (user_id, _day(row.get("usage_date", row.get("date"))),
+                 str(row["model"]),
+                 int(row.get("input_tokens", row.get("prompt_tokens", 0)) or 0),
+                 int(row.get("cache_read_tokens", row.get("cache_tokens", 0)) or 0),
+                 int(row.get("output_tokens", row.get("completion_tokens", 0)) or 0),
+                 int(row.get("request_count", 0) or 0), int(eq_micro)),
+            )
+            if billed_micro:
+                conn.execute(
+                    """UPDATE users SET actual_cost_micro_cny=
+                           actual_cost_micro_cny+? WHERE id=?""",
+                    (int(billed_micro), user_id),
+                )
+        return len(rows)
+
+    def upsert_proxy_data(self, date: str, model: str, account_id: int,
+                          prompt_tokens: int, completion_tokens: int,
+                          cache_read_tokens: int, request_count: int,
                           cost: float = 0.0,
                           billed_usage_cost: float | None = None) -> int:
-        """Insert proxy usage into the normalized ``daily_usage`` grain.
+        return self.upsert_proxy_batch([{
+            "date": date, "model": model, "account_id": account_id,
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "cache_read_tokens": cache_read_tokens, "request_count": request_count,
+            "cost": cost,
+            "billed_usage_cost": cost if billed_usage_cost is None else billed_usage_cost,
+        }])
 
-        ``cost`` is the historical equivalent cost and
-        ``billed_usage_cost`` is the actual metered cost. Both values are
-        copied from the proxy ledger and never recomputed by the dashboard.
-        Buckets are keyed by stable ``account_id`` and additive export upserts
-        preserve the request-log high-water-mark semantics.
-        """
+    def upsert_proxy_batch(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
         conn = self._connect()
         try:
-            billed = cost if billed_usage_cost is None else billed_usage_cost
+            conn.execute("BEGIN IMMEDIATE")
+            count = self._upsert_usage_rows(conn, rows)
+            conn.commit()
+            return count
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _add_actual_cost(self, account_id: int, name: str, amount: object) -> int:
+        amount_micro = _micro(amount)
+        if amount_micro == 0:
+            return 0
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT 1 FROM users WHERE id=?", (int(account_id),)
+            ).fetchone()
+            if existing is None:
+                self._ensure_user(conn, int(account_id), name)
             conn.execute(
-                """INSERT INTO daily_usage
-                   (date,account_id,model,input_tokens,cache_tokens,output_tokens,
-                    request_count,equivalent_cost,billed_usage_cost)
-                   VALUES(?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(date,account_id,model) DO UPDATE SET
-                     input_tokens=daily_usage.input_tokens+excluded.input_tokens,
-                     cache_tokens=daily_usage.cache_tokens+excluded.cache_tokens,
-                     output_tokens=daily_usage.output_tokens+excluded.output_tokens,
-                     request_count=daily_usage.request_count+excluded.request_count,
-                     equivalent_cost=daily_usage.equivalent_cost+excluded.equivalent_cost,
-                     billed_usage_cost=daily_usage.billed_usage_cost+excluded.billed_usage_cost""",
-                (date, account_id, model, prompt_tokens, cache_read_tokens,
-                 completion_tokens, request_count, cost, billed),
+                "UPDATE users SET actual_cost_micro_cny=actual_cost_micro_cny+? WHERE id=?",
+                (amount_micro, int(account_id)),
             )
             conn.commit()
             return 1
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
-
-    def upsert_proxy_batch(self, rows: list[dict]) -> int:
-        """Bulk export using one connection and one transaction."""
-        if not rows:
-            return 0
-        conn = self._connect()
-        try:
-            conn.executemany(
-                """INSERT INTO daily_usage
-                   (date,account_id,model,input_tokens,cache_tokens,output_tokens,
-                    request_count,equivalent_cost,billed_usage_cost)
-                   VALUES(:date,:account_id,:model,:prompt_tokens,:cache_read_tokens,
-                          :completion_tokens,:request_count,:cost,:billed_usage_cost)
-                   ON CONFLICT(date,account_id,model) DO UPDATE SET
-                     input_tokens=daily_usage.input_tokens+excluded.input_tokens,
-                     cache_tokens=daily_usage.cache_tokens+excluded.cache_tokens,
-                     output_tokens=daily_usage.output_tokens+excluded.output_tokens,
-                     request_count=daily_usage.request_count+excluded.request_count,
-                     equivalent_cost=daily_usage.equivalent_cost+excluded.equivalent_cost,
-                     billed_usage_cost=daily_usage.billed_usage_cost+excluded.billed_usage_cost""",
-                rows,
-            )
-            conn.commit()
-            return len(rows)
-        finally:
-            try:
-                conn.close()
-            except sqlite3.ProgrammingError:
-                # An earlier SQLite failure may already have closed it.
-                conn = None
 
     def upsert_frozen_plan_charge(self, *, period_start: str | None = None,
                                   month: str | None = None, account_id: int,
                                   billing_unit_id: str, recurring_charge: float,
                                   normalized_recurring_cost: float | None,
-                                  currency: str, base_currency: str,
-                                  fx_rate_date: str | None,
-                                  frozen_on: str) -> int:
-        """Insert one immutable recurring charge at calendar-day grain."""
-        if (recurring_charge == 0 and (normalized_recurring_cost or 0) == 0):
+                                  currency: str = "CNY",
+                                  base_currency: str = "CNY",
+                                  fx_rate_date: str | None = None,
+                                  frozen_on: str,
+                                  account_name: str | None = None) -> int:
+        if normalized_recurring_cost is None:
             return 0
-        period_start = period_start or (
-            month if month and "T" in month else f"{month}-01T00:00:00Z")
-        frozen_on = _day(frozen_on)
-        conn = self._connect()
-        try:
-            cursor = conn.execute(
-                """INSERT INTO monthly_recurring_costs
-                   (period_start,account_id,billing_unit_id,recurring_charge,equivalent_cost,
-                    currency,normalized_recurring_cost,base_currency,fx_rate_date,
-                    is_frozen,frozen_on)
-                   VALUES(?,?,?,?,0,?,?,?,?,1,?)
-                   ON CONFLICT(period_start,account_id,billing_unit_id) DO UPDATE SET
-                     recurring_charge=excluded.recurring_charge,
-                     currency=excluded.currency,
-                     normalized_recurring_cost=excluded.normalized_recurring_cost,
-                     base_currency=excluded.base_currency,
-                     fx_rate_date=excluded.fx_rate_date,
-                     is_frozen=excluded.is_frozen,
-                     frozen_on=excluded.frozen_on
-                   WHERE monthly_recurring_costs.is_frozen=0""",
-                (period_start, account_id, billing_unit_id, recurring_charge, currency,
-                 normalized_recurring_cost, base_currency, fx_rate_date, frozen_on),
-            )
-            conn.commit()
-            return max(cursor.rowcount, 0)
-        finally:
-            conn.close()
+        return self._add_actual_cost(
+            account_id, account_name or f"用户 {int(account_id)}",
+            normalized_recurring_cost)
 
-    def upsert_frozen_agent_allocation(self, *, period_start: str | None = None,
-                                       month: str | None = None, account_id: int,
-                                       billing_unit_id: str,
-                                       recurring_charge: float,
-                                       normalized_recurring_cost: float | None,
-                                       currency: str, base_currency: str,
-                                       fx_rate_date: str | None,
-                                       frozen_on: str) -> int:
-        return self.upsert_frozen_plan_charge(
-            period_start=period_start, month=month, account_id=account_id,
-            billing_unit_id=billing_unit_id,
-            recurring_charge=recurring_charge,
-            normalized_recurring_cost=normalized_recurring_cost,
-            currency=currency, base_currency=base_currency,
-            fx_rate_date=fx_rate_date, frozen_on=frozen_on)
+    def upsert_frozen_agent_allocation(self, **kwargs) -> int:
+        return self.upsert_frozen_plan_charge(**kwargs)
 
     def upsert_agent_software(self, rows: list[dict]) -> int:
-        """Compatibility adapter: agent names live in the generic mirror."""
         return self.upsert_account_batch([
-            {"account_id": row["software_id"], "name": row["name"],
-             "updated_at": row.get("updated_at"), "account_kind": "agent"}
+            {"account_id": row["software_id"], "name": row["name"]}
             for row in rows
         ])
 
     def upsert_agent_batch(self, rows: list[dict]) -> int:
-        """Compatibility adapter: agent usage uses the generic daily grain."""
         return self.upsert_proxy_batch([
             {**row, "account_id": row["software_id"]} for row in rows
         ])
 
-    def reconcile_agent_allocations(
-            self, allocations: dict[tuple[int, str], dict[str, dict]],
-            current_month: str) -> None:
-        """Insert immutable agent allocations without rewriting old periods."""
-        for (account_id, unit_id), periods in allocations.items():
+    def reconcile_agent_allocations(self, allocations, current_month: str) -> None:
+        for (account_id, _unit_id), periods in allocations.items():
             for month, values in periods.items():
-                period_start = (month if "T" in str(month)
-                                else f"{month}-01T00:00:00Z")
-                self.upsert_frozen_agent_allocation(
-                    period_start=period_start,
-                    account_id=account_id,
-                    billing_unit_id=unit_id,
-                    recurring_charge=float(values.get("recurring_charge", 0) or 0),
+                self.upsert_frozen_plan_charge(
+                    account_id=account_id, billing_unit_id="agent",
+                    recurring_charge=values.get("recurring_charge", 0),
                     normalized_recurring_cost=values.get("normalized_recurring_cost"),
-                    currency=values.get("currency", "CNY"),
-                    base_currency=values.get("base_currency", "CNY"),
-                    fx_rate_date=values.get("fx_rate_date"),
-                    frozen_on=values.get("finalized_on") or str(period_start)[:10])
+                    frozen_on=values.get("finalized_on") or str(month)[:10],
+                )
 
     def purge_zero_agent_usage_rows(self) -> int:
-        """Compatibility no-op after agent archive unification."""
         return 0
 
     def purge_zero_usage_rows(self) -> int:
-        """Delete archive rows that carry no real usage.
-
-        A (date, model, account_id) bucket with request/cost rows but NO
-        token_usage rows represents failed/aborted or test requests — they are
-        recorded with zero tokens (and zero cost) and must not show up as
-        empty per-model cards. token_usage rows only exist for positive
-        amounts, so "has token rows" == "has real usage"; buckets with any
-        token usage (even 0-cost) are always preserved. Returns rows deleted.
-        """
         conn = self._connect()
         try:
-            deleted = conn.execute(
-                "DELETE FROM daily_usage WHERE input_tokens=0 AND "
-                "cache_tokens=0 AND output_tokens=0 AND equivalent_cost=0"
-            ).rowcount
-            conn.commit()
-            return deleted
-        finally:
-            conn.close()
-
-    def accumulate_plan_summary(self, period_start: str | None = None,
-                                account_id: int = 0,
-                                billing_unit_id: str = "",
-                                subscription_cost: float = 0,
-                                virtual_cost: float = 0,
-                                refresh_subscription: bool = False,
-                                month: str | None = None):
-        """Accumulate request-derived virtual cost without changing charges."""
-        period_start = period_start or (
-            month if month and "T" in month else f"{month}-01T00:00:00Z")
-        conn = self._connect()
-        try:
-            conn.execute(
-                """INSERT INTO monthly_recurring_costs
-                   (period_start,account_id,billing_unit_id,recurring_charge,equivalent_cost,
-                    normalized_recurring_cost,base_currency)
-                   VALUES(?,?,?,0,?,0,'CNY')
-                   ON CONFLICT(period_start,account_id,billing_unit_id) DO UPDATE SET
-                     equivalent_cost=monthly_recurring_costs.equivalent_cost+
-                                     excluded.equivalent_cost""",
-                (period_start, account_id, billing_unit_id, virtual_cost),
+            cursor = conn.execute(
+                """DELETE FROM daily_model_usage
+                   WHERE input_tokens=0 AND cache_read_tokens=0
+                     AND output_tokens=0 AND request_count=0
+                     AND api_equivalent_cost_micro_cny=0"""
             )
             conn.commit()
+            return cursor.rowcount
         finally:
             conn.close()
+
+    def accumulate_plan_summary(self, **kwargs):
+        """Compatibility no-op: plan/agent cost is already in daily usage."""
+        return 0
 
     def reconcile_plan_subscription(self, account_id: int, billing_unit_id: str,
                                     subscriptions: dict[str, float]) -> None:
-        """Compatibility adapter for inserting already-confirmed CNY charges."""
         for month, cost in subscriptions.items():
             self.upsert_frozen_plan_charge(
-                period_start=f"{month}-01T00:00:00Z", account_id=account_id,
-                billing_unit_id=billing_unit_id,
+                account_id=account_id, billing_unit_id=billing_unit_id,
                 recurring_charge=float(cost or 0),
                 normalized_recurring_cost=float(cost or 0),
-                currency="CNY", base_currency="CNY", fx_rate_date=None,
-                frozen_on=str(month)[:10] + "-01" if len(str(month)) == 7
-                else str(month)[:10])
+                frozen_on=f"{str(month)[:7]}-01")
 
-    def record_billing_export_event(self, event: dict,
-                                    payload_hash: str) -> int:
-        """Apply one immutable billing event by its natural fact key."""
-        if (float(event.get("recurring_charge") or 0) == 0 and
-                float(event.get("normalized_recurring_cost") or 0) == 0):
-            # A zero-valued finalized source fact is retained in Token-Board,
-            # but it is not a Dashboard fact and must not create an empty
-            # account identity.
+    def record_billing_export_event(self, event: dict, payload_hash: str) -> int:
+        if event.get("normalized_recurring_cost") is None:
             return 0
-        frozen_on = _day(event["frozen_on"])
-        conn = self._connect()
-        try:
-            account = conn.execute(
-                "SELECT 1 FROM accounts WHERE account_id=?", (event["account_id"],)
-            ).fetchone()
-            if account is None:
-                conn.execute(
-                    "INSERT INTO accounts(account_id,name,updated_at,account_kind) "
-                    "VALUES(?,?,?,?)",
-                    (event["account_id"], event["account_name"],
-                     frozen_on, event["account_kind"]),
-                )
-            existing = conn.execute(
-                "SELECT recurring_charge,normalized_recurring_cost,currency,"
-                "base_currency,fx_rate_date,is_frozen,frozen_on FROM monthly_recurring_costs "
-                "WHERE period_start=? AND account_id=? AND billing_unit_id=?",
-                (event["period_start"], event["account_id"], event["billing_unit_id"]),
-            ).fetchone()
-            if existing is None:
-                # V1 Dashboard rows were month-grained.  On the first V2
-                # event, move that provisional month row to the immutable
-                # period_start rather than creating a second charge for the
-                # same account/unit.
-                legacy_period = f"{event['month']}-01T00:00:00Z"
-                if legacy_period != event["period_start"]:
-                    legacy = conn.execute(
-                        "SELECT recurring_charge,normalized_recurring_cost,currency,"
-                        "base_currency,fx_rate_date,is_frozen,frozen_on FROM "
-                        "monthly_recurring_costs WHERE period_start=? AND account_id=? "
-                        "AND billing_unit_id=?",
-                        (legacy_period, event["account_id"], event["billing_unit_id"]),
-                    ).fetchone()
-                    if legacy is not None:
-                        conn.execute(
-                            "UPDATE monthly_recurring_costs SET period_start=? "
-                            "WHERE period_start=? AND account_id=? AND billing_unit_id=?",
-                            (event["period_start"], legacy_period,
-                             event["account_id"], event["billing_unit_id"]),
-                        )
-                        existing = legacy
-            if existing is not None:
-                current = (existing[0], existing[1], existing[2], existing[3],
-                           existing[4], existing[5], existing[6])
-                expected = (event["recurring_charge"], event["normalized_recurring_cost"],
-                            event["currency"], event["base_currency"],
-                            event["fx_rate_date"], 1, frozen_on)
-                # An older request-log export may have created a provisional
-                # row for this natural key.  The immutable billing event is
-                # allowed to freeze that row once; after freezing, a payload
-                # change is a data conflict rather than an additive update.
-                if not existing[5]:
-                    conn.execute(
-                        "UPDATE monthly_recurring_costs SET recurring_charge=?,"
-                        "currency=?,normalized_recurring_cost=?,base_currency=?,"
-                        "fx_rate_date=?,is_frozen=1,frozen_on=? WHERE period_start=? AND "
-                        "account_id=? AND billing_unit_id=?",
-                        (event["recurring_charge"], event["currency"],
-                         event["normalized_recurring_cost"], event["base_currency"],
-                        event["fx_rate_date"], frozen_on, event["period_start"],
-                         event["account_id"], event["billing_unit_id"]),
-                    )
-                    conn.commit()
-                    return 1
-                if any(current[index] != expected[index] for index in range(7)):
-                    raise ValueError(
-                        f"billing event payload changed: {event['event_key']}")
-                conn.commit()
-                return 0
-
-            if not (float(event["recurring_charge"] or 0) == 0 and
-                    float(event["normalized_recurring_cost"] or 0) == 0):
-                conn.execute(
-                    """INSERT INTO monthly_recurring_costs
-                       (period_start,account_id,billing_unit_id,recurring_charge,
-                        equivalent_cost,currency,normalized_recurring_cost,
-                        base_currency,fx_rate_date,is_frozen,frozen_on)
-                       VALUES(?,?,?,?,0,?,?,?,?,1,?)
-                       ON CONFLICT(period_start,account_id,billing_unit_id) DO UPDATE SET
-                         recurring_charge=excluded.recurring_charge,
-                         currency=excluded.currency,
-                         normalized_recurring_cost=excluded.normalized_recurring_cost,
-                         base_currency=excluded.base_currency,
-                         fx_rate_date=excluded.fx_rate_date,
-                         is_frozen=excluded.is_frozen,
-                         frozen_on=excluded.frozen_on
-                       WHERE monthly_recurring_costs.is_frozen=0""",
-                    (event["period_start"], event["account_id"],
-                     event["billing_unit_id"], event["recurring_charge"],
-                     event["currency"], event["normalized_recurring_cost"],
-                     event["base_currency"], event["fx_rate_date"],
-                     frozen_on),
-                )
-            conn.commit()
-            return 1
-        finally:
-            conn.close()
+        return self._add_actual_cost(
+            int(event["account_id"]),
+            str(event.get("account_name") or f"用户 {int(event['account_id'])}"),
+            event.get("normalized_recurring_cost"),
+        )
 
     def cleanup_stale_subscription_units(self, account_id: int,
                                          active_unit_ids: set[str]) -> None:
-        """Retained for callers that still name the old reconciliation step."""
         return None

@@ -18,4 +18,5 @@ def api_refresh():
         "token_records": len(_store().token_usages),
         "request_records": len(_store().request_usages),
         "cost_records": len(_store().cost_entries),
+        "user_count": len(_store().users),
     })

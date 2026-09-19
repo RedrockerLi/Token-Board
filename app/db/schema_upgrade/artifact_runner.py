@@ -28,6 +28,7 @@ from .engine_core import (
     latest_version,
     replace,
     verify,
+    now,
 )
 from .sqlite_utils import copy_sqlite
 
@@ -185,6 +186,26 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
                 f"unsupported {database_name} schema V{current.major}.{current.minor}")
         artifact_shadow = work / f"{database_name}.v{current.major}-shadow.db"
         copy_sqlite(path, artifact_shadow)
+        dashboard_before = None
+        if (database_name == DASHBOARD_DATABASE_NAME and
+                current < SchemaVersion(2, 2)):
+            # Downloaded V2.1 artifacts take the same audited V2.2 path as
+            # local databases. Keep a labelled source copy beside the report
+            # before the shadow is mutated.
+            from .coordinator import (
+                _dashboard_v22_totals,
+                _write_dashboard_v22_pending_report,
+            )
+            report_base = (path.parent.parent
+                           if path.parent.name == "tmp_dash" else path.parent)
+            report_root = report_base / "dashboard_migration_reports"
+            report_root.mkdir(mode=0o700, exist_ok=True)
+            backup_dir = report_root / (
+                f"dashboard-v{current.major}.{current.minor}-backup-{now()}")
+            backup_dir.mkdir(mode=0o700, exist_ok=False)
+            shutil.copy2(path, backup_dir / "dashboard.db")
+            dashboard_before = _dashboard_v22_totals(artifact_shadow, new=False)
+            _write_dashboard_v22_pending_report(artifact_shadow, backup_dir, current)
         if current.major == 2:
             if database_name == DASHBOARD_DATABASE_NAME and local_token_board_path:
                 proxy_version = inspect_version(
@@ -245,6 +266,9 @@ def upgrade_artifact(path: Path, database_name: str, schema_root: Path,
         # to the live file in-place.
         current_shadow = inspect_version(artifact_shadow, database_name)
         assert current_shadow is not None
+        if dashboard_before is not None:
+            from .coordinator import _validate_dashboard_v22_migration
+            _validate_dashboard_v22_migration(artifact_shadow, dashboard_before)
         if current_shadow.major == 1 and (schema_root / database_name / "v2").is_dir():
             apply_sql_migrations(
                 str(artifact_shadow), str(schema_root), database_name,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import fcntl
+import csv
+import json
 import shutil
 import uuid
 from pathlib import Path
@@ -31,12 +33,149 @@ from .engine_core import (
     verify,
     backup_files,
     now,
+    table_exists,
     write_manifest,
     schema_root as resolve_schema_root,
 )
 from .sqlite_utils import copy_sqlite
 
 
+def _write_dashboard_v22_pending_report(
+        dashboard_shadow: Path, output_dir: Path,
+        previous: SchemaVersion | None) -> dict:
+    """Record recurring rows that V2.2 intentionally cannot price.
+
+    ``normalized_recurring_cost IS NULL`` is excluded from the new cumulative
+    actual-cost column, but migration must remain non-blocking and auditable.
+    The report lives beside the timestamped/schema-versioned upgrade backup.
+    """
+    if previous is None:
+        return {}
+    conn = sqlite_runtime.connect(dashboard_shadow, "schema_upgrade")
+    try:
+        if not table_exists(conn, "monthly_recurring_costs"):
+            return {}
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(monthly_recurring_costs)")}
+        if "normalized_recurring_cost" not in columns:
+            return {}
+        period_column = "period_start" if "period_start" in columns else "month"
+        rows = [dict(row) for row in conn.execute(
+            f"""SELECT {period_column} AS period_start,account_id,billing_unit_id,
+                          recurring_charge,normalized_recurring_cost,currency
+                     FROM monthly_recurring_costs
+                    WHERE normalized_recurring_cost IS NULL
+                    ORDER BY {period_column},account_id,billing_unit_id""")]
+    finally:
+        conn.close()
+    stamp = now()
+    prefix = output_dir / (
+        f"dashboard-v{previous.major}.{previous.minor}-to-v2.2-"
+        f"pending-{stamp}")
+    json_path = Path(str(prefix) + ".json")
+    csv_path = Path(str(prefix) + ".csv")
+    payload = {
+        "schema_from": f"V{previous.major}.{previous.minor}",
+        "schema_to": "V2.2",
+        "generated_at": stamp,
+        "reason": "normalized_recurring_cost is NULL; excluded from actual cost",
+        "count": len(rows),
+        "rows": rows,
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=(
+            "period_start", "account_id", "billing_unit_id",
+            "recurring_charge", "normalized_recurring_cost", "currency"))
+        writer.writeheader()
+        writer.writerows(rows)
+    return {"json": str(json_path), "csv": str(csv_path), "count": len(rows)}
+
+
+def _dashboard_v22_totals(path: Path, *, new: bool) -> dict[str, float] | None:
+    conn = sqlite_runtime.connect(path, "schema_upgrade")
+    try:
+        if new:
+            row = conn.execute(
+                """SELECT COALESCE(SUM(input_tokens),0),
+                          COALESCE(SUM(cache_read_tokens),0),
+                          COALESCE(SUM(output_tokens),0),
+                          COALESCE(SUM(request_count),0),
+                          COALESCE(SUM(api_equivalent_cost_micro_cny),0)
+                     FROM daily_model_usage""").fetchone()
+            actual = conn.execute(
+                "SELECT COALESCE(SUM(actual_cost_micro_cny),0) FROM users"
+            ).fetchone()[0]
+            return {
+                "input": int(row[0]), "cache": int(row[1]),
+                "output": int(row[2]), "requests": int(row[3]),
+                "theoretical": float(row[4]) / 1_000_000,
+                "actual": float(actual) / 1_000_000,
+            }
+        if not table_exists(conn, "daily_usage"):
+            return None
+        row = conn.execute(
+            """SELECT COALESCE(SUM(input_tokens),0),
+                      COALESCE(SUM(cache_tokens),0),
+                      COALESCE(SUM(output_tokens),0),
+                      COALESCE(SUM(request_count),0),
+                      COALESCE(SUM(equivalent_cost),0),
+                      COALESCE(SUM(billed_usage_cost),0)
+                 FROM daily_usage
+                WHERE model IS NOT NULL AND trim(model)<>''
+                  AND lower(trim(model))<>'unknown'""").fetchone()
+        recurring_columns = {item[1] for item in conn.execute(
+            "PRAGMA table_info(monthly_recurring_costs)")}
+        recurring = 0
+        if "normalized_recurring_cost" in recurring_columns:
+            recurring = conn.execute(
+                """SELECT COALESCE(SUM(normalized_recurring_cost),0)
+                     FROM monthly_recurring_costs
+                    WHERE normalized_recurring_cost IS NOT NULL"""
+            ).fetchone()[0]
+        return {
+            "input": int(row[0]), "cache": int(row[1]),
+            "output": int(row[2]), "requests": int(row[3]),
+            "theoretical": float(row[4]),
+            "actual": float(row[5]) + float(recurring),
+        }
+    finally:
+        conn.close()
+
+
+def _validate_dashboard_v22_migration(path: Path, before: dict) -> dict:
+    after = _dashboard_v22_totals(path, new=True)
+    for field in ("input", "cache", "output", "requests"):
+        if before[field] != after[field]:
+            raise UpgradeError(
+                f"dashboard V2.2 migration changed {field}: "
+                f"{before[field]} != {after[field]}")
+    differences = {
+        field: round(after[field] - before[field], 6)
+        for field in ("theoretical", "actual")
+    }
+    if any(abs(value) > 0.01 for value in differences.values()):
+        raise UpgradeError(
+            "dashboard V2.2 migration amount validation failed: "
+            f"{differences}")
+    return {"before": before, "after": after, "differences": differences}
+
+
+def _versioned_backup_aliases(backups: list[dict], backup_dir: Path,
+                              schema_from: dict, stamp: str) -> list[str]:
+    """Keep human-discoverable, timestamp/schema-labelled backup filenames."""
+    aliases = []
+    for item in backups:
+        source = Path(item["source"])
+        backup = item.get("backup")
+        if not backup:
+            continue
+        database = source.stem
+        label = schema_from.get(database, "unknown").replace(".", "_")
+        target = backup_dir / f"{database}-{label}-backup-{stamp}.db"
+        shutil.copy2(backup, target)
+        aliases.append(str(target))
+    return aliases
 def verify_current_database(path: str | Path, database_name: str,
                             schema_root: str | Path | None = None) -> SchemaVersion:
     """Verify that a runtime database is already at the published V2 tip."""
@@ -85,6 +224,8 @@ def _upgrade_v2_pair(proxy: Path, dashboard: Path, root: Path,
             dashboard_version.major not in (1, 2) or
             proxy_version.major == dashboard_version.major == 2):
         raise UpgradeError("V2 shadow upgrade requires at least one V1 database")
+    proxy_target = latest_version(root, TOKEN_BOARD_DATABASE_NAME, 2)
+    dashboard_target = latest_version(root, DASHBOARD_DATABASE_NAME, 2)
     work = proxy.parent / f"auto-v1-to-v2-{uuid.uuid4().hex}.work"
     backup = proxy.parent / f"auto-v1-to-v2-{uuid.uuid4().hex}.backup"
     manifest_path = proxy.parent / f"auto-v1-to-v2-{uuid.uuid4().hex}.manifest.json"
@@ -93,24 +234,39 @@ def _upgrade_v2_pair(proxy: Path, dashboard: Path, root: Path,
         manifest = {
             "kind": "v1-to-v2",
             "stage": "prepared",
+            "created_at": now(),
+            "schema_from": {"token-board": f"V{proxy_version.major}.{proxy_version.minor}",
+                            "dashboard": f"V{dashboard_version.major}.{dashboard_version.minor}"},
+            "schema_to": {"token-board": f"V{proxy_target.major}.{proxy_target.minor}",
+                          "dashboard": f"V{dashboard_target.major}.{dashboard_target.minor}"},
             "work_dir": str(work),
             "backup_dir": str(backup),
             "sources": {"token-board": str(proxy), "dashboard": str(dashboard)},
         }
         write_manifest(manifest_path, manifest)
         manifest["backups"] = backup_files([proxy, dashboard], backup)
+        manifest["versioned_backups"] = _versioned_backup_aliases(
+            manifest["backups"], backup, manifest["schema_from"], manifest["created_at"])
         manifest["stage"] = "backed_up"
         write_manifest(manifest_path, manifest)
         proxy_shadow = work / "token-board.v2-shadow.db"
         dashboard_shadow = work / "dashboard.v2-shadow.db"
         copy_sqlite(proxy, proxy_shadow)
         copy_sqlite(dashboard, dashboard_shadow)
-        proxy_target = latest_version(root, TOKEN_BOARD_DATABASE_NAME, 2)
-        dashboard_target = latest_version(root, DASHBOARD_DATABASE_NAME, 2)
+        dashboard_before = _dashboard_v22_totals(dashboard_shadow, new=False)
+        report = _write_dashboard_v22_pending_report(
+            dashboard_shadow, backup, dashboard_version)
+        if report:
+            manifest["dashboard_v22_pending_report"] = report
+            write_manifest(manifest_path, manifest)
         apply_sql_migrations(str(proxy_shadow), str(root),
                              TOKEN_BOARD_DATABASE_NAME, target=proxy_target)
         apply_sql_migrations(str(dashboard_shadow), str(root),
                              DASHBOARD_DATABASE_NAME, target=dashboard_target)
+        if dashboard_before is not None:
+            manifest["dashboard_v22_validation"] = _validate_dashboard_v22_migration(
+                dashboard_shadow, dashboard_before)
+            write_manifest(manifest_path, manifest)
         verify(proxy_shadow, TOKEN_BOARD_DATABASE_NAME, proxy_target)
         verify(dashboard_shadow, DASHBOARD_DATABASE_NAME, dashboard_target)
         manifest["shadows"] = {"token-board": str(proxy_shadow),
@@ -168,6 +324,11 @@ def _upgrade_v2_minor_pair(proxy: Path, dashboard: Path, root: Path,
         manifest = {
             "kind": "v2-minor-pair",
             "stage": "prepared",
+            "created_at": now(),
+            "schema_from": {"token-board": f"V{proxy_version.major}.{proxy_version.minor}",
+                            "dashboard": f"V{dashboard_version.major}.{dashboard_version.minor}"},
+            "schema_to": {"token-board": f"V{proxy_target.major}.{proxy_target.minor}",
+                          "dashboard": f"V{dashboard_target.major}.{dashboard_target.minor}"},
             "work_dir": str(work),
             "backup_dir": str(backup),
             "sources": {"token-board": str(proxy), "dashboard": str(dashboard)},
@@ -176,6 +337,8 @@ def _upgrade_v2_minor_pair(proxy: Path, dashboard: Path, root: Path,
         }
         write_manifest(manifest_path, manifest)
         manifest["backups"] = backup_files([proxy, dashboard], backup)
+        manifest["versioned_backups"] = _versioned_backup_aliases(
+            manifest["backups"], backup, manifest["schema_from"], manifest["created_at"])
         manifest["stage"] = "backed_up"
         write_manifest(manifest_path, manifest)
 
@@ -183,10 +346,21 @@ def _upgrade_v2_minor_pair(proxy: Path, dashboard: Path, root: Path,
         dashboard_shadow = work / "dashboard.v2-shadow.db"
         copy_sqlite(proxy, proxy_shadow)
         copy_sqlite(dashboard, dashboard_shadow)
+        dashboard_before = (_dashboard_v22_totals(dashboard_shadow, new=False)
+                            if dashboard_version < SchemaVersion(2, 2) else None)
+        report = _write_dashboard_v22_pending_report(
+            dashboard_shadow, backup, dashboard_version)
+        if report:
+            manifest["dashboard_v22_pending_report"] = report
+            write_manifest(manifest_path, manifest)
         apply_sql_migrations(str(proxy_shadow), str(root),
                              TOKEN_BOARD_DATABASE_NAME, target=proxy_target)
         apply_sql_migrations(str(dashboard_shadow), str(root),
                              DASHBOARD_DATABASE_NAME, target=dashboard_target)
+        if dashboard_before is not None:
+            manifest["dashboard_v22_validation"] = _validate_dashboard_v22_migration(
+                dashboard_shadow, dashboard_before)
+            write_manifest(manifest_path, manifest)
         verify(proxy_shadow, TOKEN_BOARD_DATABASE_NAME, proxy_target)
         verify(dashboard_shadow, DASHBOARD_DATABASE_NAME, dashboard_target)
         manifest["shadows"] = {"token-board": str(proxy_shadow),

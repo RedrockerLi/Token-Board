@@ -106,14 +106,14 @@ async function requestFile(url, options = {}) {
     return resp;
 }
 
-/** Build a relative URL with optional extra params, global api_key_name, and platform. */
+/** Build a relative URL with optional extra params and global user_id. */
 function buildParams(baseUrl, extraParams) {
     const url = new URL(baseUrl, window.location.origin);
     for (const [k, v] of Object.entries(extraParams || {})) {
         if (v != null) url.searchParams.set(k, v);
     }
-    if (typeof currentKeyName !== 'undefined' && currentKeyName) {
-        url.searchParams.set('api_key_name', currentKeyName);
+    if (typeof currentUserId !== 'undefined' && currentUserId) {
+        url.searchParams.set('user_id', currentUserId);
     }
     return url.pathname + url.search;
 }
@@ -137,11 +137,11 @@ async function fetchRefresh() {
     return requestJSON('/api/refresh');
 }
 
-/** Delete several users in one complete dashboard archive transaction. */
-async function deleteDashboardUsers(names) {
+/** Archive several users in one complete dashboard archive transaction. */
+async function deleteDashboardUsers(userIds) {
     return proxyApi('/api/proxy/dashboard/users', {
         method: 'DELETE',
-        body: JSON.stringify({ names: names }),
+        body: JSON.stringify({ user_ids: userIds }),
     });
 }
 

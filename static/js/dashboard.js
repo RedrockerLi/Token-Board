@@ -10,10 +10,10 @@
  */
 
 // ── Global state ──
-var currentKeyName = '';       // '' = overview (all users)
+var currentUserId = '';        // '' = overview (all users)
 var summaryData = null;        // cached /api/summary response
 var summaryRequest = null;     // in-flight/cached summary request for current user
-var summaryRequestKey = null;  // currentKeyName used by summaryRequest
+var summaryRequestKey = null;  // currentUserId used by summaryRequest
 var dashboardDataGeneration = 0;
 
 var calendarState = {
@@ -69,18 +69,18 @@ function buildAliasMaps(apiModels) {
 
 // Full sorted user list (backend order: most-recent call month → month volume),
 // used by the "更多用户" picker. The dropdown itself shows the top 5.
-let allKeyNames = [];
+let allUsers = [];
 const KEY_SELECTOR_TOP = 5;
-const DASHBOARD_DELETE_QUEUE_KEY = 'tokenBoard.dashboardDeleteQueue';
+const DASHBOARD_DELETE_QUEUE_KEY = 'tokenBoard.dashboardArchiveQueue';
 
 function loadPendingDashboardUserDeletes() {
     try {
         var raw = window.localStorage.getItem(DASHBOARD_DELETE_QUEUE_KEY);
-        var names = JSON.parse(raw || '[]');
-        if (!Array.isArray(names)) return [];
-        return names.filter(function (name) {
-            return typeof name === 'string' && name.trim();
-        }).map(function (name) { return name.trim(); });
+        var ids = JSON.parse(raw || '[]');
+        if (!Array.isArray(ids)) return [];
+        return ids.map(function (id) { return Number(id); }).filter(function (id) {
+            return Number.isInteger(id) && id > 0;
+        });
     } catch (err) {
         console.warn('Unable to load pending dashboard deletions:', err);
         return [];
@@ -102,27 +102,28 @@ function persistPendingDashboardUserDeletes() {
     }
 }
 
-function populateKeyNameSelector(keyNames) {
+function populateKeyNameSelector(users) {
     var keySel = document.getElementById('keyNameSelector');
     if (!keySel) return '';
     var prevKeyVal = keySel.value;
     keySel.innerHTML = '<option value="">总览 (所有用户)</option>';
-    allKeyNames = (keyNames || []).filter(function (name) {
-        return !pendingDashboardUserDeletes.has(name);
+    allUsers = (users || []).filter(function (user) {
+        return user && !pendingDashboardUserDeletes.has(Number(user.id));
     });
-    allKeyNames.slice(0, KEY_SELECTOR_TOP).forEach(function (name) {
+    allUsers.slice(0, KEY_SELECTOR_TOP).forEach(function (user) {
         var opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name;
+        opt.value = String(user.id);
+        opt.textContent = user.name;
         keySel.appendChild(opt);
     });
     // Preserve a non-top selection across reloads so the filter isn't silently
     // reset to "all users" (e.g. after picking a month/model).
-    if (prevKeyVal && allKeyNames.indexOf(prevKeyVal) >= 0 &&
-        allKeyNames.slice(0, KEY_SELECTOR_TOP).indexOf(prevKeyVal) < 0) {
+    if (prevKeyVal && allUsers.some(function (user) { return String(user.id) === prevKeyVal; }) &&
+        !allUsers.slice(0, KEY_SELECTOR_TOP).some(function (user) { return String(user.id) === prevKeyVal; })) {
         var opt = document.createElement('option');
         opt.value = prevKeyVal;
-        opt.textContent = prevKeyVal;
+        var selected = allUsers.find(function (user) { return String(user.id) === prevKeyVal; });
+        opt.textContent = selected ? selected.name : prevKeyVal;
         keySel.appendChild(opt);
     }
     return prevKeyVal;
@@ -133,19 +134,21 @@ function populateKeyNameSelector(keyNames) {
 function renderMoreUsersList() {
     var list = document.getElementById('moreUsersList');
     if (!list) return;
-    var visibleNames = allKeyNames.filter(function (name) {
-        return !pendingDashboardUserDeletes.has(name);
+    var visibleUsers = allUsers.filter(function (user) {
+        return !pendingDashboardUserDeletes.has(Number(user.id));
     });
-    if (!visibleNames.length) {
+    if (!visibleUsers.length) {
         list.innerHTML = '<div class="td-empty">暂无其他用户</div>';
     } else {
-        list.innerHTML = visibleNames.map(function (name) {
-            var active = (name === currentKeyName) ? ' more-user-row--active' : '';
+        list.innerHTML = visibleUsers.map(function (user) {
+            var active = (String(user.id) === String(currentUserId)) ? ' more-user-row--active' : '';
+            var archiveButton = Number(user.id) === 0 ? '' :
+                '<button type="button" class="btn btn--sm more-user-delete" data-user-id="' +
+                esc(String(user.id)) + '" title="归档历史数据">归档</button>';
             return '<div class="more-user-row' + active + '">' +
-                '<button type="button" class="btn btn--sm more-user-item" data-name="' +
-                esc(name) + '">' + esc(name) + '</button>' +
-                '<button type="button" class="btn btn--sm more-user-delete" data-name="' +
-                esc(name) + '" title="删除历史数据">删除</button>' +
+                '<button type="button" class="btn btn--sm more-user-item" data-user-id="' +
+                esc(String(user.id)) + '">' + esc(user.name) + '</button>' +
+                archiveButton +
                 '</div>';
         }).join('');
     }
@@ -159,8 +162,8 @@ function openMoreUsersModal() {
     openModal('moreUsersModal');
 }
 
-function removeMoreUserFromList(name) {
-    allKeyNames = allKeyNames.filter(function (item) { return item !== name; });
+function removeMoreUserFromList(userId) {
+    allUsers = allUsers.filter(function (item) { return Number(item.id) !== Number(userId); });
     renderMoreUsersList();
 }
 
@@ -170,16 +173,16 @@ async function closeMoreUsersModalImpl() {
     Array.from(controls).forEach(function (control) { control.disabled = true; });
 
     try {
-        var names = Array.from(pendingDashboardUserDeletes).sort();
-        if (!names.length) {
+        var userIds = Array.from(pendingDashboardUserDeletes).sort(function (a, b) { return a - b; });
+        if (!userIds.length) {
             closeModal('moreUsersModal');
             moreUsersModalSessionOpen = false;
             return true;
         }
 
-        var result = await deleteDashboardUsers(names);
+        var result = await deleteDashboardUsers(userIds);
         if (!result || result.status !== 'ok') {
-            throw new Error((result && result.message) || '删除失败');
+            throw new Error((result && result.message) || '归档失败');
         }
         pendingDashboardUserDeletes.clear();
         persistPendingDashboardUserDeletes();
@@ -188,7 +191,7 @@ async function closeMoreUsersModalImpl() {
         await refreshData();
         if (typeof showToast === 'function') {
             var suffix = result.uploaded ? '并已上传到云端' : '并已保存到本机';
-            showToast('已删除 ' + result.deleted_names.length + ' 个用户的历史数据' + suffix);
+            showToast('已归档 ' + (result.archived_user_ids || []).length + ' 个用户的历史数据' + suffix);
         }
         return true;
     } catch (err) {
@@ -202,15 +205,15 @@ async function closeMoreUsersModalImpl() {
             moreUsersModalSessionOpen = false;
             await refreshData();
             if (typeof showToast === 'function') {
-                showToast('待删除用户已不存在');
+                showToast('待归档用户已不存在');
             }
             return true;
         }
         if (typeof showToast === 'function') {
-            showToast('删除提交失败：' + (err.message || '操作失败') +
-                '；删除队列已保留，关闭窗口可重试', 'error');
+            showToast('归档提交失败：' + (err.message || '操作失败') +
+                '；归档队列已保留，关闭窗口可重试', 'error');
         } else {
-            alert('删除提交失败：' + (err.message || '操作失败'));
+            alert('归档提交失败：' + (err.message || '操作失败'));
         }
         return false;
     } finally {
@@ -229,27 +232,30 @@ async function closeMoreUsersModal() {
     }
 }
 
-async function selectMoreUser(name) {
+async function selectMoreUser(userId) {
     if (!await closeMoreUsersModal()) return;
-    currentKeyName = name;
+    currentUserId = String(userId);
     var keySel = document.getElementById('keyNameSelector');
     if (keySel) {
-        var existing = Array.from(keySel.options).some(function (o) { return o.value === name; });
+        var existing = Array.from(keySel.options).some(function (o) { return o.value === String(userId); });
         if (!existing) {
             var opt = document.createElement('option');
-            opt.value = name;
-            opt.textContent = name;
+            opt.value = String(userId);
+            var selected = allUsers.find(function (user) { return Number(user.id) === Number(userId); });
+            opt.textContent = selected ? selected.name : String(userId);
             keySel.appendChild(opt);
         }
-        keySel.value = name;
+        keySel.value = String(userId);
     }
     invalidateDashboardData();
     invalidateCalendarLoad();
     await refreshDashboardVisuals();
 }
 
-async function deleteMoreUser(name, button) {
-    if (!confirm('确定删除用户「' + name + '」的历史数据吗？')) {
+async function deleteMoreUser(userId, button) {
+    var user = allUsers.find(function (item) { return Number(item.id) === Number(userId); });
+    var displayName = user ? user.name : String(userId);
+    if (!confirm('确定归档用户「' + displayName + '」的历史数据吗？')) {
         return;
     }
 
@@ -258,23 +264,23 @@ async function deleteMoreUser(name, button) {
     Array.from(controls).forEach(function (control) { control.disabled = true; });
 
     try {
-        pendingDashboardUserDeletes.add(name);
+        pendingDashboardUserDeletes.add(Number(userId));
         persistPendingDashboardUserDeletes();
-        removeMoreUserFromList(name);
-        if (currentKeyName === name) {
-            currentKeyName = '';
+        removeMoreUserFromList(userId);
+        if (String(currentUserId) === String(userId)) {
+            currentUserId = '';
             var keySel = document.getElementById('keyNameSelector');
             if (keySel) keySel.value = '';
         }
         if (typeof showToast === 'function') {
-            showToast('已将用户「' + name + '」加入删除队列，关闭窗口后提交');
+            showToast('已将用户「' + displayName + '」加入归档队列，关闭窗口后提交');
         }
     } catch (err) {
         Array.from(controls).forEach(function (control) { control.disabled = false; });
         if (typeof showToast === 'function') {
-            showToast('加入删除队列失败：' + (err.message || '操作失败'), 'error');
+            showToast('加入归档队列失败：' + (err.message || '操作失败'), 'error');
         } else {
-            alert('删除失败：' + (err.message || '同步失败'));
+            alert('归档失败：' + (err.message || '同步失败'));
         }
     }
 }
@@ -431,7 +437,7 @@ function resetCurrentMonthModelCache() {
 
 function fetchCurrentMonthUsedModels() {
     var current = getBrowserCurrentMonth();
-    var requestKey = (currentKeyName || '') + '|' + current.year + '-' + current.month;
+    var requestKey = (currentUserId || '') + '|' + current.year + '-' + current.month;
     if (currentMonthUsedModels instanceof Set &&
         currentMonthUsedModelsKey === requestKey) {
         return Promise.resolve(currentMonthUsedModels);
@@ -462,14 +468,14 @@ function fetchCurrentMonthUsedModels() {
 }
 
 function updateGlobalTokenShares(summaryDataForCurrentUser) {
-    var scopeKey = currentKeyName || '';
+    var scopeKey = currentUserId || '';
     if (globalTokenSharesKey === scopeKey && globalTokenShares !== null) return;
     globalTokenShares = calculateGlobalTokenShares(summaryDataForCurrentUser);
     globalTokenSharesKey = scopeKey;
 }
 
 function fetchDashboardSummary() {
-    var requestKey = currentKeyName || '';
+    var requestKey = currentUserId || '';
     if (summaryRequest && summaryRequestKey === requestKey) return summaryRequest;
 
     var requestGeneration = dashboardDataGeneration;
@@ -492,10 +498,10 @@ function fetchDashboardSummary() {
 
 async function loadSummary() {
     await loadDisplayConfig();  // Load alias config before calculating pie shares
-    var requestKey = currentKeyName || '';
+    var requestKey = currentUserId || '';
     var requestGeneration = dashboardDataGeneration;
     var data = await fetchDashboardSummary();
-    if (requestKey !== (currentKeyName || '') ||
+    if (requestKey !== (currentUserId || '') ||
         requestGeneration !== dashboardDataGeneration) return;
 
     var elStatTotalTokens = document.getElementById('statTotalTokens');
@@ -511,8 +517,8 @@ async function loadSummary() {
     if (elStatCacheHitTokens) elStatCacheHitTokens.textContent = fmtNum(data.total_input_cache_hit_tokens);
     if (elStatRequests) elStatRequests.textContent = fmtNum(data.total_requests);
 
-    // Actual consumption is the metered bill plus the subscription allocation
-    // attached to each agent. The theoretical card is usage-derived only.
+    // Actual consumption is the cumulative value stored on the selected
+    // stable user identity; theoretical consumption comes from daily model use.
     if (elStatCost) elStatCost.textContent = fmtCost(data.actual_cost || 0);
     var statCostSub = document.getElementById('statCostSub');
     if (statCostSub) {
@@ -520,8 +526,7 @@ async function loadSummary() {
     }
 
     var months = data.available_months || [];
-    var keyNames = data.api_key_names || [];
-    var prevKeyVal = populateKeyNameSelector(keyNames);
+    var prevKeyVal = populateKeyNameSelector(data.users || []);
 
     var keySel = document.getElementById('keyNameSelector');
     if (keySel) {
@@ -529,7 +534,7 @@ async function loadSummary() {
             keySel.value = prevKeyVal;
         } else {
             keySel.value = '';
-            currentKeyName = '';
+            currentUserId = '';
         }
     }
 
@@ -547,7 +552,7 @@ async function loadSummary() {
 // ── Daily-use calendar ─────────────────────────────────────────────────────
 
 function calendarScopeKey(year, month) {
-    return (currentKeyName || '') + '|' + year + '-' + month;
+    return (currentUserId || '') + '|' + year + '-' + month;
 }
 
 function fetchDashboardDaily(year, month) {
@@ -785,7 +790,7 @@ function populateCalendarSelectors(months) {
 }
 
 function isCurrentCalendarRequest(sequence, scopeKey, mode, year, month, dataGeneration) {
-    return sequence === calendarLoadSequence && scopeKey === (currentKeyName || '') &&
+    return sequence === calendarLoadSequence && scopeKey === (currentUserId || '') &&
         dataGeneration === dashboardDataGeneration &&
         calendarState.mode === mode && calendarState.year === year &&
         (mode === 'year' || calendarState.month === month);
@@ -793,7 +798,7 @@ function isCurrentCalendarRequest(sequence, scopeKey, mode, year, month, dataGen
 
 async function loadCalendarData() {
     var sequence = ++calendarLoadSequence;
-    var scopeKey = currentKeyName || '';
+    var scopeKey = currentUserId || '';
     var dataGeneration = dashboardDataGeneration;
     var mode = calendarState.mode === 'year' ? 'year' : 'month';
     var year = Number(calendarState.year || getBrowserCurrentMonth().year);
@@ -851,14 +856,14 @@ async function loadCalendarData() {
 
 async function loadModelPie() {
     await loadDisplayConfig();  // Ensure config is loaded (may race with loadSummary)
-    var requestKey = currentKeyName || '';
+    var requestKey = currentUserId || '';
     var requestGeneration = dashboardDataGeneration;
     var loader = document.getElementById('loadingModelPie');
     if (!loader) return;
     try {
         var data = await fetchDashboardSummary();
         var currentModels = await fetchCurrentMonthUsedModels();
-        if (requestKey !== (currentKeyName || '') ||
+        if (requestKey !== (currentUserId || '') ||
             requestGeneration !== dashboardDataGeneration) return;
         updateGlobalTokenShares(data);
         var modelEntries = buildVisibleModelEntries(data, currentModels);
@@ -879,7 +884,7 @@ async function loadModelPie() {
         renderPieChart('chartModelPie', pieData);
         loader.style.display = 'none';
     } catch (err) {
-        if (requestKey !== (currentKeyName || '') ||
+        if (requestKey !== (currentUserId || '') ||
             requestGeneration !== dashboardDataGeneration) return;
         console.error('Failed to load model pie:', err);
         loader.classList.add('loading--text'); loader.textContent = '加载失败';
@@ -887,19 +892,19 @@ async function loadModelPie() {
 }
 
 async function loadTypePie() {
-    var requestKey = currentKeyName || '';
+    var requestKey = currentUserId || '';
     var requestGeneration = dashboardDataGeneration;
     var loader = document.getElementById('loadingTypePie');
     if (!loader) return;
     try {
         var data = await fetchTokenTypes();
-        if (requestKey !== (currentKeyName || '') ||
+        if (requestKey !== (currentUserId || '') ||
             requestGeneration !== dashboardDataGeneration) return;
         var filtered = data.filter(function (d) { return d.value > 0; });
         renderPieChart('chartTypePie', filtered, ['#B45F45', '#6E8B77', '#C08B42']);
         loader.style.display = 'none';
     } catch (err) {
-        if (requestKey !== (currentKeyName || '') ||
+        if (requestKey !== (currentUserId || '') ||
             requestGeneration !== dashboardDataGeneration) return;
         console.error('Failed to load type pie:', err);
         loader.classList.add('loading--text'); loader.textContent = '加载失败';
@@ -935,7 +940,7 @@ function bindDashboardEvents() {
     if (keySel && !keySel._bound) {
         keySel._bound = true;
         keySel.addEventListener('change', async function () {
-            currentKeyName = this.value;
+            currentUserId = this.value;
             invalidateDashboardData();
             invalidateCalendarLoad();
             try {
@@ -1012,11 +1017,11 @@ function bindDashboardEvents() {
         moreList.addEventListener('click', function (e) {
             var deleteBtn = e.target.closest ? e.target.closest('.more-user-delete') : null;
             if (deleteBtn) {
-                deleteMoreUser(deleteBtn.dataset.name, deleteBtn);
+                deleteMoreUser(deleteBtn.dataset.userId, deleteBtn);
                 return;
             }
             var btn = e.target.closest ? e.target.closest('.more-user-item') : null;
-            if (btn) selectMoreUser(btn.dataset.name);
+            if (btn) selectMoreUser(btn.dataset.userId);
         });
     }
 }

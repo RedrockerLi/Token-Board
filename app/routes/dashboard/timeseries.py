@@ -1,180 +1,100 @@
-"""Dashboard route group."""
+"""Token/request time-series endpoints for the homepage."""
 
 from collections import defaultdict
 
-from app.routes.dashboard.common import (
-    _store, api_error, bp, jsonify, request,
-)
+from app.routes.dashboard.common import _store, api_error, bp, jsonify, request
+
+
+def _selected_user_id():
+    raw = request.args.get("user_id", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
 
 @bp.route("/api/daily")
 def api_daily():
-    """Return daily token/cost breakdown for a given month.
-
-    Query params: year (int), month (int), api_key_name (optional),
-                  model (optional), platform (optional)
-    """
     year = request.args.get("year", type=int)
     month = request.args.get("month", type=int)
-    api_key_name = request.args.get("api_key_name", "").strip() or None
+    user_id = _selected_user_id()
     model_filter = request.args.get("model", "").strip() or None
-    platform_filter = request.args.get("platform", "").strip() or None
     if not year or not month:
         return api_error("year and month query params required", 400)
 
-    # Daily token aggregation
-    daily_tokens = defaultdict(lambda: {
+    daily = defaultdict(lambda: {
         "output_tokens": 0, "input_cache_hit": 0, "input_cache_miss": 0,
         "requests": 0, "by_model": defaultdict(lambda: {
-            "output": 0, "input_hit": 0, "input_miss": 0, "requests": 0
-        })
+            "output": 0, "input_hit": 0, "input_miss": 0, "requests": 0,
+        }),
     })
+    for usage in _store().token_usages:
+        if usage["_year"] != year or usage["_month"] != month:
+            continue
+        if user_id is not None and usage["user_id"] != user_id:
+            continue
+        if model_filter and usage["model"] != model_filter:
+            continue
+        day = daily[usage["date"]]
+        model = day["by_model"][usage["model"]]
+        if usage["token_type"] == "output":
+            day["output_tokens"] += usage["amount"]
+            model["output"] += usage["amount"]
+        elif usage["token_type"] == "input_cache_hit":
+            day["input_cache_hit"] += usage["amount"]
+            model["input_hit"] += usage["amount"]
+        else:
+            day["input_cache_miss"] += usage["amount"]
+            model["input_miss"] += usage["amount"]
 
-    for tu in _store().token_usages:
-        if tu["_year"] != year or tu["_month"] != month:
+    for usage in _store().request_usages:
+        if usage["_year"] != year or usage["_month"] != month:
             continue
-        if api_key_name and tu["api_key_name"] != api_key_name:
+        if user_id is not None and usage["user_id"] != user_id:
             continue
-        if model_filter and tu["model"] != model_filter:
+        if model_filter and usage["model"] != model_filter:
             continue
-        if platform_filter and tu["platform"] != platform_filter:
-            continue
-        day = tu["date"]
-        if tu["token_type"] == "output":
-            daily_tokens[day]["output_tokens"] += tu["amount"]
-            daily_tokens[day]["by_model"][tu["model"]]["output"] += tu["amount"]
-        elif tu["token_type"] == "input_cache_hit":
-            daily_tokens[day]["input_cache_hit"] += tu["amount"]
-            daily_tokens[day]["by_model"][tu["model"]]["input_hit"] += tu["amount"]
-        elif tu["token_type"] == "input_cache_miss":
-            daily_tokens[day]["input_cache_miss"] += tu["amount"]
-            daily_tokens[day]["by_model"][tu["model"]]["input_miss"] += tu["amount"]
+        day = daily[usage["date"]]
+        day["requests"] += usage["count"]
+        day["by_model"][usage["model"]]["requests"] += usage["count"]
 
-    for ru in _store().request_usages:
-        if ru["_year"] != year or ru["_month"] != month:
-            continue
-        if api_key_name and ru["api_key_name"] != api_key_name:
-            continue
-        if model_filter and ru["model"] != model_filter:
-            continue
-        if platform_filter and ru["platform"] != platform_filter:
-            continue
-        day = ru["date"]
-        daily_tokens[day]["requests"] += ru["count"]
-        daily_tokens[day]["by_model"][ru["model"]]["requests"] += ru["count"]
-
-    # Daily cost aggregation from the canonical V2 usage ledger.  The legacy
-    # `cost` field is the api-equivalent amount (theoretical for plan/agent),
-    # and `actual_cost` is the metered bill.
-    daily_equivalent = defaultdict(float)
-    daily_equivalent_by_model = defaultdict(lambda: defaultdict(float))
-    daily_actual = defaultdict(float)
-    for ce in _store().cost_entries:
-        if ce["_year"] != year or ce["_month"] != month:
-            continue
-        if api_key_name and ce["api_key_name"] != api_key_name:
-            continue
-        if model_filter and ce["model"] != model_filter:
-            continue
-        if platform_filter and ce["platform"] != platform_filter:
-            continue
-        day = ce["date"]
-        equiv = float(ce.get("cost", 0) or 0)
-        actual = float(ce.get("actual_cost", 0) or 0)
-        daily_equivalent[day] += equiv
-        daily_equivalent_by_model[day][ce["model"]] += equiv
-        daily_actual[day] += actual
-
-    # Recurring fees are immutable account-level facts keyed by exact
-    # period_start.  They have no model attribution: exclude them from a
-    # model-filtered timeline, where `cost` keeps the api-equivalent/virtual
-    # meaning used by by_model and monthly model views.
-    daily_recurring = defaultdict(float)
-    for row in _store().plan_summary:
-        if api_key_name and row.get("account_name") != api_key_name:
-            continue
-        if platform_filter and platform_filter not in {"agent", ""}:
-            # Proxy recurring rows have no model/platform attribution.
-            continue
-        if not model_filter:
-            period_start = str(row.get("period_start") or "")
-            if period_start[:4].isdigit() and period_start[5:7].isdigit():
-                if int(period_start[:4]) == year and int(period_start[5:7]) == month:
-                    day = period_start[:10]
-                    daily_recurring[day] += float(row.get("subscription_cost", 0) or 0)
-
-    # Build sorted daily result
-    sorted_days = sorted(set(daily_tokens.keys()) |
-                         set(daily_equivalent.keys()) |
-                         set(daily_recurring.keys()) |
-                         set(daily_actual.keys()))
     result = []
-    for day in sorted_days:
-        dt = daily_tokens[day]
-        recurring_cost = daily_recurring.get(day, 0)
-        metered_cost = daily_actual.get(day, 0)
-        theoretical_cost = round(daily_equivalent.get(day, 0), 4)
-        cost = (theoretical_cost if model_filter
-                else round(metered_cost + recurring_cost, 4))
+    for day_name in sorted(daily):
+        day = daily[day_name]
         result.append({
-            "date": day,
-            "output_tokens": dt["output_tokens"],
-            "input_cache_hit_tokens": dt["input_cache_hit"],
-            "input_cache_miss_tokens": dt["input_cache_miss"],
-            "input_tokens": dt["input_cache_hit"] + dt["input_cache_miss"],
-            "total_tokens": (dt["output_tokens"] + dt["input_cache_hit"] +
-                             dt["input_cache_miss"]),
-            "requests": dt["requests"],
-            "theoretical_cost": theoretical_cost,
-            "metered_cost": round(metered_cost, 4),
-            "recurring_cost": round(recurring_cost, 4),
-            "cost": cost,
-            "actual_cost": round(metered_cost + recurring_cost, 4),
+            "date": day_name,
+            "output_tokens": day["output_tokens"],
+            "input_cache_hit_tokens": day["input_cache_hit"],
+            "input_cache_miss_tokens": day["input_cache_miss"],
+            "input_tokens": day["input_cache_hit"] + day["input_cache_miss"],
+            "total_tokens": day["output_tokens"] + day["input_cache_hit"] + day["input_cache_miss"],
+            "requests": day["requests"],
             "by_model": {
-                m: {
-                    "output_tokens": v["output"],
-                    "input_cache_hit_tokens": v["input_hit"],
-                    "input_cache_miss_tokens": v["input_miss"],
-                    "total_tokens": v["output"] + v["input_hit"] + v["input_miss"],
-                    "requests": v["requests"],
-                    "cost": round(
-                        daily_equivalent_by_model.get(day, {}).get(m, 0), 4),
-                    "theoretical_cost": round(
-                        daily_equivalent_by_model.get(day, {}).get(m, 0), 4),
+                model: {
+                    "output_tokens": values["output"],
+                    "input_cache_hit_tokens": values["input_hit"],
+                    "input_cache_miss_tokens": values["input_miss"],
+                    "total_tokens": values["output"] + values["input_hit"] + values["input_miss"],
+                    "requests": values["requests"],
                 }
-                for m, v in sorted(dt["by_model"].items())
+                for model, values in sorted(day["by_model"].items())
             },
         })
-
-    return jsonify({
-        "year": year,
-        "month": month,
-        "days": result,
-    })
+    return jsonify({"year": year, "month": month, "days": result})
 
 
 @bp.route("/api/token_types")
 def api_token_types():
-    """Return aggregated token type breakdown (for pie chart).
-
-    Query params: api_key_name (optional)
-    """
-    api_key_name = request.args.get("api_key_name", "").strip() or None
-    total_output = 0
-    total_input_hit = 0
-    total_input_miss = 0
-
-    for tu in _store().token_usages:
-        if api_key_name and tu["api_key_name"] != api_key_name:
+    user_id = _selected_user_id()
+    totals = {"output": 0, "input_cache_hit": 0, "input_cache_miss": 0}
+    for usage in _store().token_usages:
+        if user_id is not None and usage["user_id"] != user_id:
             continue
-        if tu["token_type"] == "output":
-            total_output += tu["amount"]
-        elif tu["token_type"] == "input_cache_hit":
-            total_input_hit += tu["amount"]
-        elif tu["token_type"] == "input_cache_miss":
-            total_input_miss += tu["amount"]
-
+        totals[usage["token_type"]] += usage["amount"]
     return jsonify([
-        {"name": "输出Token", "value": total_output},
-        {"name": "输入缓存命中", "value": total_input_hit},
-        {"name": "输入缓存未命中", "value": total_input_miss},
+        {"name": "输出Token", "value": totals["output"]},
+        {"name": "输入缓存命中", "value": totals["input_cache_hit"]},
+        {"name": "输入缓存未命中", "value": totals["input_cache_miss"]},
     ])

@@ -58,8 +58,9 @@ class ProxyExportMixin:
             dash_db = DashboardDatabase(
                 target_path, schema_dir=self.schema_dir)
 
-            # A) usage + frozen cost: keyed by account_id (the identity). The
-            #    display name comes from the dashboard `accounts` mirror.
+            # A) usage + actual cost: keyed by stable user_id.  The identity
+            # name is carried in the same batch so usage and users are committed
+            # together by the Dashboard writer.
             cost_columns = (
                 "COALESCE(SUM(r.equivalent_cost),0) AS cost, "
                 "COALESCE(SUM(r.billed_usage_cost),0) AS billed_usage_cost,"
@@ -80,7 +81,7 @@ class ProxyExportMixin:
                 LEFT JOIN accounts a ON a.id = r.account_id
                 WHERE r.id > ? AND r.id <= ?
                   AND COALESCE(ai.account_kind,a.account_kind) IN ('proxy','agent')
-                  AND LOWER(r.model) != 'unknown' AND r.model != ''
+                  AND LOWER(TRIM(r.model)) != 'unknown' AND TRIM(r.model) != ''
                   -- Only successful requests carry real usage; failed/aborted
                   -- requests (timeouts, auth/limit rejections, client
                   -- disconnect) record zero tokens and must not pollute the
@@ -90,24 +91,24 @@ class ProxyExportMixin:
                 ORDER BY date(r.requested_at), COALESCE(r.account_identity_id,r.account_id), r.model
             """, (mark, max_id)).fetchall()
 
+            identity_names = {}
             identity_ids = sorted({int(row["account_id"]) for row in rows
                                    if row["account_id"] is not None})
             if identity_ids:
                 placeholders = ",".join("?" for _ in identity_ids)
-                dash_db.upsert_account_batch([
-                    {"account_id": row["id"], "name": row["name"],
-                     "updated_at": row["updated_at"],
-                     "account_kind": row["account_kind"]}
+                identity_names = {
+                    int(row["id"]): row["name"]
                     for row in conn.execute(
-                        f"SELECT id,name,updated_at,account_kind "
-                        f"FROM account_identities WHERE id IN ({placeholders})",
-                        identity_ids)
-                ])
+                        f"SELECT id,name FROM account_identities "
+                        f"WHERE id IN ({placeholders})", identity_ids)
+                }
 
             dash_count = dash_db.upsert_proxy_batch([
                 {
                     "date": r["date"], "model": r["model"],
                     "account_id": r["account_id"],
+                    "name": identity_names.get(int(r["account_id"]),
+                                                f"用户 {int(r['account_id'])}"),
                     "prompt_tokens": r["prompt_tokens"],
                     "completion_tokens": r["completion_tokens"],
                     "cache_read_tokens": r["cache_read_tokens"],
@@ -131,9 +132,9 @@ class ProxyExportMixin:
                 frozen_charge_count += dash_db.record_billing_export_event(
                     event_dict, _billing_event_payload_hash(event_dict))
 
-            # C) Request-log plan costs remain additive and are still protected
-            # by the request high-water mark. They are separate from frozen
-            # recurring charges.
+            # C) Request-log plan/agent equivalent amounts are already in the
+            # daily model rows above. Keep this traversal for compatibility,
+            # but the two-table Dashboard has no separate virtual ledger.
             now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             metas = self._plan_key_billing_meta(conn)
             by_key_id = {meta["key_id"]: meta for meta in metas if meta["key_id"] is not None}

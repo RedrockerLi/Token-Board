@@ -31,6 +31,8 @@ class DataStore:
         self.api_key_names: list[str] = []
         self.platforms: list[str] = []             # discovered platform names
         self.models: list[str] = []                # unique model names
+        self.users: list[dict] = []                # stable Dashboard identities
+        self.user_actual_cost: dict[int, float] = {}
         # DashboardDatabase accepts only normalized V2 rows.
         self.is_v2 = True
 
@@ -41,7 +43,7 @@ class DataStore:
         db_path = self.data_dir / "dashboard.db"
         if not db_path.exists():
             log.warning("dashboard archive not found: %s", db_path)
-            self._commit([], [], [], [], [], [], [], [])
+            self._commit([], [], [], [], [], [], [], [], [], {})
         else:
             self._load_from_db(str(db_path))
 
@@ -68,6 +70,8 @@ class DataStore:
             platforms,
             models,
             plan_summary,
+            users,
+            user_actual_cost,
         ) = db.load_rows()
 
         self._commit(
@@ -79,11 +83,13 @@ class DataStore:
             platforms,
             models,
             plan_summary,
+            users,
+            user_actual_cost,
         )
 
     def _commit(self, token_usages, request_usages, cost_entries,
                 available_months, api_key_names, platforms, models,
-                plan_summary=None):
+                plan_summary=None, users=None, user_actual_cost=None):
         self.token_usages = token_usages
         self.request_usages = request_usages
         self.cost_entries = cost_entries
@@ -91,5 +97,7 @@ class DataStore:
         self.api_key_names = api_key_names
         self.platforms = platforms
         self.models = models
+        self.users = users or []
+        self.user_actual_cost = user_actual_cost or {}
         if plan_summary is not None:
             self.plan_summary = plan_summary

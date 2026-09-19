@@ -31,17 +31,17 @@ def export_data():
 
 
 @bp_proxy.route("/dashboard/users", methods=["DELETE"])
-def delete_dashboard_users():
-    """Delete several users in one complete dashboard archive transaction."""
+def archive_dashboard_users():
+    """Archive several users in one complete dashboard transaction."""
     data = request.get_json(silent=True) or {}
-    names = data.get("names")
+    user_ids = data.get("user_ids")
     import os as _os
     from app.services.sync.dashboard_sync import delete_dashboard_users as _delete_users
 
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
     result = _delete_users(
-        db_path, dash_db_path, names,
+        db_path, dash_db_path, user_ids,
         schema_dir=current_app.config.get("SCHEMA_DIR"),
     )
     ds = current_app.config.get("DATA_STORE")

@@ -1,22 +1,28 @@
-"""DashboardReaderMixin implementation."""
+"""Read operations for the two-table Dashboard archive."""
+
+from __future__ import annotations
 
 import sqlite3
 
-from app.db.dashboard.common import (
-    MODEL_ORDER, _parse_date, _sort_models, _track_recency,
-)
+from app.db.dashboard.common import _parse_date, _sort_models, _track_recency
 
 
 class DashboardReaderMixin:
     def get_account_ids_by_name(self, name: str) -> list[int]:
-        """Return every archived account identity with the exact display name."""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT account_id FROM accounts WHERE name=? ORDER BY account_id",
-                (name,),
+                "SELECT id FROM users WHERE name=? ORDER BY id", (name,)
             ).fetchall()
-            return [int(row["account_id"]) for row in rows]
+            return [int(row["id"]) for row in rows]
+        finally:
+            conn.close()
+
+    def get_user_ids(self) -> list[int]:
+        conn = self._connect()
+        try:
+            return [int(row["id"]) for row in conn.execute(
+                "SELECT id FROM users ORDER BY id").fetchall()]
         finally:
             conn.close()
 
@@ -30,88 +36,80 @@ class DashboardReaderMixin:
     def get_record_count(self) -> dict:
         conn = self._connect()
         try:
-            rows = conn.execute("SELECT COUNT(*) FROM daily_usage").fetchone()[0]
-            recurring = conn.execute(
-                "SELECT COUNT(*) FROM monthly_recurring_costs").fetchone()[0]
-            return {"daily_usage": rows, "monthly_recurring_costs": recurring}
+            return {
+                "daily_model_usage": conn.execute(
+                    "SELECT COUNT(*) FROM daily_model_usage").fetchone()[0],
+                "users": conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            }
         finally:
             conn.close()
 
     def _load_v2_rows(self, conn: sqlite3.Connection):
-        token_usages, request_usages, cost_entries, plan_summary = [], [], [], []
+        token_usages, request_usages, cost_entries = [], [], []
         months_set, names, models = set(), set(), set()
         last_month, month_volume = {}, {}
+        users = []
+        actual_cost_by_user = {}
+
         for row in conn.execute(
-            "SELECT d.*,COALESCE(a.name,'unknown') AS display_name,"
-            "COALESCE(a.account_kind,'proxy') AS account_kind "
-            "FROM daily_usage d LEFT JOIN accounts a ON a.account_id=d.account_id "
-            "WHERE COALESCE(a.account_kind,'proxy')!='legacy'"):
-            y, m = _parse_date(row["date"])
-            if not y:
+            "SELECT id,name,actual_cost_micro_cny FROM users ORDER BY id"):
+            user_id = int(row["id"])
+            users.append({"id": user_id, "name": row["name"]})
+            actual_cost_by_user[user_id] = int(row["actual_cost_micro_cny"] or 0) / 1_000_000
+
+        for row in conn.execute(
+            """SELECT d.*,u.name AS display_name
+                 FROM daily_model_usage d JOIN users u ON u.id=d.user_id
+                ORDER BY d.usage_date,d.user_id,d.model"""
+        ):
+            year, month = _parse_date(row["usage_date"])
+            if not year:
                 continue
+            user_id = int(row["user_id"])
             name = row["display_name"]
-            source_kind = "agent" if row["account_kind"] == "agent" else "proxy"
-            base = {"platform": "agent" if source_kind == "agent" else "",
-                    "source_kind": source_kind, "date": row["date"],
-                    "model": row["model"],
-                    "api_key_name": name, "cost_group_key": name,
-                    "_year": y, "_month": m}
-            miss = max(row["input_tokens"] - row["cache_tokens"], 0)
+            base = {
+                "platform": "", "source_kind": "proxy",
+                "date": row["usage_date"], "model": row["model"],
+                "user_id": user_id, "api_key_name": name,
+                "cost_group_key": str(user_id), "_year": year, "_month": month,
+            }
+            miss = max(int(row["input_tokens"]) - int(row["cache_read_tokens"]), 0)
             for token_type, amount in (
-                ("input_cache_miss", miss), ("input_cache_hit", row["cache_tokens"]),
-                ("output", row["output_tokens"])):
+                ("input_cache_miss", miss),
+                ("input_cache_hit", int(row["cache_read_tokens"])),
+                ("output", int(row["output_tokens"])),
+            ):
                 if amount:
                     token_usages.append({**base, "token_type": token_type, "amount": amount})
-            request_usages.append({**base, "count": row["request_count"]})
-            # V1 keeps the two cost meanings separately. The legacy `cost`
-            # field keeps its historical meaning (api-equivalent cost, i.e.
-            # the theoretical amount for plan/agent accounts) so per-model
-            # charts render the same values as before the V1 migration;
-            # `actual_cost` is the metered bill and `theoretical_cost` is the
-            # same equivalent amount under its explicit name.
+            request_usages.append({**base, "count": int(row["request_count"])})
+            equivalent = int(row["api_equivalent_cost_micro_cny"] or 0) / 1_000_000
             cost_entries.append({
-                **base,
-                "cost": row["equivalent_cost"],
-                "actual_cost": row["billed_usage_cost"],
-                "theoretical_cost": row["equivalent_cost"],
+                **base, "cost": equivalent, "theoretical_cost": equivalent,
+                "actual_cost": 0.0,
             })
-            months_set.add((y, m)); names.add(name); models.add(row["model"])
-            _track_recency(last_month, month_volume, name, y, m, row["request_count"])
-        for row in conn.execute(
-            "SELECT p.period_start,p.account_id,COALESCE(a.name,'unknown') account_name,"
-            "COALESCE(a.account_kind,'proxy') account_kind,"
-            "SUM(CASE WHEN p.is_frozen=1 "
-            "AND p.normalized_recurring_cost IS NOT NULL "
-            "THEN p.normalized_recurring_cost ELSE 0 END) subscription_cost,"
-            "SUM(p.equivalent_cost) virtual_cost,"
-            "SUM(CASE WHEN p.normalized_recurring_cost IS NULL THEN 1 ELSE 0 END) "
-            "billing_incomplete_count FROM monthly_recurring_costs p "
-            "LEFT JOIN accounts a ON a.account_id=p.account_id "
-            "WHERE COALESCE(a.account_kind,'proxy')!='legacy' "
-            "AND (p.equivalent_cost<>0 OR p.recurring_charge<>0 "
-            "OR COALESCE(p.normalized_recurring_cost,0)<>0 "
-            "OR p.is_frozen=1) "
-            "GROUP BY p.period_start,p.account_id,a.name ORDER BY p.period_start,p.account_id"):
-            item = dict(row)
-            item["month"] = str(item["period_start"])[:7]
-            plan_summary.append(item)
-            # A subscription can be bound before the software has produced
-            # its first usage event. Keep that software/account selectable in
-            # the dashboard so its actual recurring cost is not invisible.
-            account_name = row["account_name"]
-            visible = (row["virtual_cost"] != 0 or
-                       row["subscription_cost"] != 0)
-            if visible and account_name and account_name != "unknown":
-                names.add(account_name)
-            # A recurring charge may exist in a month with no metered
-            # traffic. Keep that month visible in the dashboard selectors
-            # instead of deriving available months solely from daily_usage.
-            year, month = _parse_date(str(row["period_start"])[:10])
-            if year:
-                months_set.add((year, month))
-        available = [{"year": y, "month": m, "label": f"{y}-{m:02d}"}
-                     for y, m in sorted(months_set)]
-        ordered_names = sorted(names, key=lambda name: (
-            -last_month.get(name, -1), -month_volume.get(name, 0), name.lower()))
-        return (token_usages, request_usages, cost_entries, available,
-                ordered_names, [], _sort_models(models), plan_summary)
+            months_set.add((year, month))
+            names.add(name)
+            models.add(row["model"])
+            _track_recency(last_month, month_volume, user_id, year, month,
+                           int(row["request_count"]))
+
+        available = [
+            {"year": year, "month": month, "label": f"{year}-{month:02d}"}
+            for year, month in sorted(months_set)
+        ]
+        ordered_users = sorted(
+            users,
+            key=lambda user: (
+                user["id"] == 0,
+                -last_month.get(user["id"], -1),
+                -month_volume.get(user["id"], 0),
+                str(user["name"]).lower(),
+                user["id"],
+            ),
+        )
+        ordered_names = [user["name"] for user in ordered_users]
+        return (
+            token_usages, request_usages, cost_entries, available,
+            ordered_names, [], _sort_models(models), [], ordered_users,
+            actual_cost_by_user,
+        )

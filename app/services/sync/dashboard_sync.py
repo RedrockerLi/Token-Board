@@ -55,8 +55,8 @@ def _count_dashboard_rows(db_path: str) -> int:
     """Count rows in the normalized V2 dashboard archive."""
     conn = sqlite_runtime.connect(db_path, "dashboard_runtime")
     try:
-        return (conn.execute("SELECT COUNT(*) FROM daily_usage").fetchone()[0] +
-                conn.execute("SELECT COUNT(*) FROM monthly_recurring_costs").fetchone()[0])
+        return (conn.execute("SELECT COUNT(*) FROM daily_model_usage").fetchone()[0] +
+                conn.execute("SELECT COUNT(*) FROM users").fetchone()[0])
     finally:
         conn.close()
 def _stored_dashboard_artifact(db_path: str) -> RemoteArtifact | None:
@@ -504,9 +504,9 @@ def _run_dashboard_transaction_once(
             "remote_pulled": candidate.get("remote_pulled", False),
             "uploaded": config is not None,
         })
-        if transform_result.get("deleted_names"):
+        if transform_result.get("archived_user_ids"):
             result["message"] = (
-                f"已删除 {len(transform_result['deleted_names'])} 个用户的历史看板数据")
+                f"已归档 {len(transform_result['archived_user_ids'])} 个用户的历史看板数据")
         return result
     finally:
         if os.path.exists(tmp_dir):
