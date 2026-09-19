@@ -71,7 +71,8 @@ def delete_dashboard_users(token_board_db_path: str, dash_db_path: str,
             try:
                 return _run_dashboard_transaction_once(
                     token_board_db_path, dash_db_path, schema_dir,
-                    _archive_dashboard_users_transform(clean_ids))
+                    _archive_dashboard_users_transform(clean_ids),
+                    operation="archive")
             except WebDAVConflict as exc:
                 last_error = exc
                 log.warning("dashboard archive raced with remote update; retry %d/3",

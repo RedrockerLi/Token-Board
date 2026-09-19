@@ -14,6 +14,12 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
+## V2.4 当前增量
+
+V2.4 增加本机运行时表 `agent_usage_receipts`，永久保存 Agent 导入事件的去重回执；它与
+`request_log` 分离，因此请求日志按 30 天保留策略清理后，Hermes 等全量扫描适配器仍不会
+重放已经接受的事件。回执表不进入配置同步，也不会随 Agent 软件删除而级联删除。
+
 ## V2.3 当前增量
 
 V2.3 删除 `request_log.project` 与 `request_log.session_id`。Agent adapter 仍可在导入时
@@ -119,6 +125,8 @@ api_cost = (miss/1e6) × input_price
 清理规则:用量同步进度由 `sync_state.last_exported_log_id`、账单同步进度由
 `sync_state.last_exported_billing_event_id` 分别记录；账单事件本身不可变，不在财务事实表上写逐行 exported 标记。
 `cleanup_exported_logs` 只删 `id ≤ 检查点 且 请求时间超过 30 天` 的行;未计入存档的行永久保留。
+该清理只属于成功的普通 Dashboard 导出提交；用户归档和 Agent 导入都不会删除
+`request_log`。`agent_usage_receipts` 永久保留，不随该清理删除。
 检查点只在上传成功后推进,失败即回滚——见 [sync.md](sync.md)。
 
 ### sync_state — 同步检查点

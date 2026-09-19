@@ -96,4 +96,4 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 - 周期开始日无精确汇率时,按 `?date=period_start` 从 frankfurter **历史接口**拉取并落库后锁定(1999-01-04 起支持,早于此日期不发请求);拉取失败则用最近一条已存汇率作**临时值(provisional,不锁定)**,每轮物化重试;未锁定的 USD 行在周期结束后也**不会冻结**,直到锁定成功(网络恢复后同一次物化内完成锁定并冻结)。
 - 汇率来源 `GET https://api.frankfurter.dev/v2/rate/USD/CNY`(带 `?date=` 支持历史日期;v2 对周末请求回显请求日期、汇率为最近交易日值)。看板启动与首次使用时按 UTC 日拉取一次并存入本机 `fx_rate` 表;当天已有则直接用;拉取失败(或仍为旧数据)则用最近一条已存汇率。请求日期早于所有已存记录(如过去月份早于首次拉取)时用**最早一条已存汇率**,避免 USD 订阅被按 1.0 低估;只有该币种对从未存储过任何记录才按 1.0(等价不换算)。
 - 锁定承诺的是"不重新拉取、不随当天漂移";手工修改 `fx_rates` 行会被锁定行读到,不做防护。
-- `fx_rates`、`agent_software_runtime.cursor_json` 与请求日志均**仅存本机**,同步到云时被剔除(`sync._RUNTIME_TABLES`)。订阅、软件配置和普通用户配置会随配置快照上传；上游 API Key 明文与 WebDAV 密码留在本机。
+- `fx_rates`、`agent_software_runtime.cursor_json`、`agent_usage_receipts` 与请求日志均**仅存本机**,同步到云时被剔除(`sync._RUNTIME_TABLES`)。订阅、软件配置和普通用户配置会随配置快照上传；上游 API Key 明文与 WebDAV 密码留在本机。

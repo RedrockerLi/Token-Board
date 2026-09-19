@@ -84,7 +84,7 @@ Agent 导入过程中的 `project` 与 `session_id` 不写入 `request_log`，�
 
 ### 删除看板用户
 
-`DELETE /api/proxy/dashboard/users` 接收 `{"names":["用户名称"]}`，只删除目标账号在 dashboard 存档中的可见用量和费用行；不可见的账单导出回执不会删除。后续产生的 `request_log` 用量仍会按正常的增量导出流程写回 dashboard，但已经成功导出的旧周期账单不会再次写回。由于导出使用独立高水位线，已删除的旧请求也不会自动重放；如需恢复旧历史，应从旧的 dashboard 存档恢复。
+`DELETE /api/proxy/dashboard/users` 只在 Dashboard shadow 中合并目标用户到 `id=0` 并完成云端同步；它不导出本机 `request_log`、不推进导出高水位、不物化账单，也不清理本机日志。归档前尚未导出的用量会留在本机，后续普通导出时按增量规则写回 Dashboard，这是预期行为。已导出的旧周期账单不会因为归档再次写回；如需恢复旧历史，应从旧的 dashboard 存档恢复。
 
 ## 运行时同步健康
 

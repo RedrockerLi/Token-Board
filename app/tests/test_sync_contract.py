@@ -415,6 +415,9 @@ class SyncContractTest(unittest.TestCase):
                     "VALUES('event-1','agent','source','1:1',1,'agent',"
                     "'agent','2026-01','2026-01-01T00:00:00Z','unit-1',1,'CNY',"
                     "'2026-01-02')")
+                conn.execute(
+                    "INSERT INTO agent_usage_receipts(event_id,software_id) "
+                    "VALUES('agent-receipt-1',1)")
                 conn.commit()
             snapshot_config(proxy)
 
@@ -426,6 +429,9 @@ class SyncContractTest(unittest.TestCase):
                     ).fetchone()[0]
                     captured["allocations"] = uploaded.execute(
                         "SELECT count(*) FROM agent_subscription_charge_allocations"
+                    ).fetchone()[0]
+                    captured["agent_receipts"] = uploaded.execute(
+                        "SELECT count(*) FROM agent_usage_receipts"
                     ).fetchone()[0]
                     captured["foreign_key_check"] = uploaded.execute(
                         "PRAGMA foreign_key_check"
@@ -440,6 +446,7 @@ class SyncContractTest(unittest.TestCase):
             self.assertEqual(result["status"], "ok", result)
             self.assertEqual(captured["period_charges"], 0)
             self.assertEqual(captured["allocations"], 0)
+            self.assertEqual(captured["agent_receipts"], 0)
             self.assertEqual(captured["foreign_key_check"], [])
             with sqlite3.connect(proxy) as conn:
                 self.assertEqual(conn.execute(
@@ -447,6 +454,9 @@ class SyncContractTest(unittest.TestCase):
                 ).fetchone()[0], 1)
                 self.assertEqual(conn.execute(
                     "SELECT count(*) FROM agent_subscription_charge_allocations"
+                ).fetchone()[0], 1)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM agent_usage_receipts"
                 ).fetchone()[0], 1)
         finally:
             shutil.rmtree(temp, ignore_errors=True)

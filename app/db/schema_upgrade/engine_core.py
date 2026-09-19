@@ -197,6 +197,7 @@ def rebuild_snapshot(proxy_path: Path,
     conn = sqlite_runtime.connect(temporary, "snapshot_restore")
     try:
         for table in ("request_attempts", "request_log",
+                      "agent_usage_receipts",
                       "billing_period_charges",
                       "billing_export_events",
                       "agent_subscription_period_charges",

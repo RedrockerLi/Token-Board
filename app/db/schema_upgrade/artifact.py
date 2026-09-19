@@ -15,6 +15,7 @@ def strip_runtime_artifact(path: Path, database_name: str) -> None:
     runtime_tables = (
         "request_log", "request_attempts", "billing_period_charges",
         "billing_export_events",
+        "agent_usage_receipts",
         "agent_subscription_period_charges", "agent_subscription_charge_allocations",
         "agent_software_runtime",
         "fx_rates", "sync_state",

@@ -69,6 +69,74 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         self.assertFalse(result["uploaded"])
         self.assertEqual(self._names(), ["keep-me"])
 
+    def test_archive_does_not_export_or_clean_local_usage(self) -> None:
+        with sqlite3.connect(self.proxy_path) as conn:
+            conn.execute(
+                "INSERT INTO accounts(id,uuid,name,account_kind) "
+                "VALUES(7,'archive-agent','remove-me','agent')"
+            )
+            conn.execute(
+                "INSERT INTO request_log"
+                "(event_id,source_kind,account_id,agent_software_id,model,"
+                "prompt_tokens,completion_tokens,cache_read_tokens,total_tokens,"
+                "equivalent_cost,billed_usage_cost,status_code,requested_at) "
+                "VALUES('archive-pending','import',7,7,'old-model',10,5,0,15,"
+                "1.25,0,200,'2020-01-01T00:00:00Z')"
+            )
+            conn.commit()
+
+        with patch.object(
+                dashboard_sync, "_export_dashboard",
+                side_effect=AssertionError("archive must not export usage")), \
+                patch("app.db.proxy.billing.materialize_all_period_charges",
+                      side_effect=AssertionError("archive must not materialize billing")), \
+                patch.object(
+                    ProxyDatabase, "set_export_marks",
+                    side_effect=AssertionError("archive must not advance export marks")), \
+                patch.object(
+                    ProxyDatabase, "cleanup_exported_logs",
+                    side_effect=AssertionError("archive must not clean logs")):
+            result = delete_dashboard_users(
+                str(self.proxy_path), str(self.dashboard_path), [7],
+                schema_dir=str(self.root / "schema"),
+            )
+
+        self.assertEqual(result["status"], "ok", result)
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM request_log "
+                    "WHERE event_id='archive-pending'"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertIsNone(conn.execute(
+                "SELECT value FROM sync_state "
+                "WHERE key='last_exported_log_id'"
+            ).fetchone())
+        self.assertCountEqual(self._names(), ["keep-me"])
+
+    def test_archive_does_not_resume_an_old_export_pending(self) -> None:
+        pending = dashboard_sync._pending_dashboard_path(str(self.dashboard_path))
+        safe_copy_db(str(self.dashboard_path), pending)
+        set_state = {
+            "dashboard_pending_path": pending,
+            # No operation marker: legacy pending state is an export.
+            "dashboard_pending_export_max_id": "17",
+            "dashboard_pending_remote_artifact": "",
+            "dashboard_pending_remote_etag": "",
+        }
+        set_sync_state_many(str(self.proxy_path), set_state)
+
+        result = delete_dashboard_users(
+            str(self.proxy_path), str(self.dashboard_path), [7],
+            schema_dir=str(self.root / "schema"),
+        )
+
+        self.assertEqual(result["status"], "conflict", result)
+        self.assertTrue(os.path.exists(pending))
+        self.assertCountEqual(self._names(), ["keep-me", "remove-me"])
+
     def test_batch_delete_publishes_the_mutated_candidate(self) -> None:
         self._configure_webdav()
         published_rows = []
@@ -108,6 +176,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         ).purge_accounts({7})
         set_sync_state_many(str(self.proxy_path), {
             "dashboard_pending_path": pending,
+            "dashboard_pending_operation": "archive",
             "dashboard_pending_export_max_id": "0",
             "dashboard_pending_remote_artifact": "",
             "dashboard_pending_remote_etag": "",

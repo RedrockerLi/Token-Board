@@ -68,6 +68,7 @@ def _stored_dashboard_artifact(db_path: str) -> RemoteArtifact | None:
     return RemoteArtifact(name, etag=etag or None)
 _DASHBOARD_PENDING_KEYS = (
     "dashboard_pending_path",
+    "dashboard_pending_operation",
     "dashboard_pending_export_max_id",
     "dashboard_pending_billing_max_id",
     "dashboard_pending_remote_artifact",
@@ -75,15 +76,21 @@ _DASHBOARD_PENDING_KEYS = (
 )
 
 
+def _dashboard_operation(value: str | None) -> str:
+    """Decode pending operation state with export-safe compatibility."""
+    return value if value in {"export", "archive"} else "export"
+
+
 @dataclass(frozen=True)
 class PreparedDashboard:
-    """Durable candidate whose bytes and export boundary move together."""
+    """Durable Dashboard candidate and its optional export boundary."""
 
     path: Path
     max_log_id: int
     max_billing_event_id: int
     checksum: str
     expected_remote: RemoteArtifact | None
+    operation: str = "export"
 
 
 def _pending_dashboard_path(dash_db_path: str) -> str:
@@ -93,11 +100,13 @@ def _pending_dashboard_path(dash_db_path: str) -> str:
 def _prepare_pending(token_board_db_path: str, source_path: str,
                      dash_db_path: str, max_id: int,
                      max_billing_event_id: int,
-                     expected_remote: RemoteArtifact | None) -> PreparedDashboard:
+                     expected_remote: RemoteArtifact | None,
+                     operation: str = "export") -> PreparedDashboard:
     pending_path = _pending_dashboard_path(dash_db_path)
     safe_copy_db(source_path, pending_path)
     set_sync_state_many(token_board_db_path, {
         "dashboard_pending_path": pending_path,
+        "dashboard_pending_operation": operation,
         "dashboard_pending_export_max_id": str(max_id),
         "dashboard_pending_billing_max_id": str(max_billing_event_id),
         "dashboard_pending_remote_artifact": "",
@@ -109,6 +118,7 @@ def _prepare_pending(token_board_db_path: str, source_path: str,
         max_billing_event_id=max_billing_event_id,
         checksum=file_checksum(Path(pending_path)),
         expected_remote=expected_remote,
+        operation=operation,
     )
 
 
@@ -118,6 +128,8 @@ def _prepared_from_state(token_board_db_path: str) -> PreparedDashboard | None:
         token_board_db_path, "dashboard_pending_export_max_id")
     billing_max_value = get_sync_state(
         token_board_db_path, "dashboard_pending_billing_max_id")
+    operation = _dashboard_operation(get_sync_state(
+        token_board_db_path, "dashboard_pending_operation"))
     if not pending_path and not max_value:
         return None
     if not pending_path or not max_value:
@@ -134,6 +146,7 @@ def _prepared_from_state(token_board_db_path: str) -> PreparedDashboard | None:
                            "last_exported_billing_event_id") or 0),
         checksum=file_checksum(path),
         expected_remote=_stored_dashboard_artifact(token_board_db_path),
+        operation=operation,
     )
 
 
@@ -158,21 +171,25 @@ def _commit_dashboard_pending(token_board_db_path: str, dash_db_path: str,
                               published: RemoteArtifact | None,
                               schema_dir: str | None,
                               export_result: dict | None = None,
-                              *, recovered: bool = False) -> dict:
+                              *, recovered: bool = False,
+                              operation: str = "export") -> dict:
     """Commit one durable prepared dashboard exactly once.
 
-    The copy is deliberately before the proxy checkpoint and request-log
-    cleanup.  Any exception leaves the pending sidecar and markers intact, so
-    the next run can repeat this idempotently.
+    The copy is deliberately before the optional proxy checkpoint and
+    request-log cleanup. Any exception leaves the pending sidecar and markers
+    intact, so the next run can repeat this idempotently. Archive operations
+    only install Dashboard bytes and never touch request-log state.
     """
     from app.db.proxy_db import ProxyDatabase
     resolved_schema_dir = schema_dir or schema_dir_for(dash_db_path, "dashboard")
     proxy_db = ProxyDatabase(token_board_db_path, schema_dir=resolved_schema_dir)
 
     # Local installation is the boundary after which it is safe to advance
-    # the source high-water mark.
+    # the source high-water mark. Dashboard-only mutations deliberately do
+    # not advance it.
     safe_copy_db(pending_path, dash_db_path)
-    proxy_db.set_export_marks(max_id, max_billing_event_id)
+    if operation == "export":
+        proxy_db.set_export_marks(max_id, max_billing_event_id)
     state = {"sync_health": "ok"}
     if published is not None:
         state.update({
@@ -186,16 +203,17 @@ def _commit_dashboard_pending(token_board_db_path: str, dash_db_path: str,
             token_board_db_path, "dashboard", file_checksum(Path(dash_db_path)),
             version.major if version else None,
             version.minor if version else None)
-    cleaned = proxy_db.cleanup_exported_logs(max_id)
-    if cleaned > 0:
-        log.info("cleaned archived request_log rows: count=%d", cleaned)
+    if operation == "export":
+        cleaned = proxy_db.cleanup_exported_logs(max_id)
+        if cleaned > 0:
+            log.info("cleaned archived request_log rows: count=%d", cleaned)
     # Remove the sidecar only after every durable local commit step succeeds.
     # If this unlink itself fails, the markers remain and the next recovery
     # repeats the idempotent commit instead of losing the prepared bytes.
     Path(pending_path).unlink(missing_ok=True)
     clear_sync_state_many(token_board_db_path, _DASHBOARD_PENDING_KEYS)
     upload_count = _count_dashboard_rows(dash_db_path)
-    if export_result is None:
+    if export_result is None or operation != "export":
         message = (f"仪表板：上传 {upload_count} 条至云端" if published
                    else f"仪表板：本地提交 {upload_count} 条")
         exported = 0
@@ -218,7 +236,8 @@ def _commit_dashboard_pending(token_board_db_path: str, dash_db_path: str,
 def _recover_dashboard_pending(token_board_db_path: str,
                                dash_db_path: str,
                                config: SyncConfig,
-                               schema_dir: str | None = None) -> dict | None:
+                               schema_dir: str | None = None,
+                               expected_operation: str | None = None) -> dict | None:
     """Reconcile a durable dashboard commit left by a prior interrupted run."""
     pending_path = get_sync_state(token_board_db_path, "dashboard_pending_path")
     max_value = get_sync_state(
@@ -227,8 +246,16 @@ def _recover_dashboard_pending(token_board_db_path: str,
         token_board_db_path, "dashboard_pending_billing_max_id")
     pending_name = get_sync_state(
         token_board_db_path, "dashboard_pending_remote_artifact")
+    operation = _dashboard_operation(get_sync_state(
+        token_board_db_path, "dashboard_pending_operation"))
     if not pending_path and not max_value and not pending_name:
         return None
+    if expected_operation is not None and operation != expected_operation:
+        return {
+            "status": "conflict",
+            "message": "存在待完成的 Dashboard 导出事务，请先完成导出后再归档",
+            "pending": True,
+        }
     if not pending_path or not max_value:
         error = RuntimeError("dashboard pending state is incomplete")
         _mark_sync_degraded(token_board_db_path, "dashboard recovery", error)
@@ -272,7 +299,7 @@ def _recover_dashboard_pending(token_board_db_path: str,
     return _commit_dashboard_pending(
         token_board_db_path, dash_db_path, pending_path, max_id,
         max_billing_event_id, published,
-        schema_dir, recovered=True)
+        schema_dir, recovered=True, operation=operation)
 def _download_dashboard_shadow(token_board_db_path: str, dash_db_path: str,
                                shadow_path: str,
                                schema_dir: str | None,
@@ -384,6 +411,7 @@ def _publish_prepared(token_board_db_path: str, dash_db_path: str,
         set_sync_state(token_board_db_path, "dashboard_v2_manifest", "1")
     set_sync_state_many(token_board_db_path, {
         "dashboard_pending_path": str(prepared.path),
+        "dashboard_pending_operation": prepared.operation,
         "dashboard_pending_export_max_id": str(prepared.max_log_id),
         "dashboard_pending_billing_max_id": str(prepared.max_billing_event_id),
         "dashboard_pending_remote_artifact": published.name,
@@ -393,11 +421,12 @@ def _publish_prepared(token_board_db_path: str, dash_db_path: str,
     return _commit_dashboard_pending(
         token_board_db_path, dash_db_path, str(prepared.path),
         prepared.max_log_id, prepared.max_billing_event_id, published,
-        schema_dir, export_result)
+        schema_dir, export_result, operation=prepared.operation)
 
 
 def _recover_local_pending(token_board_db_path: str, dash_db_path: str,
-                           schema_dir: str | None) -> dict | None:
+                           schema_dir: str | None,
+                           expected_operation: str | None = None) -> dict | None:
     """Finish a local-only transaction without guessing remote state."""
     try:
         prepared = _prepared_from_state(token_board_db_path)
@@ -406,6 +435,12 @@ def _recover_local_pending(token_board_db_path: str, dash_db_path: str,
         return {"status": "error", "message": str(exc), "pending": True}
     if prepared is None:
         return None
+    if expected_operation is not None and prepared.operation != expected_operation:
+        return {
+            "status": "conflict",
+            "message": "存在待完成的 Dashboard 导出事务，请先完成导出后再归档",
+            "pending": True,
+        }
     remote_name = get_sync_state(
         token_board_db_path, "dashboard_pending_remote_artifact")
     if remote_name:
@@ -416,7 +451,7 @@ def _recover_local_pending(token_board_db_path: str, dash_db_path: str,
     return _commit_dashboard_pending(
         token_board_db_path, dash_db_path, str(prepared.path),
         prepared.max_log_id, prepared.max_billing_event_id, None,
-        schema_dir, recovered=True)
+        schema_dir, recovered=True, operation=prepared.operation)
 
 
 def _build_dashboard_candidate(token_board_db_path: str, dash_db_path: str,
@@ -445,7 +480,8 @@ DashboardTransform = Callable[[str, str], dict]
 def _run_dashboard_transaction_once(
         token_board_db_path: str, dash_db_path: str,
         schema_dir: str | None = None,
-        transform: DashboardTransform | None = None) -> dict:
+        transform: DashboardTransform | None = None,
+        *, operation: str = "export") -> dict:
     """Build, optionally transform, publish, and commit one archive."""
     project_root = Path(dash_db_path).resolve().parent
     tmp_dir = project_root / "tmp_dash"
@@ -455,10 +491,12 @@ def _run_dashboard_transaction_once(
     try:
         if config is not None:
             recovered = _recover_dashboard_pending(
-                token_board_db_path, dash_db_path, config, schema_dir)
+                token_board_db_path, dash_db_path, config, schema_dir,
+                "archive" if operation == "archive" else None)
         else:
             recovered = _recover_local_pending(
-                token_board_db_path, dash_db_path, schema_dir)
+                token_board_db_path, dash_db_path, schema_dir,
+                "archive" if operation == "archive" else None)
         if recovered is not None and recovered.get("status") != "ok":
             return recovered
 
@@ -469,9 +507,21 @@ def _run_dashboard_transaction_once(
         if candidate.get("status") != "ok":
             return candidate
 
-        export_result = _export_dashboard(
-            token_board_db_path, candidate_path,
-            candidate["resolved_schema_dir"])
+        if operation == "export":
+            export_result = _export_dashboard(
+                token_board_db_path, candidate_path,
+                candidate["resolved_schema_dir"])
+        else:
+            from app.db.proxy_db import ProxyDatabase
+            proxy_db = ProxyDatabase(
+                token_board_db_path,
+                schema_dir=candidate["resolved_schema_dir"],
+            )
+            export_result = {
+                "record_count": 0,
+                "max_id": proxy_db.get_export_mark(),
+                "billing_max_id": proxy_db.get_billing_export_mark(),
+            }
 
         transform_result = (transform(candidate_path,
                                       candidate["resolved_schema_dir"])
@@ -487,14 +537,14 @@ def _run_dashboard_transaction_once(
         prepared = _prepare_pending(
             token_board_db_path, candidate_path, dash_db_path,
             export_result["max_id"], export_result["billing_max_id"],
-            expected)
+            expected, operation=operation)
 
         if config is None:
             result = _commit_dashboard_pending(
                 token_board_db_path, dash_db_path, str(prepared.path),
                 prepared.max_log_id, prepared.max_billing_event_id, None,
                 candidate["resolved_schema_dir"],
-                export_result)
+                export_result, operation=operation)
         else:
             result = _publish_prepared(
                 token_board_db_path, dash_db_path, prepared, config,

@@ -114,13 +114,20 @@ class ProxyRoutingMixin:
                                 session_id: str | None = None) -> bool:
         """Insert one imported software usage row on the caller's connection.
 
-        A pending V1 event lets SQLite select the current write-time price and FX.  The
-        event_id UNIQUE constraint makes INSERT OR IGNORE idempotent across
-        crashes/restarts.  `requested_at` must be a SQLite UTC timestamp
+        A pending V1 event lets SQLite select the current write-time price and FX.  A
+        permanent receipt makes INSERT OR IGNORE idempotent even after the
+        request_log retention window; `requested_at` must be a SQLite UTC timestamp
         "YYYY-MM-DD HH:MM:SS".  The legacy ``project`` and ``session_id`` arguments
         are accepted for caller compatibility but are intentionally not persisted.
         Returns True when a row was inserted.
         """
+        receipt = conn.execute(
+            "INSERT OR IGNORE INTO agent_usage_receipts"
+            "(event_id,software_id) VALUES(?,?)",
+            (event_id, software_id),
+        )
+        if receipt.rowcount == 0:
+            return False
         cur = conn.execute(
             "INSERT OR IGNORE INTO request_log"
             "(event_id,source_kind,account_id,agent_software_id,model,prompt_tokens,completion_tokens,"

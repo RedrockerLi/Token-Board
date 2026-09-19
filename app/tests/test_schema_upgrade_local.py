@@ -46,12 +46,13 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertEqual(self._version(proxy), self._latest("token-board"))
         self.assertEqual(self._version(dashboard), self._latest("dashboard"))
 
-    def test_v23_removes_agent_request_context(self) -> None:
+    def test_v23_removes_agent_request_context_and_v24_adds_usage_receipts(self) -> None:
         proxy = self.root / "data/token-board.db"
         dashboard = self.root / "data/dashboard.db"
         legacy_schema = self.root / "schema-v22"
         shutil.copytree(self.root / "schema", legacy_schema)
         (legacy_schema / "token-board/v2/2-3_remove_agent_request_context.sql").unlink()
+        (legacy_schema / "token-board/v2/2-4_agent_usage_receipts.sql").unlink()
 
         ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
         with sqlite3.connect(proxy) as conn:
@@ -77,7 +78,11 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                 "SELECT model,total_tokens,status_code FROM request_log "
                 "WHERE event_id='v23-context'"
             ).fetchone(), ("context-model", 12, 200))
-        self.assertEqual(self._version(proxy), (2, 3))
+            self.assertEqual(conn.execute(
+                "SELECT event_id FROM agent_usage_receipts "
+                "WHERE event_id='v23-context'"
+            ).fetchone(), ("v23-context",))
+        self.assertEqual(self._version(proxy), self._latest("token-board"))
 
     def test_current_proxy_schema_treats_every_business_name_as_display_data(self) -> None:
         proxy = self.root / "data/token-board.db"

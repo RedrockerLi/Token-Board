@@ -95,6 +95,51 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         self.assertEqual(tuple(row), (
             "gpt-5.1-codex", 10, 20, 5, 35, "2026-08-13T01:00:00Z"))
 
+    def test_hermes_history_stays_deduplicated_after_log_retention(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        hermes_root = Path(self._sessions.name) / "hermes"
+        hermes_root.mkdir()
+        hermes_db = hermes_root / "state.db"
+        with sqlite3.connect(hermes_db) as connection:
+            connection.execute("""CREATE TABLE sessions (
+                id TEXT, model TEXT, started_at TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, cache_read_tokens INTEGER,
+                reasoning_tokens INTEGER, cache_write_tokens INTEGER
+            )""")
+            connection.execute(
+                "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)",
+                ("old-session", "hermes-model", "2020-01-01T00:00:00Z",
+                 10, 5, 0, 0, 0),
+            )
+        software_id = database.create_agent_software({
+            "name": "hermes-agent", "agent_kind": "hermes",
+            "config": {"data_root": str(hermes_root)},
+        })
+
+        self.assertEqual(import_once(database), 1)
+        with sqlite3.connect(self.proxy_path) as connection:
+            max_id = connection.execute(
+                "SELECT max(id) FROM request_log"
+            ).fetchone()[0]
+        self.assertGreater(max_id, 0)
+        self.assertEqual(database.cleanup_exported_logs(max_id), 1)
+        self.assertEqual(import_once(database), 0)
+        with sqlite3.connect(self.proxy_path) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM request_log WHERE agent_software_id=?",
+                (software_id,),
+            ).fetchone()[0], 0)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM agent_usage_receipts"
+            ).fetchone()[0], 1)
+        self.assertTrue(database.delete_agent_software(software_id))
+        with sqlite3.connect(self.proxy_path) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM agent_usage_receipts"
+            ).fetchone()[0], 1)
+
     def test_agent_context_is_not_persisted(self) -> None:
         from app.db.proxy_db import ProxyDatabase
 
