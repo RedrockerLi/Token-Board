@@ -114,6 +114,8 @@ bool AnthropicCodec::parse_response(const json &in, ir::ChatResponse &out,
     }
     if (in.contains("type")) out.extras["type"] = in["type"];
     if (in.contains("role")) out.extras["role"] = in["role"];
+    if (in.contains("context_management"))
+        out.extras["context_management"] = in["context_management"];
     return true;
 }
 
@@ -125,6 +127,8 @@ json AnthropicCodec::serialize_response(const ir::ChatResponse &in,
     out["role"] = "assistant";
     out["model"] = in.model;
     out["content"] = serialize_anthropic_blocks(in.content);
+    if (in.extras.contains("context_management"))
+        out["context_management"] = in.extras["context_management"];
     out["stop_reason"] = fmt::stop_reason_to_anthropic(in.stop_reason);
     if (in.stop_sequence.has_value())
         out["stop_sequence"] = *in.stop_sequence;

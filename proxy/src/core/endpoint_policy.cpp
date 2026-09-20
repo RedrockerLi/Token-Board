@@ -3,7 +3,7 @@
 #include <array>
 
 namespace {
-constexpr std::array<EndpointPolicy, 5> policies{{
+constexpr std::array<EndpointPolicy, 6> policies{{
     {EndpointKind::Chat, "chat", "POST", "/chat/completions",
      ir::ApiFormat::OpenAI, true, true, HttpMethod::Post, BodyMode::Json,
      ResponseMode::Codec, UsageMode::Json, LocalResponseMode::None,
@@ -16,6 +16,10 @@ constexpr std::array<EndpointPolicy, 5> policies{{
      ir::ApiFormat::OpenAIResponses, true, true, HttpMethod::Post, BodyMode::Json,
      ResponseMode::Codec, UsageMode::Json, LocalResponseMode::None,
      TimeoutClass::Streaming},
+    {EndpointKind::ResponsesCompact, "responses_compact", "POST",
+     "/responses/compact", ir::ApiFormat::OpenAIResponses, true, true,
+     HttpMethod::Post, BodyMode::Json, ResponseMode::Codec, UsageMode::Json,
+     LocalResponseMode::None, TimeoutClass::Streaming},
     {EndpointKind::Embeddings, "embeddings", "POST", "/embeddings",
      ir::ApiFormat::OpenAI, false, true, HttpMethod::Post, BodyMode::Json,
      ResponseMode::Codec, UsageMode::Json, LocalResponseMode::None,
@@ -32,6 +36,9 @@ const EndpointPolicy &endpoint_policy(EndpointKind kind) {
 }
 
 const EndpointPolicy &endpoint_policy_for_path(const std::string &path) {
+    if (path.size() >= 18 &&
+        path.compare(path.size() - 18, 18, "/responses/compact") == 0)
+        return endpoint_policy(EndpointKind::ResponsesCompact);
     if (path.size() >= 9 && path.compare(path.size() - 9, 9, "/messages") == 0)
         return endpoint_policy(EndpointKind::Messages);
     if (path.size() >= 10 && path.compare(path.size() - 10, 10, "/responses") == 0)
@@ -84,7 +91,8 @@ void resolve_upstream_path(const EndpointPolicy &policy,
                     base_path.compare(base_path.size() - 3, 3, "/v1") == 0)
             ? "/messages" : "/v1/messages";
     } else if (format == ir::ApiFormat::OpenAIResponses) {
-        out_path = "/responses";
+        out_path = policy.kind == EndpointKind::ResponsesCompact
+            ? "/responses/compact" : "/responses";
     } else {
         // The path is selected by the target upstream format, not by the
         // client's endpoint policy. This matters for cross-format chat and

@@ -106,18 +106,21 @@ inline void log_proxy_failure(
     const ProxyLogContext &context, const char *phase, const char *reason,
     int status_code, int duration_ms = -1, std::size_t attempt = 0,
     std::size_t attempts = 0, bool retrying = false, int timeout_secs = 0,
-    const UpstreamCandidate *candidate = nullptr) {
+    const UpstreamCandidate *candidate = nullptr,
+    const std::string &extra_fields = {}) {
     proxy_error_log_emitted = true;
     const std::string method = proxy_log_value(context.method);
     const std::string endpoint = proxy_log_value(context.endpoint);
     const std::string format = proxy_log_value(context.format);
     const std::string model = proxy_log_value(context.model);
+    const std::string suffix = extra_fields.empty() ? std::string()
+                                                     : " " + extra_fields;
     TB_LOG_WARN(
         "[ProxyError] request_id=%llu phase=%s method=%s endpoint=%s "
         "format=%s model=%s streaming=%d route_account_id=%d local_key_id=%d "
         "status=%d reason=%s attempt=%zu attempts=%zu retrying=%d "
         "duration_ms=%d timeout_secs=%d upstream_account_id=%d upstream_id=%d "
-        "upstream_key_id=%d priority_group=%d\n",
+        "upstream_key_id=%d priority_group=%d%s\n",
         static_cast<unsigned long long>(context.request_id), phase, method.c_str(),
         endpoint.c_str(), format.c_str(), model.c_str(), context.streaming ? 1 : 0,
         context.route_account_id, context.local_key_id, status_code, reason,
@@ -125,5 +128,5 @@ inline void log_proxy_failure(
         candidate ? candidate->account().id : 0,
         candidate ? candidate->account().upstream_id : 0,
         candidate ? candidate->key_slot_id : 0,
-        candidate ? candidate->priority_group : 0);
+        candidate ? candidate->priority_group : 0, suffix.c_str());
 }

@@ -43,6 +43,65 @@ int main() {
     assert(reasoning_roundtrip["include"].size() == 2);
     assert(reasoning_roundtrip["include"][0] == "foo");
     assert(reasoning_roundtrip["include"][1] == "reasoning.encrypted_content");
+
+    ir::ChatRequest context_management_request;
+    context_management_request.model = "gpt-test";
+    context_management_request.extras["context_management"] = json{
+        {"edits", json::array({json{{"type", "clear_tool_uses_20250919"}}})}};
+    ir::ConversionContext native_context;
+    native_context.source = ir::ApiFormat::OpenAIResponses;
+    native_context.target = ir::ApiFormat::OpenAIResponses;
+    json native_context_request = responses->serialize_request(
+        context_management_request, &native_context);
+    assert(native_context_request["context_management"] ==
+           context_management_request.extras["context_management"]);
+    ir::ConversionContext anthropic_context;
+    anthropic_context.source = ir::ApiFormat::Anthropic;
+    anthropic_context.target = ir::ApiFormat::OpenAIResponses;
+    json dropped_context_request = responses->serialize_request(
+        context_management_request, &anthropic_context);
+    assert(!dropped_context_request.contains("context_management"));
+
+    ir::ChatResponse context_response;
+    context_response.id = "resp-context";
+    context_response.model = "gpt-test";
+    context_response.stop_reason = ir::StopReason::Stop;
+    context_response.extras["object"] = "response";
+    context_response.extras["context_management"] = json{
+        {"applied_edits", json::array({json{{"type", "compaction"}}})}};
+    json context_response_wire = responses->serialize_response(context_response,
+                                                                &native_context);
+    assert(context_response_wire["context_management"] ==
+           context_response.extras["context_management"]);
+    assert(context_response_wire["object"] == "response");
+    ir::ChatResponse parsed_context_response;
+    assert(responses->parse_response(context_response_wire,
+                                     parsed_context_response, error,
+                                     &native_context));
+    assert(parsed_context_response.extras["context_management"] ==
+           context_response.extras["context_management"]);
+    ir::ChatResponse chat_source_response = context_response;
+    chat_source_response.extras["object"] = "chat.completion";
+    ir::ConversionContext chat_to_responses_context;
+    chat_to_responses_context.source = ir::ApiFormat::OpenAI;
+    chat_to_responses_context.target = ir::ApiFormat::OpenAIResponses;
+    json chat_to_responses_wire = responses->serialize_response(
+        chat_source_response, &chat_to_responses_context);
+    assert(chat_to_responses_wire["object"] == "response");
+
+    const auto compact_wire = json{
+        {"id", "resp-compact"}, {"object", "response.compaction"},
+        {"status", "completed"}, {"model", "gpt-test"},
+        {"output", json::array({json{{"type", "compaction"},
+                                       {"id", "cmp-1"},
+                                       {"encrypted_content", "opaque"}}})}};
+    ir::ChatResponse compact_response;
+    assert(responses->parse_response(compact_wire, compact_response, error,
+                                     &native_context));
+    json compact_roundtrip = responses->serialize_response(compact_response,
+                                                            &native_context);
+    assert(compact_roundtrip["object"] == "response.compaction");
+    assert(compact_roundtrip["output"][0] == compact_wire["output"][0]);
     auto chat = make_openai_codec();
     ir::ConversionContext chat_context;
     json chat_request = chat->serialize_request(parsed, &chat_context);
@@ -262,17 +321,45 @@ int main() {
     ir::StreamEvent native_finish;
     native_finish.type = ir::StreamEventType::MessageFinish;
     native_finish.stop_reason = ir::StopReason::Stop;
+    native_finish.extra["object"] = "response";
+    native_finish.extra["context_management"] = json{
+        {"applied_edits", json::array({json{{"type", "compaction"}}})}};
     native_emitter->emit(native_finish, native_sink);
     native_emitter->finish(native_sink);
-    bool preserved_tool = false, preserved_text = false;
+    bool preserved_tool = false, preserved_text = false, preserved_context = false;
     for (const auto &frame : native_frames) {
         preserved_tool = preserved_tool ||
             frame.find("native-tool-item") != std::string::npos &&
             frame.find("\"output_index\":3") != std::string::npos;
         preserved_text = preserved_text || frame.find("native-text-item") != std::string::npos &&
             frame.find("\"output_index\":1") != std::string::npos;
+        preserved_context = preserved_context ||
+            frame.find("context_management") != std::string::npos &&
+            frame.find("compaction") != std::string::npos;
     }
-    assert(preserved_tool && preserved_text);
+    assert(preserved_tool && preserved_text && preserved_context);
+
+    auto anthropic_stream_emitter = anthropic->make_stream_emitter();
+    std::vector<std::string> anthropic_stream_frames;
+    auto anthropic_stream_sink = [&](const std::string &frame) {
+        anthropic_stream_frames.push_back(frame); return true;
+    };
+    ir::StreamEvent anthropic_start;
+    anthropic_start.type = ir::StreamEventType::MessageStart;
+    anthropic_start.extra["id"] = "msg-context";
+    anthropic_stream_emitter->emit(anthropic_start, anthropic_stream_sink);
+    ir::StreamEvent anthropic_finish;
+    anthropic_finish.type = ir::StreamEventType::MessageFinish;
+    anthropic_finish.stop_reason = ir::StopReason::Stop;
+    anthropic_finish.extra["context_management"] = json{
+        {"applied_edits", json::array({json{{"type", "clear_tool_uses_20250919"}}})}};
+    anthropic_stream_emitter->emit(anthropic_finish, anthropic_stream_sink);
+    anthropic_stream_emitter->finish(anthropic_stream_sink);
+    bool preserved_anthropic_context = false;
+    for (const auto &frame : anthropic_stream_frames)
+        preserved_anthropic_context = preserved_anthropic_context ||
+            frame.find("context_management") != std::string::npos;
+    assert(preserved_anthropic_context);
 
     auto empty_emitter = responses->make_stream_emitter(&native_stream_context);
     std::vector<std::string> empty_frames;

@@ -17,6 +17,7 @@ private:
     bool started_ = false, finished_ = false, completed_emitted_ = false;
     std::string deferred_status_ = "completed";
     ir::Usage last_usage_;
+    json terminal_extras_ = json::object();
     std::map<int, std::string> text_, reasoning_text_, item_ids_;
     std::map<int, std::string> reasoning_signatures_, reasoning_redacted_data_;
     std::map<int, json> raw_items_;

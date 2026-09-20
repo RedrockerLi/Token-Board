@@ -176,6 +176,8 @@ bool ResponsesCodec::parse_response(const json &in, ir::ChatResponse &out,
     out.extras["created_at"] = in.contains("created_at") ? in["created_at"] : json(nullptr);
     out.extras["object"] = in.value("object", "response");
     if (in.contains("status")) out.extras["status"] = in["status"];
+    if (in.contains("context_management"))
+        out.extras["context_management"] = in["context_management"];
     return true;
 }
 
@@ -187,11 +189,20 @@ json ResponsesCodec::serialize_response(const ir::ChatResponse &in,
                ? context->generated_response_id : fmt::generate_response_id())
         : in.id;
     out["id"] = response_id;
-    out["object"] = "response";  // forced — never inherit source format
+    const std::string source_object = in.extras.value("object", "response");
+    const bool native_responses_context = context &&
+        context->source == ApiFormat::OpenAIResponses &&
+        context->target == ApiFormat::OpenAIResponses;
+    const bool preserve_native_metadata = native_responses_context ||
+        (!context && (source_object == "response" ||
+                      source_object == "response.compaction"));
+    out["object"] = preserve_native_metadata ? source_object : "response";
     out["created_at"] = in.extras.contains("created_at") ? in.extras["created_at"]
                                                          : json(nullptr);
     out["status"] = fmt::stop_reason_to_responses(in.stop_reason);
     out["model"] = in.model;
+    if (preserve_native_metadata && in.extras.contains("context_management"))
+        out["context_management"] = in.extras["context_management"];
 
     json output = json::array();
     if (!in.output_items.empty()) {

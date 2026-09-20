@@ -14,6 +14,7 @@ void ProxyServer::setup_routes(httplib::Server &server) {
     server.Options("/v1/models", cors_handler);
     server.Options("/v1/messages", cors_handler);
     server.Options("/v1/responses", cors_handler);
+    server.Options("/v1/responses/compact", cors_handler);
     // Double-/v1 aliases: a client whose ANTHROPIC_BASE_URL already ends in
     // "/v1" appends the endpoint path again (e.g. "/v1/v1/messages"). Serve
     // them so such clients work without reconfiguring the base URL.
@@ -22,17 +23,21 @@ void ProxyServer::setup_routes(httplib::Server &server) {
     server.Options("/v1/v1/models", cors_handler);
     server.Options("/v1/v1/messages", cors_handler);
     server.Options("/v1/v1/responses", cors_handler);
+    server.Options("/v1/v1/responses/compact", cors_handler);
 
-    // The three chat endpoints share one format-agnostic pipeline.
+    // Chat and Responses compaction endpoints share one format-agnostic
+    // pipeline; the compact policy keeps its native upstream path.
     auto chat_handler = [this](const httplib::Request &req, httplib::Response &res) {
         handle_chat_request(req, res);
     };
     server.Post("/v1/chat/completions", chat_handler);
     server.Post("/v1/messages", chat_handler);
     server.Post("/v1/responses", chat_handler);
+    server.Post("/v1/responses/compact", chat_handler);
     server.Post("/v1/v1/chat/completions", chat_handler);
     server.Post("/v1/v1/messages", chat_handler);
     server.Post("/v1/v1/responses", chat_handler);
+    server.Post("/v1/v1/responses/compact", chat_handler);
 
     // Embedding endpoint
     server.Post("/v1/embeddings",

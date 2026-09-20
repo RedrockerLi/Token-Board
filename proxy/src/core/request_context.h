@@ -1,6 +1,7 @@
 #pragma once
 
 #include "codec.h"
+#include "endpoint_policy.h"
 
 #include <string>
 #include <memory>
@@ -11,6 +12,7 @@ namespace httplib { struct Request; }
 struct RequestContext {
     std::shared_ptr<const std::string> raw_body;
     ir::ApiFormat client_format = ir::ApiFormat::OpenAI;
+    EndpointKind endpoint_kind = EndpointKind::Chat;
     std::string model;
     bool streaming = false;
     std::string session_id;

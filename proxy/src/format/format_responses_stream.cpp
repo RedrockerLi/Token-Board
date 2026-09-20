@@ -264,7 +264,11 @@ private:
         if (type == "response.completed" || type == "response.incomplete") {
             if (!j.contains("response") || !j["response"].is_object()) return;
             const auto &r = j["response"]; StreamEvent fin; fin.type = StreamEventType::MessageFinish;
-            fin.stop_reason = fmt::responses_status_to_stop(r.value("status", type)); emit(fin);
+            fin.stop_reason = fmt::responses_status_to_stop(r.value("status", type));
+            if (r.contains("object")) fin.extra["object"] = r["object"];
+            if (r.contains("context_management"))
+                fin.extra["context_management"] = r["context_management"];
+            emit(fin);
             if (r.contains("usage") && r["usage"].is_object()) { StreamEvent u; u.type = StreamEventType::UsageEvent; u.usage = fmt::parse_usage_json(r["usage"]); emit(u); }
             return;
         }

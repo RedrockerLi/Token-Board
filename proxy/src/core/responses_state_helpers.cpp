@@ -100,8 +100,10 @@ std::vector<RequestFeatureFailure> request_feature_failures(
         if (!request.extras.contains(key)) continue;
 
         if (std::string(key) == "context_management") {
-            if (target != ir::ApiFormat::OpenAIResponses)
-                add(key, "context_management cannot be represented by the target protocol");
+            const auto decision = fmt::context_management_decision(
+                harness, target, request.extras[key]);
+            if (decision.action == fmt::ContextManagementAction::Reject)
+                add(key, decision.reason);
             continue;
         }
 

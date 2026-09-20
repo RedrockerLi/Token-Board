@@ -45,9 +45,10 @@ struct Response;
 ///   POST /v1/chat/completions   — OpenAI-compatible proxy endpoint
 ///   POST /v1/messages           — Anthropic-compatible proxy endpoint
 ///   POST /v1/responses          — OpenAI Responses proxy endpoint
+///   POST /v1/responses/compact  — native Responses compaction endpoint
 ///   GET  /health                — health-check
 ///
-/// The three chat endpoints share one pipeline: the harness (client) format is
+/// The chat and Responses compaction endpoints share one pipeline: the harness (client) format is
 /// derived from the incoming URL path (/v1/chat/completions → OpenAI,
 /// /v1/responses → Responses, /v1/messages → Anthropic), and converted to the
 /// account's upstream format via the codec registry when they differ.
@@ -189,6 +190,7 @@ private:
                           std::uint64_t request_id, size_t start,
                           const std::string &session_id,
                           int route_account_id, int local_key_id,
+                          EndpointKind endpoint_kind,
                           ir::ApiFormat harness,
                           const std::string &resolved_model,
                           std::shared_ptr<const json> parsed_json,

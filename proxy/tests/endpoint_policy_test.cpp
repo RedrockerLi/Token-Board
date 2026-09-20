@@ -17,6 +17,10 @@ int main() {
 
     assert(&endpoint_policy_for_path("/v1/embeddings") == &embeddings);
     assert(&endpoint_policy_for_path("/v1/models") == &models);
+    const auto &compact = endpoint_policy(EndpointKind::ResponsesCompact);
+    assert(compact.client_format == ir::ApiFormat::OpenAIResponses);
+    assert(compact.default_path == std::string("/responses/compact"));
+    assert(&endpoint_policy_for_path("/v1/v1/responses/compact") == &compact);
 
     std::string path;
     bool path_is_full = false;
@@ -41,6 +45,10 @@ int main() {
                           "openai_responses", "http://upstream/v1/", "",
                           path, path_is_full);
     assert(path == "/responses");
+    assert(!path_is_full);
+    resolve_upstream_path(compact, "openai_responses", "http://upstream/v1/", "",
+                          path, path_is_full);
+    assert(path == "/responses/compact");
     assert(!path_is_full);
     return 0;
 }

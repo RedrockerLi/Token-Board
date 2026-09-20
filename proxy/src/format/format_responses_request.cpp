@@ -1,4 +1,5 @@
 #include "format_responses_internal.h"
+#include "context_management.h"
 using namespace ir;
 bool ResponsesCodec::parse_request(const json &in, ir::ChatRequest &out,
                                    std::string &err) const {
@@ -322,6 +323,12 @@ json ResponsesCodec::serialize_request(const ir::ChatRequest &in,
          "prompt_cache_options", "prompt_cache_retention", "safety_identifier",
          "service_tier", "store", "stream_options", "text", "top_logprobs",
          "top_p", "truncation", "user"});
+    if (context && body.contains("context_management")) {
+        const auto decision = fmt::context_management_decision(
+            context->source, context->target, body["context_management"]);
+        if (decision.action == fmt::ContextManagementAction::Drop)
+            body.erase("context_management");
+    }
     body["model"] = in.model;
     body["stream"] = in.stream;
     if (in.max_tokens.has_value())

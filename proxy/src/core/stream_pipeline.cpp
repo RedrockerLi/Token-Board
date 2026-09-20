@@ -4,6 +4,7 @@ void ProxyServer::handle_streaming(
     const std::vector<CandidateRequestBody> &candidate_bodies,
     std::uint64_t request_id, size_t start,
     const std::string &session_id, int route_account_id, int local_key_id,
+    EndpointKind endpoint_kind,
     ir::ApiFormat harness,
     const std::string &resolved_model, std::shared_ptr<const json> parsed_json,
     std::shared_ptr<const ir::ChatRequest> parsed_request, std::shared_ptr<const ir::ConversionContext> conversion_context,
@@ -11,24 +12,27 @@ void ProxyServer::handle_streaming(
     const std::string &anthropic_beta, const httplib::Request &req,
     httplib::Response &res, std::chrono::steady_clock::time_point t0) {
     const FormatCodec &harness_codec = codecs_.get(harness);
+    const auto &request_policy = endpoint_policy(endpoint_kind);
     auto log_context = make_proxy_log_context(request_id, req.method, req.path, ir::to_string(harness));
     set_proxy_log_stream_fields(log_context, resolved_model, route_account_id, local_key_id);
     const std::string content_type = req.has_header("Content-Type") ? req.get_header_value("Content-Type") : "application/json";
     const std::string scope = affinity_scope(local_key_id, harness);
     const auto order = candidate_order(cands, start, routing_rr_.fetch_add(1, std::memory_order_relaxed));
-    const auto base_timeouts = timeout_config_cached(chat_endpoint_policy(harness).kind);
+    const auto base_timeouts = timeout_config_cached(request_policy.kind);
     const int budget_seconds = base_timeouts.streaming_first_byte_timeout > 0 ? base_timeouts.streaming_first_byte_timeout : 60; const auto deadline = t0 + std::chrono::seconds(budget_seconds);
     res.set_chunked_content_provider(
         "text/event-stream",
         [this, cands, candidate_bodies, order, session_id, scope, log_context,
          local_key_id,
-         harness, resolved_model, parsed_json, parsed_request, conversion_context,
+         endpoint_kind, harness, resolved_model, parsed_json, parsed_request, conversion_context,
          state_current_input, reservation,
          anthropic_beta,
          base_timeouts, deadline, budget_seconds,
          content_type, t0, &res,
          client_sock = req.client_socket](size_t, httplib::DataSink &sink) -> bool {
-            const FormatCodec &out_codec = codecs_.get(harness); std::uint64_t inflight_id = 0;
+            const FormatCodec &out_codec = codecs_.get(harness);
+            const auto &request_policy = endpoint_policy(endpoint_kind);
+            std::uint64_t inflight_id = 0;
             adopt_accounting_reservation(reservation);
             mark_accounting_upstream_started(
                 cands.empty() ? 0 : cands.front().account().id, local_key_id,
@@ -46,6 +50,7 @@ void ProxyServer::handle_streaming(
             int upstream_semantic_ttft = -1;
             bool client_write_failed = false, terminal_error_forwarded = false;
             bool source_terminal_seen = false; ir::Usage final_stream_usage; std::string final_stream_model;
+            bool context_management_logged = false;
             json responses_terminal; fmt::SseFrameBuffer responses_state_sse; AttemptExecutor attempt_executor(gate_);
             std::unordered_map<std::string, std::string> converted_bodies;
             auto write_to_sink = [&](const std::string &data) -> bool {
@@ -92,6 +97,17 @@ void ProxyServer::handle_streaming(
                                                    candidate.upstream_model(), true);
                 }
                 const auto upstream = ir::parse_api_format(candidate.account().api_format);
+                if (!context_management_logged && parsed_request &&
+                    parsed_request->extras.contains("context_management")) {
+                    const auto decision = fmt::context_management_decision(
+                        harness, upstream,
+                        parsed_request->extras["context_management"]);
+                    if (decision.action == fmt::ContextManagementAction::Drop) {
+                        log_context_management_downgrade(
+                            log_context, harness, upstream, decision, &candidate);
+                        context_management_logged = true;
+                    }
+                }
                 const bool responses_item_adapter = harness == ir::ApiFormat::OpenAIResponses &&
                     parsed_request && responses_request_needs_tool_adapter(*parsed_request);
                 const bool passthrough = harness == upstream &&
@@ -152,10 +168,15 @@ void ProxyServer::handle_streaming(
                         converted.model = candidate.upstream_model();
                         if (conversion_context)
                             converted.tools = conversion_context->tools.target_tools;
+                        auto request_context = conversion_context
+                            ? std::make_shared<ir::ConversionContext>(*conversion_context)
+                            : std::make_shared<ir::ConversionContext>();
+                        request_context->source = harness;
+                        request_context->target = upstream;
                         found = converted_bodies.emplace(
                             cache_key,
                             codecs_.get(upstream).serialize_request(
-                                converted, conversion_context.get()).dump()
+                                converted, request_context.get()).dump()
                         ).first;
                     }
                     body = &found->second;
@@ -289,7 +310,7 @@ void ProxyServer::handle_streaming(
                 };
                 const auto attempt_started = std::chrono::steady_clock::now();
                 auto result = forward_endpoint_attempt(
-                    upstream_, chat_endpoint_policy(harness), candidate, *body,
+                    upstream_, request_policy, candidate, *body,
                     passthrough ? content_type : "application/json",
                     attempt_request.remaining_budget_ms, attempt_timeouts,
                     client_sock, on_chunk,
@@ -429,7 +450,9 @@ void ProxyServer::handle_streaming(
                                      upstream_semantic_ttft, final_result.duration_ms,
                                      attempts_made, attempts);
                 affinity_.bind(scope, session_id, used->key_slot_id);
-                if (harness == ir::ApiFormat::OpenAIResponses && parsed_json &&
+                if (harness == ir::ApiFormat::OpenAIResponses &&
+                    endpoint_kind != EndpointKind::ResponsesCompact &&
+                    parsed_json &&
                     source_terminal_seen)
                     responses_state_sse.finish([&](const std::string &frame) {
                         std::string event_name, payload;
@@ -443,6 +466,7 @@ void ProxyServer::handle_streaming(
                     });
                 sink.done();
                 if (harness == ir::ApiFormat::OpenAIResponses &&
+                    endpoint_kind != EndpointKind::ResponsesCompact &&
                     parsed_json && source_terminal_seen &&
                     !responses_terminal.is_null())
                     record_responses_state(*this, *parsed_json,

@@ -196,6 +196,25 @@ def main() -> None:
             wait_for_health(proxy_port)
             chat = {"messages": [{"role": "user", "content": "hi"}]}
 
+            # Cross-format requests with an unknown Anthropic content block
+            # must expose the preflight feature detail both in the response
+            # and in the structured proxy log.  The detail is metadata only;
+            # the sentinel must never be copied into the journal.
+            status, body, _ = send(
+                proxy_port, "POST", "/v1/messages", "tb-chatto",
+                {"model": "chatto-model", "max_tokens": 16,
+                 "messages": [{"role": "user", "content": [{
+                     "type": "future_block",
+                     "sentinel": "must-not-appear-in-log"}]}]})
+            assert status == 422, (status, body)
+            assert body["error"]["code"] == "unsupported_feature", body
+            assert body["error"]["details"] == [{
+                "feature": "unknown_content",
+                "target": "openai",
+                "reason": "unknown content blocks cannot be converted losslessly",
+            }], body
+            print("0a OK: unsupported feature includes safe preflight detail")
+
             # A route miss is rejected by cpp-httplib before a business
             # handler runs; the framework logger must still emit a structured
             # WARN without any request credential material.
@@ -362,10 +381,16 @@ def main() -> None:
                 assert "reason=upstream_timeout" in stderr_output, stderr_output
                 assert "reason=provider_quota_cooldown" in stderr_output, stderr_output
                 assert "reason=route_not_found" in stderr_output, stderr_output
+                assert (
+                    "validation_details=unknown_content@openai:"
+                    "unknown_content_blocks_cannot_be_converted_losslessly"
+                    in stderr_output
+                ), stderr_output
                 # Request credentials and control payload fields must never be
                 # copied into the journal record.
                 assert "sk-chat-500" not in stderr_output, stderr_output
                 assert "mock_status_by_key" not in stderr_output, stderr_output
+                assert "must-not-appear-in-log" not in stderr_output, stderr_output
             if proxy.returncode not in (0, -15):
                 print(stderr_output, file=sys.stderr)
 

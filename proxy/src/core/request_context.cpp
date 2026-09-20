@@ -26,6 +26,7 @@ std::string session_id(const httplib::Request &request,
 bool parse_request_context(const httplib::Request &request,
                            RequestContext &context, std::string &error) {
     const auto &policy = endpoint_policy_for_path(request.path);
+    context.endpoint_kind = policy.kind;
     context.client_format = policy.client_format;
     context.raw_body = std::make_shared<const std::string>(request.body);
     context.queue_ms = current_request_queue_delay_ms();

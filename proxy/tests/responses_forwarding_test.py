@@ -37,7 +37,53 @@ class FakeResponsesUpstream(BaseHTTPRequestHandler):
                 "anthropic_beta": self.headers.get("anthropic-beta"),
                 "body": body,
             })
+        if self.path.endswith("/responses/compact"):
+            payload = {
+                "id": "resp-compact",
+                "object": "response.compaction",
+                "created_at": 1,
+                "status": "completed",
+                "model": body.get("model", "compact-model"),
+                "output": [{
+                    "type": "compaction", "id": "compact-item",
+                    "encrypted_content": "opaque-compaction-state",
+                }],
+            }
+            self._send_json(payload)
+            return
         if self.path.endswith("/responses"):
+            if body.get("stream"):
+                response = {
+                    "id": "resp-stream",
+                    "object": "response",
+                    "status": "completed",
+                    "model": body.get("model", "responses-model"),
+                    "output": [{
+                        "id": "msg-stream", "type": "message",
+                        "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text",
+                                      "text": "responses-stream-ok",
+                                      "annotations": []}],
+                    }],
+                    "usage": {"input_tokens": 2, "output_tokens": 1,
+                              "total_tokens": 3},
+                }
+                frames = [
+                    {"type": "response.created", "response": {
+                        "id": response["id"], "object": "response",
+                        "status": "in_progress", "model": response["model"]}},
+                    {"type": "response.output_item.added", "output_index": 0,
+                     "item": response["output"][0]},
+                    {"type": "response.output_text.delta", "output_index": 0,
+                     "item_id": "msg-stream", "content_index": 0,
+                     "delta": "responses-stream-ok"},
+                    {"type": "response.output_item.done", "output_index": 0,
+                     "item": response["output"][0]},
+                    {"type": "response.completed", "response": response},
+                ]
+                self._send_sse(("".join("data: " + json.dumps(frame) +
+                                         "\n\n" for frame in frames)).encode())
+                return
             payload = {
                 "id": "resp-direct",
                 "object": "response",
@@ -74,12 +120,17 @@ class FakeResponsesUpstream(BaseHTTPRequestHandler):
             self._send_sse(data.encode())
             return
         if self.path.endswith("/messages"):
-            self._send_json({
+            payload = {
                 "id": "msg-converted", "type": "message", "role": "assistant",
                 "model": body.get("model", "anthropic-model"),
                 "content": [{"type": "text", "text": "anthropic-ok"}],
                 "stop_reason": "end_turn", "usage": {"input_tokens": 2, "output_tokens": 1},
-            })
+            }
+            if body.get("model") == "anthropic-context":
+                payload["context_management"] = {
+                    "applied_edits": [{"type": "clear_tool_uses_20250919"}]
+                }
+            self._send_json(payload)
             return
         self.send_error(404)
 
@@ -192,10 +243,31 @@ def main() -> None:
                 "model": "direct-model", "stream": False,
                 "input": [{"role": "user", "content": "direct"}],
                 "background": True,
+                "context_management": [{"type": "compaction",
+                                         "compact_threshold": 1000}],
             }
             status, direct_result = post(proxy_port, "tb-responses", direct_body)
             assert status == 200
             assert json.loads(direct_result)["output"][0]["content"][0]["text"] == "direct-ok"
+            with FakeResponsesUpstream.lock:
+                direct_request = next(item for item in reversed(FakeResponsesUpstream.requests)
+                                      if item["auth"] == "Bearer sk-responses" and
+                                      item["body"].get("model") == "direct-model")
+            assert direct_request["body"] == direct_body
+
+            compact_body = {
+                "model": "compact-model", "stream": False,
+                "input": [{"role": "user", "content": "compact"}],
+            }
+            status, compact_result = post_path(
+                proxy_port, "tb-responses", "/v1/responses/compact", compact_body)
+            assert status == 200, compact_result
+            assert json.loads(compact_result)["object"] == "response.compaction"
+            with FakeResponsesUpstream.lock:
+                compact_request = next(item for item in reversed(FakeResponsesUpstream.requests)
+                                       if item["auth"] == "Bearer sk-responses" and
+                                       item["path"].endswith("/responses/compact"))
+            assert compact_request["body"] == compact_body
 
             # A converted second Responses turn must receive the complete
             # cached Item chain, not an upstream previous_response_id.
@@ -237,6 +309,8 @@ def main() -> None:
             converted_body = {
                 "model": "chat-model", "stream": True,
                 "input": [{"role": "user", "content": "hello"}],
+                "context_management": [{"type": "compaction",
+                                         "compact_threshold": 1000}],
                 "tools": [{"type": "function", "name": "lookup",
                             "parameters": {"type": "object"}}],
                 "tool_choice": {"type": "function", "name": "lookup"},
@@ -260,6 +334,7 @@ def main() -> None:
             assert chat["body"]["tool_choice"] == {
                 "type": "function", "function": {"name": "lookup"}}
             assert chat["body"]["tools"][0]["type"] == "function"
+            assert "context_management" not in chat["body"]
 
             sentinel = "IMG" + ("X" * 113 * 1024)
             media_body = {
@@ -334,6 +409,51 @@ def main() -> None:
                 anthropic_context["context_management"]
             assert context_request["anthropic_beta"] == \
                 "prompt-caching-2024-07-31,context-management-2025-06-27"
+            assert json.loads(context_result)["context_management"] == {
+                "applied_edits": [{"type": "clear_tool_uses_20250919"}]
+            }
+
+            anthropic_to_chat_context = {
+                "model": "anthropic-chat-context", "max_tokens": 20,
+                "stream": True,
+                "messages": [{"role": "user", "content": "keep going"}],
+                "context_management": {
+                    "edits": [{"type": "clear_tool_uses_20250919"}]
+                },
+            }
+            status, context_chat_result = post_path(
+                proxy_port, "tb-chat", "/v1/messages",
+                anthropic_to_chat_context)
+            assert status == 200, context_chat_result
+            assert "anthropic-ok" not in context_chat_result
+            with FakeResponsesUpstream.lock:
+                context_chat_request = next(
+                    item for item in reversed(FakeResponsesUpstream.requests)
+                    if item["auth"] == "Bearer sk-chat" and
+                    item["body"].get("model") == "anthropic-chat-context")
+            assert "context_management" not in context_chat_request["body"]
+            assert context_chat_request["anthropic_beta"] is None
+
+            anthropic_to_responses_context = {
+                "model": "anthropic-responses-context", "max_tokens": 20,
+                "stream": True,
+                "messages": [{"role": "user", "content": "keep going"}],
+                "context_management": {
+                    "edits": [{"type": "clear_tool_uses_20250919"}]
+                },
+            }
+            status, context_responses_result = post_path(
+                proxy_port, "tb-responses", "/v1/messages",
+                anthropic_to_responses_context)
+            assert status == 200, context_responses_result
+            assert "message_start" in context_responses_result
+            assert "responses-stream-ok" in context_responses_result
+            with FakeResponsesUpstream.lock:
+                context_responses_request = next(
+                    item for item in reversed(FakeResponsesUpstream.requests)
+                    if item["auth"] == "Bearer sk-responses" and
+                    item["body"].get("model") == "anthropic-responses-context")
+            assert "context_management" not in context_responses_request["body"]
 
             responses_to_anthropic = {
                 "model": "anthropic-image", "stream": False,
@@ -364,6 +484,16 @@ def main() -> None:
             status, cross_result = post_path(
                 proxy_port, "tb-anthropic", "/v1/responses", cross_format_context)
             assert status == 422 and "context_management" in cross_result
+            assert len(FakeResponsesUpstream.requests) == before
+
+            compact_cross_body = {
+                "model": "compact-cross", "stream": False,
+                "input": "must not be compacted by Chat",
+            }
+            before = len(FakeResponsesUpstream.requests)
+            status, compact_cross_result = post_path(
+                proxy_port, "tb-chat", "/v1/responses/compact", compact_cross_body)
+            assert status == 422 and "responses_compact" in compact_cross_result
             assert len(FakeResponsesUpstream.requests) == before
 
             unsupported_audio = {

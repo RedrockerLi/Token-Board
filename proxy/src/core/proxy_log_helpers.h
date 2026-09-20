@@ -1,6 +1,7 @@
 #pragma once
 
 #include "attempt_executor.h"
+#include "context_management.h"
 #include "json.hpp"
 #include "proxy_error_log.h"
 
@@ -37,9 +38,72 @@ inline void set_proxy_log_stream_fields(
     context.local_key_id = local_key_id;
 }
 
+inline std::string proxy_validation_detail_value(
+    const nlohmann::json &details) {
+    if (!details.is_array()) return "-";
+    std::string out;
+    constexpr std::size_t kMaxDetailsBytes = 768;
+    for (const auto &entry : details) {
+        if (!entry.is_object()) continue;
+        const std::string feature = proxy_log_value(
+            entry.value("feature", std::string("unknown")), 64);
+        const std::string target = proxy_log_value(
+            entry.value("target", std::string("unknown")), 64);
+        const std::string reason = proxy_log_value(
+            entry.value("reason", std::string("unspecified")), 160);
+        const std::string item = feature + "@" + target + ":" + reason;
+        const std::size_t separator = out.empty() ? 0 : 1;
+        if (out.size() + separator + item.size() > kMaxDetailsBytes) {
+            if (out.size() + separator + 3 <= kMaxDetailsBytes)
+                out += out.empty() ? "..." : ",...";
+            break;
+        }
+        if (!out.empty()) out.push_back(',');
+        out += item;
+    }
+    return out.empty() ? "-" : out;
+}
+
 inline void log_proxy_validation_failure(
-    const ProxyLogContext &context, const char *reason, int status) {
-    log_proxy_failure(context, "request_validation", reason, status);
+    const ProxyLogContext &context, const char *reason, int status,
+    const nlohmann::json *details = nullptr,
+    std::size_t candidate_count = 0) {
+    if (!details) {
+        log_proxy_failure(context, "request_validation", reason, status);
+        return;
+    }
+    const std::size_t detail_count = details->is_array() ? details->size() : 0;
+    const std::string extra =
+        "validation_details=" + proxy_validation_detail_value(*details) +
+        " validation_detail_count=" + std::to_string(detail_count) +
+        " validation_candidate_count=" + std::to_string(candidate_count);
+    log_proxy_failure(context, "request_validation", reason, status,
+                      -1, 0, 0, false, 0, nullptr, extra);
+}
+
+inline void log_context_management_downgrade(
+    const ProxyLogContext &context, ir::ApiFormat source, ir::ApiFormat target,
+    const fmt::ContextManagementDecision &decision,
+    const UpstreamCandidate *candidate = nullptr) {
+    if (decision.action != fmt::ContextManagementAction::Drop) return;
+    TB_LOG_WARN(
+        "[Proxy] context_management_downgrade request_id=%llu phase=request_conversion "
+        "method=%s endpoint=%s source_format=%s target_format=%s model=%s "
+        "streaming=%d action=%s edit_types=%s reason=%s "
+        "upstream_account_id=%d upstream_id=%d upstream_key_id=%d priority_group=%d\n",
+        static_cast<unsigned long long>(context.request_id),
+        proxy_log_value(context.method).c_str(),
+        proxy_log_value(context.endpoint).c_str(),
+        proxy_log_value(ir::to_string(source)).c_str(),
+        proxy_log_value(ir::to_string(target)).c_str(),
+        proxy_log_value(context.model).c_str(), context.streaming ? 1 : 0,
+        fmt::context_management_action_name(decision.action),
+        proxy_log_value(decision.edit_types).c_str(),
+        proxy_log_value(decision.reason, 240).c_str(),
+        candidate ? candidate->account().id : 0,
+        candidate ? candidate->account().upstream_id : 0,
+        candidate ? candidate->key_slot_id : 0,
+        candidate ? candidate->priority_group : 0);
 }
 
 inline void log_proxy_auth_failure(const ProxyLogContext &context,

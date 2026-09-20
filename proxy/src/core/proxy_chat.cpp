@@ -62,8 +62,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             "application/json");
         return;
     }
+    const auto &request_policy = endpoint_policy(context.endpoint_kind);
     log_context.model = context.model; log_context.streaming = context.streaming;
     if (context.client_format == ir::ApiFormat::OpenAIResponses &&
+        context.endpoint_kind != EndpointKind::ResponsesCompact &&
         !expand_responses_state(*this, codecs_, context, parse_error)) {
         log_proxy_validation_failure(log_context, "previous_response_state", 400);
         res.status = 400;
@@ -140,9 +142,15 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 target != harness ||
                 (harness == ir::ApiFormat::OpenAIResponses &&
                  responses_request_needs_tool_adapter(context.parsed_ir));
-            const auto feature_failures = candidate_needs_conversion
+            auto feature_failures = candidate_needs_conversion
                 ? request_feature_failures(target, harness, context.parsed_ir)
                 : std::vector<RequestFeatureFailure>{};
+            if (context.endpoint_kind == EndpointKind::ResponsesCompact &&
+                target != ir::ApiFormat::OpenAIResponses) {
+                feature_failures.push_back({
+                    "responses_compact",
+                    "the Responses compact endpoint requires a Responses-capable upstream"});
+            }
             const bool feature_ok = feature_failures.empty();
             std::string media_reason;
             const bool media_ok = !candidate_needs_conversion ||
@@ -167,7 +175,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             }
         }
         if (compatible.empty()) {
-            log_proxy_validation_failure(log_context, feature_failure ? "unsupported_feature" : "unsupported_media", 422);
+            log_proxy_validation_failure(
+                log_context,
+                feature_failure ? "unsupported_feature" : "unsupported_media",
+                422, &unsupported_details, cands.size());
             res.status = 422;
             res.set_content(codecs_.get(harness).serialize_error_body(
                 json{{"message", incompatibility.empty()
@@ -228,7 +239,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         const auto scope = affinity_scope(ar.route.local_key_id, harness);
         size_t start = affinity_start(affinity_, scope, session_id, cands);
         handle_streaming(cands, candidate_bodies, request_id, start, session_id,
-                         ar.route.account_id, ar.route.local_key_id, harness, model,
+                         ar.route.account_id, ar.route.local_key_id,
+                         context.endpoint_kind, harness, model,
                          std::move(parsed_json), std::move(parsed_request),
                          std::move(conversion_context),
                          context.state_expanded
@@ -260,6 +272,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
 
     int concurrent_count = 0;
     bool think_filter = false;
+    bool context_management_logged = false;
     ir::ApiFormat used_upstream_fmt = harness;
     const FormatCodec *upstream_codec = nullptr;
     std::optional<ir::ChatResponse> converted_response;
@@ -274,8 +287,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     size_t start = affinity_start(affinity_, scope, session_id, cands);
     const auto order = candidate_order(
         cands, start, routing_rr_.fetch_add(1, std::memory_order_relaxed));
-    const auto base_timeouts = timeout_config_cached(
-        chat_endpoint_policy(harness).kind);
+    const auto base_timeouts = timeout_config_cached(request_policy.kind);
     const int budget_seconds = base_timeouts.non_streaming_timeout > 0
         ? base_timeouts.non_streaming_timeout : 600;
     const auto deadline = t0 + std::chrono::seconds(budget_seconds);
@@ -290,6 +302,17 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         concurrent_count = in_flight_count();
 
         ir::ApiFormat upstream = ir::parse_api_format(c.account().api_format);
+        if (!context_management_logged &&
+            context.parsed_ir.extras.contains("context_management")) {
+            const auto decision = fmt::context_management_decision(
+                harness, upstream,
+                context.parsed_ir.extras["context_management"]);
+            if (decision.action == fmt::ContextManagementAction::Drop) {
+                log_context_management_downgrade(
+                    log_context, harness, upstream, decision, &c);
+                context_management_logged = true;
+            }
+        }
         auto attempt_timeouts = base_timeouts;
         attempt_timeouts.non_streaming_timeout = std::max(1, std::min(
             attempt_timeouts.non_streaming_timeout,
@@ -316,13 +339,13 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 const std::string body = codecs_.get(upstream).serialize_request(
                     cReq, &same_context).dump();
                 result = forward_endpoint_attempt(
-                    upstream_, chat_endpoint_policy(harness), c, body,
+                    upstream_, request_policy, c, body,
                     "application/json", attempt.remaining_budget_ms,
                     attempt_timeouts, req.client_socket, nullptr,
                     configure_forward);
             } else {
                 result = forward_endpoint_attempt(
-                    upstream_, chat_endpoint_policy(harness), c,
+                    upstream_, request_policy, c,
                     body_cache.for_candidate(c), content_type,
                     attempt.remaining_budget_ms, attempt_timeouts,
                     req.client_socket, nullptr, configure_forward);
@@ -345,7 +368,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                         cReq, &request_context).dump();
                 });
             result = forward_endpoint_attempt(
-                upstream_, chat_endpoint_policy(harness), c, body,
+                upstream_, request_policy, c, body,
                 "application/json", attempt.remaining_budget_ms,
                 attempt_timeouts, req.client_socket, nullptr,
                 configure_forward);
@@ -488,7 +511,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             else
                 res.set_content(fwd.body, "application/json");
             res.status = fwd.status_code;
-            if (harness == ir::ApiFormat::OpenAIResponses)
+            if (harness == ir::ApiFormat::OpenAIResponses &&
+                context.endpoint_kind != EndpointKind::ResponsesCompact)
                 record_responses_state(
                     *this, context.parsed_json, fwd.body,
                     context.state_expanded ? &context.state_current_input : nullptr);
@@ -524,10 +548,12 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                                      fwd.status_code, fwd.duration_ms, used->key_slot_id,
                                      -1, -1, -1.0, -1, -1, attempts_made, attempts);
                 auto response_context = request_conversion;
+                response_context.source = used_upstream_fmt;
                 response_context.target = harness;
                 std::string outgoing_body = harness_codec.serialize_response(
                     cResp, &response_context).dump();
-                if (harness == ir::ApiFormat::OpenAIResponses)
+                if (harness == ir::ApiFormat::OpenAIResponses &&
+                    context.endpoint_kind != EndpointKind::ResponsesCompact)
                     record_responses_state(
                         *this, context.parsed_json, outgoing_body,
                         context.state_expanded ? &context.state_current_input : nullptr);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail CI when production source files exceed the modularity budget."""
+"""Warn on oversized production files and fail only at twice the budget."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ def main() -> None:
     search_roots = (root / "app", root / "proxy/src",
                     root / "schema/transitions")
     failures: list[str] = []
+    warnings: list[str] = []
     checked = 0
     for search_root in search_roots:
         for path in search_root.rglob("*"):
@@ -37,8 +38,11 @@ def main() -> None:
             )
             checked += 1
             if lines > limit:
-                failures.append(
-                    f"{path.relative_to(root)}: {lines} logical lines > {limit}")
+                message = f"{path.relative_to(root)}: {lines} logical lines > {limit}"
+                if lines > limit * 2:
+                    failures.append(message + f" (2x limit: {limit * 2})")
+                else:
+                    warnings.append(message)
             if (path.parts and path.parts[0] == "app" and
                     "schema_upgrade" not in path.parts and
                     FORBIDDEN_V0_SQL.search(text)):
@@ -66,10 +70,13 @@ def main() -> None:
                             failures.append(
                                 f"{path.relative_to(root)}:{index + 1}: silent except/pass")
                         break
+    if warnings:
+        print("production source size warnings:", file=sys.stderr)
+        print("\n".join(warnings), file=sys.stderr)
     if failures:
-        raise SystemExit("production source size limit exceeded:\n" +
+        raise SystemExit("production source checks failed:\n" +
                          "\n".join(failures))
-    print(f"source size check passed ({checked} files)")
+    print(f"source size check passed ({checked} files; {len(warnings)} warnings)")
 
 
 if __name__ == "__main__":

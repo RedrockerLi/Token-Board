@@ -226,13 +226,21 @@ private:
                 thinking_blocks_.erase(index);
             }
         } else if (type == "message_delta") {
+            json context_management;
+            if (j.contains("context_management"))
+                context_management = j["context_management"];
             if (j.contains("delta") && j["delta"].is_object()) {
                 const json &d = j["delta"];
+                if (context_management.is_null() &&
+                    d.contains("context_management"))
+                    context_management = d["context_management"];
                 if (d.contains("stop_reason") && d["stop_reason"].is_string()) {
                     StreamEvent ev;
                     ev.type = StreamEventType::MessageFinish;
                     ev.stop_reason = fmt::anthropic_stop_reason_to_stop(
                         d["stop_reason"].get<std::string>());
+                    if (!context_management.is_null())
+                        ev.extra["context_management"] = context_management;
                     if (!emit(ev)) return;
                 }
             }
@@ -320,6 +328,8 @@ public:
             case StreamEventType::MessageFinish:
                 seen_finish_ = true;
                 deferred_stop_ = fmt::stop_reason_to_anthropic(ev.stop_reason);
+                if (ev.extra.contains("context_management"))
+                    context_management_ = ev.extra["context_management"];
                 if (!started_ && !emit_message_start(sink)) return false;
                 return true;  // message_delta deferred until usage or finish
             case StreamEventType::UsageEvent:
@@ -371,6 +381,7 @@ private:
     bool seen_finish_ = false;              // a MessageFinish has been seen
     bool failed_ = false;
     json failure_;
+    json context_management_;
 
     std::string frame(const std::string &event, const json &data) {
         return "event: " + event + "\ndata: " + data.dump() + "\n\n";
@@ -451,8 +462,11 @@ private:
         json d;
         d["stop_reason"] = deferred_stop_;
         d["stop_sequence"] = nullptr;
-        return sink(frame("message_delta", json{
-            {"type", "message_delta"}, {"delta", d}, {"usage", usage}}));
+        json message_delta{{"type", "message_delta"}, {"delta", d},
+                           {"usage", usage}};
+        if (!context_management_.is_null())
+            message_delta["context_management"] = context_management_;
+        return sink(frame("message_delta", message_delta));
     }
 
     bool emit_limit_error(const Sink &sink, const std::string &message) {

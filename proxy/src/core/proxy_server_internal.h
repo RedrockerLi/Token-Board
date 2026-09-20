@@ -5,6 +5,7 @@
 #include "endpoint_policy.h"
 #include "error_render.h"
 #include "format_common.h"
+#include "context_management.h"
 #include "format_media.h"
 #include "logging.h"
 #include "request_context.h"

@@ -218,6 +218,7 @@ bool ResponsesStreamEmitter::emit(const StreamEvent &ev, const Sink &sink) {
         case StreamEventType::MessageFinish:
             if (finished_) return true;
             if (!close_open_items(sink)) return false;
+            if (ev.extra.is_object()) terminal_extras_ = ev.extra;
             deferred_status_ = fmt::stop_reason_to_responses(ev.stop_reason);
             return true;
         case StreamEventType::UsageEvent:
@@ -491,6 +492,10 @@ bool ResponsesStreamEmitter::emit_completed(const Sink &sink) {
                                   {"output_tokens", last_usage_.completion_tokens},
                                   {"total_tokens", last_usage_.total_tokens}}},
                   {"error", nullptr}, {"incomplete_details", nullptr}};
+    if (terminal_extras_.contains("object"))
+        response["object"] = terminal_extras_["object"];
+    if (terminal_extras_.contains("context_management"))
+        response["context_management"] = terminal_extras_["context_management"];
     const std::string event = deferred_status_ == "incomplete" ? "response.incomplete" : "response.completed";
     return sink(frame(event, json{{"type", event}, {"response", response}}));
 }

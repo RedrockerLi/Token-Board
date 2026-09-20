@@ -4,7 +4,14 @@
 
 #include <string>
 
-enum class EndpointKind { Chat, Messages, Responses, Embeddings, Models };
+enum class EndpointKind {
+    Chat,
+    Messages,
+    Responses,
+    ResponsesCompact,
+    Embeddings,
+    Models,
+};
 enum class HttpMethod { Get, Post };
 enum class BodyMode { Json, Empty };
 enum class ResponseMode { Codec, Raw, Stream };
