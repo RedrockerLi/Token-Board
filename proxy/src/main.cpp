@@ -15,6 +15,7 @@
 #include "format_anthropic.h"
 #include "format_openai.h"
 #include "format_responses.h"
+#include "http_debug_log.h"
 #include "logging.h"
 #include "proxy_server.h"
 #include "proxy_error_log.h"
@@ -132,6 +133,7 @@ int main(int argc, char *argv[]) {
 
     server.set_pre_routing_handler(
         [](const httplib::Request &, httplib::Response &) {
+            tb_http_debug::reset_downstream_request_state();
             reset_proxy_error_log_scope();
             return httplib::Server::HandlerResponse::Unhandled;
         });
@@ -192,6 +194,8 @@ int main(int argc, char *argv[]) {
         });
     server.set_logger([&proxy_server](const httplib::Request &req,
                                       const httplib::Response &res) {
+        tb_http_debug::downstream_request_if_missing(req);
+        tb_http_debug::downstream_response(req, res);
         const bool structured_error = consume_proxy_error_log_scope();
         if (res.status >= 400 && res.status <= 599 && !structured_error) {
             ProxyLogContext log_context;

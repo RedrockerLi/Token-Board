@@ -29,7 +29,8 @@ void ProxyServer::handle_streaming(
          anthropic_beta,
          base_timeouts, deadline, budget_seconds,
          content_type, t0, &res,
-         client_sock = req.client_socket](size_t, httplib::DataSink &sink) -> bool {
+         client_sock = req.client_socket,
+         downstream_target = req.path](size_t, httplib::DataSink &sink) -> bool {
             const FormatCodec &out_codec = codecs_.get(harness);
             const auto &request_policy = endpoint_policy(endpoint_kind);
             std::uint64_t inflight_id = 0;
@@ -53,9 +54,13 @@ void ProxyServer::handle_streaming(
             bool context_management_logged = false;
             json responses_terminal; fmt::SseFrameBuffer responses_state_sse; AttemptExecutor attempt_executor(gate_);
             std::unordered_map<std::string, std::string> converted_bodies;
+            std::size_t downstream_chunk_index = 0;
             auto write_to_sink = [&](const std::string &data) -> bool {
                 if (data.empty()) return true;
                 bool ok = sink.write(data.data(), data.size());
+                tb_http_debug::response_chunk(
+                    "downstream", downstream_target, ++downstream_chunk_index,
+                    data.data(), data.size());
                 if (ok) {
                     committed = true;
                     if (harness == ir::ApiFormat::OpenAIResponses) {

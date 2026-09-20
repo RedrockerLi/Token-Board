@@ -25,9 +25,22 @@ transition→解析 C++ CLI 参数→打开并校验已准备好的 V1 schema→
 输出流按严重程度分开:
 
 - `error`、`warn` 写入 `stderr`。请求级代理错误使用单行 `key=value` 结构化格式，
-  经过 `proxy_log_value` 清理并限制长度，不记录 API Key、请求头或请求/响应 body。
+  经过 `proxy_log_value` 清理并限制长度；这类常规错误记录不包含 API Key、请求头
+  或请求/响应 body。
 - `info`、`debug` 写入 `stdout`。`debug` 包括 HTTP 请求、路由选择、请求级诊断等
   高频信息，只有显式启用 debug 级别才会产生。
+
+显式进入前台 debug 后，HTTP 边界会另外输出完整的交换内容，格式带有
+`[HTTP_DEBUG][downstream]` 或 `[HTTP_DEBUG][upstream]` 标记:
+
+- 下游 request: 方法、路径、脱敏后的请求头和完整请求 body。
+- 上游 request: 实际发送的方法、完整 URL 路径、脱敏后的请求头和转换后的 body。
+- response: 状态码和响应头；非流式响应输出完整 body，流式响应逐 chunk 输出，所以
+  转换前的上游数据和转换后实际写给下游的数据都能逐段对照。
+
+`Authorization`、`x-api-key`、Cookie、名称中带 `api-key` 或 `token` 的头值会显示为
+`<redacted>`；body 不做脱敏，可能包含 prompt、工具参数或 provider 返回内容。因此
+这组日志只在需要时以前台 `--debug` 查看，不应作为长期日志保存。
 
 ### systemd 常驻模式
 
@@ -55,14 +68,16 @@ SQLite 的 `request_log`，与 stdout/stderr 日志策略无关。
 需要完整诊断时运行:
 
 ```bash
-bash scripts/start-proxy.sh --debug
+bash start.sh --debug
+# 等价的代理专用入口:
+# bash scripts/start-proxy.sh --debug
 ```
 
 脚本先验证 schema；如果 `token-proxy` 正在运行，就先停止该 systemd 服务，然后用
 同一个代理二进制在当前终端前台启动 `--log-level debug`。此时 stdout 和 stderr 都
-继承当前终端，所以能看到完整 debug 输出，且这些消息不会写入 journal。调试期间会
-有短暂服务中断，不会同时运行两个代理；按 `Ctrl+C` 或进程退出后，脚本会恢复调试
-前的服务状态。
+继承当前终端，所以能看到路由日志以及每一次上下游 HTTP request/response 的完整内容，
+且这些消息不会写入 journal。调试期间会有短暂服务中断，不会同时运行两个代理；按
+`Ctrl+C` 或进程退出后，脚本会恢复调试前的服务状态。
 
 ## 线程池:SemaphorePool
 

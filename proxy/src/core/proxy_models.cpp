@@ -2,6 +2,7 @@
 
 void ProxyServer::handle_list_models(const httplib::Request &req,
                                       httplib::Response &res) {
+    tb_http_debug::downstream_request(req);
     add_cors_headers(res);
     const auto &policy = endpoint_policy(EndpointKind::Models);
     const auto request_id = allocate_request_id();

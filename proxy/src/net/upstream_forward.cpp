@@ -1,4 +1,5 @@
 #include "transport_internal.h"
+#include "http_debug_log.h"
 #include "upstream_failure_kind.h"
 
 namespace upstream_metrics_detail {
@@ -54,6 +55,7 @@ UpstreamClient::forward(const std::string &method,
     }
 
     std::string full_path = opts.path_is_full ? path : url_path + path;
+    const std::string debug_target = scheme_host + full_path;
     const bool streaming = static_cast<bool>(on_chunk);
     const long long deadline_started_ms = now_ms();
     const TimeoutChoice connection_timeout =
@@ -209,6 +211,7 @@ UpstreamClient::forward(const std::string &method,
         SseProgressFallback progress_fallback;
         bool client_connected = true;
         bool first_chunk = true;
+        std::size_t response_chunk_index = 0;
         std::chrono::steady_clock::time_point t_first;
         std::chrono::steady_clock::time_point request_sent;
 
@@ -227,6 +230,8 @@ UpstreamClient::forward(const std::string &method,
                 t_first = received_at;
                 first_chunk = false;
             }
+            tb_http_debug::response_chunk(
+                "upstream", debug_target, ++response_chunk_index, data, len);
             const bool successful_status =
                 upstream_status >= 200 && upstream_status < 300;
             if (!successful_status) accumulated.append(data, len);
@@ -244,12 +249,16 @@ UpstreamClient::forward(const std::string &method,
         req.body = body;
         req.response_handler = [&](const httplib::Response &r) -> bool {
             upstream_status = r.status;
+            tb_http_debug::response_headers("upstream", debug_target,
+                                           r.status, r.headers);
             return true;  // always read the body; the receiver decides
         };
         req.content_receiver = receiver;
 
         httplib::Response upstream_res;
         httplib::Error err;
+        tb_http_debug::request("upstream", req.method, debug_target,
+                               req.headers, req.body);
         request_sent = std::chrono::steady_clock::now();
         bool ok = cli.send(req, upstream_res, err);
 
@@ -266,6 +275,11 @@ UpstreamClient::forward(const std::string &method,
         }
         result.body_truncated = accumulated.truncated();
         result.body = accumulated.take();
+        tb_http_debug::exchange_result(
+            "upstream", debug_target,
+            upstream_status != 0 ? upstream_status : upstream_res.status, ok,
+            ok ? std::string() : std::string(httplib::to_string(err)),
+            result.duration_ms, result.body.size());
 
         if (watch->client_disconnected.load(std::memory_order_acquire)) {
             result.status_code = 499;
@@ -345,6 +359,8 @@ UpstreamClient::forward(const std::string &method,
         req.body = body;
         req.response_handler = [&](const httplib::Response &response) {
             upstream_status = response.status;
+            tb_http_debug::response_headers("upstream", debug_target,
+                                           response.status, response.headers);
             result.first_byte_ms = static_cast<int>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - request_sent).count());
@@ -362,6 +378,8 @@ UpstreamClient::forward(const std::string &method,
         };
         httplib::Response upstream_res;
         httplib::Error request_error;
+        tb_http_debug::request("upstream", req.method, debug_target,
+                               req.headers, req.body);
         request_sent = std::chrono::steady_clock::now();
         const bool ok = cli.send(req, upstream_res, request_error);
 
@@ -371,6 +389,12 @@ UpstreamClient::forward(const std::string &method,
         if (result.first_byte_ms == 0 && ok)
             result.first_byte_ms = result.duration_ms;
         result.ttft_ms = result.duration_ms;  // non-streaming: no first-token concept
+        tb_http_debug::response_body("upstream", debug_target, response_body);
+        tb_http_debug::exchange_result(
+            "upstream", debug_target,
+            upstream_status != 0 ? upstream_status : upstream_res.status, ok,
+            ok ? std::string() : std::string(httplib::to_string(request_error)),
+            result.duration_ms, response_body.size());
 
         if (watch->client_disconnected.load(std::memory_order_acquire)) {
             result.status_code = 499;

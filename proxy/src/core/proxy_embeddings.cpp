@@ -2,6 +2,7 @@
 
 void ProxyServer::handle_embeddings(const httplib::Request &req,
                                     httplib::Response &res) {
+    tb_http_debug::downstream_request(req);
     EndpointRunner endpoint_runner(*this);
     add_cors_headers(res);
     const auto &policy = endpoint_policy(EndpointKind::Embeddings);

@@ -175,10 +175,12 @@ journalctl --user -u token-maintenance -f
 journalctl --user -u token-proxy -f       # 仅 warning/error 与 systemd 生命周期日志
 
 # 按需查看完整 debug 日志（暂停服务，日志只输出到当前终端）
-bash scripts/start-proxy.sh --debug       # Ctrl+C 后自动恢复原服务状态
+bash start.sh --debug                    # 根目录入口；打印上下游每次 HTTP 请求/响应
+# 或直接调用代理启动脚本
+bash scripts/start-proxy.sh --debug      # Ctrl+C 后恢复原服务状态
 ```
 
-常驻的 `token-proxy` 服务会丢弃 info/debug 标准输出，避免大量日志进入磁盘；warning/error 仍保留在 journal 便于发现故障。需要完整请求级诊断时使用上面的 `--debug`，不要把 systemd 服务改成 `--log-level debug`。
+常驻的 `token-proxy` 服务会丢弃 info/debug 标准输出，避免大量日志进入磁盘；warning/error 仍保留在 journal 便于发现故障。需要完整请求级诊断时使用上面的 `--debug`，它会把上下游每一次 HTTP 请求、响应头、非流式 body 和流式 chunk 打到当前终端（认证头脱敏），不要把 systemd 服务改成 `--log-level debug`。
 
 日志级别、输出流和前台调试生命周期的完整说明见[代理日志系统](doc/proxy-internals.md#日志系统)。
 

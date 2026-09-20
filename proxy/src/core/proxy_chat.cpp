@@ -37,6 +37,7 @@ std::string prepare_anthropic_beta(const httplib::Request &request,
 
 void ProxyServer::handle_chat_request(const httplib::Request &req,
                                       httplib::Response &res) {
+    tb_http_debug::downstream_request(req);
     EndpointRunner endpoint_runner(*this);
     add_cors_headers(res);
     auto t0 = std::chrono::steady_clock::now();

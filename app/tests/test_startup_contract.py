@@ -21,6 +21,8 @@ class StartupContractTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("START_ALL=false", self.script)
+        self.assertIn("DEBUG_MODE=false", self.script)
+        self.assertIn('exec bash "$SCRIPT_DIR/scripts/start-proxy.sh" --debug', self.script)
         self.assertIn("if $START_ALL; then", self.script)
         self.assertIn("schema_upgrade.cli", self.script)
         self.assertIn("token-maintenance", self.script)

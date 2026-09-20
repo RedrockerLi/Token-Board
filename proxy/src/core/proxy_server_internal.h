@@ -7,6 +7,7 @@
 #include "format_common.h"
 #include "context_management.h"
 #include "format_media.h"
+#include "http_debug_log.h"
 #include "logging.h"
 #include "request_context.h"
 #include "request_body_cache.h"

@@ -3,6 +3,7 @@
 #
 #   bash start.sh              quick foreground dashboard (read-only schema check)
 #   bash start.sh --all        upgrade databases and restart proxy/maintenance
+#   bash start.sh --debug      pause systemd proxy and enter foreground debug mode
 #   bash start.sh --no-browser suppress browser opening
 set -Eeuo pipefail
 
@@ -42,14 +43,24 @@ LEGACY_IMPORT_TIMER_FILE="${TB_IMPORT_TIMER_FILE:-$SYSTEMD_USER_DIR/${LEGACY_IMP
 LEGACY_TIMEZONE="${TB_LEGACY_TIMEZONE:-Asia/Shanghai}"
 
 START_ALL=false
+DEBUG_MODE=false
 NO_BROWSER=false
 for arg in "$@"; do
     case "$arg" in
         --all) START_ALL=true ;;
+        --debug) DEBUG_MODE=true ;;
         --no-browser) NO_BROWSER=true ;;
         *) echo "[ERROR] unknown option: $arg" >&2; exit 2 ;;
     esac
 done
+
+if $DEBUG_MODE; then
+    if $START_ALL; then
+        echo "[ERROR] --debug cannot be combined with --all" >&2
+        exit 2
+    fi
+    exec bash "$SCRIPT_DIR/scripts/start-proxy.sh" --debug
+fi
 
 GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 

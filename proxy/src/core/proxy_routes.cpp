@@ -5,7 +5,8 @@ void ProxyServer::setup_routes(httplib::Server &server) {
     // already open when main constructs ProxyServer).
     start_cooldown_probe();
     // CORS preflight
-    auto cors_handler = [this](const httplib::Request &, httplib::Response &res) {
+    auto cors_handler = [this](const httplib::Request &req, httplib::Response &res) {
+        tb_http_debug::downstream_request(req);
         add_cors_headers(res);
         res.status = 204;
     };
@@ -61,6 +62,7 @@ void ProxyServer::setup_routes(httplib::Server &server) {
 
     // Health check
     server.Get("/health", [this](const httplib::Request &req, httplib::Response &res) {
+        tb_http_debug::downstream_request(req);
         add_cors_headers(res);
         ProxyLogContext log_context;
         log_context.request_id = allocate_request_id();

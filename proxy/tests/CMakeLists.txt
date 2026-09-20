@@ -115,6 +115,36 @@ target_link_libraries(upstream_client_test PRIVATE
 )
 target_compile_features(upstream_client_test PRIVATE cxx_std_17)
 
+# Debug HTTP exchange formatting: bodies are visible only at debug level and
+# authentication headers are redacted before they reach the terminal.
+add_executable(http_debug_log_test http_debug_log_test.cpp)
+target_include_directories(http_debug_log_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(http_debug_log_test PRIVATE cxx_std_17)
+target_link_libraries(http_debug_log_test PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+)
+
+# Runtime forwarding regression: the actual UpstreamClient emits non-streaming
+# bodies and every streaming response chunk at debug level.
+add_executable(upstream_debug_exchange_test
+    upstream_debug_exchange_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/upstream_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/upstream_forward.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/upstream_metrics.cpp
+)
+target_include_directories(upstream_debug_exchange_test PRIVATE
+    ${TEST_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
+)
+target_link_libraries(upstream_debug_exchange_test PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+)
+target_compile_features(upstream_debug_exchange_test PRIVATE cxx_std_17)
+
 # Connection-reuse gate: sequential forward() calls against one origin must
 # reuse a pooled keep-alive connection (accepted connections << requests).
 # "fresh" mode remains available on the binary for Before/After comparison;
@@ -240,6 +270,8 @@ add_test(
             ${CMAKE_SOURCE_DIR}/..
 )
 add_test(NAME upstream_client COMMAND upstream_client_test)
+add_test(NAME http_debug_log COMMAND http_debug_log_test)
+add_test(NAME upstream_debug_exchange COMMAND upstream_debug_exchange_test)
 # Money-equivalence gate (1/2): v17 trigger == v18 view-based trigger across a
 # pricing edge-case matrix (pure SQL, exact api_cost equality).  Proves the
 # 0018 view extraction changes no money before the column drop lands.
