@@ -7,10 +7,15 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     const auto &policy = endpoint_policy(EndpointKind::Embeddings);
 
     auto t0 = std::chrono::steady_clock::now();
+    const auto request_id = allocate_request_id();
+    auto log_context = make_proxy_log_context(
+        request_id, req.method, req.path, ir::to_string(policy.client_format));
 
     // 1. Auth + route lookup
     auto ar = extract_and_route(req, router_);
     if (!ar.success) {
+        log_proxy_auth_failure(log_context, req.has_header("Authorization"),
+                               req.has_header("x-api-key"));
         res.status = 401;
         res.set_content(ar.error_json, "application/json");
         return;
@@ -21,14 +26,19 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     RequestContext context;
     std::string parse_error;
     if (!parse_request_context(req, context, parse_error)) {
+        log_proxy_failure(log_context, "request_validation", "invalid_request", 400);
         res.status = 400;
         res.set_content(json_error(parse_error, 400),
                         "application/json");
         return;
     }
     std::string req_model = context.model;
+    log_context.model = req_model;
+    log_context.route_account_id = ar.route.account_id;
+    log_context.local_key_id = ar.route.local_key_id;
     auto cands = resolve_candidates_cached(ar.route, req_model);
     if (cands.empty()) {
+        log_proxy_failure(log_context, "routing", "model_unavailable", 400);
         res.status = 400;
         res.set_content(json_error("Model '" + req_model +
                                    "' is not available on this account", 400),
@@ -36,6 +46,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         return;
     }
     if (!endpoint_runner.try_reserve_accounting()) {
+        log_proxy_failure(log_context, "accounting", "accounting_unavailable", 503);
         res.status = 503;
         res.set_header("Retry-After", "1");
         res.set_content(json_error(
@@ -67,7 +78,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     AttemptExecutor executor(gate_);
     auto outcome = executor.execute(
         {&cands, order, embedding_deadline, embedding_budget_seconds,
-         [this](const std::string &m) { return request_started(m, false); },
+         [this, request_id](const std::string &m) {
+             return request_started(request_id, m, false);
+         },
          [this](std::uint64_t id) { request_finished(id); },
          [&](const AttemptRequest &attempt) {
         const auto &c = attempt.candidate;
@@ -86,7 +99,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         [&](const UpstreamClient::ForwardResult &result) {
             return result.client_disconnected ||
                    client_socket_gone(req.client_socket);
-        }});
+        },
+        proxy_attempt_failure_logger(log_context),
+        proxy_candidate_skip_logger(log_context)});
     auto &fwd = outcome.result;
     const auto *used = outcome.used;
     const auto *last_attempted = outcome.last_attempted;
@@ -95,6 +110,10 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     if (!used) {
         const int final_status = no_upstream_status(
             fwd, attempts, outcome.no_candidate_reason);
+        const char *reason = proxy_terminal_failure_reason(outcome, fwd);
+        log_proxy_failure(log_context, "request_final", reason, final_status,
+                          fwd.duration_ms, attempts.size(), attempts.size(),
+                          false, fwd.timeout_secs, last_attempted);
         enqueue_zero_usage(last_attempted ? last_attempted->account().id
                                           : ar.route.account_id,
                            ar.route.local_key_id, req_model, false, final_status,
@@ -118,9 +137,8 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
 
     // ── Check if client disconnected while waiting for upstream ──
     if (fwd.client_disconnected || client_socket_gone(req.client_socket)) {
-            TB_LOG_DEBUG("[Proxy] Client gone (embeddings), drop response "
-                    "(model=%s)\n",
-                    req_model.c_str());
+            log_proxy_client_disconnect(log_context, fwd.duration_ms,
+                                        attempts.size(), used);
             enqueue_zero_usage(used->account().id, ar.route.local_key_id,
                                req_model, false, 499, fwd.duration_ms,
                                used->key_slot_id,
@@ -131,6 +149,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     res.set_header("X-Upstream-Duration-Ms", std::to_string(fwd.duration_ms));
 
     // Parse usage
+    const bool response_json_valid = fwd.success && proxy_response_json_valid(
+        log_context, fwd.body, fwd.status_code, fwd.duration_ms,
+        attempts.size(), used);
     auto usage = parse_usage_for_format(used->account().api_format, fwd.body);
     if (usage.has_value()) {
         // Prefer the model reported by the successful upstream.  A provider
@@ -146,9 +167,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                              -1, -1, -1.0, -1, -1,
                              static_cast<int>(attempts.size()), attempts);
     } else {
-        TB_LOG_WARN("[Proxy] Warning: could not parse usage "
-                        "from embedding response, model=%s\n",
-                        req_model.c_str());
+        if (fwd.success && response_json_valid)
+            log_proxy_usage_unavailable(log_context, fwd.status_code,
+                                        fwd.duration_ms, attempts.size(), used);
         enqueue_zero_usage(used->account().id, ar.route.local_key_id,
                            fwd.success ? model_for_success_log("", *used)
                                        : req_model,
@@ -161,6 +182,10 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         res.status = fwd.status_code;
         res.set_content(fwd.body, "application/json");
     } else {
+        log_proxy_failure(log_context, "request_final",
+                          proxy_failure_reason(fwd), fwd.status_code,
+                          fwd.duration_ms, attempts.size(), attempts.size(),
+                          false, fwd.timeout_secs, used);
         const auto err = render_terminal_error(
             codecs_.get(policy.client_format), &codecs_.get(policy.client_format),
             fwd, attempts, {.used = true});

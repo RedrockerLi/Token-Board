@@ -40,6 +40,11 @@ public:
         const AttemptRequest &)>;
     using Disconnected = std::function<bool(
         const UpstreamClient::ForwardResult &)>;
+    using AttemptFailed = std::function<void(
+        const AttemptRequest &, const UpstreamClient::ForwardResult &,
+        std::size_t attempt_number, bool retrying)>;
+    using CandidateSkipped = std::function<void(
+        const UpstreamCandidate &, AccountGate::KeyAcquireResult)>;
 
     // Everything a request needs from the candidate loop, packaged so handlers
     // stop re-assembling order/deadline/budget and the inflight bookkeeping on
@@ -58,6 +63,8 @@ public:
         std::function<void(std::uint64_t)> inflight_end;
         Forward forward;
         Disconnected disconnected;
+        AttemptFailed attempt_failed;
+        CandidateSkipped candidate_skipped;
     };
 
     explicit AttemptExecutor(AccountGate &gate) : gate_(gate) {}
@@ -79,6 +86,7 @@ private:
         const std::vector<std::size_t> &order,
         std::chrono::steady_clock::time_point deadline,
         int budget_seconds, const Forward &forward,
-        const Disconnected &disconnected) const;
+        const Disconnected &disconnected, const AttemptFailed &attempt_failed,
+        const CandidateSkipped &candidate_skipped) const;
     AccountGate &gate_;
 };

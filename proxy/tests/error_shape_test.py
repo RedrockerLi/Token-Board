@@ -196,6 +196,13 @@ def main() -> None:
             wait_for_health(proxy_port)
             chat = {"messages": [{"role": "user", "content": "hi"}]}
 
+            # A route miss is rejected by cpp-httplib before a business
+            # handler runs; the framework logger must still emit a structured
+            # WARN without any request credential material.
+            status, _, _ = send(proxy_port, "GET", "/not-found", "tb-chat500", None)
+            assert status == 404, status
+            print("0 OK: framework route miss is logged")
+
             # ── 1. Chat OpenAI used-failure 500 → raw passthrough ──
             status, body, _ = send(proxy_port, "POST", "/v1/chat/completions",
                 "tb-chat500", {**chat, "model": "chat500-model",
@@ -346,8 +353,21 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 proxy.kill()
                 proxy.wait()
+            stderr_output = proxy.stderr.read() if proxy.stderr is not None else ""
+            if proxy.returncode in (0, -15):
+                assert "[ProxyError]" in stderr_output, stderr_output
+                assert "phase=upstream_attempt" in stderr_output, stderr_output
+                assert "phase=request_final" in stderr_output, stderr_output
+                assert "phase=candidate_selection" in stderr_output, stderr_output
+                assert "reason=upstream_timeout" in stderr_output, stderr_output
+                assert "reason=provider_quota_cooldown" in stderr_output, stderr_output
+                assert "reason=route_not_found" in stderr_output, stderr_output
+                # Request credentials and control payload fields must never be
+                # copied into the journal record.
+                assert "sk-chat-500" not in stderr_output, stderr_output
+                assert "mock_status_by_key" not in stderr_output, stderr_output
             if proxy.returncode not in (0, -15):
-                print(proxy.stderr.read(), file=sys.stderr)
+                print(stderr_output, file=sys.stderr)
 
     upstream.shutdown()
     upstream.server_close()

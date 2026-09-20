@@ -64,7 +64,9 @@ AttemptOutcome AttemptExecutor::execute(const ExecutionRequest &request) const {
     }
     AttemptOutcome outcome = run(*request.candidates, request.order,
                                  request.deadline, request.budget_seconds,
-                                 forward, request.disconnected);
+                                 forward, request.disconnected,
+                                 request.attempt_failed,
+                                 request.candidate_skipped);
     if (inflight_id != 0 && request.inflight_end)
         request.inflight_end(inflight_id);
     return outcome;
@@ -74,7 +76,9 @@ AttemptOutcome AttemptExecutor::run(
     const std::vector<UpstreamCandidate> &candidates,
     const std::vector<std::size_t> &order,
     std::chrono::steady_clock::time_point deadline, int budget_seconds,
-    const Forward &forward, const Disconnected &disconnected) const {
+    const Forward &forward, const Disconnected &disconnected,
+    const AttemptFailed &attempt_failed,
+    const CandidateSkipped &candidate_skipped) const {
     AttemptOutcome outcome;
     bool saw_concurrency_full = false;
     bool saw_subscription_cooldown = false;
@@ -84,6 +88,8 @@ AttemptOutcome AttemptExecutor::run(
         const auto &candidate = candidates[index];
         const auto acquire_result = acquire(candidate);
         if (acquire_result != AccountGate::KeyAcquireResult::kAcquired) {
+            if (candidate_skipped)
+                candidate_skipped(candidate, acquire_result);
             saw_concurrency_full = saw_concurrency_full ||
                 acquire_result == AccountGate::KeyAcquireResult::kConcurrencyFull;
             saw_subscription_cooldown = saw_subscription_cooldown ||
@@ -98,9 +104,14 @@ AttemptOutcome AttemptExecutor::run(
             gate_.release(candidate.key_slot_id);
             outcome.result.status_code = 504;
             outcome.result.is_timeout = true;
+            outcome.result.failure_kind = UpstreamFailureKind::Timeout;
             outcome.result.timeout_secs = budget_seconds;
             outcome.result.error = "request retry budget exhausted";
             outcome.budget_exhausted = true;
+            if (attempt_failed)
+                attempt_failed(
+                    AttemptRequest{candidate, index, remaining}, outcome.result,
+                    outcome.attempts.size() + 1, false);
             break;
         }
 
@@ -115,6 +126,9 @@ AttemptOutcome AttemptExecutor::run(
 
         const bool retry = should_retry(outcome.result, downstream_gone,
                                         position + 1 < order.size());
+        if (!outcome.successful && attempt_failed)
+            attempt_failed(AttemptRequest{candidate, index, remaining},
+                           outcome.result, outcome.attempts.size(), retry);
         if (retry) continue;
         outcome.used = &candidate;
         break;

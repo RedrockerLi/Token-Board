@@ -17,6 +17,7 @@
 #include "format_responses.h"
 #include "logging.h"
 #include "proxy_server.h"
+#include "proxy_error_log.h"
 #include "router.h"
 #include "semaphore_pool.h"
 #include "upstream_client.h"
@@ -26,6 +27,8 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <string>
 #include <thread>
 
 // Signal-safe flag for graceful shutdown
@@ -102,7 +105,12 @@ int main(int argc, char *argv[]) {
             pool->queue_average_ms(), pool->queue_p95_ms(),
             pool->queue_oldest_age_ms()};
     });
-    server.task_queue_rejection_handler = [](socket_t sock) {
+    server.task_queue_rejection_handler = [&proxy_server](socket_t sock) {
+        ProxyLogContext log_context;
+        log_context.request_id = proxy_server.allocate_request_id();
+        log_context.method = "UNKNOWN";
+        log_context.endpoint = "unknown";
+        log_proxy_failure(log_context, "framework", "proxy_queue_full", 503);
         static constexpr char response[] =
             "HTTP/1.1 503 Service Unavailable\r\n"
             "Content-Type: application/json\r\n"
@@ -121,10 +129,85 @@ int main(int argc, char *argv[]) {
         }
     };
 
+    server.set_pre_routing_handler(
+        [](const httplib::Request &, httplib::Response &) {
+            reset_proxy_error_log_scope();
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
     proxy_server.setup_routes(server);
+    server.set_error_handler([&proxy_server](const httplib::Request &req,
+                                              httplib::Response &res) {
+        // Business handlers log their own 4xx/5xx responses. These statuses
+        // are emitted by cpp-httplib before a handler runs (or for an
+        // unsupported method/path), so they need a framework-level record.
+        if (res.status == 404 || res.status == 405 || res.status == 413 ||
+            res.status == 414 || res.status == 431) {
+            ProxyLogContext log_context;
+            log_context.request_id = proxy_server.allocate_request_id();
+            log_context.method = req.method;
+            log_context.endpoint = req.path;
+            log_context.format = "http";
+            const char *reason = res.status == 404 ? "route_not_found"
+                : res.status == 405 ? "method_not_allowed"
+                : res.status == 413 ? "request_body_too_large"
+                : res.status == 414 ? "request_target_too_large"
+                                     : "request_headers_too_large";
+            log_proxy_failure(log_context, "framework", reason, res.status);
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+    server.set_exception_handler(
+        [&proxy_server](const httplib::Request &req, httplib::Response &res,
+                        std::exception_ptr exception) {
+            ProxyLogContext log_context;
+            log_context.request_id = proxy_server.allocate_request_id();
+            log_context.method = req.method;
+            log_context.endpoint = req.path;
+            log_context.format = "http";
+            log_proxy_failure(log_context, "framework", "handler_exception", 500);
+            res.status = 500;
+            // Preserve cpp-httplib's existing response contract while keeping
+            // the exception out of the new structured journal record.
+            if (!exception) {
+                res.set_header("EXCEPTION_WHAT", "UNKNOWN");
+                return;
+            }
+            try {
+                std::rethrow_exception(exception);
+            } catch (const std::exception &error) {
+                const char *message = error.what();
+                std::string escaped;
+                if (message) {
+                    for (const char *cursor = message; *cursor; ++cursor) {
+                        if (*cursor == '\r') escaped += "\\r";
+                        else if (*cursor == '\n') escaped += "\\n";
+                        else escaped += *cursor;
+                    }
+                }
+                res.set_header("EXCEPTION_WHAT", escaped);
+            } catch (...) {
+                res.set_header("EXCEPTION_WHAT", "UNKNOWN");
+            }
+        });
     server.set_logger([&proxy_server](const httplib::Request &req,
                                       const httplib::Response &res) {
-        proxy_server.record_http_result(res.status);
+        const bool structured_error = consume_proxy_error_log_scope();
+        if (res.status >= 400 && res.status <= 599 && !structured_error) {
+            ProxyLogContext log_context;
+            log_context.request_id = proxy_server.allocate_request_id();
+            log_context.method = req.method;
+            log_context.endpoint = req.path;
+            log_context.format = "http";
+            const char *reason = res.status == 400 ? "http_bad_request"
+                : res.status == 404 ? "route_not_found"
+                : res.status == 405 ? "method_not_allowed"
+                : res.status == 413 ? "request_body_too_large"
+                : res.status == 414 ? "request_target_too_large"
+                : res.status == 416 ? "invalid_range"
+                : res.status == 431 ? "request_headers_too_large"
+                                     : "http_response_error";
+            log_proxy_failure(log_context, "framework", reason, res.status);
+        }
         TB_LOG_DEBUG("[HTTP] %s %s status=%d\n", req.method.c_str(),
                      req.path.c_str(), res.status);
     });
@@ -141,38 +224,9 @@ int main(int argc, char *argv[]) {
         server.listen(cfg.host.c_str(), cfg.port);
     });
 
-    // Wait for signal, with periodic cleanup + auto-scale
-    auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
-    auto info_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    std::uint64_t last_requests = 0;
-    std::uint64_t last_errors = 0;
+    // Wait for signal while the server runs.
     while (!g_shutdown) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-        auto now = std::chrono::steady_clock::now();
-
-        if (now >= info_deadline) {
-            info_deadline = now + std::chrono::seconds(10);
-            const auto requests = proxy_server.completed_requests();
-            const auto errors = proxy_server.error_requests();
-            const auto interval_requests = requests - last_requests;
-            const auto interval_errors = errors - last_errors;
-            last_requests = requests;
-            last_errors = errors;
-            TB_LOG_INFO("[Perf] rps=%.1f errors=%llu workers=%zu active=%zu "
-                        "queue=%zu queue_avg=%.2fms queue_p95=%.2fms "
-                        "rejected=%zu in_flight=%d\n",
-                        interval_requests / 10.0,
-                        static_cast<unsigned long long>(interval_errors),
-                        pool->size(), pool->active(), pool->queued(),
-                        pool->queue_average_ms(), pool->queue_p95_ms(),
-                        pool->rejected(), proxy_server.in_flight_count());
-        }
-
-        // ── Periodic cleanup: every 5 min ────────────────────────────
-        if (now >= cleanup_deadline) {
-            cleanup_deadline = now + std::chrono::minutes(5);
-        }
     }
 
     printf("\nShutting down...\n");

@@ -1,14 +1,18 @@
 #include "proxy_server_internal.h"
 void ProxyServer::handle_streaming(
     const std::vector<UpstreamCandidate> &cands,
-    const std::vector<CandidateRequestBody> &candidate_bodies, size_t start,
-    const std::string &session_id, int local_key_id, ir::ApiFormat harness,
+    const std::vector<CandidateRequestBody> &candidate_bodies,
+    std::uint64_t request_id, size_t start,
+    const std::string &session_id, int route_account_id, int local_key_id,
+    ir::ApiFormat harness,
     const std::string &resolved_model, std::shared_ptr<const json> parsed_json,
     std::shared_ptr<const ir::ChatRequest> parsed_request, std::shared_ptr<const ir::ConversionContext> conversion_context,
     std::shared_ptr<const std::vector<json>> state_current_input, std::shared_ptr<UsageReservation> reservation,
     const std::string &anthropic_beta, const httplib::Request &req,
     httplib::Response &res, std::chrono::steady_clock::time_point t0) {
     const FormatCodec &harness_codec = codecs_.get(harness);
+    auto log_context = make_proxy_log_context(request_id, req.method, req.path, ir::to_string(harness));
+    set_proxy_log_stream_fields(log_context, resolved_model, route_account_id, local_key_id);
     const std::string content_type = req.has_header("Content-Type") ? req.get_header_value("Content-Type") : "application/json";
     const std::string scope = affinity_scope(local_key_id, harness);
     const auto order = candidate_order(cands, start, routing_rr_.fetch_add(1, std::memory_order_relaxed));
@@ -16,7 +20,8 @@ void ProxyServer::handle_streaming(
     const int budget_seconds = base_timeouts.streaming_first_byte_timeout > 0 ? base_timeouts.streaming_first_byte_timeout : 60; const auto deadline = t0 + std::chrono::seconds(budget_seconds);
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, cands, candidate_bodies, order, session_id, scope, local_key_id,
+        [this, cands, candidate_bodies, order, session_id, scope, log_context,
+         local_key_id,
          harness, resolved_model, parsed_json, parsed_request, conversion_context,
          state_current_input, reservation,
          anthropic_beta,
@@ -83,7 +88,8 @@ void ProxyServer::handle_streaming(
                 const auto &candidate = attempt_request.candidate;
                 terminal_error_forwarded = false;
                 if (inflight_id == 0) {
-                    inflight_id = request_started(candidate.upstream_model(), true);
+                    inflight_id = request_started(log_context.request_id,
+                                                   candidate.upstream_model(), true);
                 }
                 const auto upstream = ir::parse_api_format(candidate.account().api_format);
                 const bool responses_item_adapter = harness == ir::ApiFormat::OpenAIResponses &&
@@ -93,12 +99,7 @@ void ProxyServer::handle_streaming(
                 const bool filter_thinking = passthrough && upstream == ir::ApiFormat::OpenAI;
                 auto attempt_timeouts = base_timeouts;
                 if (!clamp_to_remaining_budget(attempt_timeouts, deadline, true)) {
-                    UpstreamClient::ForwardResult result;
-                    result.status_code = 504;
-                    result.is_timeout = true;
-                    result.timeout_secs = budget_seconds;
-                    result.error = "stream retry budget exhausted";
-                    return result;
+                    return proxy_stream_timeout_failure(budget_seconds, "stream retry budget exhausted");
                 }
                 ++attempts_made; const std::string *body = nullptr;
                 if (passthrough) {
@@ -123,10 +124,7 @@ void ProxyServer::handle_streaming(
                         body = cached.get();
                     } else {
                         if (!parsed_json) {
-                            UpstreamClient::ForwardResult result;
-                            result.status_code = 502;
-                            result.error = "missing shared request JSON";
-                            return result;
+                            return proxy_request_conversion_failure("missing shared request JSON", 502);
                         }
                         const std::string cache_key =
                             std::to_string(static_cast<int>(upstream)) + "\n" +
@@ -148,10 +146,7 @@ void ProxyServer::handle_streaming(
                     auto found = converted_bodies.find(cache_key);
                     if (found == converted_bodies.end()) {
                         if (!parsed_request) {
-                            UpstreamClient::ForwardResult result;
-                            result.status_code = 502;
-                            result.error = "missing shared request IR";
-                            return result;
+                            return proxy_request_conversion_failure("missing shared request IR", 502);
                         }
                         auto converted = *parsed_request;
                         converted.model = candidate.upstream_model();
@@ -268,26 +263,25 @@ void ProxyServer::handle_streaming(
                             if (!observed && !attempt_has_stream_error) {
                                 metrics_enabled = false;
                             }
-                        } catch (const std::exception &e) {
-                            TB_LOG_WARN(
-                                    "[Proxy] metrics stream parser disabled: %s\n",
-                                    e.what());
-                            metrics_enabled = false;
                         } catch (...) {
-                            TB_LOG_WARN(
-                                    "[Proxy] metrics stream parser disabled\n");
+                            log_proxy_stream_protocol_error(log_context, candidate, 0);
                             metrics_enabled = false;
                         }
                     }
                     if (attempt_has_stream_error && !committed) return false;
                     bool forwarded = true;
-                    if (!passthrough) {
-                        forwarded = parser->feed(data, len, on_combined_event);
-                    } else if (!filter_thinking) {
-                        forwarded = write_attempt(std::string(data, len));
-                    } else {
-                        std::string filtered = think_filter.feed(data, len);
-                        forwarded = filtered.empty() || write_attempt(filtered);
+                    try {
+                        if (!passthrough) {
+                            forwarded = parser->feed(data, len, on_combined_event);
+                        } else if (!filter_thinking) {
+                            forwarded = write_attempt(std::string(data, len));
+                        } else {
+                            std::string filtered = think_filter.feed(data, len);
+                            forwarded = filtered.empty() || write_attempt(filtered);
+                        }
+                    } catch (...) {
+                        mark_proxy_stream_parser_exception(log_context, candidate, attempt_has_stream_error, attempt_stream_error, attempt_stream_error_status);
+                        forwarded = false;
                     }
                     if (attempt_has_stream_error && committed)
                         terminal_error_forwarded = true;
@@ -314,23 +308,20 @@ void ProxyServer::handle_streaming(
                             passthrough ? ir::StreamParser::EmitFn(on_metrics_event)
                                          : ir::StreamParser::EmitFn(on_combined_event);
                         parser->finish(finish_events);
-                    } catch (const std::exception &e) {
-                        TB_LOG_WARN(
-                                "[Proxy] metrics stream finish ignored: %s\n",
-                                e.what());
                     } catch (...) {
-                        TB_LOG_WARN(
-                                "[Proxy] metrics stream finish ignored\n");
+                        log_proxy_stream_protocol_error(log_context, candidate, result.duration_ms);
+                        mark_proxy_stream_protocol_failure(result, 502, "upstream stream parser failure");
                     }
                 }
                 if (attempt_has_stream_error && !result.client_disconnected) {
-                    result.status_code = attempt_stream_error_status;
-                    result.success = false;
-                    result.is_timeout = false;
-                    result.timeout_secs = 0;
-                    result.error = stream_error_message(attempt_stream_error);
+                    mark_proxy_stream_protocol_failure(
+                        result, attempt_stream_error_status,
+                        stream_error_message(attempt_stream_error));
                 }
                 if (committed) promote_attempt_metrics();
+                if (client_write_failed && !result.client_disconnected) {
+                    mark_proxy_client_disconnect(result);
+                }
                 bool filter_tail_flushed = false;
                 if (passthrough && filter_thinking && !client_write_failed &&
                     (committed ||
@@ -391,7 +382,9 @@ void ProxyServer::handle_streaming(
                     return result.client_disconnected || client_write_failed ||
                            (committed && !result.success) ||
                            client_socket_gone(client_sock);
-                }});
+                },
+                proxy_attempt_failure_logger(log_context),
+                proxy_candidate_skip_logger(log_context)});
             used = outcome.used;
             final_result = std::move(outcome.result);
             attempts = std::move(outcome.attempts);
@@ -405,6 +398,8 @@ void ProxyServer::handle_streaming(
             last_duration_ms = final_result.duration_ms;
             inflight_guard.run_now();
             if (used && client_write_failed) {
+                log_proxy_client_disconnect(log_context, final_result.duration_ms,
+                                            attempts.size(), used);
                 enqueue_zero_usage(used->account().id, local_key_id,
                                    resolved_model, true, 499,
                                    final_result.duration_ms, used->key_slot_id,
@@ -458,6 +453,8 @@ void ProxyServer::handle_streaming(
             }
             if (client_write_failed || final_result.client_disconnected ||
                 client_socket_gone(client_sock)) {
+                log_proxy_client_disconnect(log_context, final_result.duration_ms,
+                                            attempts.size(), used);
                 if (last_account_id) {
                     enqueue_zero_usage(last_account_id, local_key_id,
                                        resolved_model, true, 499,
@@ -471,6 +468,9 @@ void ProxyServer::handle_streaming(
                 &codecs_.get(harness), final_result, attempts, last_timeout,
                 last_stream_error.is_null() ? json() : last_stream_error,
                 last_status, outcome.no_candidate_reason);
+            const char *final_reason = proxy_stream_terminal_failure_reason(
+                outcome, final_result, last_stream_error);
+            log_proxy_request_final(log_context, final_reason, err.status, final_result.duration_ms, attempts.size(), final_result.timeout_secs, outcome.last_attempted);
             res.status = err.status;
             if (err.retry_after_seconds > 0)
                 res.set_header("Retry-After", std::to_string(err.retry_after_seconds));

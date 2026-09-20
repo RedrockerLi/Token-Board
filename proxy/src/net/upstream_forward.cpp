@@ -1,4 +1,5 @@
 #include "transport_internal.h"
+#include "upstream_failure_kind.h"
 
 namespace upstream_metrics_detail {
 
@@ -29,12 +30,14 @@ UpstreamClient::forward(const std::string &method,
     size_t scheme_end = base_url.find("://");
     if (scheme_end == std::string::npos) {
         result.status_code = 502;
+        result.failure_kind = UpstreamFailureKind::Configuration;
         result.error = "Invalid base_url: no scheme";
         return result;
     }
     scheme_end += 3;  // past "://"
     if (scheme_end >= base_url.size()) {
         result.status_code = 502;
+        result.failure_kind = UpstreamFailureKind::Configuration;
         result.error = "Invalid base_url: missing host";
         return result;
     }
@@ -59,6 +62,7 @@ UpstreamClient::forward(const std::string &method,
     const OriginParts origin_parts = parse_origin(scheme_host);
     if (!origin_parts.valid) {
         result.status_code = 502;
+        result.failure_kind = UpstreamFailureKind::Configuration;
         result.error = "Invalid upstream origin";
         return result;
     }
@@ -72,6 +76,7 @@ UpstreamClient::forward(const std::string &method,
         origin_parts.origin, lease_budget_ms);
     if (!origin_lease) {
         result.status_code = 503;
+        result.failure_kind = UpstreamFailureKind::OriginCapacity;
         result.error = "Upstream connection lease budget exhausted";
         return result;
     }
@@ -102,11 +107,13 @@ UpstreamClient::forward(const std::string &method,
             case DnsResolution::Status::TimedOut:
                 result.status_code = 504;
                 result.is_timeout = true;
+                result.failure_kind = UpstreamFailureKind::DnsTimeout;
                 result.timeout_secs = connection_timeout.seconds;
                 result.error = "Upstream DNS deadline exceeded";
                 return result;
             default:
                 result.status_code = 502;
+                result.failure_kind = UpstreamFailureKind::DnsFailure;
                 result.error = dns.error.empty() ? "Upstream DNS lookup failed"
                                                  : dns.error;
                 return result;
@@ -114,6 +121,7 @@ UpstreamClient::forward(const std::string &method,
     }
     if (dns_addresses.empty()) {
         result.status_code = 502;
+        result.failure_kind = UpstreamFailureKind::DnsNoAddress;
         result.error = "Upstream DNS returned no usable addresses";
         return result;
     }
@@ -263,6 +271,7 @@ UpstreamClient::forward(const std::string &method,
             result.status_code = 499;
             result.client_disconnected = true;
             result.success = false;
+            result.failure_kind = UpstreamFailureKind::None;
             result.error = "Client disconnected";
         } else if (ok && !watch->expired.load(std::memory_order_acquire)) {
             result.status_code = upstream_res.status;
@@ -270,6 +279,10 @@ UpstreamClient::forward(const std::string &method,
                 !opts.terminal_seen->load(std::memory_order_acquire);
             result.success = (upstream_res.status >= 200 &&
                               upstream_res.status < 300) && !truncated;
+            if (truncated)
+                result.failure_kind = UpstreamFailureKind::StreamTruncated;
+            else if (!result.success)
+                result.failure_kind = UpstreamFailureKind::HttpStatus;
             if (!result.success)
                 result.error = truncated
                     ? "Upstream stream truncated before terminal event"
@@ -279,6 +292,9 @@ UpstreamClient::forward(const std::string &method,
         } else {
             result.is_timeout = watch->expired.load(std::memory_order_acquire) ||
                                 err == httplib::Error::ConnectionTimeout;
+            result.failure_kind = classify_transport_failure(err,
+                                                              result.is_timeout,
+                                                              true);
             if (result.is_timeout) {
                 switch (watch->expired_reason.load(std::memory_order_acquire)) {
                     case 1:
@@ -360,17 +376,21 @@ UpstreamClient::forward(const std::string &method,
             result.status_code = 499;
             result.client_disconnected = true;
             result.success = false;
+            result.failure_kind = UpstreamFailureKind::None;
             result.error = "Client disconnected";
         } else if (ok && !watch->expired.load(std::memory_order_acquire)) {
             result.status_code = upstream_status != 0
                 ? upstream_status : upstream_res.status;
             result.body = std::move(response_body);
             result.success = (result.status_code >= 200 && result.status_code < 300);
+            if (!result.success)
+                result.failure_kind = UpstreamFailureKind::HttpStatus;
             if (result.status_code >= 400)
                 result.usage_limit = is_usage_limit_error(result.body);
             if (response_too_large) {
                 result.body_too_large = true;
                 result.success = false;
+                result.failure_kind = UpstreamFailureKind::ResponseTooLarge;
                 result.body.clear();
                 result.error = "Upstream response exceeded the non-streaming body limit";
             } else if (!result.success) {
@@ -385,6 +405,9 @@ UpstreamClient::forward(const std::string &method,
             result.is_timeout = watch->expired.load(std::memory_order_acquire) ||
                                 request_err == httplib::Error::ConnectionTimeout ||
                                 idle_read_timeout;
+            result.failure_kind = classify_transport_failure(request_err,
+                                                              result.is_timeout,
+                                                              false);
             if (watch->expired.load(std::memory_order_acquire))
                 result.timeout_secs = opts.non_streaming_total_timeout;
             else if (request_err == httplib::Error::ConnectionTimeout)
@@ -437,6 +460,7 @@ UpstreamClient::forward(const std::string &method,
             lease = acquire();
             if (!lease.valid()) {
                 result.status_code = 502;
+                result.failure_kind = UpstreamFailureKind::Connect;
                 result.error = "Unable to establish upstream client";
                 return result;
             }

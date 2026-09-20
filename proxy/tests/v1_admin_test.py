@@ -148,14 +148,14 @@ def main() -> None:
     dashboard = sqlite3.connect(dashboard_path)
     try:
         archived = dashboard.execute(
-            "SELECT equivalent_cost,billed_usage_cost FROM daily_usage "
-            "WHERE account_id=?", (software_id,)
+            "SELECT api_equivalent_cost_micro_cny FROM daily_model_usage "
+            "WHERE user_id=? AND model=?", (software_id, "gpt-test")
         ).fetchone()
-        assert archived and abs(archived[0] - 2.8) < 1e-9 and archived[1] == 0
+        assert archived and archived[0] == 2_800_000
         assert dashboard.execute(
-            "SELECT recurring_charge FROM monthly_recurring_costs "
-            "WHERE account_id=?", (software_id,)
-        ).fetchone()[0] == 20
+            "SELECT actual_cost_micro_cny FROM users WHERE id=?",
+            (software_id,),
+        ).fetchone()[0] == 20_000_000
     finally:
         dashboard.close()
     print("V2 admin CRUD passed")

@@ -40,9 +40,12 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     EndpointRunner endpoint_runner(*this);
     add_cors_headers(res);
     auto t0 = std::chrono::steady_clock::now();
+    const auto request_id = allocate_request_id();
+    auto log_context = make_proxy_log_context(request_id, req.method, req.path, ir::to_string(harness_format_from_path(req.path)));
 
     auto ar = extract_and_route(req, router_);
     if (!ar.success) {
+        log_proxy_auth_failure(log_context, req.has_header("Authorization"), req.has_header("x-api-key"));
         res.status = 401;
         res.set_content(ar.error_json, "application/json");
         return;
@@ -51,6 +54,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     RequestContext context;
     std::string parse_error;
     if (!parse_request_context(req, context, parse_error)) {
+        log_proxy_failure(log_context, "request_validation", "invalid_request", 400);
         const auto format = harness_format_from_path(req.path);
         res.status = 400;
         res.set_content(codecs_.get(format).serialize_error_body(
@@ -58,8 +62,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             "application/json");
         return;
     }
+    log_context.model = context.model; log_context.streaming = context.streaming;
     if (context.client_format == ir::ApiFormat::OpenAIResponses &&
         !expand_responses_state(*this, codecs_, context, parse_error)) {
+        log_proxy_validation_failure(log_context, "previous_response_state", 400);
         res.status = 400;
         res.set_content(codecs_.get(context.client_format).serialize_error_body(
             json{{"message", parse_error}, {"type", "invalid_request_error"},
@@ -74,7 +80,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     // split.  For plain accounts this only strips the `[1m]`/`[1M]` marker.
     std::string model = context.model;
     auto cands = resolve_candidates_cached(ar.route, model);
+    set_proxy_log_route_fields(log_context, model, ar.route.account_id, ar.route.local_key_id);
     if (cands.empty()) {
+        log_proxy_failure(log_context, "routing", "model_unavailable", 400);
         res.status = 400;
         res.set_content(json_error("Model '" + model +
                                    "' is not available on this account", 400),
@@ -87,6 +95,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             return ir::parse_api_format(candidate.account().api_format) != harness;
         });
     if (!ensure_request_ir(codecs_, context, parse_error)) {
+        log_proxy_validation_failure(log_context, "request_parse", 400);
         res.status = 400;
         res.set_content(codecs_.get(harness).serialize_error_body(
             json{{"message", parse_error}, {"type", "parse_error"}}).dump(),
@@ -101,6 +110,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     std::string tool_error;
     if (!fmt::build_tool_context(context.parsed_ir.tools,
                                  request_conversion.tools, tool_error)) {
+        log_proxy_validation_failure(log_context, "tool_name_collision", 422);
         res.status = 422;
         res.set_content(codecs_.get(harness).serialize_error_body(
             json{{"message", tool_error}, {"type", "unsupported_feature"},
@@ -157,6 +167,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             }
         }
         if (compatible.empty()) {
+            log_proxy_validation_failure(log_context, feature_failure ? "unsupported_feature" : "unsupported_media", 422);
             res.status = 422;
             res.set_content(codecs_.get(harness).serialize_error_body(
                 json{{"message", incompatibility.empty()
@@ -198,6 +209,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         // has succeeded.  A malformed conversion must not strand accounting
         // capacity for a request that never contacts an upstream.
         if (!endpoint_runner.try_reserve_accounting()) {
+            log_proxy_accounting_failure(log_context);
             res.status = 503;
             res.set_header("Retry-After", "1");
             res.set_content(json_error(
@@ -215,8 +227,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         const std::string &session_id = context.session_id;
         const auto scope = affinity_scope(ar.route.local_key_id, harness);
         size_t start = affinity_start(affinity_, scope, session_id, cands);
-        handle_streaming(cands, candidate_bodies, start, session_id,
-                         ar.route.local_key_id, harness, model,
+        handle_streaming(cands, candidate_bodies, request_id, start, session_id,
+                         ar.route.account_id, ar.route.local_key_id, harness, model,
                          std::move(parsed_json), std::move(parsed_request),
                          std::move(conversion_context),
                          context.state_expanded
@@ -231,6 +243,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     const std::string &content_type = context.content_type;
     const FormatCodec &harness_codec = codecs_.get(harness);
     if (!endpoint_runner.try_reserve_accounting()) {
+        log_proxy_accounting_failure(log_context);
         res.status = 503;
         res.set_header("Retry-After", "1");
         res.set_content(json_error(
@@ -270,7 +283,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     AttemptExecutor executor(gate_);
     auto outcome = executor.execute(
         {&cands, order, deadline, budget_seconds,
-         [this](const std::string &m) { return request_started(m, false); },
+         [this, request_id](const std::string &m) { return request_started(request_id, m, false); },
          [this](std::uint64_t id) { request_finished(id); },
          [&](const AttemptRequest &attempt) {
         const auto &c = attempt.candidate;
@@ -318,9 +331,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             converted_response.reset();
         } else {
             if (!ensure_request_ir(codecs_, context, perr)) {
-                result.status_code = 400;
-                result.error = perr.empty() ? "request conversion failed" : perr;
-                return result;
+                return proxy_request_conversion_failure(perr.empty() ? "request conversion failed" : perr);
             }
             cReq = context.parsed_ir;
             cReq.model = c.upstream_model();
@@ -381,18 +392,17 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             if (parsed_ok) {
                 converted_response = std::move(parsed);
             } else {
-                result.success = false;
-                result.status_code = 502;
-                result.error = "Invalid upstream response for configured format";
-                if (!perr.empty()) result.error += ": " + perr;
+                result = proxy_response_protocol_failure(perr);
             }
         }
         return result;
         },
-        [&](const UpstreamClient::ForwardResult &result) {
+         [&](const UpstreamClient::ForwardResult &result) {
             return result.client_disconnected ||
                    client_socket_gone(req.client_socket);
-        }});
+        },
+        proxy_attempt_failure_logger(log_context),
+        proxy_candidate_skip_logger(log_context)});
     auto &fwd = outcome.result;
     const auto *used = outcome.used;
     const auto *last_attempted = outcome.last_attempted;
@@ -405,6 +415,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     if (!used) {
         const int final_status = no_upstream_status(
             fwd, attempts, outcome.no_candidate_reason);
+        const char *reason = proxy_terminal_failure_reason(outcome, fwd);
+        log_proxy_request_final(log_context, reason, final_status, fwd.duration_ms, attempts.size(), fwd.timeout_secs, last_attempted);
         enqueue_zero_usage(last_attempted ? last_attempted->account().id
                                           : ar.route.account_id,
                            ar.route.local_key_id, model, false, final_status,
@@ -430,6 +442,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     }
 
     if (fwd.client_disconnected || client_disconnected(req, 0, model)) {
+        log_proxy_client_disconnect(log_context, fwd.duration_ms, attempts.size(), used);
         // Record the aborted request truthfully (client closed before we
         // could send a response): status 499, zero tokens.
         int dur = static_cast<int>(std::chrono::duration_cast<
@@ -448,6 +461,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         (harness == ir::ApiFormat::OpenAIResponses && responses_item_adapter);
     if (!response_converted) {
         if (fwd.success) {
+            const bool response_json_valid = proxy_response_json_valid(log_context, fwd.body, fwd.status_code, fwd.duration_ms, attempts.size(), used);
             auto usage = parse_usage_for_format(ir::to_string(used_upstream_fmt),
                                                 fwd.body);
             if (usage.has_value()) {
@@ -460,9 +474,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                                      fwd.duration_ms, used->key_slot_id,
                                      -1, -1, -1.0, -1, -1, attempts_made, attempts);
             } else {
-                TB_LOG_WARN("[Proxy] Warning: could not parse usage "
-                                "from non-streaming response, model=%s\n",
-                        model.c_str());
+                if (response_json_valid)
+                    log_proxy_usage_unavailable(log_context, fwd.status_code, fwd.duration_ms, attempts.size(), used);
                 enqueue_zero_usage(used->account().id, ar.route.local_key_id,
                                    model_for_success_log("", *used), false,
                                    fwd.status_code,
@@ -485,6 +498,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             enqueue_zero_usage(used->account().id, ar.route.local_key_id,
                                model, false, fwd.status_code, fwd.duration_ms,
                                used->key_slot_id, attempts_made, attempts);
+            log_proxy_request_final(log_context, proxy_failure_reason(fwd), fwd.status_code, fwd.duration_ms, attempts.size(), fwd.timeout_secs, used);
             // Passthrough means the upstream body already uses the client's
             // protocol, so a non-empty body is preserved verbatim.
             const auto err = render_terminal_error(
@@ -525,6 +539,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 enqueue_zero_usage(used->account().id, ar.route.local_key_id,
                                    model, false, 502, fwd.duration_ms,
                                    used->key_slot_id, attempts_made, attempts);
+                log_proxy_converted_response_missing(log_context, fwd.duration_ms, attempts.size(), used);
                 res.status = 502;
                 res.set_content(harness_codec.serialize_error_body(
                     json{{"message", "Invalid converted upstream response"},
@@ -537,6 +552,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             enqueue_zero_usage(used->account().id, ar.route.local_key_id,
                                model, false, fwd.status_code, fwd.duration_ms,
                                used->key_slot_id, attempts_made, attempts);
+            log_proxy_request_final(log_context, proxy_failure_reason(fwd), fwd.status_code, fwd.duration_ms, attempts.size(), fwd.timeout_secs, used);
             // Converted failures keep a truthful upstream status when >= 400
             // and coerce a sub-400 failure to 502.
             const auto err = render_terminal_error(

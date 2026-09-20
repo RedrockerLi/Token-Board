@@ -4,9 +4,14 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
                                       httplib::Response &res) {
     add_cors_headers(res);
     const auto &policy = endpoint_policy(EndpointKind::Models);
+    const auto request_id = allocate_request_id();
+    auto log_context = make_proxy_log_context(
+        request_id, req.method, req.path, ir::to_string(policy.client_format));
 
     auto ar = extract_and_route(req, router_);
     if (!ar.success) {
+        log_proxy_auth_failure(log_context, req.has_header("Authorization"),
+                               req.has_header("x-api-key"));
         res.status = 401;
         res.set_content(ar.error_json, "application/json");
         return;
@@ -46,7 +51,10 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     // ordinary requests correctly spill to a healthy sibling.
     std::string catalog_model;
     auto cands = resolve_candidates_cached(ar.route, catalog_model);
+    log_context.route_account_id = ar.route.account_id;
+    log_context.local_key_id = ar.route.local_key_id;
     if (cands.empty()) {
+        log_proxy_failure(log_context, "routing", "no_upstream_candidate", 503);
         res.status = 503;
         res.set_content(json_error("No upstream key is configured", 503),
                         "application/json");
@@ -64,8 +72,8 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     AttemptExecutor executor(gate_);
     auto outcome = executor.execute(
         {&cands, order, deadline, budget_seconds,
-         [this](const std::string &) {
-             return request_started("/v1/models", false);
+         [this, request_id](const std::string &) {
+             return request_started(request_id, "/v1/models", false);
          },
          [this](std::uint64_t id) { request_finished(id); },
          [&](const AttemptRequest &attempt) {
@@ -79,13 +87,21 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         [&](const UpstreamClient::ForwardResult &result) {
             return result.client_disconnected ||
                    client_socket_gone(req.client_socket);
-        }});
+        },
+        proxy_attempt_failure_logger(log_context),
+        proxy_candidate_skip_logger(log_context)});
     auto &fwd = outcome.result;
     const auto *used = outcome.used;
 
     // Models records no usage, so the busy case is a render-only early return
     // (the shared renderer's attempts.empty() branch) — no accounting.
     if (!used && outcome.attempts.empty() && !fwd.is_timeout) {
+        const char *reason = proxy_terminal_failure_reason(outcome, fwd);
+        log_proxy_failure(log_context, "request_final", reason,
+                          outcome.no_candidate_reason ==
+                                  NoCandidateReason::kProviderQuotaCooldown
+                              ? 429 : 503,
+                          fwd.duration_ms, 0, 0, false, fwd.timeout_secs, nullptr);
         TerminalErrorOptions opts;
         opts.busy_message = "All upstream keys are busy or cooling down";
         opts.no_candidate_reason = outcome.no_candidate_reason;
@@ -104,9 +120,15 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     if (fwd.success) {
         // Real upstream model catalog, passed through unmodified — no
         // `[1m]`/`[1M]` aliases (those are internal to cc's Anthropic flow).
+        proxy_response_json_valid(log_context, fwd.body, fwd.status_code,
+                                  fwd.duration_ms, outcome.attempts.size(), used);
         res.status = fwd.status_code;
         res.set_content(fwd.body, "application/json");
     } else {
+        log_proxy_failure(log_context, "request_final",
+                          proxy_failure_reason(fwd), fwd.status_code,
+                          fwd.duration_ms, outcome.attempts.size(),
+                          outcome.attempts.size(), false, fwd.timeout_secs, used);
         TerminalErrorOptions opts;
         opts.used = (used != nullptr);
         const auto err = render_terminal_error(

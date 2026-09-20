@@ -90,6 +90,7 @@ int main() {
         "application/json", nullptr, opts);
     assert(!invalid.success);
     assert(invalid.status_code == 502);
+    assert(invalid.failure_kind == UpstreamFailureKind::Configuration);
 
     ForwardOptions slow_opts;
     slow_opts.non_streaming_timeout = 1;
@@ -100,6 +101,7 @@ int main() {
     assert(slow.is_timeout);
     assert(slow.status_code == 504);
     assert(slow.timeout_secs == 1);
+    assert(slow.failure_kind == UpstreamFailureKind::Timeout);
 
     ForwardOptions first_byte_opts;
     first_byte_opts.streaming_first_byte_timeout = 1;
@@ -145,6 +147,7 @@ int main() {
         assert(!trunc.success);
         assert(trunc.status_code == 200);
         assert(trunc.error.find("truncated") != std::string::npos);
+        assert(trunc.failure_kind == UpstreamFailureKind::StreamTruncated);
     }
     // Positive control: a terminal frame published before EOF stays a success.
     {

@@ -114,13 +114,13 @@ Database::TimeoutConfig ProxyServer::timeout_config_cached(
     return router_.timeout_config(endpoint_policy(kind).name);
 }
 
-std::uint64_t ProxyServer::request_started(const std::string &model,
+std::uint64_t ProxyServer::request_started(std::uint64_t request_id,
+                                           const std::string &model,
                                            bool streaming) {
-    std::uint64_t id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
-    // Zero is the invalid sentinel. The wrap can only occur after 2^64-1
-    // requests, but handle it without leaking the live-request entry.
-    if (id == 0)
-        id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+    // Zero is the invalid sentinel. The handler allocates the request ID before
+    // validation so the same ID is available for early failures and upstream
+    // attempts; retain a safe fallback for internal callers.
+    const std::uint64_t id = request_id == 0 ? allocate_request_id() : request_id;
     {
         std::lock_guard<std::mutex> lock(live_requests_mutex_);
         live_requests_.emplace(id, LiveRequest{

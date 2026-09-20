@@ -10,6 +10,7 @@
 #include "request_context.h"
 #include "request_body_cache.h"
 #include "request_timing.h"
+#include "proxy_log_helpers.h"
 #include "router.h"
 #include "think_filter.h"
 #include "upstream_client.h"

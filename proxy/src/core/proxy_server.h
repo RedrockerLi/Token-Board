@@ -100,6 +100,12 @@ public:
     void run_cooldown_probe_cycle();
 
     void setup_routes(httplib::Server &server);
+    std::uint64_t allocate_request_id() noexcept {
+        auto id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+        if (id == 0)
+            id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+        return id;
+    }
     void set_queue_metrics_provider(std::function<QueueMetrics()> provider) {
         queue_metrics_provider_ = std::move(provider);
     }
@@ -143,17 +149,6 @@ public:
     std::uint64_t accounting_rejected() const noexcept {
         return accounting_rejected_.load(std::memory_order_acquire);
     }
-    void record_http_result(int status_code) noexcept {
-        completed_requests_.fetch_add(1, std::memory_order_relaxed);
-        if (status_code >= 400)
-            error_requests_.fetch_add(1, std::memory_order_relaxed);
-    }
-    std::uint64_t completed_requests() const noexcept {
-        return completed_requests_.load(std::memory_order_relaxed);
-    }
-    std::uint64_t error_requests() const noexcept {
-        return error_requests_.load(std::memory_order_relaxed);
-    }
     QueueMetrics queue_metrics() const {
         return queue_metrics_provider_ ? queue_metrics_provider_() : QueueMetrics{};
     }
@@ -191,8 +186,10 @@ private:
     /// fails is an error status (429/504) committed to the client.
     void handle_streaming(const std::vector<UpstreamCandidate> &cands,
                           const std::vector<CandidateRequestBody> &candidate_bodies,
-                          size_t start, const std::string &session_id,
-                          int local_key_id, ir::ApiFormat harness,
+                          std::uint64_t request_id, size_t start,
+                          const std::string &session_id,
+                          int route_account_id, int local_key_id,
+                          ir::ApiFormat harness,
                           const std::string &resolved_model,
                           std::shared_ptr<const json> parsed_json,
                           std::shared_ptr<const ir::ChatRequest> parsed_request,
@@ -210,7 +207,8 @@ private:
     std::vector<UpstreamCandidate> resolve_candidates_cached(
         const Router::RouteResult &route, std::string &model);
     Database::TimeoutConfig timeout_config_cached(EndpointKind kind);
-    std::uint64_t request_started(const std::string &model, bool streaming);
+    std::uint64_t request_started(std::uint64_t request_id,
+                                  const std::string &model, bool streaming);
     void request_finished(std::uint64_t request_id);
     void add_cors_headers(httplib::Response &res);
 
@@ -231,8 +229,6 @@ private:
     };
     std::atomic<std::uint64_t> next_request_id_{1};
     std::atomic<int> in_flight_count_{0};
-    std::atomic<std::uint64_t> completed_requests_{0};
-    std::atomic<std::uint64_t> error_requests_{0};
     std::function<QueueMetrics()> queue_metrics_provider_;
     static thread_local std::shared_ptr<UsageReservation> accounting_reservation_;
     // Per-request round-robin offset for in-group key rotation (tier-5

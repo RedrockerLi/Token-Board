@@ -68,6 +68,27 @@ struct ForwardOptions {
     int downstream_socket = -1;
 };
 
+enum class UpstreamFailureKind {
+    None,
+    Configuration,
+    OriginCapacity,
+    DnsFailure,
+    DnsTimeout,
+    DnsNoAddress,
+    Connect,
+    Tls,
+    Write,
+    Read,
+    Timeout,
+    HttpStatus,
+    ResponseTooLarge,
+    StreamTruncated,
+    StreamProtocol,
+    RequestConversion,
+    ResponseProtocol,
+    Transport,
+};
+
 /// Forwards requests to the upstream CSTCloud API.
 ///
 /// Uses httplib::Client internally.  Supports both regular (full-response)
@@ -116,6 +137,7 @@ public:
         // exhaustion from ordinary upstream failures; only the former may
         // enter the retained 5h provider-quota cooldown.
         bool usage_limit = false;
+        UpstreamFailureKind failure_kind = UpstreamFailureKind::None;
     };
 
     /// Forward a request to the upstream API.

@@ -57,6 +57,11 @@ void ProxyServer::setup_routes(httplib::Server &server) {
     // Health check
     server.Get("/health", [this](const httplib::Request &req, httplib::Response &res) {
         add_cors_headers(res);
+        ProxyLogContext log_context;
+        log_context.request_id = allocate_request_id();
+        log_context.method = req.method;
+        log_context.endpoint = req.path;
+        log_context.format = "health";
         json j;
         const auto dropped = accounting_dropped();
         const auto rejected = accounting_rejected();
@@ -118,6 +123,8 @@ void ProxyServer::setup_routes(httplib::Server &server) {
             dropped != 0 || rejected != 0 ||
             persist_failures != 0 || lost_events != 0 || queue.rejected != 0)
             res.status = 503;
+        if (res.status == 503)
+            log_proxy_failure(log_context, "health", "health_degraded", 503);
         // Live concurrency is a useful local signal (status.sh, dashboard
         // realtime view) but a mild info leak if /health is reachable
         // off-loopback — only report it to loopback clients.
