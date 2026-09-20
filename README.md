@@ -172,8 +172,15 @@ systemctl --user restart token-maintenance
 systemctl --user status token-proxy         # 查看代理状态
 systemctl --user restart token-proxy
 journalctl --user -u token-maintenance -f
-journalctl --user -u token-proxy -f
+journalctl --user -u token-proxy -f       # 仅 warning/error 与 systemd 生命周期日志
+
+# 按需查看完整 debug 日志（暂停服务，日志只输出到当前终端）
+bash scripts/start-proxy.sh --debug       # Ctrl+C 后自动恢复原服务状态
 ```
+
+常驻的 `token-proxy` 服务会丢弃 info/debug 标准输出，避免大量日志进入磁盘；warning/error 仍保留在 journal 便于发现故障。需要完整请求级诊断时使用上面的 `--debug`，不要把 systemd 服务改成 `--log-level debug`。
+
+日志级别、输出流和前台调试生命周期的完整说明见[代理日志系统](doc/proxy-internals.md#日志系统)。
 
 用户服务通常在登录后启动;若需无人值守(开机未登录也启动),可执行 `sudo loginctl enable-linger <用户>` 启用 linger。`start.sh` 会检测并提示,不会自行提权。
 

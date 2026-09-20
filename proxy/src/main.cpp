@@ -39,7 +39,8 @@ extern "C" void signal_handler(int /*signum*/) {
 }
 
 int main(int argc, char *argv[]) {
-    // Unbuffered stderr for real-time logging
+    // Unbuffered output for real-time foreground debugging and service logs.
+    setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
     // ── Parse config ──────────────────────────────────────────────────

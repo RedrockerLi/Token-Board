@@ -153,7 +153,10 @@ ExecStart="$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --host 
 Restart=always
 RestartSec=5
 TimeoutStopSec=15
-StandardOutput=journal
+# Keep detailed info/debug output out of the persistent journal. The proxy
+# logger writes warnings/errors to stderr, so service failures remain visible;
+# use scripts/start-proxy.sh --debug for full foreground output on demand.
+StandardOutput=null
 StandardError=journal
 
 [Install]

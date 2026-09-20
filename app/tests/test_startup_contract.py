@@ -11,6 +11,8 @@ class StartupContractTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(__file__).resolve().parents[2]
         self.script = (self.root / "start.sh").read_text(encoding="utf-8")
+        self.proxy_script = (self.root / "scripts/start-proxy.sh").read_text(
+            encoding="utf-8")
 
     def test_start_script_is_valid_and_has_two_explicit_modes(self) -> None:
         result = subprocess.run(
@@ -35,8 +37,23 @@ class StartupContractTest(unittest.TestCase):
         self.assertIn('maintenance.py" --token-board-db', self.script)
         self.assertIn('ExecStart="$PROXY_BIN" --db', self.script)
         self.assertIn('TimeoutStopSec=15', self.script)
+        self.assertIn('StandardOutput=null', self.script)
+        self.assertIn('StandardError=journal', self.script)
         self.assertIn('databases_are_current()', self.script)
         self.assertIn('本地数据库已是最新版，跳过完整升级', self.script)
+
+    def test_debug_mode_is_foreground_and_restores_active_service(self) -> None:
+        result = subprocess.run(
+            ["bash", "-n", str(self.root / "scripts/start-proxy.sh")],
+            check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--debug", self.proxy_script)
+        self.assertIn("--log-level debug", self.proxy_script)
+        self.assertIn("systemctl --user stop", self.proxy_script)
+        self.assertIn("systemctl --user start", self.proxy_script)
+        self.assertIn("StandardOutput=null", self.proxy_script)
+        self.assertIn("StandardError=journal", self.proxy_script)
 
     def test_fast_mode_does_not_run_upgrade_or_restart_services(self) -> None:
         fast_marker = 'echo "[dash] 快速启动模式：不迁移数据库、不重启后台服务"'

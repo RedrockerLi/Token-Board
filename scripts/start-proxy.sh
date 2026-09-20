@@ -3,6 +3,7 @@
 # Token Board 代理启动脚本
 # Usage:
 #   bash scripts/start-proxy.sh              # 前台启动（调试用）
+#   bash scripts/start-proxy.sh --debug      # 暂停 systemd，前台详细调试
 #   bash scripts/start-proxy.sh --daemon     # 后台启动
 #   bash scripts/start-proxy.sh --install    # 安装为 systemd 用户服务（开机自启）
 #   bash scripts/start-proxy.sh --uninstall  # 移除 systemd 服务
@@ -19,6 +20,7 @@ PYTHON_BIN="${TB_PYTHON_BIN:-python3}"
 
 SERVICE_NAME="token-proxy"
 SERVICE_FILE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
+DEBUG_SERVICE_WAS_ACTIVE=false
 
 # ── Colors ──
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -68,7 +70,8 @@ Environment=PYTHONPATH=$SCRIPT_DIR
 ExecStart=$PROXY_BIN --db $TOKEN_BOARD_DB --schema-dir $SCHEMA_DIR --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
-StandardOutput=journal
+# Keep info/debug out of the persistent journal; warnings/errors remain there.
+StandardOutput=null
 StandardError=journal
 
 [Install]
@@ -86,7 +89,8 @@ EOF
     echo "  systemctl --user status $SERVICE_NAME    # 查看状态"
     echo "  systemctl --user stop $SERVICE_NAME      # 停止代理"
     echo "  systemctl --user restart $SERVICE_NAME   # 重启代理"
-    echo "  journalctl --user -u $SERVICE_NAME -f    # 查看日志"
+    echo "  journalctl --user -u $SERVICE_NAME -f    # 查看 warning/error"
+    echo "  bash scripts/start-proxy.sh --debug     # 终端查看完整 debug"
     echo ""
     echo "代理地址: http://localhost:$PROXY_PORT/v1"
 }
@@ -108,6 +112,36 @@ do_start() {
     echo "  按 Ctrl+C 停止"
     echo ""
     exec "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1 --port "$PROXY_PORT"
+}
+
+do_debug() {
+    verify_schema
+
+    cleanup_debug() {
+        local status=$?
+        trap - EXIT INT TERM
+        if $DEBUG_SERVICE_WAS_ACTIVE; then
+            echo -e "${CYAN}恢复 systemd 服务 $SERVICE_NAME...${NC}"
+            if ! systemctl --user start "$SERVICE_NAME"; then
+                echo -e "${RED}[ERROR] 无法恢复 systemd 服务 $SERVICE_NAME${NC}" >&2
+                [ "$status" -eq 0 ] && status=1
+            fi
+        fi
+        exit "$status"
+    }
+    trap cleanup_debug EXIT
+    trap 'exit 130' INT TERM
+
+    if command -v systemctl >/dev/null 2>&1 &&
+       systemctl --user is-active --quiet "$SERVICE_NAME"; then
+        DEBUG_SERVICE_WAS_ACTIVE=true
+        echo -e "${CYAN}暂停 systemd 服务 $SERVICE_NAME，进入前台 debug...${NC}"
+        systemctl --user stop "$SERVICE_NAME"
+    fi
+
+    echo "详细日志直接输出到当前终端；按 Ctrl+C 退出并恢复原服务状态。"
+    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" \
+        --host 127.0.0.1 --port "$PROXY_PORT" --log-level debug
 }
 
 do_daemon() {
@@ -134,11 +168,13 @@ do_daemon() {
 case "${1:-}" in
     --install)   do_install ;;
     --uninstall) do_uninstall ;;
+    --debug)     do_debug ;;
     --daemon)    do_daemon ;;
     *)
-        echo "Usage: bash scripts/start-proxy.sh [--daemon|--install|--uninstall]"
+        echo "Usage: bash scripts/start-proxy.sh [--debug|--daemon|--install|--uninstall]"
         echo ""
         echo "  (无参数)      前台启动（调试用，Ctrl+C 停止）"
+        echo "  --debug       暂停 systemd，前台输出完整 debug 日志"
         echo "  --daemon      后台启动"
         echo "  --install     安装为 systemd 用户服务，开机自启"
         echo "  --uninstall   移除 systemd 服务"

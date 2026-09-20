@@ -25,11 +25,21 @@ inline bool log_enabled(LogLevel level) {
            tb_log_level.load(std::memory_order_acquire);
 }
 
+inline FILE *log_stream(LogLevel level) {
+    // Keep warnings and errors visible to service managers while allowing
+    // informational/debug output to be discarded by a service's stdout
+    // policy without losing it in the foreground debug mode.
+    return level == LogLevel::Error || level == LogLevel::Warn ?
+        stderr : stdout;
+}
+
 inline void log_message(LogLevel level, const char *format, ...) {
     if (!log_enabled(level)) return;
     va_list args;
     va_start(args, format);
-    std::vfprintf(stderr, format, args);
+    FILE *stream = log_stream(level);
+    std::vfprintf(stream, format, args);
+    std::fflush(stream);
     va_end(args);
 }
 

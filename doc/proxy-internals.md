@@ -14,8 +14,55 @@ transition→解析 C++ CLI 参数→打开并校验已准备好的 V1 schema→
 
 - enqueue 发现 backlog 且没有空闲 worker 时立即扩容；不等待周期轮询。
 - 每 250ms 检查 `config_state.generation`，后台构建并原子替换路由快照。
-- info 日志每 10 秒输出 RPS、错误、队列和连接池聚合，成功请求逐条日志仅在 debug。
 - 周期清理:`cleanup_stale_in_flight(10)` 清掉 `in_flight_requests` 遗留表里超过 10 分钟的僵死记录(旧版本代理的观测表;新版本已不写)。
+
+## 日志系统
+
+代理日志由 `proxy/src/core/logging.h` 提供，级别从低到高为
+`error`、`warn`、`info`、`debug`。`--log-level` 设置阈值，默认是 `info`；例如
+`--log-level debug` 会启用全部四个级别。日志消息会立即 flush，适合观察前台进程。
+
+输出流按严重程度分开:
+
+- `error`、`warn` 写入 `stderr`。请求级代理错误使用单行 `key=value` 结构化格式，
+  经过 `proxy_log_value` 清理并限制长度，不记录 API Key、请求头或请求/响应 body。
+- `info`、`debug` 写入 `stdout`。`debug` 包括 HTTP 请求、路由选择、请求级诊断等
+  高频信息，只有显式启用 debug 级别才会产生。
+
+### systemd 常驻模式
+
+`start.sh --all` 和 `scripts/start-proxy.sh --install` 生成的 `token-proxy.service`
+使用:
+
+```ini
+StandardOutput=null
+StandardError=journal
+```
+
+因此常驻服务会丢弃 `info`/`debug`，避免详细诊断进入持久化 journal；`warn`/`error`
+以及 systemd 自身的启动、停止、失败事件仍可通过下面的命令查看:
+
+```bash
+journalctl --user -u token-proxy -f
+```
+
+这里的 `journalctl` 只是读取 journald，不能动态把一个已经运行的 systemd 进程的
+标准输出接到当前终端。代理的请求用量、计费和性能字段仍按正常业务流程写入
+SQLite 的 `request_log`，与 stdout/stderr 日志策略无关。
+
+### 按需前台 debug
+
+需要完整诊断时运行:
+
+```bash
+bash scripts/start-proxy.sh --debug
+```
+
+脚本先验证 schema；如果 `token-proxy` 正在运行，就先停止该 systemd 服务，然后用
+同一个代理二进制在当前终端前台启动 `--log-level debug`。此时 stdout 和 stderr 都
+继承当前终端，所以能看到完整 debug 输出，且这些消息不会写入 journal。调试期间会
+有短暂服务中断，不会同时运行两个代理；按 `Ctrl+C` 或进程退出后，脚本会恢复调试
+前的服务状态。
 
 ## 线程池:SemaphorePool
 
