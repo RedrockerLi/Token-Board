@@ -270,20 +270,43 @@ add_test(
 add_test(NAME upstream_client COMMAND upstream_client_test)
 add_test(NAME http_debug_log COMMAND http_debug_log_test)
 add_test(NAME upstream_debug_exchange COMMAND upstream_debug_exchange_test)
-# Money-equivalence gate (1/2): v17 trigger == v18 view-based trigger across a
-# pricing edge-case matrix (pure SQL, exact api_cost equality).  Proves the
-# 0018 view extraction changes no money before the column drop lands.
+# Current pricing gate: V1 is the published pre-transition schema and V2 is
+# what the proxy runs.  Keep both the equivalence and restart/recovery paths
+# tied to those current migration directories.
 add_test(
-    NAME pricing_equivalence
+    NAME pricing_v1_v2_equivalence
     COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/pricing_equivalence_test.py
-            ${CMAKE_SOURCE_DIR}/../schema/token-board/v0
-            ${CMAKE_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/pricing_v1_v2_equivalence_test.py
+            equivalence
+            ${CMAKE_SOURCE_DIR}/../schema
+)
+add_test(
+    NAME pricing_v1_v2_recovery
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/pricing_v1_v2_equivalence_test.py
+            recovery
+            ${CMAKE_SOURCE_DIR}/../schema
 )
 add_test(
     NAME proxy_forwarding
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/proxy_forwarding_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME client_disconnect
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/client_disconnect_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME payload_limit
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/payload_limit_test.py
             $<TARGET_FILE:token_proxy>
             ${CMAKE_SOURCE_DIR}/../schema
             ${CMAKE_SOURCE_DIR}/..
@@ -387,6 +410,10 @@ add_test(
             --requests 1000 --concurrency 64
             --min-rps 1000 --max-p95 200 --max-queue-p95 50
 )
+# The gate drives exactly 64 concurrent clients. Keep the proxy's dynamic
+# worker ceiling aligned with that workload so small CI/desktop hosts do not
+# spend the short benchmark growing an unnecessarily large native thread pool.
+set_tests_properties(perf_gate_1000_64 PROPERTIES ENVIRONMENT "TB_MAX_WORKERS=64")
 # GoUsageLimitError cooldown discrimination: quota-exhaustion 429 cools a plan
 # key down; ordinary provider failures never create cross-request key state.
 add_test(
@@ -435,7 +462,7 @@ add_test(
 # Keep CI selection explicit without maintaining a second test manifest.
 set_tests_properties(upstream_client_perf_reuse PROPERTIES LABELS "performance")
 set_tests_properties(
-    pricing_snapshot_equiv schema_version pricing_equivalence
+    pricing_snapshot_equiv schema_version pricing_v1_v2_equivalence pricing_v1_v2_recovery
     PROPERTIES LABELS "schema;unit"
 )
 set_tests_properties(format_conversion session_affinity endpoint_policy source_size
@@ -461,7 +488,7 @@ set_tests_properties(stream_rss_100 accounting_soak_60s
 # is the build tree, so make the repository root explicit instead of relying
 # on whichever interpreter happens to be launched from the source tree.
 set_tests_properties(
-    schema_version source_size refactor_boundaries pricing_equivalence
+    schema_version source_size refactor_boundaries pricing_v1_v2_equivalence pricing_v1_v2_recovery
     proxy_forwarding v1_routing model_accounting responses_forwarding v1_admin v1_sync
     transition_recovery queue_saturation accounting_recovery stream_rss_100
     accounting_soak_60s perf_stress perf_gate_1000_64 cooldown_discrimination

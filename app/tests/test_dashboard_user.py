@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from app.db.dashboard_db import DashboardDatabase
 from app.services.sync import dashboard_sync
-from app.services.sync.dashboard_sync import delete_dashboard_users
+from app.services.sync.dashboard_user_delete import delete_dashboard_users
 from app.services.sync.settings import SyncConfig, save_sync_config
 from app.services.sync.state import get_sync_state, set_sync_state_many
 from app.services.sync.webdav import RemoteArtifact, WebDAVConflict, WebDAVError

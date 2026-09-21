@@ -78,18 +78,6 @@ struct ForwardWatch {
         state_cv.notify_all();
     }
 
-    void force_expire(int reason) {
-        std::lock_guard<std::mutex> lock(state_mutex);
-        if (!running.load(std::memory_order_acquire) ||
-            client_disconnected.load(std::memory_order_acquire) ||
-            expired.load(std::memory_order_acquire))
-            return;
-        expired_reason.store(reason, std::memory_order_release);
-        expired.store(true, std::memory_order_release);
-        if (cancel_socket != INVALID_SOCKET)
-            shutdown_socket_copy(cancel_socket);
-    }
-
     void finish() {
         std::unique_lock<std::mutex> lock(state_mutex);
         running.store(false, std::memory_order_release);

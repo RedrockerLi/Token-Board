@@ -61,9 +61,8 @@ class MaintenanceService:
                 name: dict(value) for name, value in self.health.items()
                 if name not in {"pid", "started_at", "heartbeat_at", "tasks"}
             }
-            # Keep task entries out of the top level; older in-process health
-            # dictionaries used that shape, but the sidecar contract exposes
-            # one explicit ``tasks`` object for the standalone service.
+            # Keep task entries out of the top level; the sidecar contract
+            # exposes one explicit ``tasks`` object for the standalone service.
             for name in list(payload):
                 if name not in {"pid", "started_at", "heartbeat_at", "tasks"}:
                     payload.pop(name, None)

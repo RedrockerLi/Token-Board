@@ -114,6 +114,9 @@ endforeach()
 # Test targets are defined only in tests/CMakeLists.txt and built solely
 # under BUILD_TESTING. They never link into token_proxy.
 if(BUILD_TESTING)
+    # The durable-spool crash hook is test-only. Production builds, including
+    # Release builds with BUILD_TESTING=OFF, never compile the injection point.
+    target_compile_definitions(token_proxy_store PRIVATE TB_ENABLE_TEST_CRASH=1)
     enable_testing()
     add_subdirectory(tests)
     add_subdirectory(

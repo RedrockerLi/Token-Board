@@ -401,13 +401,15 @@ void Database::log_writer_loop() {
                                 "[DB] request-log spool batch sync error: %s\n",
                                 std::strerror(errno));
                 }
+#ifdef TB_ENABLE_TEST_CRASH
                 // Test-only crash point: prove that a frame which reached
                 // durable spool before SQLite commit is replayed exactly once
-                // after restart. Production never sets this variable.
+                // after restart. This code is compiled only into test builds.
                 if (spool_synced && std::getenv("TB_TEST_CRASH_AFTER_SPOOL_SYNC")) {
                     TB_LOG_WARN("[DB] test crash after request-log spool sync\n");
                     ::_exit(86);
                 }
+#endif
                 if (spool_synced &&
                     persist_log_records(records.data(), records.size()))
                     break;

@@ -49,21 +49,6 @@ inline int64_t timeout_ms(int seconds) {
     return seconds > 0 ? static_cast<int64_t>(seconds) * 1000 : 0;
 }
 
-inline int64_t earlier_deadline(int64_t first, int64_t second) {
-    if (first == 0) return second;
-    if (second == 0) return first;
-    return std::min(first, second);
-}
-
-inline int timeout_seconds_for_report(int configured_seconds,
-                                      int64_t budget_ms = 0) {
-    if (budget_ms <= 0) return configured_seconds;
-    const int budget_seconds = static_cast<int>(std::max<int64_t>(
-        1, (budget_ms + 999) / 1000));
-    return configured_seconds > 0
-        ? std::min(configured_seconds, budget_seconds) : budget_seconds;
-}
-
 /// Connection-establishment timeout choice.  When an attempt budget is set,
 /// connection establishment shares that budget (capped by the conservative
 /// connect cap so a wedged peer cannot burn the whole budget); otherwise the

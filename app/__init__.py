@@ -90,15 +90,8 @@ def create_app(token_board_db_path: str | None = None, host: str = "127.0.0.1",
     # Background maintenance is owned by token-maintenance.service. The
     # dashboard only starts its configuration-gated deletion finalizer after
     # the async cloud baseline has completed.
-    if token_board_db_path and start_background_tasks:
-        if testing:
-            # Test apps may still exercise the legacy in-process worker. The
-            # production server never takes this branch; maintenance.py owns
-            # those workers there.
-            from app.services.runtime_tasks import start_runtime_tasks
-            start_runtime_tasks(flask_app, pdb, token_board_db_path)
-        else:
-            start_config_session(flask_app)
+    if token_board_db_path and start_background_tasks and not testing:
+        start_config_session(flask_app)
 
     return flask_app
 

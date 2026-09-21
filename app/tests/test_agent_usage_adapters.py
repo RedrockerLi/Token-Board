@@ -11,9 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.services.agent_usage.adapters import (
-    antigravity, claude_code, cline, codearts_agent, codebuddy, codex, cola,
-    craft_agent, cursor, devin, dsh, grok, hermes, kiro,
-    kimi_code, mcode, opencode, pi_common, qoder, qoder_cn, workbuddy,
+    alma, amp, antigravity, claude_code, cline, codearts_agent, codebuddy,
+    codex, cola, copilot_cli, craft_agent, cursor, devin, dimagent, droid,
+    dsh, gemini_cli, grok, hermes, kiro, kimi_code, mcode, mimocode,
+    openclaw, opencode, pi_common, qoder, qoder_cn, roo_code, qwen_code,
+    trae_cli, workbuddy, zcode,
 )
 from app.services.agent_usage import cindy_ledger
 from app.services.agent_usage.ir import UsageEvent, UsageSource
@@ -21,6 +23,24 @@ from app.services.agent_usage.registry import ADAPTERS
 
 
 class AgentUsageAdapterTestCase(unittest.TestCase):
+    def assert_one_event(self, parsed, *, model: str, prompt: int,
+                         completion: int, cache: int, total: int,
+                         project: str | None = None,
+                         session_id: str | None = None) -> None:
+        self.assertFalse(parsed.skipped)
+        self.assertEqual(len(parsed.events), 1)
+        event = parsed.events[0]
+        self.assertEqual(
+            (event.model, event.prompt_tokens, event.completion_tokens,
+             event.cache_read_tokens, event.total_tokens),
+            (model, prompt, completion, cache, total),
+        )
+        if project is not None:
+            self.assertEqual(event.project, project)
+        if session_id is not None:
+            self.assertEqual(event.session_id, session_id)
+        self.assertTrue(event.event_id)
+
     def test_registry_matches_reference_agent_set(self) -> None:
         self.assertEqual(len(ADAPTERS), 34)
         self.assertEqual(set(ADAPTERS), {
@@ -32,6 +52,316 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             "mcode", "cola", "qoder", "qoder-cn", "devin", "codebuddy",
             "codearts-agent",
         })
+
+    def test_copilot_cli_parses_shutdown_model_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "session-state" / "session-1"
+            root.mkdir(parents=True)
+            (root / "events.jsonl").write_text("\n".join([
+                json.dumps({
+                    "type": "session.start", "timestamp": "2026-09-20T15:00:00Z",
+                    "data": {"context": {"gitRoot": "/work/copilot-demo"}},
+                }),
+                json.dumps({
+                    "type": "session.shutdown", "timestamp": "2026-09-20T15:01:00Z",
+                    "data": {"modelMetrics": {
+                        "gpt-5-codex": {"usage": {
+                            "inputTokens": 100, "cacheReadTokens": 20,
+                            "outputTokens": 7,
+                        }},
+                    }},
+                }),
+            ]) + "\n", encoding="utf-8")
+
+            items = copilot_cli.discover({"config": {"data_root": str(root.parent)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                copilot_cli.parse(items[0]), model="gpt-5-codex",
+                prompt=100, completion=7, cache=20, total=107,
+                project="copilot-demo", session_id="session-1")
+
+    def test_dimagent_deduplicates_mirrored_usage_ledger_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "dimcode.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE sessions (sessionId TEXT, cwd TEXT)")
+            conn.execute("""CREATE TABLE usage_ledger (
+                ledgerId TEXT, runId TEXT, providerId TEXT, modelId TEXT,
+                usage TEXT, cost TEXT, createdAt TEXT, sessionId TEXT
+            )""")
+            usage = json.dumps({
+                "promptTokens": 120, "cacheReadTokens": 20,
+                "completionTokens": 8,
+            })
+            row = ("run-1", "provider", "dim-model", usage, "0.1",
+                   "2026-09-20T15:00:00Z", "session-1")
+            conn.execute("INSERT INTO sessions VALUES (?,?)",
+                         ("session-1", "/work/dim-demo"))
+            conn.execute("INSERT INTO usage_ledger VALUES (?,?,?,?,?,?,?,?)",
+                         ("entry-1", *row))
+            conn.execute("INSERT INTO usage_ledger VALUES (?,?,?,?,?,?,?,?)",
+                         ("ledger_mirror", *row))
+            conn.commit()
+            conn.close()
+
+            items = dimagent.discover({"config": {"data_root": str(db)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                dimagent.parse(items[0]), model="dim-model",
+                prompt=120, completion=8, cache=20, total=128,
+                project="dim-demo")
+
+    def test_gemini_cli_parses_native_usage_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "session.json"
+            path.write_text(json.dumps({
+                "directories": ["/work/gemini-demo"],
+                "messages": [
+                    {"role": "user", "timestamp": "2026-09-20T15:00:00Z"},
+                    {"type": "gemini", "model": "gemini-2.5-pro",
+                     "createTime": "2026-09-20T15:01:00Z",
+                     "usageMetadata": {
+                         "promptTokenCount": 100,
+                         "cachedContentTokenCount": 20,
+                         "candidatesTokenCount": 12,
+                         "thoughtsTokenCount": 2,
+                     }},
+                ],
+            }), encoding="utf-8")
+
+            items = gemini_cli.discover({"config": {"data_root": str(root)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                gemini_cli.parse(items[0]), model="gemini-2.5-pro",
+                prompt=100, completion=12, cache=20, total=112,
+                project="gemini-demo", session_id="session")
+
+    def test_openclaw_discovers_profile_session_and_reads_usage_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "openclaw-demo"
+            path = root / "agents" / "session.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({
+                "type": "message", "timestamp": "2026-09-20T15:00:00Z",
+                "message": {
+                    "role": "assistant", "model": "openclaw-model",
+                    "usage": {
+                        "inputTokens": 100, "cacheCreationInputTokens": 5,
+                        "cacheRead": 20, "outputTokens": 8,
+                    },
+                },
+            }) + "\n", encoding="utf-8")
+
+            items = openclaw.discover({"config": {"data_root": str(root / "agents")}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                openclaw.parse(items[0]), model="openclaw-model",
+                prompt=125, completion=8, cache=20, total=133,
+                project="openclaw-demo", session_id="session")
+
+    def test_qwen_code_deduplicates_repeated_message_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "qwen-tmp" / "2026" / "chats"
+            root.mkdir(parents=True)
+            event = {
+                "type": "assistant", "uuid": "message-1",
+                "timestamp": "2026-09-20T15:00:00Z", "cwd": "/work/qwen-demo",
+                "model": "qwen3-coder",
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "cachedContentTokenCount": 20,
+                    "candidatesTokenCount": 12,
+                    "thoughtsTokenCount": 2,
+                },
+            }
+            (root / "session.jsonl").write_text(
+                "\n".join(json.dumps(value) for value in (event, event)) + "\n",
+                encoding="utf-8")
+
+            items = qwen_code.discover({"config": {"data_root": str(root.parent.parent)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                qwen_code.parse(items[0]), model="qwen3-coder",
+                prompt=100, completion=12, cache=20, total=112,
+                project="qwen-demo", session_id="session")
+
+    def test_amp_prefers_usage_ledger_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "threads"
+            root.mkdir()
+            (root / "T-1.json").write_text(json.dumps({
+                "id": "amp-thread-1",
+                "messages": [{"usage": {"cacheCreationInputTokens": 5,
+                                           "cacheReadInputTokens": 20}}],
+                "usageLedger": {"events": [{
+                    "toMessageId": 0, "model": "amp-model",
+                    "timestamp": "2026-09-20T15:00:00Z",
+                    "tokens": {"input": 100, "output": 8},
+                }]},
+            }), encoding="utf-8")
+
+            items = amp.discover({"config": {"data_root": str(root)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                amp.parse(items[0]), model="amp-model",
+                prompt=125, completion=8, cache=20, total=133,
+                session_id="amp-thread-1")
+
+    def test_alma_reads_usage_records_and_workspace_project(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "chat_threads.db"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE workspaces (id INTEGER PRIMARY KEY, name TEXT) WITHOUT ROWID")
+            conn.execute(
+                "CREATE TABLE chat_threads (id TEXT PRIMARY KEY, workspace_id INTEGER) WITHOUT ROWID")
+            conn.execute("""CREATE TABLE usage_records (
+                timestamp TEXT, model TEXT, input_tokens INTEGER,
+                output_tokens INTEGER, cached_input_tokens INTEGER,
+                reasoning_tokens INTEGER, cache_write_input_tokens INTEGER,
+                thread_id TEXT
+            )""")
+            conn.execute("INSERT INTO workspaces VALUES (1, 'alma-demo')")
+            conn.execute("INSERT INTO chat_threads VALUES ('thread-1', 1)")
+            conn.execute(
+                "INSERT INTO usage_records VALUES (?,?,?,?,?,?,?,?)",
+                ("2026-09-20T15:00:00Z", "provider:alma-model", 100, 8,
+                 20, 2, 5, "thread-1"))
+            conn.commit()
+            conn.close()
+
+            items = alma.discover({"config": {"data_root": str(db)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                alma.parse(items[0]), model="alma-model",
+                prompt=125, completion=10, cache=20, total=135,
+                project="alma-demo")
+
+    def test_droid_combines_session_and_settings_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project-demo"
+            root.mkdir()
+            session = root / "session.jsonl"
+            session.write_text(json.dumps({
+                "type": "message", "timestamp": "2026-09-20T15:00:00Z",
+            }) + "\n", encoding="utf-8")
+            (root / "session.settings.json").write_text(json.dumps({
+                "model": "auto",
+                "tokenUsage": {
+                    "inputTokens": 100, "cacheReadTokens": 20,
+                    "cacheCreationTokens": 5, "outputTokens": 10,
+                    "thinkingTokens": 2,
+                },
+            }), encoding="utf-8")
+
+            items = droid.discover({"config": {"data_root": str(root)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                droid.parse(items[0]), model="droid-auto",
+                prompt=125, completion=10, cache=20, total=135,
+                project="demo", session_id="session")
+
+    def test_trae_cli_selects_primary_trace_spans(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "session-1"
+            root.mkdir()
+            (root / "session.json").write_text(json.dumps({
+                "metadata": {"cwd": "/work/trae-demo", "model_name": "fallback"},
+            }), encoding="utf-8")
+            (root / "traces.jsonl").write_text(json.dumps({
+                "startTime": 1789916400000,
+                "tags": [
+                    {"key": "span.category", "value": "model.stream.eino"},
+                    {"key": "model.name", "value": "trae-model"},
+                    {"key": "usage.input_tokens", "value": 100},
+                    {"key": "usage.output_tokens", "value": 10},
+                    {"key": "usage.cache_read_tokens", "value": 20},
+                    {"key": "usage.reasoning_tokens", "value": 2},
+                ],
+            }) + "\n", encoding="utf-8")
+
+            items = trae_cli.discover({"config": {"data_root": str(root.parent)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                trae_cli.parse(items[0]), model="trae-model",
+                prompt=120, completion=12, cache=20, total=132,
+                project="trae-demo", session_id="session-1")
+
+    def test_mimocode_reads_assistant_message_and_cache_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "mimocode.db"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT)")
+            conn.execute("CREATE TABLE message (session_id TEXT, time_created TEXT, data TEXT)")
+            conn.execute("INSERT INTO session VALUES ('s1', '/work/mimo-demo')")
+            conn.execute("INSERT INTO message VALUES ('s1', ?, ?)", (
+                "2026-09-20T15:00:00Z", json.dumps({
+                    "role": "assistant", "modelID": "mimo-model",
+                    "time": {"created": "2026-09-20T15:00:00Z"},
+                    "tokens": {"input": 100, "output": 10,
+                               "reasoning": 2,
+                               "cache": {"read": 20, "write": 5}},
+                })))
+            conn.commit()
+            conn.close()
+
+            items = mimocode.discover({"config": {"data_root": str(db)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                mimocode.parse(items[0]), model="mimo-model",
+                prompt=125, completion=12, cache=20, total=137,
+                project="mimo-demo", session_id="s1")
+
+    def test_roo_code_reads_indexed_task_api_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = root / "tasks" / "task-1"
+            tasks.mkdir(parents=True)
+            (root / "tasks" / "_index.json").write_text(json.dumps({
+                "entries": [{"id": "task-1", "workspace": "/work/roo-demo",
+                             "apiConfigName": "roo-default"}],
+            }), encoding="utf-8")
+            (tasks / "ui_messages.json").write_text(json.dumps([
+                {"type": "say", "say": "api_req_started",
+                 "ts": 1789916400000,
+                 "text": json.dumps({
+                     "model": "roo-model", "tokensIn": 100,
+                     "cacheWrites": 5, "cacheReads": 20, "tokensOut": 8,
+                 })},
+            ]), encoding="utf-8")
+
+            items = roo_code.discover({"config": {"data_root": str(root)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                roo_code.parse(items[0]), model="roo-model",
+                prompt=125, completion=8, cache=20, total=133,
+                project="roo-demo", session_id="task-1")
+
+    def test_zcode_reads_sqlite_message_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "db.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT)")
+            conn.execute("CREATE TABLE message (session_id TEXT, time_created TEXT, data TEXT)")
+            conn.execute("INSERT INTO session VALUES ('z1', '/work/zcode-demo')")
+            conn.execute("INSERT INTO message VALUES ('z1', ?, ?)", (
+                "2026-09-20T15:00:00Z", json.dumps({
+                    "role": "assistant", "modelId": "zcode-model",
+                    "tokens": {"input": 100, "output": 10,
+                               "reasoning": 2,
+                               "cache": {"read": 20, "write": 5}},
+                    "path": {"root": "/work/zcode-demo"},
+                })))
+            conn.commit()
+            conn.close()
+
+            items = zcode.discover({"config": {"data_root": str(db)}})
+            self.assertEqual(len(items), 1)
+            self.assert_one_event(
+                zcode.parse(items[0]), model="zcode-model",
+                prompt=105, completion=10, cache=20, total=115,
+                project="zcode-demo", session_id="z1")
 
     def test_claude_reads_cache_hits_and_applies_reference_fast_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1163,6 +1493,36 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual(ev_cli.prompt_tokens, 800)
             self.assertEqual(ev_cli.cache_read_tokens, 200)
             self.assertEqual(ev_cli.completion_tokens, 50)
+
+    def test_qoder_path_environment_uses_canonical_names_with_legacy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            primary_projects = Path(directory) / "primary-projects"
+            legacy_projects = Path(directory) / "legacy-projects"
+            primary_db = Path(directory) / "primary.db"
+            legacy_db = Path(directory) / "legacy.db"
+            with patch.dict(os.environ, {
+                "QODER_PROJECTS_DIR": str(primary_projects),
+                "VIBE_USAGE_QODER_PROJECTS": str(legacy_projects),
+                "QODER_DB_PATH": str(primary_db),
+                "VIBE_USAGE_QODER_DB": str(legacy_db),
+                "QODERCN_PROJECTS_DIR": str(primary_projects),
+                "VIBE_USAGE_QODER_CN_PROJECTS": str(legacy_projects),
+                "QODERCN_DB_PATH": str(primary_db),
+                "VIBE_USAGE_QODER_CN_DB": str(legacy_db),
+            }):
+                self.assertEqual(qoder.get_qoder_projects_dir(), primary_projects)
+                self.assertEqual(qoder.get_qoder_db_path(), primary_db)
+                self.assertEqual(qoder.get_qoder_projects_dir("qoder-cn"), primary_projects)
+                self.assertEqual(qoder.get_qoder_db_path("qoder-cn"), primary_db)
+
+            with patch.dict(os.environ, {
+                "QODER_PROJECTS_DIR": "",
+                "VIBE_USAGE_QODER_PROJECTS": str(legacy_projects),
+                "QODER_DB_PATH": "",
+                "VIBE_USAGE_QODER_DB": str(legacy_db),
+            }):
+                self.assertEqual(qoder.get_qoder_projects_dir(), legacy_projects)
+                self.assertEqual(qoder.get_qoder_db_path(), legacy_db)
 
     def test_devin_schema_guard_and_snapshot_parsing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

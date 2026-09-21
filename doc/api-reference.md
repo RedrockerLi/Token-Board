@@ -37,7 +37,7 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/proxy/agent-usage/import` | POST | 非阻塞唤醒服务器内置 Agent 用量 worker；网页每次加载时调用一次，返回 202 |
+| `/api/proxy/agent-usage/import` | POST | 通过本地 Unix socket 非阻塞唤醒 `token-maintenance` 的 Agent 用量 worker；网页每次加载时调用一次，返回 202 |
 
 ### 智能体管理
 

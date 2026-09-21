@@ -108,12 +108,6 @@ public:
     };
     bool load_routing_config(RoutingConfig &config);
     std::uint64_t routing_config_generation();
-    TimeoutConfig get_timeout_config(const std::string &app_type);
-    struct AggregateEntry {
-        std::string pattern;
-        int upstream_account_id = 0;
-        std::string upstream_model;
-    };
     struct AttemptInfo {
         int account_id = 0;
         int upstream_id = 0;

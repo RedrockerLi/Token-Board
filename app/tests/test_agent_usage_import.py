@@ -1,4 +1,4 @@
-"""服务器内置 Agent 用量导入的端到端与调度测试。
+"""token-maintenance Agent 用量导入的端到端与调度测试。
 
 覆盖:单次导入、幂等、服务器 worker 启动/定时/浏览器唤醒与停止。
 """
@@ -372,26 +372,23 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         self.assertEqual(len(states), 2)
         self.assertEqual(self._codex_rows(), 4)
 
-    def test_browser_endpoint_wakes_server_owned_worker(self) -> None:
+    def test_browser_endpoint_wakes_maintenance_owned_worker(self) -> None:
+        import socket
+
         from app import create_app
-
-        class FakeWorker:
-            def __init__(self):
-                self.calls = 0
-
-            def trigger(self):
-                self.calls += 1
-                return True
 
         app = create_app(str(self.proxy_path), testing=True,
                          start_background_tasks=False)
-        worker = FakeWorker()
-        app.config["AGENT_USAGE_IMPORT_WORKER"] = worker
-
-        response = app.test_client().post("/api/proxy/agent-usage/import")
+        with patch("app.services.runtime_tasks.socket.socket") as factory:
+            response = app.test_client().post("/api/proxy/agent-usage/import")
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json(), {"status": "scheduled"})
-        self.assertEqual(worker.calls, 1)
+        factory.assert_called_once_with(socket.AF_UNIX, socket.SOCK_DGRAM)
+        client = factory.return_value.__enter__.return_value
+        client.settimeout.assert_called_once_with(0.2)
+        client.sendto.assert_called_once_with(
+            b"IMPORT", app.config["MAINTENANCE_SOCKET"])
+        self.assertNotIn("AGENT_USAGE_IMPORT_WORKER", app.config)
         self.assertEqual(
             app.test_client().get("/api/proxy/agent-usage/import").status_code,
             405,
@@ -413,10 +410,18 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         self.assertEqual(app.config["DATA_STORE"].schema_dir,
                          str(schema_root.resolve()))
 
+    def test_testing_app_does_not_start_maintenance_workers(self) -> None:
+        from app import create_app
+
+        app = create_app(str(self.proxy_path), testing=True,
+                         start_background_tasks=True)
+        self.assertNotIn("AGENT_USAGE_IMPORT_WORKER", app.config)
+        self.assertNotIn("BACKGROUND_TASK_THREADS", app.config)
+
     def test_server_lifecycle_imports_on_start_and_browser_open(self) -> None:
         from app import create_app
         from app.db.proxy_db import ProxyDatabase
-        from app.services.runtime_tasks import stop_runtime_tasks
+        from maintenance import MaintenanceService
 
         database = ProxyDatabase(str(self.proxy_path))
         self._create_software(database)
@@ -433,13 +438,20 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                 time.sleep(0.01)
             return self._codex_rows() == expected
 
-        with patch("app.services.fx.ensure_rate"), patch(
-                "app.services.runtime_tasks.materialize_period_charges"):
+        socket_path = self.root / "data" / "token-maintenance.sock"
+        health_path = self.root / "data" / "token-maintenance-health.json"
+        service = MaintenanceService(
+            str(self.proxy_path), str(self.root / "schema"),
+            str(socket_path), str(health_path))
+        with patch("maintenance.fx.ensure_rate"), patch(
+                "maintenance.materialize_all_period_charges"):
+            service.start()
             app = create_app(str(self.proxy_path), testing=True,
-                             start_background_tasks=True)
+                             start_background_tasks=False,
+                             schema_dir=str(self.root / "schema"))
             try:
                 self.assertTrue(wait_for_rows(2),
-                                "server startup did not import usage")
+                                "maintenance startup did not import usage")
                 extra = json.dumps({
                     "type": "event_msg",
                     "timestamp": "2026-08-13T01:02:00.000Z",
@@ -457,9 +469,9 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                     "/api/proxy/agent-usage/import")
                 self.assertEqual(response.status_code, 202)
                 self.assertTrue(wait_for_rows(3),
-                                "browser open did not trigger another import")
+                                "maintenance socket did not trigger another import")
             finally:
-                stop_runtime_tasks(app)
+                service.stop()
 
 
 class AgentUsageWorkerTest(unittest.TestCase):

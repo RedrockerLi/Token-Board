@@ -38,8 +38,10 @@ QODER_CONFIG = {
         "cli_env": "QODER_CONFIG_DIR",
         "ide_dir_name": "Qoder",
         "ide_home_env": "QODER_HOME",
-        "test_projects_env": "VIBE_USAGE_QODER_PROJECTS",
-        "test_db_env": "VIBE_USAGE_QODER_DB",
+        "projects_env": "QODER_PROJECTS_DIR",
+        "db_env": "QODER_DB_PATH",
+        "legacy_projects_env": "VIBE_USAGE_QODER_PROJECTS",
+        "legacy_db_env": "VIBE_USAGE_QODER_DB",
         "default_cli_path": Path.home() / ".qoder" / "projects",
     },
     "qoder-cn": {
@@ -49,13 +51,21 @@ QODER_CONFIG = {
         "cli_env": "QODERCN_CONFIG_DIR",
         "ide_dir_name": "QoderCN",
         "ide_home_env": "QODER_CN_HOME",
-        "test_projects_env": "VIBE_USAGE_QODER_CN_PROJECTS",
-        "test_db_env": "VIBE_USAGE_QODER_CN_DB",
+        "projects_env": "QODERCN_PROJECTS_DIR",
+        "db_env": "QODERCN_DB_PATH",
+        "legacy_projects_env": "VIBE_USAGE_QODER_CN_PROJECTS",
+        "legacy_db_env": "VIBE_USAGE_QODER_CN_DB",
         "default_cli_path": Path.home() / ".qoder-cn" / "projects",
     },
 }
 
 IDE_DB_RELATIVE = Path("SharedClientCache") / "cache" / "db" / "local.db"
+
+
+def _env_path(cfg: dict, primary: str, legacy: str) -> str:
+    """Read the canonical path variable, then the pre-rename alias."""
+    return (os.environ.get(cfg[primary], "").strip()
+            or os.environ.get(cfg[legacy], "").strip())
 
 
 def normalize_qoder_model(key: Any) -> str:
@@ -74,9 +84,9 @@ def get_qoder_projects_dir(edition: str = "qoder", software: dict | None = None)
             if root.name == "projects" or not (root / "projects").is_dir():
                 return root
             return root / "projects"
-    test_env = os.environ.get(cfg["test_projects_env"], "").strip()
-    if test_env:
-        return Path(test_env).expanduser()
+    configured = _env_path(cfg, "projects_env", "legacy_projects_env")
+    if configured:
+        return Path(configured).expanduser()
     cli_env = os.environ.get(cfg["cli_env"], "").strip()
     if cli_env:
         return Path(cli_env).expanduser() / "projects"
@@ -85,9 +95,9 @@ def get_qoder_projects_dir(edition: str = "qoder", software: dict | None = None)
 
 def get_qoder_db_path(edition: str = "qoder") -> Path:
     cfg = QODER_CONFIG[edition]
-    test_env = os.environ.get(cfg["test_db_env"], "").strip()
-    if test_env:
-        return Path(test_env).expanduser()
+    configured = _env_path(cfg, "db_env", "legacy_db_env")
+    if configured:
+        return Path(configured).expanduser()
     ide_home = os.environ.get(cfg["ide_home_env"], "").strip()
     if ide_home:
         return Path(ide_home).expanduser() / "cache" / "db" / "local.db"

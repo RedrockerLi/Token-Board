@@ -39,7 +39,6 @@ from app.services.sync.state import (
 from app.services.sync.storage import safe_copy_db
 from app.services.sync.dashboard_user_delete import (
     _DASHBOARD_TRANSACTION_LOCK,
-    delete_dashboard_users,
 )
 
 

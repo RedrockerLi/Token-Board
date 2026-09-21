@@ -2,7 +2,7 @@
 
 from app.core.time import billing_period, utc_now
 from app.db.proxy.agent_subscription_helpers import (
-    _iso_start, _json_object, _number, _reject_legacy_agent_fields,
+    _iso_start, _number, _reject_legacy_agent_fields,
 )
 from app.db.proxy.common import (
     _billing_period_month, _next_month, _parse_iso_date, _period_start,

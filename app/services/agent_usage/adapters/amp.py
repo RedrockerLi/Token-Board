@@ -1,6 +1,5 @@
 """Amp thread JSON adapter."""
 
-import json
 import os
 from pathlib import Path
 

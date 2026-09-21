@@ -2,7 +2,7 @@
 
 from app.core.time import utc_now
 from app.db.proxy.common import (
-    _parse_iso_date, _subscription_date, billing_period, ConflictError,
+    _parse_iso_date, _subscription_date, ConflictError,
     mask_key, sqlite3, uuid,
 )
 from app.domain.account_template import AccountTemplate, AccountTemplateAdapter

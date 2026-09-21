@@ -160,7 +160,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$SCRIPT_DIR
 Environment="PYTHONPATH=$SCRIPT_DIR"
-ExecStart="$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1 --port $PROXY_PORT
+ExecStart="$PROXY_BIN" --db "$TOKEN_BOARD_DB" --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
 TimeoutStopSec=15
@@ -308,7 +308,7 @@ PY
 }
 
 launch_fallback_proxy() {
-    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" \
+    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" \
         --host 127.0.0.1 --port "$PROXY_PORT" >/dev/null 2>&1 &
     PROXY_PID=$!
     printf '%s\n' "$PROXY_PID" > "$PROXY_PID_FILE"

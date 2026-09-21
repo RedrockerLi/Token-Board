@@ -2,7 +2,8 @@
 
 from app.core.time import utc_now
 from app.db.proxy.common import json, sqlite3, uuid
-from app.db.proxy.agent_subscriptions import ProxySubscriptionMixin, _json_object
+from app.db.proxy.agent_subscription_helpers import _json_object
+from app.db.proxy.agent_subscriptions import ProxySubscriptionMixin
 from app.services.agent_usage.registry import AGENT_TYPES
 
 

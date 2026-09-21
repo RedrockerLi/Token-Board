@@ -8,10 +8,6 @@ import threading
 import time
 from collections.abc import Callable
 
-from app.db.proxy.billing import (
-    materialize_all_period_charges,
-    materialize_period_charges,  # public compatibility hook for integrations/tests
-)
 from app.core.time import format_utc, utc_now
 
 log = logging.getLogger(__name__)
@@ -137,62 +133,6 @@ class AgentUsageImportWorker:
                 "agent-usage-importer", "stopped")
 
 
-def start_runtime_tasks(flask_app, proxy_db, token_board_db_path: str) -> None:
-    """Compatibility helper for embedded/test apps.
-
-    Production uses ``maintenance.py`` plus ``start_dashboard_tasks``; this
-    all-in-one path is retained only for integrations that explicitly request
-    in-process background tasks.
-    """
-    if flask_app.config.get("BACKGROUND_TASKS_STARTED"):
-        return
-    flask_app.config["BACKGROUND_TASKS_STARTED"] = True
-
-    from app.services import fx
-    from app.services.agent_usage.importer import import_once
-
-    def prewarm_fx() -> None:
-        conn = proxy_db._connect()
-        try:
-            failures = []
-            fx.ensure_rate(conn, on_error=failures.append)
-            if failures:
-                raise RuntimeError(
-                    f"FX refresh failed: {type(failures[0]).__name__}: {failures[0]}")
-        finally:
-            conn.close()
-
-    health = flask_app.config.setdefault("BACKGROUND_TASK_HEALTH", {})
-    health_lock = flask_app.config.setdefault(
-        "BACKGROUND_TASK_HEALTH_LOCK", threading.Lock())
-    threads = flask_app.config.setdefault("BACKGROUND_TASK_THREADS", [])
-    workers = [
-        ("fx-prewarm", 86400, prewarm_fx),
-        ("deletion-finalizer", 60, proxy_db.finalize_deferred_deletions),
-        ("billing-materializer", 60,
-         lambda: materialize_all_period_charges(token_board_db_path)),
-    ]
-    for name, interval, action in workers:
-        stop = threading.Event()
-        flask_app.config[f"{name.upper().replace('-', '_')}_STOP"] = stop
-        thread = threading.Thread(
-            target=_periodic,
-            args=(stop, interval, name, action, health, health_lock),
-            daemon=True, name=name)
-        threads.append(thread)
-        thread.start()
-
-    importer = AgentUsageImportWorker(
-        lambda: import_once(proxy_db, stop_event=importer.stop_event),
-        interval=AGENT_USAGE_IMPORT_INTERVAL_SECONDS,
-        health=health,
-        health_lock=health_lock,
-    )
-    flask_app.config["AGENT_USAGE_IMPORT_WORKER"] = importer
-    threads.append(importer.thread)
-    importer.start()
-
-
 def start_dashboard_tasks(flask_app, proxy_db) -> None:
     """Start only the config-mutating dashboard finalizer.
 
@@ -223,38 +163,16 @@ def start_dashboard_tasks(flask_app, proxy_db) -> None:
 def trigger_agent_usage_import(flask_app) -> bool:
     """Wake the standalone importer after a dashboard is opened."""
     socket_path = flask_app.config.get("MAINTENANCE_SOCKET")
-    if socket_path:
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
-                client.settimeout(0.2)
-                client.sendto(b"IMPORT", socket_path)
-            return True
-        except (OSError, socket.timeout):
-            # Testing/embedded apps may intentionally retain the old worker;
-            # production has no fallback worker and returns False below.
-            log.debug("maintenance importer socket is unavailable: %s", socket_path)
-    worker = flask_app.config.get("AGENT_USAGE_IMPORT_WORKER")
-    return bool(worker and worker.trigger())
-
-
-def stop_runtime_tasks(flask_app, join_timeout: float = 2.0) -> None:
-    """Request a clean stop for all app-owned workers.
-
-    The factory keeps worker handles in config so tests and controlled
-    shutdowns can stop background work without leaving importer/materializer
-    threads attached to a discarded Flask app.
-    """
-    importer = flask_app.config.get("AGENT_USAGE_IMPORT_WORKER")
-    if importer is not None:
-        importer.stop()
-    for key, value in flask_app.config.items():
-        if key.endswith("_STOP") and isinstance(value, threading.Event):
-            value.set()
-    all_stopped = True
-    for thread in flask_app.config.get("BACKGROUND_TASK_THREADS", []):
-        thread.join(timeout=join_timeout)
-        all_stopped = all_stopped and not thread.is_alive()
-    flask_app.config["BACKGROUND_TASKS_STARTED"] = not all_stopped
+    if not socket_path:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.settimeout(0.2)
+            client.sendto(b"IMPORT", socket_path)
+        return True
+    except (OSError, socket.timeout):
+        log.debug("maintenance importer socket is unavailable: %s", socket_path)
+        return False
 
 
 def stop_dashboard_tasks(flask_app, join_timeout: float = 2.0) -> None:

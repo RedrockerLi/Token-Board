@@ -44,6 +44,21 @@ class StartupContractTest(unittest.TestCase):
         self.assertIn('databases_are_current()', self.script)
         self.assertIn('本地数据库已是最新版，跳过完整升级', self.script)
 
+    def test_proxy_launch_commands_match_cpp_runtime_cli(self) -> None:
+        for name, content in (
+                ("start.sh", self.script),
+                ("scripts/start-proxy.sh", self.proxy_script)):
+            commands = [
+                line.strip() for line in content.splitlines()
+                if "$PROXY_BIN" in line
+            ]
+            self.assertTrue(commands, name)
+            self.assertFalse(
+                any("--schema-dir" in line for line in commands),
+                f"{name} passes Python-only --schema-dir to token_proxy:\n"
+                + "\n".join(commands),
+            )
+
     def test_debug_mode_is_foreground_and_restores_active_service(self) -> None:
         result = subprocess.run(
             ["bash", "-n", str(self.root / "scripts/start-proxy.sh")],

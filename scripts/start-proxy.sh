@@ -67,7 +67,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$SCRIPT_DIR
 Environment=PYTHONPATH=$SCRIPT_DIR
-ExecStart=$PROXY_BIN --db $TOKEN_BOARD_DB --schema-dir $SCHEMA_DIR --host 127.0.0.1 --port $PROXY_PORT
+ExecStart=$PROXY_BIN --db $TOKEN_BOARD_DB --host 127.0.0.1 --port $PROXY_PORT
 Restart=always
 RestartSec=5
 # Keep info/debug out of the persistent journal; warnings/errors remain there.
@@ -111,7 +111,7 @@ do_start() {
     echo "  数据库: $TOKEN_BOARD_DB"
     echo "  按 Ctrl+C 停止"
     echo ""
-    exec "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --host 127.0.0.1 --port "$PROXY_PORT"
+    exec "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --host 127.0.0.1 --port "$PROXY_PORT"
 }
 
 do_debug() {
@@ -140,7 +140,7 @@ do_debug() {
     fi
 
     echo "详细日志直接输出到当前终端；按 Ctrl+C 退出并恢复原服务状态。"
-    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" \
+    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" \
         --host 127.0.0.1 --port "$PROXY_PORT" --log-level debug
 }
 
@@ -156,7 +156,7 @@ do_daemon() {
     fi
 
     echo -e "${CYAN}启动代理 (后台)...${NC}"
-    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --schema-dir "$SCHEMA_DIR" --port "$PROXY_PORT" &
+    "$PROXY_BIN" --db "$TOKEN_BOARD_DB" --port "$PROXY_PORT" &
     PROXY_PID=$!
     echo -e "${GREEN}✓ 代理已启动 (PID: $PROXY_PID)${NC}"
     echo "  代理地址: http://localhost:$PROXY_PORT/v1"

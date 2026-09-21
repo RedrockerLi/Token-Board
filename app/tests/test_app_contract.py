@@ -351,7 +351,7 @@ class AppContractTest(AppDatabaseTestCase):
                          "sync upload degraded: conflict")
         self.assertEqual(degraded["background_health"], "degraded")
 
-        from app.services.runtime_tasks import stop_runtime_tasks
+        from app.services.runtime_tasks import stop_dashboard_tasks
         stop = threading.Event()
         finished = threading.Event()
 
@@ -361,9 +361,9 @@ class AppContractTest(AppDatabaseTestCase):
 
         thread = threading.Thread(target=worker)
         thread.start()
-        app.config["TEST_STOP"] = stop
-        app.config["BACKGROUND_TASK_THREADS"] = [thread]
-        stop_runtime_tasks(app, join_timeout=1.0)
+        app.config["DELETION_FINALIZER_STOP"] = stop
+        app.config["DASHBOARD_TASK_THREADS"] = [thread]
+        stop_dashboard_tasks(app, join_timeout=1.0)
         self.assertTrue(finished.wait(0.1))
         self.assertFalse(thread.is_alive())
 

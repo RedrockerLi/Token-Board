@@ -36,7 +36,7 @@ def archive_dashboard_users():
     data = request.get_json(silent=True) or {}
     user_ids = data.get("user_ids")
     import os as _os
-    from app.services.sync.dashboard_sync import delete_dashboard_users as _delete_users
+    from app.services.sync.dashboard_user_delete import delete_dashboard_users as _delete_users
 
     db_path = current_app.config["TOKEN_BOARD_DB"].db_path
     dash_db_path = _os.path.join(_os.path.dirname(db_path), "dashboard.db")
