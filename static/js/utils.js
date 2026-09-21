@@ -260,6 +260,7 @@ function esc(s) {
             optionElement.setAttribute('aria-disabled', String(disabled));
             optionElement.dataset.index = String(index);
             optionElement.textContent = optionLabel(option);
+            optionElement.title = optionLabel(option);
             optionElement.addEventListener('pointerdown', function (event) {
                 // Keep focus on the combobox while choosing with a pointer.
                 event.preventDefault();
@@ -312,6 +313,7 @@ function esc(s) {
             else instance.trigger.removeAttribute(attribute);
         });
         if (select.title) instance.trigger.title = select.title;
+        else if (selected) instance.trigger.title = label;
         else instance.trigger.removeAttribute('title');
 
         instance.wrapper.classList.toggle('themed-select--disabled', select.disabled);
@@ -351,13 +353,19 @@ function esc(s) {
         var openUp = below < 220 && above > below;
         var available = Math.max(96, (openUp ? above : below) - gap);
 
-        instance.menu.style.width = Math.max(1, width) + 'px';
+        instance.menu.style.minWidth = Math.max(1, width) + 'px';
+        instance.menu.style.width = 'max-content';
+        instance.menu.style.maxWidth = Math.min(640, window.innerWidth - viewportPadding * 2) + 'px';
         instance.menu.style.maxHeight = Math.min(320, available) + 'px';
         instance.menu.dataset.placement = openUp ? 'top' : 'bottom';
 
+        var menuWidth = Math.min(
+            Math.max(width, instance.menu.offsetWidth || 0),
+            window.innerWidth - viewportPadding * 2
+        );
         var left = Math.min(
             Math.max(viewportPadding, rect.left),
-            Math.max(viewportPadding, window.innerWidth - width - viewportPadding)
+            Math.max(viewportPadding, window.innerWidth - menuWidth - viewportPadding)
         );
         var height = instance.menu.offsetHeight;
         var top = openUp ? rect.top - height - gap : rect.bottom + gap;
@@ -473,6 +481,13 @@ function esc(s) {
         wrapper.className = 'themed-select';
         if (select.classList.contains('select-styled')) wrapper.classList.add('select-styled');
         if (select.id === 'keyNameSelector') wrapper.classList.add('themed-select--key-name');
+        if (select.classList && select.classList.length) {
+            select.classList.forEach(function (cls) {
+                if (cls && !cls.startsWith('themed-select')) {
+                    wrapper.classList.add('themed-select--' + cls);
+                }
+            });
+        }
         if (select.style.width) wrapper.style.width = select.style.width;
 
         trigger.type = 'button';

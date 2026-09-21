@@ -974,14 +974,16 @@ function aggRow(pattern, accountId, accountName, upstreamModel) {
         ? aggAccountsCache.map(a =>
             `<option value="${a.id}" ${a.id === accountId ? 'selected' : ''}>${esc(a.name)}</option>`).join('')
         : `<option value="${accountId || ''}">${esc(accountName || '加载中...')}</option>`;
-    return `<div class="map-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
-        <input value="${esc(pattern||'')}" placeholder="模型名称" title="精确模型名；同一模型可配多行（多上游账户），按顺序依次使用" style="flex:1;font-size:12px;padding:4px 8px;border:1px solid var(--color-border);border-radius:4px;">
-        <span style="color:var(--color-text-tertiary);">→</span>
-        <select class="agg-acct" onchange="resetAggModel(this)">${accountOpts}</select>
-        <select class="agg-model" onfocus="loadAggModels(this)"><option value="${esc(upstreamModel||'')}">${esc(upstreamModel||'点击获取模型')}</option></select>
-        <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'up')" title="上移">▲</button>
-        <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'down')" title="下移">▼</button>
-        <button type="button" class="btn btn--sm" onclick="this.parentElement.remove()" style="color:var(--color-danger);">✕</button>
+    return `<div class="map-row">
+        <input class="agg-pattern" value="${esc(pattern||'')}" placeholder="模型名称" title="精确模型名；同一模型可配多行（多上游账户），按顺序依次使用">
+        <span class="map-row__arrow">→</span>
+        <select class="agg-acct" title="${esc(accountName||'选择账户')}" onchange="resetAggModel(this)">${accountOpts}</select>
+        <select class="agg-model" title="${esc(upstreamModel||'点击获取模型')}" onfocus="loadAggModels(this)"><option value="${esc(upstreamModel||'')}">${esc(upstreamModel||'点击获取模型')}</option></select>
+        <div class="map-row__actions">
+            <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'up')" title="上移">▲</button>
+            <button type="button" class="btn btn--sm" onclick="moveAggRow(this, 'down')" title="下移">▼</button>
+            <button type="button" class="btn btn--sm" onclick="this.closest('.map-row').remove()" style="color:var(--color-danger);" title="删除">✕</button>
+        </div>
     </div>`;
 }
 
@@ -992,7 +994,8 @@ function addAggRow() {
 }
 
 function moveAggRow(btn, dir) {
-    const row = btn.parentElement;
+    const row = btn.closest('.map-row');
+    if (!row) return;
     if (dir === 'up' && row.previousElementSibling) {
         row.parentElement.insertBefore(row, row.previousElementSibling);
     } else if (dir === 'down' && row.nextElementSibling) {
@@ -1120,7 +1123,7 @@ function initAggregatesPage() {
             </table>
         </div>
         <div class="modal-overlay" id="aggregateModal" style="display:none">
-            <div class="modal" style="max-width:720px;">
+            <div class="modal modal--wide" style="width:min(100%, 880px); max-width:880px;">
                 <div class="modal__header">
                     <h3>聚合账户</h3>
                     <button class="modal__close" onclick="closeModal('aggregateModal')">&times;</button>
@@ -1171,7 +1174,7 @@ function addSlotRow(slot) {
         '<input type="time" class="slot-start" step="60" value="' + startVal + '">' +
         '<span style="color:var(--color-text-secondary);">至</span>' +
         '<input type="time" class="slot-end" step="60" value="' + endVal + '">' +
-        '<input type="number" class="slot-multiplier" step="0.05" min="0" value="' + multVal + '" style="width:70px;" placeholder="倍率">' +
+        '<input type="number" class="slot-multiplier" step="0.05" min="0" value="' + multVal + '" style="width:85px;" placeholder="倍率">' +
         '<button type="button" class="btn btn--sm" onclick="removeSlotRow(this)">×</button>';
     rows.appendChild(div);
 }
@@ -1237,7 +1240,7 @@ function addLengthTierRow(tier) {
     };
     const div = document.createElement('div');
     div.className = 'length-tier-row';
-    div.style.cssText = 'display:grid;grid-template-columns:minmax(80px,1fr) 58px repeat(3,minmax(64px,1fr)) auto;gap:6px;align-items:center;margin-bottom:6px;';
+    div.style.cssText = 'display:grid;grid-template-columns:minmax(110px,1.2fr) 68px repeat(3,minmax(90px,1fr)) auto;gap:8px;align-items:center;margin-bottom:6px;';
     div.innerHTML =
         '<input type="number" class="tier-threshold-value" min="0" step="any" value="' + parts.value + '" aria-label="输入长度数值" placeholder="例如 128">' +
         '<select class="tier-threshold-unit" aria-label="输入长度单位">' +
@@ -1644,7 +1647,7 @@ function initPricingPage() {
         </div>
         <p class="pricing-order-help" id="pricingOrderHelp"><span class="pricing-drag-grip" aria-hidden="true">⠿</span> 拖动左侧把手调整匹配优先级；也可聚焦把手后使用 ↑↓、Home、End 键。</p>
         <div class="modal-overlay" id="pricingModal" style="display:none">
-            <div class="modal">
+            <div class="modal modal--wide" style="width:min(100%, 820px); max-width:820px;">
                 <div class="modal__header">
                     <h3>模型定价</h3>
                     <button class="modal__close" onclick="closeModal('pricingModal')">&times;</button>
@@ -1664,7 +1667,7 @@ function initPricingPage() {
                         <div style="font-size:13px;color:var(--color-text-secondary);margin-bottom:6px;">
                             输入长度条件价（达到门槛后生效；留空字段继承基本价）
                         </div>
-                        <div style="display:grid;grid-template-columns:minmax(80px,1fr) 58px repeat(3,minmax(64px,1fr)) auto;gap:6px;color:var(--color-text-tertiary);font-size:12px;margin-bottom:5px;">
+                        <div style="display:grid;grid-template-columns:minmax(110px,1.2fr) 68px repeat(3,minmax(90px,1fr)) auto;gap:8px;color:var(--color-text-tertiary);font-size:12px;margin-bottom:5px;">
                             <span>门槛</span><span>单位</span><span>输入价</span><span>缓存价</span><span>输出价</span><span></span>
                         </div>
                         <div id="lengthTierRows"></div>
