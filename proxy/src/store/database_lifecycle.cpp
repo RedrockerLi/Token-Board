@@ -58,8 +58,7 @@ bool validate_v2_schema(sqlite3 *db, const std::string &path,
 
 }  // namespace
 
-bool Database::open(const std::string &path, const std::string &schema_dir) {
-    (void)schema_dir;
+bool Database::open(const std::string &path) {
     std::unique_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     if (write_db_ || read_db_ || pricing_db_) {
         TB_LOG_ERROR( "[DB] open called on an already-open database\n");
@@ -177,4 +176,5 @@ void Database::close() {
 //
 // Python app.db.schema_upgrade owns SQL migrations and data transitions.
 // The C++ runtime only validates the prepared Proxy V2 metadata before it
-// starts serving requests; schema_dir is intentionally not consulted here.
+// starts serving requests; schema preparation is intentionally not performed
+// here.

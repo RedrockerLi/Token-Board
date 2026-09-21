@@ -13,9 +13,6 @@ using json = nlohmann::json;
 /// If so, we should NOT strip <think> tags — the provider is doing it right.
 bool has_reasoning_field(const json &message);
 
-/// Strip <think>...</think> tags (and trailing whitespace) from a string.
-std::string strip_think_tags(const std::string &text);
-
 /// Sanitize a single message object: strip think tags from content
 /// iff no reasoning field is already populated.
 void sanitize_message(json &msg);

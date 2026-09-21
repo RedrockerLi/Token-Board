@@ -116,9 +116,6 @@ void record_responses_state(ProxyServer &server, const json &request_body,
                             const std::vector<json> *current_input = nullptr);
 bool expand_responses_state(ProxyServer &server, CodecRegistry &codecs,
                             RequestContext &context, std::string &error);
-bool target_supports_request(ir::ApiFormat target, ir::ApiFormat harness,
-                             const ir::ChatRequest &request,
-                             std::string &reason);
 struct RequestFeatureFailure {
     std::string feature;
     std::string reason;
@@ -177,11 +174,3 @@ bool client_disconnected(const httplib::Request &request,
                          std::uint64_t inflight_id,
                          const std::string &model);
 bool client_socket_gone(int socket);
-UpstreamClient::ForwardResult forward_once(
-    UpstreamClient &upstream, const std::string &body,
-    const std::string &content_type, const UpstreamCandidate &candidate,
-    const UpstreamTarget &target, int client_socket);
-Database::AttemptInfo attempt_info(
-    const UpstreamCandidate &candidate,
-    const UpstreamClient::ForwardResult &result,
-    int semantic_ttft_ms = -1);

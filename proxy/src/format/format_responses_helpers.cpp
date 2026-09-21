@@ -23,15 +23,6 @@ bool responses_request_key_consumed(const std::string &key) {
     return false;
 }
 
-json parse_responses_arguments(const std::string &arguments) {
-    try {
-        json value = json::parse(arguments);
-        return value.is_object() ? value : json::object();
-    } catch (...) {
-        return json::object();
-    }
-}
-
 void parse_responses_content(const json &content,
                              std::vector<ContentBlock> &output) {
     if (content.is_string()) {

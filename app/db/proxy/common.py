@@ -30,11 +30,9 @@ from app.domain.account_types import (
     ACCOUNT_TYPES,
     deletion_policy,
     holds_keys as type_holds_keys,
-    import_types,
     is_routable,
     is_subscription,
     spec,
-    subscription_types,
 )
 
 
@@ -142,8 +140,7 @@ __all__ = [
     "monthrange", "date", "datetime", "timedelta", "timezone", "UTC",
     "as_utc", "billing_period", "format_utc", "ACCOUNT_TYPES",
     "deletion_policy", "type_holds_keys",
-    "import_types", "is_routable", "is_subscription", "spec",
-    "subscription_types", "_generate_key", "mask_key",
+    "is_routable", "is_subscription", "spec", "_generate_key", "mask_key",
     "_parse_iso_date", "_period_start",
     "_previous_month", "_next_month", "_billing_period_month",
     "_iter_months", "_cancellation_end",

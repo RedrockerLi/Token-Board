@@ -155,8 +155,8 @@ def main() -> None:
 
         proxy_port = free_port()
         env = {**os.environ, "TB_COOLDOWN_PROBE_SECS": "2"}
-        command = [str(proxy_binary), "--db", str(db_path), "--schema-dir",
-                   str(schema_dir), "--host", "127.0.0.1", "--port", str(proxy_port)]
+        command = [str(proxy_binary), "--db", str(db_path), "--host",
+                   "127.0.0.1", "--port", str(proxy_port)]
         if os.environ.get("TB_TEST_DEBUG"):
             command.extend(["--log-level", "debug"])
         proxy = subprocess.Popen(

@@ -1,7 +1,7 @@
 """The single live-resource lifecycle module for Token-Board V2."""
 
 from app.core.time import parse_runtime_timestamp, utc_now
-from app.db.proxy.common import _cancellation_end, _parse_iso_date, sqlite3, uuid
+from app.db.proxy.common import _cancellation_end, _parse_iso_date, uuid
 
 
 class ProxyLifecycleMixin:
@@ -253,12 +253,16 @@ class ProxyLifecycleMixin:
     def create_aggregate(self, data: dict) -> int:
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             aggregate_id = self._next_shared_id(conn)
             conn.execute("INSERT INTO route_sets(id,uuid,name,account_id) VALUES(?,?,?,NULL)",
                          (aggregate_id, str(uuid.uuid4()), data["name"]))
             self._replace_v1_aggregate_rules(conn, aggregate_id, data.get("entries", []))
             conn.commit()
             return aggregate_id
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

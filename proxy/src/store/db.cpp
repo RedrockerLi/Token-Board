@@ -1,6 +1,5 @@
 #include "db.h"
 #include "json.hpp"
-#include "core/account_types.h"
 
 #include <algorithm>
 #include <array>

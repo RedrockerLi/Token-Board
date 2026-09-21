@@ -101,15 +101,6 @@ def _session_candidates(root: Path) -> list[tuple[Path, int]]:
     ]
 
 
-def _session_files(root: Path) -> list[Path]:
-    """Return the selected canonical session paths.
-
-    Keep this small compatibility helper separate from the version-aware
-    candidate list; a few callers and fixtures use it for discovery checks.
-    """
-    return [path for path, _ in _session_candidates(root)]
-
-
 def _logical_session_key(path: Path) -> str:
     """Read the header id when possible; fall back to the directory name."""
     try:

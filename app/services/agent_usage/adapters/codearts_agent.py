@@ -8,7 +8,6 @@ from pathlib import Path
 from ..common import (
     batch,
     config_value,
-    configured_root,
     make_event,
     project_name,
     safe_int,

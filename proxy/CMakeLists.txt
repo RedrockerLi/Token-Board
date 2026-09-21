@@ -40,7 +40,7 @@ set(STORE_SOURCES
     src/store/db.cpp src/store/database_lifecycle.cpp
     src/store/database_statements.cpp src/store/routing_repository.cpp
     src/store/pricing_repository.cpp src/store/durable_spool.cpp
-    src/store/usage_writer.cpp src/store/database_catalog.cpp
+    src/store/usage_writer.cpp
     src/store/usage_recorder.cpp)
 
 set(RUNTIME_SOURCES

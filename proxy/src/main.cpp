@@ -82,6 +82,7 @@ int main(int argc, char *argv[]) {
 
     // ── Configure httplib server ──────────────────────────────────────
     httplib::Server server;
+    server.set_payload_max_length(32u * 1024u * 1024u);
 
     // Start at 2× logical CPUs (bounded to 8..64) and grow on enqueue. A bounded ceiling
     // prevents a stalled provider from turning queued requests into thousands
@@ -99,13 +100,15 @@ int main(int argc, char *argv[]) {
         const auto parsed = std::strtoull(configured, nullptr, 10);
         if (parsed > 0) task_queue_max = std::min<std::size_t>(parsed, 1'000'000);
     }
-    auto *pool = new SemaphorePool(initial_workers, max_workers, task_queue_max);
-    server.new_task_queue = [pool] { return pool; };
-    proxy_server.set_queue_metrics_provider([pool] {
+    SemaphorePool pool(initial_workers, max_workers, task_queue_max);
+    server.new_task_queue = [&pool] {
+        return new NonOwningTaskQueueProxy(pool);
+    };
+    proxy_server.set_queue_metrics_provider([&pool] {
         return ProxyServer::QueueMetrics{
-            pool->queued(), pool->active(), pool->size(), pool->rejected(),
-            pool->queue_average_ms(), pool->queue_p95_ms(),
-            pool->queue_oldest_age_ms()};
+            pool.queued(), pool.active(), pool.size(), pool.rejected(),
+            pool.queue_average_ms(), pool.queue_p95_ms(),
+            pool.queue_oldest_age_ms()};
     });
     server.task_queue_rejection_handler = [&proxy_server](socket_t sock) {
         ProxyLogContext log_context;
@@ -237,6 +240,7 @@ int main(int argc, char *argv[]) {
     printf("\nShutting down...\n");
     server.stop();
     server_thread.join();
+    pool.shutdown();
 
     // Drain and join the accounting thread before closing the DB it writes to.
     proxy_server.shutdown();

@@ -31,15 +31,6 @@ std::string to_string(ApiFormat f) {
     return "openai";
 }
 
-json merge_preserving(const json &extras, const json &generated) {
-    json out = extras.is_object() ? extras : json::object();
-    if (generated.is_object()) {
-        for (auto it = generated.begin(); it != generated.end(); ++it)
-            out[it.key()] = it.value();
-    }
-    return out;
-}
-
 void usage_merge(Usage &dst, const Usage &src) {
     dst.prompt_tokens = src.prompt_tokens;
     dst.completion_tokens = src.completion_tokens;

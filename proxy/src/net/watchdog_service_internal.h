@@ -84,7 +84,7 @@ private:
     std::thread worker_;
 };
 
-}  // namespace
+}  // namespace tb_transport
 
 inline bool is_usage_limit_error(const std::string &body) {
     if (body.empty()) return false;

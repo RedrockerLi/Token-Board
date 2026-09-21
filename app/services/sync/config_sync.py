@@ -22,7 +22,7 @@ from app.db.migrations import TOKEN_BOARD_DATABASE_NAME, schema_dir_for
 from app.services.sync.common import RUNTIME_TABLE_DELETE_ORDER
 from app.services.sync.config_merge import merge_config_tables, sanitize_upload_columns
 from app.services.sync.settings import SyncConfig, load_sync_config
-from app.services.sync.snapshot import restore_config_snapshot, snapshot_config
+from app.services.sync.snapshot import snapshot_config
 from app.services.sync.state import (
     clear_sync_state_many,
     get_sync_state,
@@ -176,20 +176,16 @@ def sync_config_upload(db_path: str, schema_dir: str | None = None,
         return _upload_current(db_path, config, schema_dir=schema_dir)
     except Exception as exc:
         log.exception("config upload failed")
-        try:
-            if not restore_config_snapshot(db_path):
-                raise FileNotFoundError("没有可回滚的配置基线")
-            set_sync_state(db_path, "sync_health", "config upload rolled back")
-            return {
-                "status": "rolled_back",
-                "message": f"上传失败，已恢复云端基线: {type(exc).__name__}: {exc}",
-            }
-        except Exception as rollback_exc:
-            _mark_sync_degraded(db_path, "config upload rollback", rollback_exc)
-            return {
-                "status": "error",
-                "message": f"上传失败且无法恢复云端基线: {type(rollback_exc).__name__}: {rollback_exc}",
-            }
+        # A failed upload is not evidence that the snapshot is stale. The
+        # local database may contain edits made after the last pull, so
+        # restoring the old baseline here would destroy user data. Preserve
+        # the working copy, mark sync degraded, and let the next explicit
+        # pull/manual resolution establish a new baseline.
+        _mark_sync_degraded(db_path, "config upload", exc)
+        return {
+            "status": "error",
+            "message": f"上传失败，本地修改已保留: {type(exc).__name__}: {exc}",
+        }
 
 
 def _pull_current(db_path: str, config: SyncConfig,

@@ -1,6 +1,6 @@
 #include "database_internal.h"
 
-UsageReservation::~UsageReservation() {
+void UsageReservation::abandon() noexcept {
     Database *db = database_;
     if (!db) return;
     if (upstream_started_) {
@@ -22,18 +22,40 @@ UsageReservation::~UsageReservation() {
         if (consumed) return;
     }
     db->release_log_slot();
+    database_ = nullptr;
+    upstream_started_ = false;
 }
 
+UsageReservation::~UsageReservation() { abandon(); }
+
 UsageReservation::UsageReservation(UsageReservation &&other) noexcept
-    : database_(other.database_) {
+    : database_(other.database_),
+      upstream_started_(other.upstream_started_),
+      context_account_id_(other.context_account_id_),
+      context_local_key_id_(other.context_local_key_id_),
+      context_model_(std::move(other.context_model_)),
+      context_streaming_(other.context_streaming_) {
     other.database_ = nullptr;
+    other.upstream_started_ = false;
+    other.context_account_id_ = 0;
+    other.context_local_key_id_ = 0;
+    other.context_streaming_ = false;
 }
 
 UsageReservation &UsageReservation::operator=(UsageReservation &&other) noexcept {
     if (this == &other) return *this;
-    if (database_) database_->release_log_slot();
+    abandon();
     database_ = other.database_;
+    upstream_started_ = other.upstream_started_;
+    context_account_id_ = other.context_account_id_;
+    context_local_key_id_ = other.context_local_key_id_;
+    context_model_ = std::move(other.context_model_);
+    context_streaming_ = other.context_streaming_;
     other.database_ = nullptr;
+    other.upstream_started_ = false;
+    other.context_account_id_ = 0;
+    other.context_local_key_id_ = 0;
+    other.context_streaming_ = false;
     return *this;
 }
 
@@ -54,19 +76,6 @@ std::int64_t Database::log_oldest_age_ms() {
     if (stamp.time_since_epoch().count() == 0) return 0;
     return std::max<std::int64_t>(0, std::chrono::duration_cast<
         std::chrono::milliseconds>(std::chrono::steady_clock::now() - stamp).count());
-}
-
-bool Database::reserve_log_slot() {
-    std::lock_guard<std::mutex> lock(log_queue_mutex_);
-    const auto pending_spool = log_spool_write_offset_ - log_spool_read_offset_;
-    const auto reserved_frames = log_memory_queue_.size() + log_reservations_ + 1;
-    if (!log_accepting_ ||
-        reserved_frames > kLogQueueMax ||
-        pending_spool + reserved_frames * (kSpoolHeaderBytes + kLogRecordMaxBytes)
-            > kLogSpoolHardLimit)
-        return false;
-    ++log_reservations_;
-    return true;
 }
 
 std::shared_ptr<UsageReservation> Database::reserve_usage_event() {
@@ -332,6 +341,15 @@ bool Database::write_log_record_in_transaction(const LogRecord &record,
 
 bool Database::update_accounting_metrics(
     const std::vector<const LogRecord *> &records) {
+    if (records.empty()) return true;
+    if (sqlite3_exec(write_db_, "BEGIN", nullptr, nullptr, nullptr) !=
+        SQLITE_OK) {
+        TB_LOG_ERROR("[DB] request-log accounting BEGIN error: %s\n",
+                     sqlite3_errmsg(write_db_));
+        log_persist_failures_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    int last_accounting_ms = 0;
     for (const LogRecord *record : records) {
         if (!record) continue;
         const int accounting_ms = record->enqueued_at.time_since_epoch().count()
@@ -349,12 +367,23 @@ bool Database::update_accounting_metrics(
         if (rc != SQLITE_DONE) {
             TB_LOG_ERROR("[DB] request-log accounting metric update error (%d): %s\n",
                          rc, sqlite3_errmsg(write_db_));
+            sqlite3_exec(write_db_, "ROLLBACK", nullptr, nullptr, nullptr);
             log_persist_failures_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        log_last_accounting_ms_.store(static_cast<std::uint64_t>(accounting_ms),
-                                      std::memory_order_release);
+        last_accounting_ms = accounting_ms;
     }
+    if (sqlite3_exec(write_db_, "COMMIT", nullptr, nullptr, nullptr) !=
+        SQLITE_OK) {
+        TB_LOG_ERROR("[DB] request-log accounting COMMIT error: %s\n",
+                     sqlite3_errmsg(write_db_));
+        sqlite3_exec(write_db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        log_persist_failures_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    log_last_accounting_ms_.store(
+        static_cast<std::uint64_t>(last_accounting_ms),
+        std::memory_order_release);
     return true;
 }
 
@@ -484,5 +513,3 @@ bool Database::log_request(int account_id, int local_key_id,
     if (out_cost) *out_cost = accepted_cost;
     return true;
 }
-
-// ── resolve_aggregate ────────────────────────────────────────────────────

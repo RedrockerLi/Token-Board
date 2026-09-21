@@ -79,8 +79,6 @@ def create_app(token_board_db_path: str | None = None, host: str = "127.0.0.1",
         flask_app.config["MAINTENANCE_SOCKET"] = str(
             Path(token_board_db_path).resolve().parent / "token-maintenance.sock")
 
-        dash_db_path = str(Path(token_board_db_path).resolve().parent / "dashboard.db")
-
     # ── Access-token auth (off-loopback or TB_DASHBOARD_TOKEN) ──
     from app import dashboard_auth  # noqa: E402
     token = dashboard_auth.resolve_token(host, data_dir)

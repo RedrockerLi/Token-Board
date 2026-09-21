@@ -218,19 +218,6 @@ bool client_socket_gone(int sock) {
            (pfd.revents & (POLLHUP | POLLERR | POLLNVAL));
 }
 
-/// Synchronous non-streaming forward.  UpstreamClient's process-wide watchdog
-/// monitors the downstream socket without creating a per-request thread.
-UpstreamClient::ForwardResult
-forward_once(UpstreamClient &upstream, const std::string &body,
-             const std::string &content_type, const UpstreamCandidate &c,
-             const UpstreamTarget &target, int client_sock) {
-    auto opts = target.opts;
-    opts.downstream_socket = client_sock;
-    return upstream.forward(
-        "POST", c.account().base_url, c.key(),
-        target.path, body, content_type, nullptr, opts);
-}
-
 UpstreamClient::ForwardResult forward_endpoint_attempt(
     UpstreamClient &upstream, const EndpointPolicy &policy,
     const UpstreamCandidate &candidate, const std::string &body,
@@ -259,28 +246,6 @@ UpstreamClient::ForwardResult forward_endpoint_attempt(
     return upstream.forward(method, candidate.account().base_url,
                             candidate.key(), target.path, body, content_type,
                             on_chunk, target.opts);
-}
-
-Database::AttemptInfo attempt_info(
-    const UpstreamCandidate &candidate,
-    const UpstreamClient::ForwardResult &result,
-    int semantic_ttft_ms) {
-    Database::AttemptInfo out;
-    out.account_id = candidate.account().id;
-    out.upstream_id = candidate.account().upstream_id;
-    out.upstream_key_id = candidate.key_slot_id;
-    out.status_code = result.status_code;
-    out.duration_ms = result.duration_ms;
-    out.dns_ms = result.dns_ms;
-    out.connect_ms = result.connect_ms;
-    out.tls_ms = result.tls_ms;
-    out.lease_wait_ms = result.lease_wait_ms;
-    out.first_byte_ms = result.first_byte_ms;
-    out.connection_reused = result.connection_reused;
-    out.ttft_ms = semantic_ttft_ms;
-    out.is_timeout = result.is_timeout;
-    out.error = result.error;
-    return out;
 }
 
 // ── handle_chat_request ──────────────────────────────────────────────────

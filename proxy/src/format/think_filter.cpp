@@ -4,7 +4,6 @@
 #include "json.hpp"
 
 #include <algorithm>
-#include <regex>
 
 using json = nlohmann::json;
 
@@ -20,12 +19,6 @@ bool has_reasoning_field(const json &message) {
         !message["reasoning"].get<std::string>().empty())
         return true;
     return false;
-}
-
-std::string strip_think_tags(const std::string &text) {
-    // Still used as a fallback to remove any remaining <think> blocks
-    static const std::regex re(R"(<think>[\s\S]*?</think>\s*)");
-    return std::regex_replace(text, re, "");
 }
 
 void sanitize_message(json &msg) {

@@ -11,19 +11,6 @@ advanced only AFTER a successful upload — any failed step rolls back by
 discarding the shadow db (no partial state, no per-row markers).
 """
 
-import hashlib
-import os
-import re
-import shutil
-import sqlite3
-import urllib.parse
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-
-import requests
-from requests.auth import HTTPBasicAuth
-
 # These are the persistent V1 tables used by local snapshots and config
 # merging.  The upload copy is sanitized separately: usable upstream secrets
 # and the WebDAV password stay on the machine, while client_keys (the keys

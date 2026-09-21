@@ -1,7 +1,7 @@
 """ProxyDatabase methods for ProxyBillingReadMixin."""
 
 from app.core.time import format_utc, utc_now
-from app.db.proxy.common import datetime, timedelta
+from app.db.proxy.common import timedelta
 from app.services.billing_report import (
     _agent_charge_sql,
     _agent_allocation_sql,

@@ -135,7 +135,7 @@ private:
     std::optional<PooledClient> value_;
 };
 
-std::optional<PooledClient>
+inline std::optional<PooledClient>
 make_client(const OriginParts &origin, const std::string &address,
             std::string &error) {
     try {

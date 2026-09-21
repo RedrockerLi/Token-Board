@@ -9,7 +9,6 @@ from typing import Any
 from ..common import (
     batch,
     config_value,
-    configured_root,
     iter_jsonl,
     make_event,
     project_name,

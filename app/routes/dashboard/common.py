@@ -1,7 +1,5 @@
 """Flask Blueprint: all page routes and API endpoints."""
 
-from collections import defaultdict
-
 from flask import Blueprint, current_app, jsonify, render_template, request
 
 bp = Blueprint("dashboard", __name__)

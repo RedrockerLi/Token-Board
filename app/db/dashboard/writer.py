@@ -245,33 +245,6 @@ class DashboardWriterMixin:
             account_id, account_name or f"用户 {int(account_id)}",
             normalized_recurring_cost)
 
-    def upsert_frozen_agent_allocation(self, **kwargs) -> int:
-        return self.upsert_frozen_plan_charge(**kwargs)
-
-    def upsert_agent_software(self, rows: list[dict]) -> int:
-        return self.upsert_account_batch([
-            {"account_id": row["software_id"], "name": row["name"]}
-            for row in rows
-        ])
-
-    def upsert_agent_batch(self, rows: list[dict]) -> int:
-        return self.upsert_proxy_batch([
-            {**row, "account_id": row["software_id"]} for row in rows
-        ])
-
-    def reconcile_agent_allocations(self, allocations, current_month: str) -> None:
-        for (account_id, _unit_id), periods in allocations.items():
-            for month, values in periods.items():
-                self.upsert_frozen_plan_charge(
-                    account_id=account_id, billing_unit_id="agent",
-                    recurring_charge=values.get("recurring_charge", 0),
-                    normalized_recurring_cost=values.get("normalized_recurring_cost"),
-                    frozen_on=values.get("finalized_on") or str(month)[:10],
-                )
-
-    def purge_zero_agent_usage_rows(self) -> int:
-        return 0
-
     def purge_zero_usage_rows(self) -> int:
         conn = self._connect()
         try:
@@ -290,15 +263,6 @@ class DashboardWriterMixin:
         """Compatibility no-op: plan/agent cost is already in daily usage."""
         return 0
 
-    def reconcile_plan_subscription(self, account_id: int, billing_unit_id: str,
-                                    subscriptions: dict[str, float]) -> None:
-        for month, cost in subscriptions.items():
-            self.upsert_frozen_plan_charge(
-                account_id=account_id, billing_unit_id=billing_unit_id,
-                recurring_charge=float(cost or 0),
-                normalized_recurring_cost=float(cost or 0),
-                frozen_on=f"{str(month)[:7]}-01")
-
     def record_billing_export_event(self, event: dict, payload_hash: str) -> int:
         if event.get("normalized_recurring_cost") is None:
             return 0
@@ -307,7 +271,3 @@ class DashboardWriterMixin:
             str(event.get("account_name") or f"用户 {int(event['account_id'])}"),
             event.get("normalized_recurring_cost"),
         )
-
-    def cleanup_stale_subscription_units(self, account_id: int,
-                                         active_unit_ids: set[str]) -> None:
-        return None

@@ -30,7 +30,6 @@ from app.services.sync.webdav import (
 )
 from app.services.sync.settings import SyncConfig, load_sync_config
 from app.services.sync.state import (
-    clear_sync_state,
     clear_sync_state_many,
     get_sync_state,
     record_remote_metadata,

@@ -38,6 +38,7 @@ public:
 private:
     friend class Database;
     explicit UsageReservation(Database *database) : database_(database) {}
+    void abandon() noexcept;
     void consume() noexcept { database_ = nullptr; }
     bool belongs_to(const Database *database) const noexcept {
         return database_ == database;

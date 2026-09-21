@@ -298,6 +298,8 @@ void Database::log_writer_loop() {
                 payloads.reserve(records.size());
                 std::size_t bytes = 0;
                 std::size_t accepted = 0;
+                std::size_t failed_index = records.size();
+                std::string poison_event_id;
                 bool encoding_error = false;
                 for (; accepted < records.size(); ++accepted) {
                     std::string payload;
@@ -307,15 +309,21 @@ void Database::log_writer_loop() {
                         TB_LOG_ERROR( "[DB] request-log encode error: %s\n",
                                 e.what());
                         encoding_error = true;
+                        failed_index = accepted;
+                        poison_event_id = records[accepted].event_id;
                         break;
                     } catch (...) {
                         TB_LOG_ERROR( "[DB] request-log encode error\n");
                         encoding_error = true;
+                        failed_index = accepted;
+                        poison_event_id = records[accepted].event_id;
                         break;
                     }
                     const auto frame_bytes = kSpoolHeaderBytes + payload.size();
                     if (payload.empty() || payload.size() > kLogRecordMaxBytes) {
                         encoding_error = true;
+                        failed_index = accepted;
+                        poison_event_id = records[accepted].event_id;
                         break;
                     }
                     if (accepted != 0 && bytes + frame_bytes > kLogBatchBytes)
@@ -325,18 +333,22 @@ void Database::log_writer_loop() {
                 }
                 if (accepted < records.size()) {
                     std::lock_guard<std::mutex> lock(log_queue_mutex_);
-                    for (std::size_t i = records.size(); i > accepted; --i)
+                    const std::size_t tail_start = encoding_error
+                        ? failed_index + 1 : accepted;
+                    for (std::size_t i = records.size(); i > tail_start; --i)
                         log_memory_queue_.push_front(std::move(records[i - 1]));
                     records.resize(accepted);
                 }
                 if (encoding_error) {
                     std::lock_guard<std::mutex> lock(log_queue_mutex_);
-                    for (std::size_t i = records.size(); i > 0; --i)
-                        log_memory_queue_.push_front(std::move(records[i - 1]));
-                    log_accepting_ = false;
+                    log_lost_events_.fetch_add(1, std::memory_order_relaxed);
                     log_persist_failures_.fetch_add(1, std::memory_order_relaxed);
+                    TB_LOG_ERROR(
+                            "[DB] request-log poison event %s was discarded\n",
+                            poison_event_id.empty() ? "<unknown>"
+                                                    : poison_event_id.c_str());
                     log_queue_cv_.notify_all();
-                    continue;
+                    if (records.empty()) continue;
                 }
                 bool spool_error = false;
                 std::size_t appended = 0;
@@ -364,8 +376,10 @@ void Database::log_writer_loop() {
                 }
                 if (spool_error) {
                     std::unique_lock<std::mutex> lock(log_queue_mutex_);
+                    if (log_stop_) break;
                     log_queue_cv_.wait_for(lock, std::chrono::seconds(1),
                                            [this] { return log_stop_; });
+                    if (log_stop_) break;
                     continue;
                 }
             }

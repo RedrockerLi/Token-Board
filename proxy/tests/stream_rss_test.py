@@ -82,7 +82,7 @@ def main() -> None:
             env = os.environ.copy()
             env["TB_MAX_WORKERS"] = "128"
             proxy = subprocess.Popen(
-                [str(binary), "--db", str(db), "--schema-dir", str(schema),
+                [str(binary), "--db", str(db),
                  "--host", "127.0.0.1", "--port", str(port)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                 env=env,

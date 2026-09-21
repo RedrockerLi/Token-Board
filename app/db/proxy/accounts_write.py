@@ -22,6 +22,11 @@ class ProxyAccountWriteMixin:
                       if raw_valid_from not in (None, "") else None)
         conn = self._connect()
         try:
+            # The shared id is intentionally allocated by the application
+            # because accounts, route sets and identities share one id space.
+            # Serialize the read and every dependent insert as one write
+            # transaction so concurrent creators cannot observe the same max.
+            conn.execute("BEGIN IMMEDIATE")
             shared_id = self._next_shared_id(conn)
             now = utc_now()
             start_date = (valid_from or now.date()).isoformat()
@@ -91,6 +96,9 @@ class ProxyAccountWriteMixin:
                 materialize_period_charges_conn(conn, now, current_only=True)
             conn.commit()
             return shared_id
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

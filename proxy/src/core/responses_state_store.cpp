@@ -1,7 +1,7 @@
 #include "responses_state_store.h"
 #include "logging.h"
 
-#include <algorithm>
+#include <iterator>
 
 bool ResponsesStateStore::lookup(const std::string &response_id,
                                  std::vector<nlohmann::json> &items) const {
@@ -19,8 +19,6 @@ bool ResponsesStateStore::record(
     if (response_id.empty()) return false;
 
     Entry entry;
-    entry.input_items = input_items;
-    entry.output_items = output_items;
     entry.items.reserve(input_items.size() + output_items.size());
     for (const auto &item : input_items) entry.items.push_back(item);
     for (const auto &item : output_items) entry.items.push_back(item);
@@ -35,7 +33,7 @@ bool ResponsesStateStore::record(
     auto old = entries_.find(response_id);
     if (old != entries_.end()) {
         bytes_ -= old->second.bytes;
-        order_.erase(std::find(order_.begin(), order_.end(), response_id));
+        order_.erase(old->second.order);
         entries_.erase(old);
     }
     while (!order_.empty() &&
@@ -51,6 +49,7 @@ bool ResponsesStateStore::record(
     if (bytes_ + entry.bytes > kMaxBytes) return false;
     bytes_ += entry.bytes;
     order_.push_back(response_id);
+    entry.order = std::prev(order_.end());
     entries_.emplace(response_id, std::move(entry));
     return true;
 }

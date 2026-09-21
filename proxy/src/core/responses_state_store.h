@@ -3,7 +3,7 @@
 #include "json.hpp"
 
 #include <cstddef>
-#include <deque>
+#include <list>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -28,13 +28,12 @@ public:
 private:
     struct Entry {
         std::vector<nlohmann::json> items;
-        std::vector<nlohmann::json> input_items;
-        std::vector<nlohmann::json> output_items;
         std::size_t bytes = 0;
+        std::list<std::string>::iterator order;
     };
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, Entry> entries_;
-    std::deque<std::string> order_;
+    std::list<std::string> order_;
     std::size_t bytes_ = 0;
 };

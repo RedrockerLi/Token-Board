@@ -214,10 +214,6 @@ struct StreamEvent {
     json extra = json::object();
 };
 
-/// Start from `extras` and overwrite with `generated` keys, so serialization
-/// preserves unknown format-specific fields while emitting canonical ones.
-json merge_preserving(const json &extras, const json &generated);
-
 /// Accumulate a usage snapshot into `dst` (for streaming, last snapshot wins).
 void usage_merge(Usage &dst, const Usage &src);
 

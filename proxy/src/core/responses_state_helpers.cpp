@@ -62,14 +62,6 @@ bool expand_responses_state(ProxyServer &server, CodecRegistry &codecs,
     return true;
 }
 
-bool target_supports_request(ir::ApiFormat target, ir::ApiFormat harness,
-                             const ir::ChatRequest &request,
-                             std::string &reason) {
-    const auto failures = request_feature_failures(target, harness, request);
-    if (!failures.empty()) { reason = failures.front().reason; return false; }
-    return true;
-}
-
 std::vector<RequestFeatureFailure> request_feature_failures(
     ir::ApiFormat target, ir::ApiFormat harness,
     const ir::ChatRequest &request) {

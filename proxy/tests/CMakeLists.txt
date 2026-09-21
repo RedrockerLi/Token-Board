@@ -181,7 +181,6 @@ add_executable(pricing_snapshot_equiv_test
     ${CMAKE_SOURCE_DIR}/src/store/pricing_repository.cpp
     ${CMAKE_SOURCE_DIR}/src/store/durable_spool.cpp
     ${CMAKE_SOURCE_DIR}/src/store/usage_writer.cpp
-    ${CMAKE_SOURCE_DIR}/src/store/database_catalog.cpp
     ${CMAKE_SOURCE_DIR}/third_party/sqlite3.c
 )
 target_include_directories(pricing_snapshot_equiv_test PRIVATE
@@ -217,7 +216,6 @@ add_executable(accounting_abort_test
     ${CMAKE_SOURCE_DIR}/src/store/pricing_repository.cpp
     ${CMAKE_SOURCE_DIR}/src/store/durable_spool.cpp
     ${CMAKE_SOURCE_DIR}/src/store/usage_writer.cpp
-    ${CMAKE_SOURCE_DIR}/src/store/database_catalog.cpp
     ${CMAKE_SOURCE_DIR}/third_party/sqlite3.c
 )
 target_include_directories(accounting_abort_test PRIVATE

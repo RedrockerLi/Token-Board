@@ -461,7 +461,7 @@ class SyncContractTest(unittest.TestCase):
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
-    def test_config_upload_failure_rolls_back_to_snapshot(self) -> None:
+    def test_config_upload_failure_preserves_local_edits(self) -> None:
         temp, proxy, _ = self._repo_layout()
         try:
             self._webdav_mocks()
@@ -477,10 +477,10 @@ class SyncContractTest(unittest.TestCase):
             with patch("app.services.sync.config_sync.publish_config_artifact",
                        side_effect=WebDAVError("put failed")):
                 result = sync_config_upload(proxy)
-            self.assertEqual(result["status"], "rolled_back", result)
+            self.assertEqual(result["status"], "error", result)
             with sqlite3.connect(proxy) as conn:
                 self.assertEqual(conn.execute(
-                    "SELECT name FROM accounts WHERE id=1").fetchone()[0], "base")
+                    "SELECT name FROM accounts WHERE id=1").fetchone()[0], "changed")
         finally:
             patch.stopall()
             shutil.rmtree(temp, ignore_errors=True)

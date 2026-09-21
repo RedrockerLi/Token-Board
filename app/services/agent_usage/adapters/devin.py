@@ -8,7 +8,6 @@ from pathlib import Path
 from ..common import (
     batch,
     config_value,
-    configured_root,
     make_event,
     project_name,
     safe_int,
@@ -81,7 +80,7 @@ def _resolve_timestamp(row) -> str | None:
             if val > 0:
                 return timestamp(val)
         except (TypeError, ValueError):
-            pass
+            return None
     return None
 
 

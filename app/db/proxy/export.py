@@ -224,19 +224,6 @@ class ProxyExportMixin:
         finally:
             conn.close()
 
-    def set_export_mark(self, max_id: int):
-        """Advance the high-water mark (commit point of a successful sync)."""
-        conn = self._connect()
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state (key, value) "
-                "VALUES ('last_exported_log_id', ?)",
-                (str(max_id),),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
     def get_billing_export_mark(self) -> int:
         """Read the independent immutable-billing export high-water mark."""
         conn = self._connect()
@@ -256,18 +243,6 @@ class ProxyExportMixin:
             return int(conn.execute(
                 "SELECT COALESCE(MAX(id),0) FROM billing_export_events"
             ).fetchone()[0])
-        finally:
-            conn.close()
-
-    def set_billing_export_mark(self, max_id: int) -> None:
-        """Advance the billing export mark after dashboard commit."""
-        conn = self._connect()
-        try:
-            conn.execute(
-                "INSERT OR REPLACE INTO sync_state(key,value) VALUES(?,?)",
-                ("last_exported_billing_event_id", str(max_id)),
-            )
-            conn.commit()
         finally:
             conn.close()
 

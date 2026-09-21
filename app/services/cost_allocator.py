@@ -65,26 +65,3 @@ def compute_proportional_cost_by_month(
         cost[key] += value
         cost_by_model[key][ce["model"]] += value
     return cost, cost_by_model
-
-
-def compute_proportional_cost_by_day(
-    token_usages: list[dict],
-    cost_entries: list[dict],
-    api_key_name: str,
-) -> tuple[dict, dict]:
-    """Return actual costs by day; keys are "YYYY-MM-DD" strings.
-
-    Returns RAW floats — callers round at JSON output.
-
-    Returns:
-        (cost_by_day, cost_by_day_by_model)
-    """
-    del token_usages
-    cost = defaultdict(float)
-    cost_by_model = defaultdict(lambda: defaultdict(float))
-    for ce in _selected_rows(cost_entries, api_key_name):
-        key = ce["date"]
-        value = float(ce.get("cost", 0) or 0)
-        cost[key] += value
-        cost_by_model[key][ce["model"]] += value
-    return cost, cost_by_model

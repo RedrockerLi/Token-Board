@@ -7,7 +7,7 @@
 // C++ boundary ensures Database::open() and the production schema agree while
 // leaving one authoritative implementation of the billing formula.
 //
-// Usage: pricing_sql_authority_test <schema_dir> <prepared_db>
+// Usage: pricing_sql_authority_test <prepared_db>
 
 #include "store/db.h"
 
@@ -77,12 +77,11 @@ bool exec_sql(sqlite3 *db, const std::string &sql) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    assert(argc >= 3);
-    const std::string schema_dir = argv[1];
-    const std::string db_path = argv[2];
+    assert(argc >= 2);
+    const std::string db_path = argv[1];
 
     Database db;
-    assert(db.open(db_path, schema_dir));
+    assert(db.open(db_path));
     db.close();
 
     // Seed pricing data (must COMMIT before either track reads it).

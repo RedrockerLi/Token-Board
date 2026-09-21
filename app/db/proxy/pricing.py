@@ -2,7 +2,6 @@
 
 import math
 
-from app.db.proxy.common import sqlite3
 
 
 class ProxyPricingMixin:

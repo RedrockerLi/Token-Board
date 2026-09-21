@@ -17,9 +17,11 @@ from unittest import mock
 
 from app.core.time import utc_now
 from app.db.proxy.billing import (
+    materialize_period_charges_conn,
     materialize_agent_subscription_charges,
     materialize_period_charges,
 )
+from app.core import sqlite_runtime
 from app.db.dashboard_db import DashboardDatabase
 from app.db.proxy_db import ProxyDatabase
 from app.services import fx
@@ -159,6 +161,22 @@ class BillingFxLockTest(AppDatabaseTestCase):
             get.assert_called_once()
             self.assertEqual(get.call_args.kwargs["params"],
                              {"date": "2026-07-15"})
+
+    def test_caller_owned_materializer_never_fetches_inside_write_transaction(self) -> None:
+        db = self.proxy_database()
+        self._usd_plan(db)
+        conn = sqlite_runtime.connect(self.proxy_path, "billing_write")
+        try:
+            with mock.patch("app.services.fx.requests.get",
+                            side_effect=AssertionError("network in write transaction")):
+                with sqlite_runtime.transaction(conn, "immediate"):
+                    materialize_period_charges_conn(conn, _at())
+            with sqlite3.connect(self.proxy_path) as check:
+                row = _rates(check, "2026-07-15T00:00:00Z")
+                self.assertIsNone(row[2])
+                self.assertIsNone(row[4])
+        finally:
+            conn.close()
 
     def test_fetch_failure_freezes_nearest_fallback(self) -> None:
         db = self.proxy_database()

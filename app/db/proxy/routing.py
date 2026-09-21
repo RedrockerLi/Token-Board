@@ -1,6 +1,6 @@
 """ProxyDatabase methods for ProxyRoutingMixin."""
 
-from app.db.proxy.common import _generate_key, json, sqlite3, uuid
+from app.db.proxy.common import _generate_key, sqlite3, uuid
 
 
 class ProxyRoutingMixin:

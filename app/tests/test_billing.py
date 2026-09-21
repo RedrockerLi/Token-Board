@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -16,6 +17,44 @@ from app.tests.support import AppDatabaseTestCase
 
 
 class BillingTest(AppDatabaseTestCase):
+    def test_shared_id_creators_serialize_the_read_and_insert(self) -> None:
+        db = self.proxy_database()
+
+        def create_api(index: int) -> int:
+            return db.create_account({
+                "name": f"parallel-api-{index}",
+                "account_type": "api",
+                "base_url": "http://example.test",
+                "upstream_keys": [f"sk-parallel-{index}"],
+            })
+
+        def create_aggregate(index: int) -> int:
+            return db.create_aggregate({"name": f"parallel-aggregate-{index}"})
+
+        def create_agent(index: int) -> int:
+            return db.create_agent_software({
+                "name": f"parallel-agent-{index}",
+                "agent_kind": "codex",
+            })
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            api_ids = list(pool.map(create_api, range(8)))
+            aggregate_ids = list(pool.map(create_aggregate, range(8)))
+            agent_ids = list(pool.map(create_agent, range(8)))
+
+        all_ids = api_ids + aggregate_ids + agent_ids
+        self.assertEqual(len(set(all_ids)), len(all_ids))
+        with sqlite3.connect(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM accounts WHERE id IN (%s)"
+                % ",".join("?" for _ in api_ids + agent_ids),
+                api_ids + agent_ids,
+            ).fetchone()[0], len(api_ids + agent_ids))
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM route_sets WHERE id IN (%s)"
+                % ",".join("?" for _ in aggregate_ids), aggregate_ids
+            ).fetchone()[0], len(aggregate_ids))
+
     def test_subscription_effective_dates_are_utc_calendar_dates(self) -> None:
         db = self.proxy_database()
         for legacy_field in ("start_time", "effective_at", "ends_at"):

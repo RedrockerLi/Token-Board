@@ -14,14 +14,13 @@ as soon as their period-start amount is known.
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 
 from app.core import sqlite_runtime
 from app.core.time import (
-    UTC, as_utc, billing_period, format_utc, next_billing_period,
+    as_utc, billing_period, format_utc, next_billing_period,
     parse_runtime_timestamp, utc_now,
 )
-from app.db.proxy.common import _parse_iso_date
 from app.db.proxy.billing_export import ensure_billing_export_events_conn
 from app.services import fx
 from app.services.billing_units import BillingUnitResolver
@@ -93,30 +92,63 @@ def _rate(conn: sqlite3.Connection, contract_id: int, start: str,
 
 
 def _normalized_charge(conn: sqlite3.Connection, price: float,
-                       currency: str, start_date: str,
-                       attempted: set[tuple[str, str]] | None = None
+                       currency: str, start_date: str
                        ) -> tuple[float | None, str | None, bool]:
     """Convert ``price`` to CNY at the rate locked on the period start date.
 
-    A USD row is locked using the exact period-start rate when available. If
-    it is missing, one best-effort historical fetch is attempted and the
-    nearest stored rate becomes the permanent fallback. A currency with no
-    stored rate at all remains pending instead of silently using 1.0.
+    A USD row is locked using the exact period-start rate when available. FX
+    prewarming happens before the caller's write transaction; this function is
+    deliberately read-only so it can never perform network I/O while SQLite
+    writes are locked. A currency with no stored rate remains pending.
     """
     if currency == "CNY":
         return price, None, True
     resolution = fx.FxRateResolver.resolve(conn, currency, "CNY", start_date)
-    if not resolution.exact:
-        key = (currency, start_date)
-        if attempted is None or key not in attempted:
-            resolution = fx.FxRateResolver.ensure(conn, currency, "CNY", start_date)
-            if attempted is not None:
-                attempted.add(key)
-        else:
-            resolution = fx.FxRateResolver.resolve(conn, currency, "CNY", start_date)
     if resolution.source_date is None:
         return None, None, False
     return price * resolution.rate, resolution.source_date, True
+
+
+def prewarm_period_fx_rates_conn(conn: sqlite3.Connection,
+                                 at: datetime | None = None,
+                                 *, agent: bool = False) -> None:
+    """Fetch missing period-start FX rows before a write transaction begins.
+
+    The caller owns the connection, but this helper must be called while it is
+    outside a transaction. The materializer itself only resolves stored rows.
+    """
+    moment = as_utc(at or utc_now()).replace(microsecond=0)
+    units = (BillingUnitResolver.agent_units(conn, at=moment)
+             if agent else BillingUnitResolver.proxy_units(conn, at=moment))
+    seen: set[tuple[str, str]] = set()
+    for unit in units:
+        if unit.currency == "CNY":
+            continue
+        target = _current_period_start(moment, unit.anchor_day)[:10]
+        if agent:
+            frozen = conn.execute(
+                "SELECT 1 FROM agent_subscription_period_charges "
+                "WHERE instance_id=? AND period_start=? AND is_finalized=1 LIMIT 1",
+                (unit.owner_id, f"{target}T00:00:00Z"),
+            ).fetchone()
+        else:
+            frozen = conn.execute(
+                "SELECT 1 FROM billing_period_charges "
+                "WHERE contract_id=? AND credential_uuid IS ? AND period_start=? "
+                "AND finalized_at IS NOT NULL LIMIT 1",
+                (unit.contract_id, unit.credential_uuid,
+                 f"{target}T00:00:00Z"),
+            ).fetchone()
+        if frozen is not None:
+            # A failed historical fetch may have frozen a nearest stored rate
+            # without creating an exact FX row. Never retry the network for a
+            # charge that is already a financial fact.
+            continue
+        key = (unit.currency, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        fx.FxRateResolver.ensure(conn, unit.currency, "CNY", target)
 
 
 def _rate_from_table(conn: sqlite3.Connection, table: str, owner_column: str,
@@ -138,7 +170,6 @@ def _materialize_period_stream(
         moment: datetime, now: str,
         rate_table: str, rate_owner_column: str, charge_table: str,
         charge_owner_column: str, credential_uuid: str | None,
-        attempted: set[tuple[str, str]],
         charge_subscription_id: int | None = None,
         charge_software_id: int | None = None,
         current_only: bool = False) -> int:
@@ -198,14 +229,14 @@ def _materialize_period_stream(
                     existing["fx_rate_date"], True)
             else:
                 normalized, fx_date, can_finalize = _normalized_charge(
-                    conn, price, row_currency, start[:10], attempted)
+                    conn, price, row_currency, start[:10])
             currency = row_currency
         else:
             price = _rate_from_table(
                 conn, rate_table, rate_owner_column, owner_id, start, start,
                 "effective_on" if agent_charge else "effective_at")
             normalized, fx_date, can_finalize = _normalized_charge(
-                conn, price, currency, start[:10], attempted)
+                conn, price, currency, start[:10])
         values = (price, currency, normalized, "CNY", fx_date)
         if existing is None:
             if has_credential:
@@ -303,7 +334,6 @@ def materialize_period_charges_conn(conn: sqlite3.Connection,
     moment = as_utc(at or utc_now()).replace(microsecond=0)
     now = format_utc(moment)
     changed = 0
-    attempted: set[tuple[str, str]] = set()
     period_starts: set[str] = set()
     for unit in BillingUnitResolver.proxy_units(conn, at=moment):
         period_starts.add(_current_period_start(moment, unit.anchor_day))
@@ -316,7 +346,7 @@ def materialize_period_charges_conn(conn: sqlite3.Connection,
             rate_owner_column="contract_id",
             charge_table="billing_period_charges",
             charge_owner_column="contract_id",
-            credential_uuid=unit.credential_uuid, attempted=attempted,
+            credential_uuid=unit.credential_uuid,
             current_only=current_only)
     changed += _finalize_period_stream(
         conn, "billing_period_charges", now, period_starts)
@@ -329,6 +359,7 @@ def materialize_period_charges(db_path: str,
     """Create/update current charges idempotently and freeze closed periods."""
     conn = sqlite_runtime.connect(db_path, "billing_write")
     try:
+        prewarm_period_fx_rates_conn(conn, at, agent=False)
         with sqlite_runtime.transaction(conn, "immediate"):
             return materialize_period_charges_conn(conn, at, current_only=True)
     finally:
@@ -343,7 +374,6 @@ def materialize_agent_subscription_charges_conn(
     moment = as_utc(at or utc_now()).replace(microsecond=0)
     now = moment.date().isoformat()
     changed = 0
-    attempted: set[tuple[str, str]] = set()
     period_starts: set[str] = set()
     for unit in BillingUnitResolver.agent_units(
             conn, at=moment, include_ended=include_ended):
@@ -361,7 +391,7 @@ def materialize_agent_subscription_charges_conn(
             charge_owner_column="instance_id", credential_uuid=None,
             charge_subscription_id=unit.subscription_id,
             charge_software_id=unit.account_id,
-            attempted=attempted, current_only=current_only)
+            current_only=current_only)
     changed += _finalize_period_stream(
         conn, "agent_subscription_period_charges", now, period_starts)
     changed += ensure_billing_export_events_conn(conn)
@@ -373,6 +403,7 @@ def materialize_agent_subscription_charges(
     """Materialize agent subscription instances with Plan's exact rules."""
     conn = sqlite_runtime.connect(db_path, "billing_write")
     try:
+        prewarm_period_fx_rates_conn(conn, at, agent=True)
         with sqlite_runtime.transaction(conn, "immediate"):
             return materialize_agent_subscription_charges_conn(conn, at, current_only=True)
     finally:

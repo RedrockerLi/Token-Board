@@ -1,10 +1,9 @@
 """ProxyDatabase methods for ProxyAccountReadMixin."""
 
-from app.core.time import parse_runtime_timestamp, utc_now
+from app.core.time import utc_now
 from app.db.proxy.common import (
-    ACCOUNT_TYPES, UTC, _billing_period_month, _cancellation_end,
-    _parse_iso_date, _period_start, _subscription_date,
-    billing_period, ConflictError, datetime, json, mask_key, sqlite3, uuid,
+    _parse_iso_date, _subscription_date, billing_period, ConflictError,
+    mask_key, sqlite3, uuid,
 )
 from app.domain.account_template import AccountTemplate, AccountTemplateAdapter
 
@@ -127,11 +126,6 @@ class ProxyAccountReadMixin:
                 else row["cancellation_mode"]
             ),
         }
-
-    @staticmethod
-    def _refresh_upstream_keys_cloud(conn: sqlite3.Connection, account_id: int) -> None:
-        """V1 credential metadata is already safe for cloud synchronization."""
-        return
 
     def _set_upstream_keys(self, conn: sqlite3.Connection, account_id: int,
                            keep_ids: list[int], new_keys: list[str],

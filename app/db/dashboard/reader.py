@@ -33,17 +33,6 @@ class DashboardReaderMixin:
         finally:
             conn.close()
 
-    def get_record_count(self) -> dict:
-        conn = self._connect()
-        try:
-            return {
-                "daily_model_usage": conn.execute(
-                    "SELECT COUNT(*) FROM daily_model_usage").fetchone()[0],
-                "users": conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
-            }
-        finally:
-            conn.close()
-
     def _load_v2_rows(self, conn: sqlite3.Connection):
         token_usages, request_usages, cost_entries = [], [], []
         months_set, names, models = set(), set(), set()

@@ -171,7 +171,7 @@ def _session_id_for_path(path: Path) -> str:
                         return value.strip()
                 break
     except (OSError, EOFError, gzip.BadGzipFile):
-        pass
+        return _session_id_from_path(path)
     return _session_id_from_path(path)
 
 

@@ -31,10 +31,9 @@ public:
     Database(Database &&) = delete;
     Database &operator=(Database &&) = delete;
 
-    // schema_dir is retained as a source-compatible, deprecated argument for
-    // launchers from the previous release.  The C++ runtime never reads SQL
-    // or changes schema state; Python must prepare the database first.
-    bool open(const std::string &path, const std::string &schema_dir = {});
+    // Python owns all schema preparation; the C++ runtime only validates the
+    // already-prepared database before serving requests.
+    bool open(const std::string &path);
     int schema_major() const noexcept { return schema_major_; }
     int schema_minor() const noexcept { return schema_minor_; }
 
@@ -44,9 +43,13 @@ public:
         int id;
         std::string key_value;
         int account_id;
-        std::string label;
     };
-    std::optional<KeyInfo> lookup_local_key(const std::string &key_value);
+
+    struct KeySlot {
+        int id;
+        std::string key_value;
+        int position = 0;
+    };
 
     struct AccountInfo {
         int id;
@@ -56,26 +59,15 @@ public:
         std::string endpoint_path;
         std::string auth_header;
         int upstream_id = 0;
-        bool is_aggregate = false;
-        std::string account_type;
         bool extended_usage_limit_cooldown = false;
         int max_concurrency = 0;
         bool deleted = false;
     };
-    std::optional<AccountInfo> get_account(int account_id);
 
     struct RouteInfo {
         KeyInfo key;
         AccountInfo account;
     };
-    std::optional<RouteInfo> lookup_route(const std::string &key_value);
-
-    struct KeySlot {
-        int id;
-        std::string key_value;
-        int position = 0;
-    };
-    std::vector<KeySlot> get_upstream_keys(int account_id);
 
     struct ProbeTarget {
         std::string base_url;
@@ -122,9 +114,6 @@ public:
         int upstream_account_id = 0;
         std::string upstream_model;
     };
-    std::vector<AggregateEntry> resolve_aggregate(int account_id,
-                                                  const std::string &model);
-    std::vector<std::string> get_aggregate_model_patterns(int account_id);
     struct AttemptInfo {
         int account_id = 0;
         int upstream_id = 0;
@@ -155,19 +144,10 @@ public:
                      int queue_ms = 0,
                      double *out_cost = nullptr,
                      UsageReservation *reservation = nullptr);
-    struct PricingEntry {
-        int id;
-        std::string model_pattern;
-        double input_price;
-        double output_price;
-    };
-
-    std::vector<PricingEntry> get_all_pricing();
     std::uint64_t log_spool_bytes();
     std::size_t log_queue_depth();
     std::int64_t log_oldest_age_ms();
     std::shared_ptr<UsageReservation> reserve_usage_event();
-    bool reserve_log_slot();
     void release_log_slot();
     bool log_writer_healthy();
     bool log_recovery_complete();
@@ -276,13 +256,6 @@ private:
     std::atomic<std::uint64_t> log_lost_events_{0};
     std::atomic<std::size_t> log_last_batch_size_{0};
     std::atomic<std::uint64_t> log_last_accounting_ms_{0};
-    sqlite3_stmt *stmt_lookup_key_ = nullptr;
-    sqlite3_stmt *stmt_get_account_ = nullptr;
-    sqlite3_stmt *stmt_lookup_route_ = nullptr;
-    sqlite3_stmt *stmt_get_upstream_keys_ = nullptr;
-    sqlite3_stmt *stmt_get_aggregate_entries_ = nullptr;
-    sqlite3_stmt *stmt_get_pricing_ = nullptr;
-    sqlite3_stmt *stmt_get_timeout_config_ = nullptr;
     sqlite3_stmt *stmt_lookup_probe_target_ = nullptr;
     sqlite3_stmt *stmt_insert_log_ = nullptr;
     sqlite3_stmt *stmt_find_log_event_ = nullptr;

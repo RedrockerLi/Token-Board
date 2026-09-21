@@ -64,12 +64,6 @@ def purge_route_sets(conn: sqlite3.Connection,
     return deleted + max(removed.rowcount, 0)
 
 
-def purge_expired_secrets(conn: sqlite3.Connection, now: str) -> int:
-    """V2 compatibility hook; paused credentials retain their secrets."""
-    del conn, now
-    return 0
-
-
 def purge_credential(conn: sqlite3.Connection, credential_uuid: str) -> int:
     """Physically delete one credential while detaching historical FKs."""
     conn.execute("UPDATE request_log SET credential_uuid=NULL,upstream_key_id=NULL "

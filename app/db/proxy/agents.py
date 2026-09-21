@@ -55,6 +55,7 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
         config_json = _json_object(data.get("config", data.get("config_json")))
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             software_id = self._next_shared_id(conn)
             now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
             conn.execute(
@@ -90,6 +91,9 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
         except sqlite3.IntegrityError as exc:
             conn.rollback()
             raise ValueError("软件数据冲突") from exc
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

@@ -21,7 +21,7 @@ def main() -> int:
         dashboard = Path(raw) / "dashboard.db"
         ensure_local_databases(str(database), str(dashboard), schema_root)
         return subprocess.run(
-            [str(executable), str(schema_root), str(database)],
+            [str(executable), str(database)],
             check=False,
         ).returncode
 

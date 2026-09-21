@@ -41,9 +41,9 @@ def wait_for_proxy(port: int, *, allow_degraded: bool = False) -> None:
     raise AssertionError("proxy did not become healthy")
 
 
-def start_proxy(binary: Path, db: Path, schema: Path, port: int, env: dict):
+def start_proxy(binary: Path, db: Path, port: int, env: dict):
     return subprocess.Popen(
-        [str(binary), "--db", str(db), "--schema-dir", str(schema),
+        [str(binary), "--db", str(db),
          "--host", "127.0.0.1", "--port", str(port)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env,
     )
@@ -79,7 +79,7 @@ def main() -> None:
             first_port = free_port()
             crash_env = os.environ.copy()
             crash_env["TB_TEST_CRASH_AFTER_SPOOL_SYNC"] = "1"
-            first = start_proxy(binary, db, schema, first_port, crash_env)
+            first = start_proxy(binary, db, first_port, crash_env)
             try:
                 wait_for_proxy(first_port)
                 body = json.dumps({
@@ -112,7 +112,7 @@ def main() -> None:
             assert spool.exists() and spool.stat().st_size > 0
 
             second_port = free_port()
-            second = start_proxy(binary, db, schema, second_port, os.environ.copy())
+            second = start_proxy(binary, db, second_port, os.environ.copy())
             try:
                 wait_for_proxy(second_port, allow_degraded=True)
                 request_count = attempt_count = 0

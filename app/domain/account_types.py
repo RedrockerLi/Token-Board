@@ -7,8 +7,8 @@ account of a given type may do (routing / keys / billing / cooldown / deletion
 comparing the string directly, so adding a type is one row in
 :data:`ACCOUNT_TYPES` — not a new branch in every caller.
 
-The C++ proxy mirrors the parts it needs in ``proxy/src/core/account_types.h``
-(non-routable filter) — keep the two in sync.
+The C++ proxy consumes the prepared SQLite routing snapshot; this module is
+the only account-type behavior specification.
 """
 
 from dataclasses import dataclass
@@ -93,38 +93,6 @@ def is_subscription(account_type: str | None) -> bool:
 
 def deletion_policy(account_type: str | None) -> str:
     return spec(account_type).deletion
-
-
-def _types_with(predicate) -> tuple[str, ...]:
-    return tuple(t for t, s in ACCOUNT_TYPES.items() if predicate(s))
-
-
-def usage_billed_types() -> tuple[str, ...]:
-    """account types whose api_cost is the real bill (currently api)."""
-    return _types_with(lambda s: s.billing == "usage")
-
-
-def subscription_types() -> tuple[str, ...]:
-    """Proxy account types billed as a subscription (plan today)."""
-    return _types_with(lambda s: s.billing == "subscription")
-
-
-def routable_types() -> tuple[str, ...]:
-    """account types that can serve proxied traffic (api + plan today)."""
-    return _types_with(lambda s: s.routable)
-
-
-def import_types() -> tuple[str, ...]:
-    """Legacy import-driven account types; agent software is separate now."""
-    return _types_with(lambda s: s.usage_source == "import")
-
-
-def sql_in(types: tuple[str, ...]) -> str:
-    """'?', '?,?'… placeholders for an ``IN (...?)`` clause.
-
-    Values are always passed as query parameters — never string-interpolated.
-    """
-    return ",".join("?" for _ in types)
 
 
 def as_payload() -> dict[str, dict]:

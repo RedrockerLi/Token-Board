@@ -51,7 +51,9 @@ public:
         const auto deadline = started + std::chrono::milliseconds(timeout_ms);
         std::unique_lock<std::mutex> lock(mutex_);
         const auto available = [&] {
-            return total_active_ < total_limit_ && active_[origin] < origin_limit_;
+            const auto found = active_.find(origin);
+            const std::size_t active = found == active_.end() ? 0 : found->second;
+            return total_active_ < total_limit_ && active < origin_limit_;
         };
         if (!cv_.wait_until(lock, deadline, available)) return {};
         ++total_active_;
@@ -86,7 +88,7 @@ private:
             --total_active_;
             if (found->second == 0) active_.erase(found);
         }
-        cv_.notify_one();
+        cv_.notify_all();
     }
 
     mutable std::mutex mutex_;

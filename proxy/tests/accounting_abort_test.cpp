@@ -12,7 +12,7 @@
 //   3. reserved and consumed by a normal log_request, then destroyed  ->  the
 //      normal row persists and no abort row is added.
 //
-// Usage: accounting_abort_test <schema_dir> <prepared_db>
+// Usage: accounting_abort_test <prepared_db>
 
 #include "store/db.h"
 
@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 #include "sqlite3.h"
 
@@ -83,12 +84,11 @@ bool stays_absent(const std::string &db_path, const std::string &model,
 }  // namespace
 
 int main(int argc, char **argv) {
-    assert(argc >= 3);
-    const std::string schema_dir = argv[1];
-    const std::string db_path = argv[2];
+    assert(argc >= 2);
+    const std::string db_path = argv[1];
 
     Database db;
-    assert(db.open(db_path, schema_dir));
+    assert(db.open(db_path));
 
     // Seed the FK targets request_log needs: account, route_set, client_key.
     sqlite3 *seed = nullptr;
@@ -116,6 +116,30 @@ int main(int argc, char **argv) {
     assert(wait_for_log(db_path, "abort-model", kInternalAbortStatus));
     printf("  1 OK: started-then-dropped -> internal_abort(%d) row\n",
            kInternalAbortStatus);
+
+    // 1b. Moving the reservation must move every abort context field. Test
+    // both move construction and move assignment; the moved-from holder must
+    // become inert so it cannot emit a duplicate abort row.
+    {
+        auto source = db.reserve_usage_event();
+        assert(source);
+        source->set_context(1, 1, "move-ctor-model", true);
+        source->mark_upstream_started();
+        UsageReservation moved(std::move(*source));
+        source.reset();
+    }
+    assert(wait_for_log(db_path, "move-ctor-model", kInternalAbortStatus));
+    {
+        auto source = db.reserve_usage_event();
+        assert(source);
+        source->set_context(1, 1, "move-assign-model", true);
+        source->mark_upstream_started();
+        UsageReservation moved;
+        moved = std::move(*source);
+        source.reset();
+    }
+    assert(wait_for_log(db_path, "move-assign-model", kInternalAbortStatus));
+    printf("  1b OK: moved reservations retain abort context and ownership\n");
 
     // 2. Never started -> slot released, no row.
     {

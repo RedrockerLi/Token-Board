@@ -4,7 +4,7 @@ import os
 import logging
 from pathlib import Path
 
-from ..common import batch, config_value, iter_jsonl, make_event, project_name, source, timestamp, walk_files
+from ..common import batch, config_value, iter_jsonl, make_event, source, timestamp, walk_files
 from ..ir import ParseBatch, UsageSource
 
 KIND = "openclaw"

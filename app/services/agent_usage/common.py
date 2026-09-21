@@ -12,7 +12,6 @@ import tempfile
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
-from urllib.parse import quote
 
 from .ir import ParseBatch, UsageEvent, UsageSource
 from app.core import sqlite_runtime

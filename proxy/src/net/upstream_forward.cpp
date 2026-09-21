@@ -479,6 +479,7 @@ UpstreamClient::forward(const std::string &method,
     };
 
     PooledLease lease(std::nullopt);
+    bool retried_reused_connection = false;
     for (;;) {
         if (!lease.valid()) {
             lease = acquire();
@@ -506,11 +507,34 @@ UpstreamClient::forward(const std::string &method,
             upstream_metrics::reused_connections.fetch_add(1, std::memory_order_relaxed);
         else
             upstream_metrics::new_connections.fetch_add(1, std::memory_order_relaxed);
-        if (retry && addr_index < dns_addresses.size()) {
-            const std::string &dead = lease.address();
-            tried_addresses.insert(dead);
-            DnsResolver::instance().mark_failed(origin_parts.hostname, dead);
-            ClientPool::instance().invalidate(origin_parts.origin, dead);
+        if (retry) {
+            const std::string failed_address = lease.address();
+            if (connection_reused && !retried_reused_connection &&
+                !failed_address.empty()) {
+                // An idle pooled socket can be closed by the provider between
+                // requests.  Replace only that socket and retry the exact
+                // resolver-selected address before affecting DNS health.
+                retried_reused_connection = true;
+                ClientPool::instance().invalidate(origin_parts.origin,
+                                                  failed_address);
+                watch->attach_client(nullptr);
+                lease.discard();
+                std::string error;
+                auto fresh = make_client(origin_parts, failed_address, error);
+                if (fresh) {
+                    ClientPool::instance().note_created();
+                    lease = PooledLease(std::move(*fresh));
+                    connection_reused = false;
+                    configure_client(lease.client());
+                    continue;
+                }
+            }
+            if (failed_address.empty()) break;
+            tried_addresses.insert(failed_address);
+            DnsResolver::instance().mark_failed(origin_parts.hostname,
+                                                 failed_address);
+            ClientPool::instance().invalidate(origin_parts.origin,
+                                              failed_address);
             watch->attach_client(nullptr);
             lease.discard();
             while (addr_index < dns_addresses.size() &&

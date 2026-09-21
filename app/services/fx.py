@@ -131,6 +131,12 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
         (base, quote, date)).fetchone()
     if row is not None:
         return float(row["rate"])
+    if conn.in_transaction:
+        # Billing materializers may be called by a larger write workflow. Do
+        # not turn a cache miss into a network call while that workflow owns
+        # SQLite's write lock; the caller can retry after the transaction.
+        log.warning("FX fetch skipped inside an active SQLite transaction")
+        return get_rate(conn, base, quote, date)
     if date < "1999-01-01":
         # frankfurter has no data before 1999; never hammer the API for a
         # period start that can never resolve.
@@ -158,6 +164,8 @@ def ensure_rate(conn, base: str = "USD", quote: str = "CNY",
         # Offline/bad payload: use the nearest stored rate below, but keep the
         # failure visible to the billing health and application logs.
         log.warning("FX fetch failed; using stored rate: %s", exc)
+        if owns_write and conn.in_transaction:
+            conn.rollback()
         if on_error:
             on_error(exc)
 

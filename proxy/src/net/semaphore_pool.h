@@ -237,3 +237,20 @@ class SemaphorePool final : public httplib::TaskQueue {
     std::atomic<std::uint64_t> queue_samples_{0};
     std::array<std::atomic<std::uint64_t>, 32> queue_histogram_{};
 };
+
+/// cpp-httplib owns the TaskQueue returned by Server::new_task_queue().  The
+/// production pool is owned by main(), so the object handed to httplib must
+/// only forward calls and must never delete the pool itself.
+class NonOwningTaskQueueProxy final : public httplib::TaskQueue {
+  public:
+    explicit NonOwningTaskQueueProxy(SemaphorePool &pool) : pool_(&pool) {}
+
+    bool enqueue(std::function<void()> fn) override {
+        return pool_->enqueue(std::move(fn));
+    }
+
+    void shutdown() override { pool_->shutdown(); }
+
+  private:
+    SemaphorePool *pool_;
+};

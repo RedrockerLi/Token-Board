@@ -16,7 +16,6 @@ from ..common import (
     safe_int,
     source,
     timestamp,
-    walk_files,
 )
 from ..ir import ParseBatch, UsageSource
 
@@ -75,15 +74,6 @@ def _roots(software: dict) -> list[Path]:
         *[base / host / "User" / "globalStorage" / "saoudrizwan.claude-dev"
           for host in HOSTS],
     ])
-
-
-def _legacy_roots() -> list[Path]:
-    roots = []
-    for root in _roots({}):
-        candidate = root / "data" if (root / "data").is_dir() else root
-        if (candidate / "state" / "taskHistory.json").is_file():
-            roots.append(candidate)
-    return _unique(roots)
 
 
 def _sdk_session_dirs(software: dict | None = None) -> list[Path]:

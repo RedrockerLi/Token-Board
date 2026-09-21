@@ -79,15 +79,10 @@ inline ContextManagementDecision context_management_decision(
     }
 
     if (target == ir::ApiFormat::OpenAIResponses) {
-        if (source == ir::ApiFormat::OpenAIResponses) {
-            decision.action = ContextManagementAction::Preserve;
-            decision.reason = "native Responses context_management is preserved";
-        } else {
-            decision.action = ContextManagementAction::Drop;
-            decision.reason =
-                "the source context_management schema is not copied into OpenAI "
-                "Responses; the control field is dropped";
-        }
+        decision.action = ContextManagementAction::Drop;
+        decision.reason =
+            "the source context_management schema is not copied into OpenAI "
+            "Responses; the control field is dropped";
         return decision;
     }
 

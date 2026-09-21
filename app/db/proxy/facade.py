@@ -8,7 +8,6 @@ from app.core.time import format_utc, utc_now
 from app.db.migrations import TOKEN_BOARD_DATABASE_NAME
 from app.db.proxy.accounts_read import ProxyAccountReadMixin
 from app.db.proxy.accounts_write import ProxyAccountWriteMixin
-from app.db.proxy.agent_subscriptions import ProxySubscriptionMixin
 from app.db.proxy.agents import ProxyAgentMixin
 from app.db.proxy.billing_ledger import ProxyBillingLedgerMixin
 from app.db.proxy.billing_read import ProxyBillingReadMixin

@@ -40,7 +40,10 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
 
-namespace {
+// These transport helpers are shared by the forwarding and metrics
+// translation units.  A named namespace gives inline singleton definitions
+// one program-wide identity instead of creating a copy per translation unit.
+namespace tb_transport {
 constexpr int NO_TIMEOUT_SECS = 24 * 3600;
 constexpr int DEFAULT_CONNECT_TIMEOUT_SECS = 10;
 constexpr int64_t DNS_SUCCESS_TTL_MS = 60 * 1000;
@@ -56,3 +59,5 @@ constexpr size_t DNS_WORKER_COUNT = 4;
 #include "connection_pool_internal.h"
 #include "forward_watchdog_internal.h"
 #include "watchdog_service_internal.h"
+
+using namespace tb_transport;

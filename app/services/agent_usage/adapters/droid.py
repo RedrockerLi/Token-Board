@@ -9,7 +9,6 @@ from ..common import (
     configured_root,
     iter_jsonl,
     make_event,
-    project_name,
     read_json,
     source,
     timestamp,

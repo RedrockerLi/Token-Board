@@ -17,10 +17,28 @@ from __future__ import annotations
 import os
 import secrets
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, Response, jsonify, make_response, redirect, request, url_for
 
 COOKIE_NAME = "tb_dash_token"
+
+
+def _safe_login_next(value: str | None) -> str:
+    """Allow only same-origin absolute paths for post-login navigation."""
+    if not value:
+        return "/"
+    if any(char in value for char in ("\\", "\r", "\n", "\t")):
+        return "/"
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return "/"
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
+        return "/"
+    if parsed.path.startswith("//"):
+        return "/"
+    return value
 
 
 def _is_loopback(host: str) -> bool:
@@ -71,7 +89,8 @@ def install_auth(app: Flask, token: str) -> None:
         if request.method == "POST":
             value = (request.form.get("token") or "").strip()
             if value and secrets.compare_digest(value, token):
-                resp = make_response(redirect(request.args.get("next") or "/"))
+                resp = make_response(redirect(_safe_login_next(
+                    request.args.get("next"))))
                 resp.set_cookie(COOKIE_NAME, token, httponly=True, samesite="Lax",
                                 max_age=30 * 24 * 3600)
                 return resp

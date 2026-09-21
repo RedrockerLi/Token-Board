@@ -231,7 +231,7 @@ def main() -> None:
 
         proxy_port = free_port()
         proxy = subprocess.Popen(
-            [str(binary), "--db", str(db), "--schema-dir", str(schema),
+            [str(binary), "--db", str(db),
              "--host", "127.0.0.1", "--port", str(proxy_port),
              "--log-level", "error"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,

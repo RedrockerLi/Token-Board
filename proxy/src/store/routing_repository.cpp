@@ -1,99 +1,5 @@
 #include "database_internal.h"
 
-std::optional<Database::KeyInfo> Database::lookup_local_key(
-    const std::string &key_value) {
-    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-    std::lock_guard<std::mutex> lock(read_mutex_);
-
-    sqlite3_reset(stmt_lookup_key_);
-    sqlite3_bind_text(stmt_lookup_key_, 1,
-                      key_value.c_str(), key_value.size(), SQLITE_STATIC);
-
-    std::optional<KeyInfo> result;
-    if (sqlite3_step(stmt_lookup_key_) == SQLITE_ROW) {
-        KeyInfo info;
-        info.id = sqlite3_column_int(stmt_lookup_key_, 0);
-        info.key_value = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_lookup_key_, 1));
-        info.account_id = sqlite3_column_int(stmt_lookup_key_, 2);
-        info.label = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_lookup_key_, 3));
-        result = std::move(info);
-    }
-    sqlite3_reset(stmt_lookup_key_);
-    return result;
-}
-
-// ── get_account ──────────────────────────────────────────────────────────
-
-std::optional<Database::AccountInfo> Database::get_account(int account_id) {
-    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-    std::lock_guard<std::mutex> lock(read_mutex_);
-
-    sqlite3_reset(stmt_get_account_);
-    sqlite3_bind_int(stmt_get_account_, 1, account_id);
-
-    std::optional<AccountInfo> result;
-    if (sqlite3_step(stmt_get_account_) == SQLITE_ROW) {
-        AccountInfo info;
-        info.id = sqlite3_column_int(stmt_get_account_, 0);
-        info.name = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 1));
-        info.base_url = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 2));
-        info.api_format = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 3));
-        if (info.api_format.empty()) info.api_format = "openai";
-        info.endpoint_path = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 4));
-        info.auth_header = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_account_, 5));
-        if (info.auth_header.empty()) info.auth_header = "bearer";
-        info.is_aggregate = sqlite3_column_int(stmt_get_account_, 6) != 0;
-        info.extended_usage_limit_cooldown =
-            sqlite3_column_int(stmt_get_account_, 7) != 0;
-        info.max_concurrency = sqlite3_column_int(stmt_get_account_, 8);
-        info.deleted = sqlite3_column_int(stmt_get_account_, 9) != 0;
-        result = std::move(info);
-    }
-    sqlite3_reset(stmt_get_account_);
-    return result;
-}
-
-std::optional<Database::RouteInfo> Database::lookup_route(
-    const std::string &key_value) {
-    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-    std::lock_guard<std::mutex> lock(read_mutex_);
-    sqlite3_reset(stmt_lookup_route_);
-    sqlite3_bind_text(stmt_lookup_route_, 1, key_value.c_str(),
-                      key_value.size(), SQLITE_STATIC);
-    std::optional<RouteInfo> result;
-    if (sqlite3_step(stmt_lookup_route_) == SQLITE_ROW) {
-        RouteInfo route;
-        route.key.id = sqlite3_column_int(stmt_lookup_route_, 0);
-        route.key.key_value = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_lookup_route_, 1));
-        route.key.account_id = sqlite3_column_int(stmt_lookup_route_, 2);
-        route.key.label = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_lookup_route_, 3));
-        auto &a = route.account;
-        a.id = sqlite3_column_int(stmt_lookup_route_, 4);
-        a.name = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 5));
-        a.base_url = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 6));
-        a.api_format = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 7));
-        a.endpoint_path = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 8));
-        a.auth_header = reinterpret_cast<const char *>(sqlite3_column_text(stmt_lookup_route_, 9));
-        a.is_aggregate = sqlite3_column_int(stmt_lookup_route_, 10) != 0;
-        a.extended_usage_limit_cooldown =
-            sqlite3_column_int(stmt_lookup_route_, 11) != 0;
-        a.max_concurrency = sqlite3_column_int(stmt_lookup_route_, 12);
-        a.deleted = sqlite3_column_int(stmt_lookup_route_, 13) != 0;
-        result = std::move(route);
-    }
-    sqlite3_reset(stmt_lookup_route_);
-    return result;
-}
-
 std::uint64_t Database::routing_config_generation() {
     std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(read_mutex_);
@@ -131,9 +37,8 @@ bool Database::load_routing_config(RoutingConfig &config) {
     sqlite3_finalize(stmt);
 
     const std::string routes_sql =
-        "SELECT ck.id,ck.key_value,ck.route_set_id,COALESCE(ck.label,''),"
-        "rs.id,rs.name,'','openai','','auto',"
-        "CASE WHEN rs.account_id IS NULL THEN 1 ELSE 0 END,0,0,0 "
+        "SELECT ck.id,ck.key_value,ck.route_set_id,"
+        "rs.id,rs.name,'','openai','','auto',0,0 "
         "FROM client_keys ck JOIN route_sets rs ON rs.id=ck.route_set_id "
         "LEFT JOIN accounts a ON a.id=rs.account_id "
         "WHERE ck.enabled=1 AND rs.enabled=1 "
@@ -150,17 +55,15 @@ bool Database::load_routing_config(RoutingConfig &config) {
         route.key.id = sqlite3_column_int(stmt, 0);
         route.key.key_value = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
         route.key.account_id = sqlite3_column_int(stmt, 2);
-        route.key.label = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3));
         auto &a = route.account;
-        a.id = sqlite3_column_int(stmt, 4);
-        a.name = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 5));
-        a.base_url = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 6));
-        a.api_format = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 7));
-        a.endpoint_path = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 8));
-        a.auth_header = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 9));
-        a.is_aggregate = sqlite3_column_int(stmt, 10) != 0;
-        a.extended_usage_limit_cooldown = sqlite3_column_int(stmt, 11) != 0;
-        a.max_concurrency = sqlite3_column_int(stmt, 12);
+        a.id = sqlite3_column_int(stmt, 3);
+        a.name = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 4));
+        a.base_url = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 5));
+        a.api_format = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 6));
+        a.endpoint_path = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 7));
+        a.auth_header = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 8));
+        a.extended_usage_limit_cooldown = sqlite3_column_int(stmt, 9) != 0;
+        a.max_concurrency = sqlite3_column_int(stmt, 10);
         a.deleted = false;
         next.routes.push_back(std::move(route));
     }
@@ -227,7 +130,6 @@ bool Database::load_routing_config(RoutingConfig &config) {
             a.upstream_id = upstream_id;
             a.extended_usage_limit_cooldown = sqlite3_column_int(stmt, 11) != 0;
             a.max_concurrency = sqlite3_column_int(stmt, 12);
-            a.is_aggregate = false;
             a.deleted = false;
             auto account_it = account_refs.try_emplace(
                 upstream_id, std::make_shared<const AccountInfo>(account)).first;
@@ -292,28 +194,6 @@ bool Database::load_routing_config(RoutingConfig &config) {
     rollback.release();
     config = std::move(next);
     return true;
-}
-
-// ── get_upstream_keys ────────────────────────────────────────────────────
-
-std::vector<Database::KeySlot> Database::get_upstream_keys(int account_id) {
-    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
-    std::lock_guard<std::mutex> lock(read_mutex_);
-
-    sqlite3_reset(stmt_get_upstream_keys_);
-    sqlite3_bind_int(stmt_get_upstream_keys_, 1, account_id);
-
-    std::vector<KeySlot> result;
-    while (sqlite3_step(stmt_get_upstream_keys_) == SQLITE_ROW) {
-        KeySlot k;
-        k.id = sqlite3_column_int(stmt_get_upstream_keys_, 0);
-        k.key_value = reinterpret_cast<const char *>(
-            sqlite3_column_text(stmt_get_upstream_keys_, 1));
-        k.position = sqlite3_column_int(stmt_get_upstream_keys_, 2);
-        result.push_back(std::move(k));
-    }
-    sqlite3_reset(stmt_get_upstream_keys_);
-    return result;
 }
 
 // ── lookup_probe_target ──────────────────────────────────────────────────

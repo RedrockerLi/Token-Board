@@ -432,7 +432,10 @@ bool parse_sse_frame(const std::string &frame, std::string *event_name,
             has_data = true;
             std::string val = line.substr(5);
             if (!val.empty() && val[0] == ' ') val.erase(0, 1);
-            if (data) *data += val;
+            if (data) {
+                if (!data->empty()) data->push_back('\n');
+                *data += val;
+            }
         }
         // lines starting with ':' are SSE comments — ignored
         if (nl == std::string::npos) break;

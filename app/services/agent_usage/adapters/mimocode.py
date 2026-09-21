@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from ..common import batch, config_value, make_event, project_name, read_json, source, sqlite_rows, sqlite_table_exists, timestamp
+from ..common import batch, config_value, make_event, project_name, source, sqlite_rows, sqlite_table_exists, timestamp
 from ..ir import ParseBatch, UsageSource
 
 KIND = "mimocode"

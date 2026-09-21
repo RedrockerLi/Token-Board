@@ -106,6 +106,19 @@ static void check(bool ok, const std::string &what) {
     }
 }
 
+static void test_sse_multiline_data() {
+    printf("--- SSE multiline data folding ---\n");
+    std::string event_name;
+    std::string data;
+    const bool parsed = fmt::parse_sse_frame(
+        "event: message\ndata: first line\ndata: second line\n\n",
+        &event_name, &data);
+    check(parsed, "SSE multiline: frame parses");
+    check(event_name == "message", "SSE multiline: event name preserved");
+    check(data == "first line\nsecond line",
+          "SSE multiline: data fields join with LF");
+}
+
 static bool request_matches(const ChatRequest &a, const ChatRequest &b) {
     if (a.model != b.model) return false;
     if (a.system.size() != b.system.size()) return false;
@@ -847,6 +860,7 @@ static int self_test() {
     }
 
     printf("=== Cross-format regression tests ===\n");
+    test_sse_multiline_data();
     test_openai_to_anthropic_stream_tool_calls(reg);
     test_openai_to_anthropic_stream_reasoning_then_text(reg);
     test_anthropic_to_openai_request_tool_result(reg);

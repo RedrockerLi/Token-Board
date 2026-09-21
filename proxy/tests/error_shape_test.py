@@ -188,8 +188,8 @@ def main() -> None:
 
         proxy_port = free_port()
         proxy = subprocess.Popen(
-            [str(proxy_binary), "--db", str(db_path), "--schema-dir",
-             str(schema_dir), "--host", "127.0.0.1", "--port", str(proxy_port)],
+            [str(proxy_binary), "--db", str(db_path), "--host", "127.0.0.1",
+             "--port", str(proxy_port)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             env=os.environ.copy())
         try:

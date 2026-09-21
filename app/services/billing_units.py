@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Iterable
-
 from app.core.time import format_utc, parse_runtime_timestamp, utc_now
 from app.db.proxy.common import _parse_iso_date
 

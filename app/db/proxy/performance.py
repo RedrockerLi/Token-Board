@@ -1,6 +1,6 @@
 """ProxyDatabase methods for ProxyPerformanceMixin."""
 
-from app.db.proxy.common import json, os, sqlite3, urllib
+from app.db.proxy.common import json, os, urllib
 
 
 class ProxyPerformanceMixin:

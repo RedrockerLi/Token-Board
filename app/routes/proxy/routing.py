@@ -1,7 +1,7 @@
 """Functional proxy API route group."""
 
 from app.routes.proxy.common import (
-    _proxy_db, api_error, bp_proxy, jsonify, request, require_json_object,
+    _proxy_db, api_error, bp_proxy, jsonify, require_json_object,
     require_config_writable,
 )
 from app.routes.contract import status_for
