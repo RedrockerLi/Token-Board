@@ -6,7 +6,9 @@ dashboard has no extra dependency.
 """
 
 import base64
+import csv
 import errno as errno_codes
+import io
 import json
 import logging
 import os
@@ -217,6 +219,32 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         raise RuntimeError(
             "cursor: 会话凭据已被拒绝，请在 Cursor 中重新登录后重试。"
         )
+
+    # Validate CSV header contract. If Cursor changes its export columns, treat as
+    # skipped run with warning to protect incremental state from being wiped.
+    header_reader = csv.reader(io.StringIO(text))
+    try:
+        raw_header = next(header_reader)
+    except StopIteration:
+        raw_header = []
+    clean_header = [str(h).strip() for h in raw_header if h]
+    has_date = any(h.lower() == "date" for h in clean_header)
+    has_model = any(h.lower() == "model" for h in clean_header)
+    token_cols = {"input (w/ cache write)", "input (w/o cache write)", "cache read", "output tokens"}
+    has_token = any(h.lower() in token_cols for h in clean_header)
+
+    if not has_date or not has_model or not has_token:
+        header_sample = ", ".join(clean_header[:8])
+        return batch(
+            [],
+            0,
+            skipped=True,
+            warnings=(
+                "cursor: 导出表头与预期不符（需要 Date、Model 及至少一个 token 列），本次已跳过以保护增量状态；"
+                f"Cursor 可能更改了导出接口，请反馈。当前表头: {header_sample}",
+            ),
+        )
+
     events = []
     rows = list(csv_rows(text))
     for index, row in enumerate(rows):

@@ -11,9 +11,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.services.agent_usage.adapters import (
-    antigravity, claude_code, cline, codex, craft_agent, cursor, dsh, grok,
-    hermes, kiro,
-    kimi_code, mcode, opencode, pi_common, workbuddy,
+    antigravity, claude_code, cline, codearts_agent, codebuddy, codex, cola,
+    craft_agent, cursor, devin, dsh, grok, hermes, kiro,
+    kimi_code, mcode, opencode, pi_common, qoder, qoder_cn, workbuddy,
 )
 from app.services.agent_usage import cindy_ledger
 from app.services.agent_usage.ir import UsageEvent, UsageSource
@@ -22,14 +22,15 @@ from app.services.agent_usage.registry import ADAPTERS
 
 class AgentUsageAdapterTestCase(unittest.TestCase):
     def test_registry_matches_reference_agent_set(self) -> None:
-        self.assertEqual(len(ADAPTERS), 28)
+        self.assertEqual(len(ADAPTERS), 34)
         self.assertEqual(set(ADAPTERS), {
             "claude-code", "codex", "grok", "copilot-cli", "craft-agent",
             "cursor", "dimagent", "gemini-cli", "opencode", "openclaw",
             "omp", "pi-coding-agent", "qwen-code", "kimi-code", "amp",
             "alma", "droid", "dsh", "antigravity", "trae-cli", "hermes",
             "kiro", "mimocode", "cline", "roo-code", "workbuddy", "zcode",
-            "mcode",
+            "mcode", "cola", "qoder", "qoder-cn", "devin", "codebuddy",
+            "codearts-agent",
         })
 
     def test_claude_reads_cache_hits_and_applies_reference_fast_marker(self) -> None:
@@ -1021,6 +1022,279 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual({event.event_id for event in events}, {
                 "workbuddy:record:shared-request",
             })
+
+    def test_cursor_header_sentinel_protects_incremental_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "state.vscdb"
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute(
+                "INSERT INTO ItemTable VALUES ('cursorAuth/accessToken', 'Auth_0|token123')"
+            )
+            conn.commit()
+            conn.close()
+
+            item = UsageSource(path=db_path, key="cursor-auth")
+
+            # Mock urlopen to return CSV with missing Model column
+            with patch("app.services.agent_usage.adapters.cursor.urlopen") as mock_url:
+                class MockResp:
+                    def __init__(self, text):
+                        self.text = text
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        pass
+                    def read(self):
+                        return self.text.encode("utf-8")
+
+                # Missing Model column -> skipped=True with warning
+                mock_url.return_value = MockResp("Date,Input (w/ Cache Write),Output Tokens\n2026-09-20T00:00:00Z,10,20\n")
+                batch_res = cursor.parse(item)
+                self.assertTrue(batch_res.skipped)
+                self.assertTrue(any("导出表头与预期不符" in w for w in batch_res.warnings))
+                self.assertEqual(len(batch_res.events), 0)
+
+                # Valid columns -> parsed successfully
+                mock_url.return_value = MockResp("Date,Model,Input (w/ Cache Write),Output Tokens\n2026-09-20T00:00:00Z,claude-3-5,10,20\n")
+                valid_batch = cursor.parse(item)
+                self.assertFalse(valid_batch.skipped)
+                self.assertEqual(len(valid_batch.events), 1)
+                self.assertEqual(valid_batch.events[0].model, "claude-3-5")
+
+    def test_cola_reads_pi_compatible_session_and_deduplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions_dir = root / "sessions" / "desktop-local"
+            sessions_dir.mkdir(parents=True)
+            session_file = sessions_dir / "session.jsonl"
+            lines = [
+                {"type": "session", "version": 3, "id": "cola-s1", "timestamp": "2026-09-10T01:00:00Z", "cwd": "/work/cola-demo"},
+                {
+                    "type": "message", "id": "m1", "parentId": None, "timestamp": "2026-09-10T01:00:01Z",
+                    "message": {
+                        "role": "assistant", "model": "claude-haiku-4-5-20251001",
+                        "usage": {"input": 100, "output": 20, "cacheRead": 30, "cacheWrite": 10, "reasoning": 4},
+                    },
+                },
+            ]
+            session_file.write_text("\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+
+            item = UsageSource(path=session_file, key="cola:desktop-local:session.jsonl", context={"sessions_root": str(root / "sessions")})
+            batch_res = cola.parse(item)
+            self.assertFalse(batch_res.skipped)
+            self.assertEqual(len(batch_res.events), 1)
+            ev = batch_res.events[0]
+            self.assertEqual(ev.model, "claude-haiku-4-5-20251001")
+            self.assertEqual(ev.project, "cola-demo")
+            self.assertEqual(ev.cache_read_tokens, 30)
+            self.assertEqual(ev.prompt_tokens, 140)
+            self.assertEqual(ev.completion_tokens, 20)
+
+    def test_qoder_and_qoder_cn_parse_ide_db_and_cli_transcripts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # 1. Test IDE SQLite db
+            db_path = root / "local.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute("""
+                CREATE TABLE chat_message (
+                    id TEXT PRIMARY KEY, session_id TEXT, request_id TEXT, role TEXT,
+                    token_info TEXT, model_info TEXT, gmt_create INTEGER
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE chat_session (
+                    session_id TEXT PRIMARY KEY, user_id TEXT, session_title TEXT,
+                    project_uri TEXT, project_name TEXT, preferred_model_info TEXT
+                )
+            """)
+            conn.execute(
+                "INSERT INTO chat_session VALUES ('s1', 'u1', 'Title', 'file:///work/my-qoder-app', 'my-qoder-app', '')"
+            )
+            conn.execute(
+                "INSERT INTO chat_message VALUES ('m1', 's1', 'r1', 'assistant', "
+                "'{\"prompt_tokens\":18756,\"completion_tokens\":112,\"cached_tokens\":16334}', "
+                "'{\"model_key\":\"auto\"}', 1788454780945)"
+            )
+            conn.commit()
+            conn.close()
+
+            item_ide = UsageSource(path=db_path, key="qoder:ide", context={"edition": "qoder", "source_type": "ide_db"})
+            batch_ide = qoder.parse(item_ide)
+            self.assertFalse(batch_ide.skipped)
+            self.assertEqual(len(batch_ide.events), 1)
+            ev_ide = batch_ide.events[0]
+            self.assertEqual(ev_ide.model, "qoder-auto")  # routing tier normalized
+            self.assertEqual(ev_ide.project, "my-qoder-app")
+            self.assertEqual(ev_ide.prompt_tokens, 18756)
+            self.assertEqual(ev_ide.cache_read_tokens, 16334)
+            self.assertEqual(ev_ide.completion_tokens, 112)
+
+            # Test qoder-cn edition on same db
+            item_cn = UsageSource(path=db_path, key="qoder-cn:ide", context={"edition": "qoder-cn", "source_type": "ide_db"})
+            batch_cn = qoder_cn.parse(item_cn)
+            self.assertFalse(batch_cn.skipped)
+            self.assertEqual(len(batch_cn.events), 1)
+            self.assertEqual(batch_cn.events[0].model, "qoder-auto")
+
+            # 2. Test CLI transcript (credit-only calls produce 0 events; token calls produce events)
+            jsonl_path = root / "session.jsonl"
+            lines = [
+                # credit only call (0 tokens)
+                {
+                    "type": "assistant", "sessionId": "s-cli", "timestamp": "2026-09-03T16:43:25Z", "cwd": "/work/cli-proj",
+                    "message": {"id": "c1", "model": "efficient", "usage": {"input_tokens": 0, "output_tokens": 0, "credits": 1.5}},
+                },
+                # real token call
+                {
+                    "type": "assistant", "sessionId": "s-cli", "timestamp": "2026-09-03T16:45:00Z", "cwd": "/work/cli-proj",
+                    "message": {"id": "c2", "model": "qmodel_38max", "usage": {"input_tokens": 500, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 200, "output_tokens": 50}},
+                },
+            ]
+            jsonl_path.write_text("\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+
+            item_cli = UsageSource(path=jsonl_path, key="qoder:cli", context={"edition": "qoder", "source_type": "transcript"})
+            batch_cli = qoder.parse(item_cli)
+            self.assertEqual(len(batch_cli.events), 1)
+            ev_cli = batch_cli.events[0]
+            self.assertEqual(ev_cli.model, "qmodel_38max")
+            self.assertEqual(ev_cli.project, "cli-proj")
+            self.assertEqual(ev_cli.prompt_tokens, 800)
+            self.assertEqual(ev_cli.cache_read_tokens, 200)
+            self.assertEqual(ev_cli.completion_tokens, 50)
+
+    def test_devin_schema_guard_and_snapshot_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "sessions.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE foo (x INTEGER)")
+            conn.commit()
+            conn.close()
+
+            item = UsageSource(path=db_path)
+            res_missing = devin.parse(item)
+            self.assertTrue(res_missing.skipped)
+
+            # Re-create with valid schema
+            conn = sqlite3.connect(db_path)
+            conn.execute("DROP TABLE foo")
+            conn.execute("""
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, working_directory TEXT NOT NULL, model TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE message_nodes (
+                    row_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                    node_id INTEGER NOT NULL, chat_message TEXT NOT NULL, created_at INTEGER NOT NULL
+                )
+            """)
+            conn.execute("INSERT INTO sessions VALUES ('devin-s1', '/work/devin-project', 'swe-2-high')")
+            chat1 = {
+                "message_id": "msg-1", "role": "assistant",
+                "metadata": {
+                    "created_at": "2026-09-18T10:00:00Z", "generation_model": "claude-3-7-sonnet",
+                    "metrics": {"input_tokens": 120, "output_tokens": 35, "cache_read_tokens": 40, "cache_creation_tokens": 10},
+                },
+            }
+            chat_dup = {
+                "message_id": "msg-1", "role": "assistant",  # duplicate node
+                "metadata": {
+                    "created_at": "2026-09-18T10:00:00Z", "generation_model": "claude-3-7-sonnet",
+                    "metrics": {"input_tokens": 120, "output_tokens": 35, "cache_read_tokens": 40, "cache_creation_tokens": 10},
+                },
+            }
+            conn.execute("INSERT INTO message_nodes VALUES (1, 'devin-s1', 1, ?, 1789525600)", (json.dumps(chat1),))
+            conn.execute("INSERT INTO message_nodes VALUES (2, 'devin-s1', 2, ?, 1789525600)", (json.dumps(chat_dup),))
+            conn.commit()
+            conn.close()
+
+            res_valid = devin.parse(item)
+            self.assertFalse(res_valid.skipped)
+            self.assertEqual(len(res_valid.events), 1)  # duplicate message deduplicated
+            ev = res_valid.events[0]
+            self.assertEqual(ev.model, "claude-3-7-sonnet")
+            self.assertEqual(ev.project, "devin-project")
+            self.assertEqual(ev.prompt_tokens, 170)
+            self.assertEqual(ev.cache_read_tokens, 40)
+            self.assertEqual(ev.completion_tokens, 35)
+
+    def test_codebuddy_parses_api_messages_and_routing_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proj_dir = root / "projects" / "private-tmp-demo-proj"
+            proj_dir.mkdir(parents=True)
+            session_file = proj_dir / "session-1.jsonl"
+            lines = [
+                {"id": "u1", "type": "message", "role": "user", "cwd": "/work/demo-proj", "timestamp": 1789525600000},
+                {
+                    "id": "a1", "type": "assistant", "timestamp": 1789525602000, "cwd": "/work/demo-proj",
+                    "message": {
+                        "model": None, "role": "assistant",
+                        "usage": {"input_tokens": 100, "output_tokens": 47, "cache_read_input_tokens": 1344, "cache_creation_input_tokens": 10},
+                    },
+                    "providerData": {
+                        "messageId": "msg-cb-1", "model": "claude-sonnet-4-6", "requestModelId": "auto",
+                    },
+                },
+            ]
+            session_file.write_text("\n".join(json.dumps(l) for l in lines) + "\n", encoding="utf-8")
+
+            item = UsageSource(path=session_file, key="codebuddy:s1", context={"projects_dir": str(root / "projects")})
+            batch_res = codebuddy.parse(item)
+            self.assertFalse(batch_res.skipped)
+            self.assertEqual(len(batch_res.events), 1)
+            ev = batch_res.events[0]
+            self.assertEqual(ev.model, "codebuddy-auto")
+            self.assertEqual(ev.project, "demo-proj")
+            self.assertEqual(ev.prompt_tokens, 1454)
+            self.assertEqual(ev.cache_read_tokens, 1344)
+            self.assertEqual(ev.completion_tokens, 47)
+
+    def test_codearts_agent_recursive_tree_and_footprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "opencode.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute("""
+                CREATE TABLE session (
+                    id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                )
+            """)
+            conn.execute("INSERT INTO session VALUES ('parent-s1', NULL, '/work/codearts-proj')")
+            conn.execute("INSERT INTO session VALUES ('child-s2', 'parent-s1', '/work/codearts-proj/sub')")
+
+            msg_data = {
+                "role": "assistant",
+                "modelID": "GLM-5.2",
+                "time": {"created": 1789525600000},
+                "tokens": {"input": 80, "output": 25, "cache": {"read": 20, "write": 15}, "reasoning": 5},
+            }
+            conn.execute(
+                "INSERT INTO message VALUES ('m-child', 'child-s2', 1789525600000, 1789525600000, ?)",
+                (json.dumps(msg_data),)
+            )
+            conn.commit()
+            conn.close()
+
+            item = UsageSource(path=db_path, key="codearts-agent:opencode.db")
+            batch_res = codearts_agent.parse(item)
+            self.assertFalse(batch_res.skipped)
+            self.assertEqual(len(batch_res.events), 1)
+            ev = batch_res.events[0]
+            self.assertEqual(ev.model, "GLM-5.2")
+            self.assertEqual(ev.project, "codearts-proj")
+            self.assertEqual(ev.session_id, "parent-s1")
+            self.assertEqual(ev.prompt_tokens, 115)
+            self.assertEqual(ev.cache_read_tokens, 20)
+            self.assertEqual(ev.completion_tokens, 30)
 
 
 if __name__ == "__main__":

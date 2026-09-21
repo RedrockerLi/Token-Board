@@ -71,12 +71,21 @@ Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter �
 
 ### Agent 用量 ref 基准
 
-当前移植基准是 `ref/vibe-usage` 的 commit `02ed3b52679cbd269639ef808476a74b062093f8`（短 hash：`02ed3b5`，提交信息：`chore: release v0.10.22`，记录日期：2026-09-07）。下次升级 ref 后，可用下面的命令查看新增提交和代码差异：
+当前移植基准是 `ref/vibe-usage` 的 commit `b4a38745785a243ea23f5130285d78624f89a9f5`（短 hash：`b4a3874`，提交信息：`修复: Grok 1.0 用量账本与两类「静默变空」格式哨兵`，记录日期：2026-09-20）。下次升级 ref 后，可用下面的命令查看新增提交和代码差异：
 
 ```bash
-git -C ref/vibe-usage log 02ed3b52679cbd269639ef808476a74b062093f8..HEAD --oneline
-git -C ref/vibe-usage diff 02ed3b52679cbd269639ef808476a74b062093f8..HEAD -- src/parsers
+git -C ref/vibe-usage log b4a38745785a243ea23f5130285d78624f89a9f5..HEAD --oneline
+git -C ref/vibe-usage diff b4a38745785a243ea23f5130285d78624f89a9f5..HEAD -- src/parsers
 ```
+
+本项目已移植全部 34 种智能体来源适配器（`app/services/agent_usage/adapters/`）：
+- **CLI / 转录文件类**：`claude-code`, `codebuddy`, `cola`, `copilot-cli`, `craft-agent`, `dimagent`, `droid`, `dsh`, `gemini-cli`, `grok`, `kimi-code`, `omp`, `openclaw`, `pi-coding-agent`, `qwen-code`, `roo-code`, `trae-cli`, `workbuddy`；
+- **本地 SQLite / WAL 数据库类**：`alma`, `codearts-agent`, `devin`, `hermes`, `kiro`, `mcode`, `mimocode`, `opencode`, `qoder`, `qoder-cn`, `zcode`（通过 `sqlite_rows_snapshot` 进行安全快照隔离读取，防御并发锁）；
+- **混合 / 平台类**：`antigravity`（离线 SQLite + protobuf 转录），`cline`（SDK 会话 + 扩展转录），`codex`（Rollout JSONL + Continuation 段重放分段去重），`cursor`（本地凭据 + CSV 导出校验）；
+- **核心设计约定**：
+  1. **路由档位命名空间隔离**：`qoder-*`、`codebuddy-*`、`droid-*` 等将本地路由档位（如 `auto`, `default`, `fast` 等）命名空间化，防止与上游公开定价模型产生价格误碰撞；
+  2. **防静默变空哨兵**：外部接口或格式变更可能导致误读为 0 Token。`cursor`（表头缺少 Date/Model/Token 列时）与 `grok`（报告有轮次但未读出用量时）实施格式哨兵拦截，返回 `skipped=True` 与报警日志，防止增量同步清空正常用量；
+  3. **测试环境约定**：测试与回归验证必须在 `conda base` 环境中执行（`conda run -n base pytest app/tests`）。
 
 ## 前端
 
