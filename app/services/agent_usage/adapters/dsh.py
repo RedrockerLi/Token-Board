@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -20,7 +21,14 @@ from ..ir import ParseBatch, UsageSource
 KIND = "dsh"
 LABEL = "DeepSeek Harness"
 DEFAULT_PATH = Path.home() / ".dsh" / "sessions"
-SESSION_FORMAT_VERSION = 0
+MAX_SESSION_FORMAT_VERSION = 3
+SESSION_FILENAME = re.compile(r"^session(?:\.v([1-9][0-9]*))?\.jsonl(\.zstd)?$")
+MAX_SESSION_FILE_BYTES = 256 * 1024 * 1024
+MAX_DECOMPRESSED_SESSION_BYTES = 512 * 1024 * 1024
+
+
+class _DshParseError(ValueError):
+    """A selected DSH source is not safe to import."""
 
 
 def _sessions_root(software: dict) -> Path:
@@ -36,37 +44,70 @@ def _sessions_root(software: dict) -> Path:
     return value if value.name == "sessions" else value / "sessions"
 
 
-def _session_files(root: Path) -> list[Path]:
+def _session_file_version(path: Path) -> int:
+    match = SESSION_FILENAME.fullmatch(path.name)
+    return int(match.group(1) or 0) if match else 0
+
+
+def _session_candidates(root: Path) -> list[tuple[Path, int]]:
     if root.is_file():
-        return [root]
+        return [(root, _session_file_version(root))]
     selected_by_directory = {}
-    for path in walk_files(root, ("session.jsonl", "session.jsonl.zstd")):
+    for path in walk_files(root, (".jsonl", ".jsonl.zstd")):
+        match = SESSION_FILENAME.fullmatch(path.name)
+        if match is None:
+            continue
         try:
             key = path.parent.resolve()
             stat = path.stat()
         except OSError:
             continue
-        # Prefer the compressed file when both representations exist. It is
-        # the authoritative current log in DSH's migration window.
-        rank = (1 if path.name.endswith(".zstd") else 0, stat.st_size, stat.st_mtime_ns)
+        version = int(match.group(1) or 0)
+        # DSH migrations leave several generations in one directory. The
+        # highest canonical generation is authoritative; compressed wins only
+        # when the generation is the same.
+        rank = (version, 1 if match.group(2) else 0, stat.st_size,
+                stat.st_mtime_ns)
         current = selected_by_directory.get(key)
         if current is None or rank > current[0]:
-            selected_by_directory[key] = (rank, path)
+            selected_by_directory[key] = (rank, path, version)
 
     # A session can be copied between project buckets while it is archived.
-    # The on-disk directory name is the stable id in DSH's layout; keep the
-    # largest/newest copy so its newer usage is not hidden by traversal order.
+    # Select the newest format first, then the largest/newest copy in that
+    # generation. This prevents a stale V0/V1 copy from masking a V3 file.
     selected_by_session = {}
-    for rank, path in selected_by_directory.values():
+    for rank, path, version in selected_by_directory.values():
         session_key = _logical_session_key(path)
         current = selected_by_session.get(session_key)
-        if current is None or (path.stat().st_size, path.stat().st_mtime_ns,
-                               rank[0]) > (current[1].stat().st_size,
-                                           current[1].stat().st_mtime_ns,
-                                           current[0][0]):
-            selected_by_session[session_key] = (rank, path)
-    return [path for _, path in sorted(selected_by_session.values(),
-                                       key=lambda value: str(value[1]))]
+        if current is None:
+            selected_by_session[session_key] = (rank, path, version)
+            continue
+        current_rank, current_path, current_version = current
+        try:
+            candidate_stat = path.stat()
+            current_stat = current_path.stat()
+        except OSError:
+            continue
+        candidate = (version, candidate_stat.st_size, candidate_stat.st_mtime_ns,
+                     rank[1])
+        selected = (current_version, current_stat.st_size,
+                    current_stat.st_mtime_ns, current_rank[1])
+        if candidate > selected:
+            selected_by_session[session_key] = (rank, path, version)
+    return [
+        (path, version)
+        for _, path, version in sorted(
+            selected_by_session.values(), key=lambda value: str(value[1]))
+    ]
+
+
+def _session_files(root: Path) -> list[Path]:
+    """Return the selected canonical session paths.
+
+    Keep this small compatibility helper separate from the version-aware
+    candidate list; a few callers and fixtures use it for discovery checks.
+    """
+    return [path for path, _ in _session_candidates(root)]
 
 
 def _logical_session_key(path: Path) -> str:
@@ -89,10 +130,11 @@ def _logical_session_key(path: Path) -> str:
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
     root = _sessions_root(software)
     out = []
-    for path in _session_files(root):
+    for path, version in _session_candidates(root):
         if stop_event is not None and stop_event.is_set():
             break
-        out.append(source(path, session_dir=path.parent))
+        out.append(source(path, session_dir=path.parent,
+                          file_version=version))
     return out
 
 
@@ -171,6 +213,9 @@ def _split_zstd_frames(buffer: bytes) -> list[tuple[int, int]]:
 
 def _text(path: Path) -> str:
     raw = path.read_bytes()
+    if len(raw) > MAX_SESSION_FILE_BYTES:
+        raise _DshParseError(
+            f"session log too large ({len(raw)} bytes)")
     if not path.name.endswith(".zstd"):
         return raw.decode("utf-8", errors="replace")
     zstd = shutil.which("zstd")
@@ -187,17 +232,16 @@ def _text(path: Path) -> str:
         [zstd, "-d", "-c"], input=complete, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, check=True, timeout=30,
     )
+    if len(result.stdout) > MAX_DECOMPRESSED_SESSION_BYTES:
+        raise _DshParseError(
+            f"decompressed session log too large ({len(result.stdout)} bytes)")
     return result.stdout.decode("utf-8", errors="replace")
 
 
 def _seq(value):
-    if isinstance(value, bool):
+    if type(value) is not int:
         return None
-    try:
-        number = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return number if number >= 0 else None
+    return value if 0 <= value <= 9_007_199_254_740_991 else None
 
 
 def _usage(value: object) -> dict | None:
@@ -228,14 +272,15 @@ def _model_name(data: dict) -> str:
     return str(value).strip() if isinstance(value, str) and value.strip() else "unknown"
 
 
-def _load_model(item: UsageSource) -> dict | None:
-    try:
-        text = _text(item.path)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
+def _message_id(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _build_model(text: str, file_version: int) -> dict:
     header = None
     messages = []
-    line_count = 0
+    lines = text.splitlines()
+    line_count = len(lines)
     for line_no, raw in enumerate(text.splitlines(), 1):
         line_count = line_no
         try:
@@ -254,42 +299,90 @@ def _load_model(item: UsageSource) -> dict | None:
         if record_type == "user/message":
             source_data = data.get("source") if isinstance(data.get("source"), dict) else {}
             if source_data.get("kind") == "user":
+                message_id = _message_id(data.get("id"))
                 messages.append({
                     "seq": _seq(record.get("seq")), "role": "user",
                     "time": requested_at, "usage": None, "model": "unknown",
+                    "message_id": message_id,
                 })
         elif record_type == "assistant/message":
+            message = data.get("message") if isinstance(data.get("message"), dict) else {}
             messages.append({
                 "seq": _seq(record.get("seq")), "role": "assistant",
                 "time": requested_at, "usage": _usage(data.get("usage")),
                 "model": _model_name(data),
+                "message_id": _message_id(message.get("id")),
             })
     if (not isinstance(header, dict)
             or not isinstance(header.get("id"), str)
             or not header["id"]):
-        return None
+        raise _DshParseError("missing session header record")
     version = header.get("version")
-    if version != SESSION_FORMAT_VERSION:
-        return None
+    if type(version) is not int or version < 0 or version > MAX_SESSION_FORMAT_VERSION:
+        raise _DshParseError(
+            f"format version {version} is not supported (parser supports 0–"
+            f"{MAX_SESSION_FORMAT_VERSION})")
+    if version != file_version:
+        raise _DshParseError(
+            f"session header format version {version} disagrees with filename "
+            f"version {file_version}")
+    if version >= 2 and type(header.get("isSeeded")) is not bool:
+        raise _DshParseError(
+            f"format v{version} session header lacks isSeeded")
+    inherited_seq = None
+    # The marker scan above needs the header version, but the header may occur
+    # after a malformed preamble. Re-scan only the tiny marker condition after
+    # validating the header, preserving the order of the message pass.
+    if version >= 2:
+        for raw in lines:
+            try:
+                record = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(record, dict) or record.get("type") != "session/end-seed":
+                continue
+            data = record.get("data") if isinstance(record.get("data"), dict) else {}
+            if data.get("inherited") is True:
+                seq = _seq(record.get("seq"))
+                if seq is None:
+                    raise _DshParseError(
+                        "inherited end-seed marker lacks a valid seq")
+                inherited_seq = seq
+        if header.get("isSeeded") != (inherited_seq is not None):
+            raise _DshParseError(
+                "isSeeded disagrees with the inherited end-seed marker")
     has_user = any(message["role"] == "user" for message in messages)
     return {
         "session_id": header["id"],
         "parent_id": header.get("parentSession") if isinstance(header.get("parentSession"), str) else None,
-        "seed_length": _seq(header.get("seedLength")) or 0,
+        "format_version": version,
+        "seed_length": (inherited_seq if version >= 2 else
+                         (_seq(header.get("seedLength")) or 0)),
         "cwd": header.get("cwd"), "messages": messages, "has_user": has_user,
         "line_count": line_count,
     }
 
 
+def _load_model(item: UsageSource, *, strict: bool = False) -> dict | None:
+    try:
+        text = _text(item.path)
+        configured_version = item.context.get("file_version")
+        file_version = (_session_file_version(item.path)
+                        if configured_version is None else int(configured_version))
+        return _build_model(text, file_version)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        if strict:
+            raise
+        return None
+
+
 def _replay_skip_count(child: dict, parent: dict | None) -> int:
     if parent is None or child["seed_length"] <= 0:
         return 0
-    parent_by_seq = {
-        message["seq"]: message for message in parent["messages"]
-        if message["seq"] is not None
-    }
+    parent_index = 0
     previous = -1
     count = 0
+    mixed_versions = child.get("format_version") != parent.get("format_version")
     for message in child["messages"]:
         seq = message["seq"]
         if seq is None or seq <= previous:
@@ -297,11 +390,27 @@ def _replay_skip_count(child: dict, parent: dict | None) -> int:
         previous = seq
         if seq >= child["seed_length"]:
             break
-        source_message = parent_by_seq.get(seq)
-        if source_message is None or source_message["role"] != message["role"]:
+        if mixed_versions:
+            if not message.get("message_id"):
+                return 0
+            while (parent_index < len(parent["messages"])
+                   and parent["messages"][parent_index].get("message_id")
+                   != message["message_id"]):
+                parent_index += 1
+        else:
+            while (parent_index < len(parent["messages"])
+                   and parent["messages"][parent_index]["seq"] is not None
+                   and parent["messages"][parent_index]["seq"] < seq):
+                parent_index += 1
+        source_message = (parent["messages"][parent_index]
+                          if parent_index < len(parent["messages"]) else None)
+        if (source_message is None
+                or (not mixed_versions and source_message["seq"] != seq)
+                or source_message["role"] != message["role"]):
             return 0
         if source_message["model"] != message["model"] or source_message["usage"] != message["usage"]:
             return 0
+        parent_index += 1
         count += 1
     return count
 
@@ -327,9 +436,16 @@ def replay_skips(sources: list[UsageSource], stop_event=None) -> dict[str, int]:
 
 
 def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_) -> ParseBatch:
-    model = _load_model(item)
+    try:
+        model = _load_model(item, strict=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return batch(
+            [], 0, skipped=True,
+            warnings=(f"dsh: skipping {item.path} ({exc})",),
+        )
     if model is None:
-        return batch([], 0)
+        return batch([], 0, skipped=True,
+                     warnings=(f"dsh: skipping {item.path} (invalid session)",))
     # Plugin-driven assistant-only logs are not user agent sessions. Keep
     # their usage out of the local import just as the reference parser does.
     if not model.get("has_user"):
@@ -349,7 +465,8 @@ def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_)
         usage = message["usage"]
         event = make_event(
             kind=KIND, source_key=f"session:{session_id}",
-            ordinal=message["seq"] if message["seq"] is not None else index,
+            ordinal=(message.get("message_id") or message["seq"]
+                     if message["seq"] is not None else index),
             model=message["model"], requested_at=message["time"],
             input_tokens=usage["input"], output_tokens=usage["output"],
             cached_input_tokens=usage["cache"],

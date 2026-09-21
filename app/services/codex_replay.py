@@ -15,6 +15,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from app.services.codex_segments import CodexMergeCancelled, merge_codex_records
+
 
 def _timestamp_ms(value) -> float | None:
     """Return an ISO or epoch timestamp as milliseconds."""
@@ -61,8 +63,10 @@ def _json_fingerprint(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _session_index(path: Path,
+def _session_index(path: Path | tuple[Path, ...],
                    stop_event: threading.Event | None = None) -> dict:
+    paths = tuple(path) if isinstance(path, (tuple, list)) else (path,)
+    source_path = Path(paths[0])
     session_id = None
     forked_from_id = None
     parent_thread_id = None
@@ -76,15 +80,26 @@ def _session_index(path: Path,
     line_no = 0
     logical_timestamp = None
     pending_token_times = []
-    with _open_maybe_gz(path) as source:
-        for raw in source:
+    try:
+        if len(paths) > 1:
+            records = ((record, context) for record, context in
+                       merge_codex_records(tuple(paths), stop_event))
+        else:
+            records = None
+        if records is None:
+            with _open_maybe_gz(source_path) as source:
+                records = []
+                for raw in source:
+                    line_no += 1
+                    try:
+                        obj = json.loads(raw)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    records.append((obj, {}))
+        for obj, _context in records:
             if stop_event is not None and stop_event.is_set():
                 return {"cancelled": True}
-            line_no += 1
-            try:
-                obj = json.loads(raw)
-            except (ValueError, UnicodeDecodeError):
-                continue
+            line_no += 1 if len(paths) > 1 else 0
             if not isinstance(obj, dict):
                 continue
             record_timestamp = _timestamp_ms(obj.get("timestamp"))
@@ -144,9 +159,16 @@ def _session_index(path: Path,
                     "started_at": _timestamp_ms(payload.get("started_at")),
                     "line_no": line_no,
                 })
+    except CodexMergeCancelled:
+        return {"cancelled": True}
     return {
-        "path": path,
-        "session_id": session_id or _session_id_from_path(path),
+        "path": source_path,
+        "size": sum(
+            (candidate.stat().st_size for candidate in paths
+             if candidate.is_file()),
+            0,
+        ),
+        "session_id": session_id or _session_id_from_path(source_path),
         "forked_from_id": forked_from_id,
         "parent_thread_id": parent_thread_id,
         "is_subagent": is_subagent,
@@ -192,7 +214,9 @@ def replay_skip_counts(files,
     for item in indexes:
         current = by_session.get(item["session_id"])
         try:
-            size = item["path"].stat().st_size
+            size = item.get("size")
+            if size is None:
+                size = item["path"].stat().st_size
         except OSError:
             size = 0
         if current is None or size > current[0]:

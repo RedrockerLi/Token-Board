@@ -11,7 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.services.agent_usage.adapters import (
-    antigravity, cline, codex, craft_agent, cursor, dsh, grok, hermes, kiro,
+    antigravity, claude_code, cline, codex, craft_agent, cursor, dsh, grok,
+    hermes, kiro,
     kimi_code, mcode, opencode, pi_common, workbuddy,
 )
 from app.services.agent_usage import cindy_ledger
@@ -30,6 +31,166 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             "kiro", "mimocode", "cline", "roo-code", "workbuddy", "zcode",
             "mcode",
         })
+
+    def test_claude_reads_cache_hits_and_applies_reference_fast_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "projects" / "-work-project" / "session.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({
+                "type": "assistant",
+                "uuid": "call-1",
+                "timestamp": "2026-09-20T15:00:00Z",
+                "cwd": "/work/project",
+                "message": {
+                    "id": "message-1",
+                    "model": "claude-opus-4-8",
+                    "usage": {
+                        "input_tokens": 11,
+                        "cache_read_input_tokens": 13,
+                        "cache_creation_input_tokens": 17,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 5,
+                            "ephemeral_1h_input_tokens": 12,
+                        },
+                        "output_tokens": 7,
+                        "speed": "fast",
+                    },
+                },
+            }) + "\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"VIBE_USAGE_CLAUDE_DIRS": str(root)}):
+                parsed = claude_code.parse(claude_code.discover({})[0])
+
+            self.assertEqual(len(parsed.events), 1)
+            event = parsed.events[0]
+            self.assertEqual(event.model, "claude-opus-4-8-fast")
+            # request_log has no cache-creation column: cache writes stay in
+            # the non-overlapping input projection, while cache reads remain
+            # independently available to the dashboard as cache hits.
+            self.assertEqual((event.prompt_tokens, event.cache_read_tokens,
+                              event.completion_tokens, event.total_tokens),
+                             (41, 13, 7, 48))
+
+    def test_claude_extra_roots_are_additive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            primary = base / "primary"
+            extra = base / "extra"
+            for root, name in ((primary, "one"), (extra, "two")):
+                path = root / "projects" / "-work-project" / f"{name}.jsonl"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({
+                    "type": "assistant",
+                    "uuid": name,
+                    "timestamp": "2026-09-20T15:00:00Z",
+                    "cwd": "/work/project",
+                    "message": {
+                        "model": "claude-sonnet-4-6",
+                        "usage": {"input_tokens": 10, "output_tokens": 2},
+                    },
+                }) + "\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"VIBE_USAGE_CLAUDE_DIRS": str(primary)}):
+                items = claude_code.discover({
+                    "config": {"extra_roots": {"claude-code": [str(extra)]}},
+                })
+                parsed = [claude_code.parse(item) for item in items]
+
+            self.assertEqual(len(items), 2)
+            self.assertEqual(sum(len(batch.events) for batch in parsed), 2)
+
+    def test_cline_sdk_session_artifact_is_imported_without_prompt_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_id = "cline-session"
+            session_dir = root / "data" / "sessions" / session_id
+            session_dir.mkdir(parents=True)
+            (session_dir / f"{session_id}.json").write_text(json.dumps({
+                "version": 1, "session_id": session_id,
+                "started_at": "2026-09-20T15:00:00Z",
+                "workspace_root": "/work/project",
+            }), encoding="utf-8")
+            (session_dir / f"{session_id}.messages.json").write_text(json.dumps({
+                "version": 1, "sessionId": session_id, "agent": "lead",
+                "messages": [
+                    {"id": "user-1", "role": "user", "ts": 1789916400000,
+                     "content": "PRIVATE PROMPT"},
+                    {"id": "assistant-1", "role": "assistant",
+                     "ts": 1789916401000, "content": "PRIVATE RESPONSE",
+                     "modelInfo": {"id": "cline-model"},
+                     "metrics": {"inputTokens": 100,
+                                 "cacheReadTokens": 30,
+                                 "outputTokens": 20}},
+                ],
+            }), encoding="utf-8")
+
+            with patch.dict(os.environ, {"VIBE_USAGE_CLINE_DIRS": str(root)}):
+                items = cline.discover({})
+                parsed = cline.parse(items[0])
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(len(parsed.events), 1)
+            self.assertEqual((parsed.events[0].model,
+                              parsed.events[0].prompt_tokens,
+                              parsed.events[0].cache_read_tokens),
+                             ("cline-model", 100, 30))
+
+    def test_cline_sdk_io_failure_drops_one_artifact_but_keeps_valid_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "data" / "sessions"
+            valid = sessions / "valid"
+            broken = sessions / "broken"
+            valid.mkdir(parents=True)
+            broken.mkdir(parents=True)
+            for session_dir, session_id in ((valid, "valid"), (broken, "broken")):
+                (session_dir / f"{session_id}.json").write_text(json.dumps({
+                    "version": 1, "session_id": session_id,
+                    "started_at": "2026-09-20T15:00:00Z",
+                    "workspace_root": "/work/project",
+                }), encoding="utf-8")
+            (valid / "valid.messages.json").write_text(json.dumps({
+                "version": 1, "sessionId": "valid", "agent": "lead",
+                "messages": [{
+                    "id": "assistant-1", "role": "assistant",
+                    "ts": 1789916401000, "modelInfo": {"id": "cline-model"},
+                    "metrics": {"inputTokens": 10, "outputTokens": 2},
+                }],
+            }), encoding="utf-8")
+            (broken / "broken.messages.json").write_text("{", encoding="utf-8")
+
+            with patch.dict(os.environ, {"VIBE_USAGE_CLINE_DIRS": str(root)}):
+                item = cline.discover({})[0]
+                parsed = cline.parse(item)
+
+            self.assertFalse(parsed.skipped)
+            self.assertEqual(len(parsed.events), 1)
+            self.assertTrue(parsed.warnings)
+
+    def test_grok_usage_ledger_without_updates_is_imported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "sessions" / "work-project" / "grok-session"
+            session.mkdir(parents=True)
+            (session / "summary.json").write_text(json.dumps({
+                "info": {"cwd": "/work/project"},
+                "current_model_id": "grok-model",
+                "updated_at": "2026-09-20T15:00:00Z",
+            }), encoding="utf-8")
+            (session / "usage.json").write_text(json.dumps({
+                "turns": [{
+                    "inputTokens": 10, "cacheCreationTokens": 2,
+                    "cachedReadTokens": 3, "outputTokens": 4,
+                    "reasoningTokens": 1,
+                }],
+            }), encoding="utf-8")
+
+            items = grok.discover({"config": {"data_root": str(Path(directory))}})
+            self.assertEqual(len(items), 1)
+            event = grok.parse(items[0]).events[0]
+            self.assertEqual((event.model, event.project, event.prompt_tokens,
+                              event.completion_tokens, event.cache_read_tokens),
+                             ("grok-model", "project", 12, 4, 3))
 
     def test_antigravity_legacy_pb_uses_language_server_trajectory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -367,6 +528,43 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
                               events[0].cache_read_tokens),
                              ("opencode-model", 10, 3, 5))
 
+    def test_opencode_merges_duplicate_messages_across_stores(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.db"
+            extra = root / "extra.db"
+
+            def write_db(path: Path, input_tokens: int) -> None:
+                connection = sqlite3.connect(path)
+                connection.execute(
+                    "CREATE TABLE message(id TEXT, data TEXT, session_id TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO message VALUES(?,?,?)",
+                    ("message-1", json.dumps({
+                        "role": "assistant", "time": {"created": 1782720000000},
+                        "modelID": "opencode-model",
+                        "tokens": {"input": input_tokens, "output": 2,
+                                    "cache": {"read": 1}},
+                        "path": {"root": "/work/project"},
+                    }), "session-1"),
+                )
+                connection.commit()
+                connection.close()
+
+            write_db(primary, 10)
+            write_db(extra, 20)
+            items = opencode.discover({"config": {
+                "data_root": str(primary),
+                "extra_roots": {"opencode": [str(extra)]},
+            }})
+            self.assertEqual(len(items), 1)
+            events = opencode.parse(items[0]).events
+            self.assertEqual(len(events), 1)
+            self.assertEqual((events[0].prompt_tokens,
+                              events[0].completion_tokens,
+                              events[0].cache_read_tokens), (20, 2, 1))
+
     def test_codex_coalesces_live_and_archived_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -404,6 +602,46 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual(len(events), 2)
             self.assertTrue(all(event.event_id.startswith(
                 f"codex:session:{session_id}:" ) for event in events))
+
+    def test_codex_merges_same_session_continuation_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "sessions" / "2026" / "09" / "01"
+            root.mkdir(parents=True)
+            session_id = "continuation-session"
+
+            def token(at: str, value: int) -> dict:
+                return {
+                    "type": "event_msg", "timestamp": at,
+                    "payload": {"type": "token_count", "info": {
+                        "last_token_usage": {
+                            "input_tokens": value, "output_tokens": 2,
+                            "total_tokens": value + 2,
+                        },
+                    }},
+                }
+
+            header = {"type": "session_meta", "payload": {"id": session_id}}
+            context = {"type": "turn_context", "payload": {"model": "gpt-segment"}}
+            first_dir = root / "live"
+            second_dir = root / "archived"
+            first_dir.mkdir()
+            second_dir.mkdir()
+            first = first_dir / f"rollout-20260901010000-{session_id}.jsonl"
+            second = second_dir / f"rollout-20260901010000-{session_id}.jsonl"
+            first.write_text("\n".join(json.dumps(value) for value in [
+                header, context, token("2026-09-01T01:00:00Z", 10),
+                token("2026-09-01T01:01:00Z", 20),
+            ]) + "\n", encoding="utf-8")
+            second.write_text("\n".join(json.dumps(value) for value in [
+                header, context, token("2026-09-01T01:02:00Z", 30),
+            ]) + "\n", encoding="utf-8")
+
+            sources = codex.discover({"config": {"data_root": str(Path(directory))}})
+            self.assertEqual(len(sources), 1)
+            self.assertEqual(len(sources[0].context["segments"]), 2)
+            events = codex.parse(sources[0]).events
+            self.assertEqual([event.prompt_tokens for event in events], [10, 20, 30])
+            self.assertEqual(sum(event.prompt_tokens for event in events), 60)
 
     def test_codex_applies_service_tier_to_post_cutover_usage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -485,6 +723,82 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
                               events[0].completion_tokens,
                               events[0].cache_read_tokens),
                              ("child", 25, 10, 3))
+
+    def test_dsh_selects_highest_generation_and_matches_mixed_version_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions" / "project-key"
+            parent = sessions / "parent"
+            child = sessions / "child"
+            parent.mkdir(parents=True)
+            child.mkdir(parents=True)
+
+            def user(seq: int, message_id: str, at: str) -> dict:
+                return {
+                    "seq": seq, "type": "user/message", "time": at,
+                    "data": {"id": message_id, "source": {"kind": "user"}},
+                }
+
+            def assistant(seq: int, message_id: str, value: int, at: str) -> dict:
+                return {
+                    "seq": seq, "type": "assistant/message", "time": at,
+                    "data": {
+                        "message": {"id": message_id,
+                                    "source": {"model": "dsh-model"}},
+                        "usage": {"inputTokens": value, "outputTokens": 10,
+                                   "reasoningTokens": 2},
+                    },
+                }
+
+            inherited = [
+                user(10, "u1", "2026-09-01T01:00:00Z"),
+                assistant(11, "a1", 100, "2026-09-01T01:00:01Z"),
+            ]
+            (parent / "session.v1.jsonl").write_text(
+                "\n".join(json.dumps(value) for value in [
+                    {"type": "session", "version": 1, "id": "parent",
+                     "cwd": "/work/parent"},
+                    *inherited,
+                ]) + "\n", encoding="utf-8")
+            child_records = [
+                {"type": "session", "version": 3, "id": "child",
+                 "parentSession": "parent", "isSeeded": True,
+                 "cwd": "/work/child"},
+                user(20, "u1", "2026-09-01T01:10:00Z"),
+                assistant(21, "a1", 100, "2026-09-01T01:10:01Z"),
+                {"type": "session/end-seed", "seq": 22,
+                 "time": "2026-09-01T01:10:02Z", "data": {"inherited": True}},
+                user(23, "u2", "2026-09-01T01:11:00Z"),
+                assistant(24, "a2", 300, "2026-09-01T01:11:01Z"),
+            ]
+            (child / "session.v3.jsonl").write_text(
+                "\n".join(json.dumps(value) for value in child_records) + "\n",
+                encoding="utf-8")
+
+            # A stale V0 copy must not win over the current V3 generation.
+            stale = sessions / "stale"
+            stale.mkdir()
+            (stale / "session.jsonl").write_text(
+                json.dumps({"type": "session", "version": 0, "id": "same"})
+                + "\n", encoding="utf-8")
+            (stale / "session.v3.jsonl").write_text(
+                json.dumps({"type": "session", "version": 3, "id": "same",
+                            "isSeeded": False}) + "\n", encoding="utf-8")
+
+            sources = dsh.discover({"config": {"data_root": str(sessions.parent)}})
+            self.assertEqual(
+                {item.path.name for item in sources},
+                {"session.v1.jsonl", "session.v3.jsonl"},
+            )
+            skips = dsh.replay_skips(sources)
+            child_source = next(item for item in sources
+                                if item.path.parent.name == "child")
+            self.assertEqual(skips[str(child_source.path)], 2)
+            events = dsh.parse(
+                child_source,
+                skip_token_count=skips[str(child_source.path)],
+            ).events
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].prompt_tokens, 300)
 
     def test_kiro_native_stream_uses_sidecar_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

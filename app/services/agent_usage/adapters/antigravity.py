@@ -174,8 +174,15 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
         ]
     else:
         dirs = [(directory, False) for directory in _conversation_dirs(DEFAULT_PATH)]
-    for root in configured_extra_roots(software, KIND):
-        dirs.extend((directory, True) for directory in _conversation_dirs(root))
+    extra_roots = configured_extra_roots(software, KIND)
+    discovery_warnings = []
+    for root in extra_roots:
+        extra_dirs = _conversation_dirs(root)
+        if not any(directory.is_dir() for directory in extra_dirs):
+            discovery_warnings.append(
+                f"antigravity: 额外数据根目录不可用，已保留上次同步状态: {root}"
+            )
+        dirs.extend((directory, True) for directory in extra_dirs)
 
     # The same directory can be reached through overlapping roots. Preserve a
     # strict flag when any route is explicitly configured so a broken DB cannot
@@ -211,6 +218,13 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
             previous = sources.get(key)
             if previous is None or (strict and not previous.context.get("strict")):
                 sources[key] = item
+    if discovery_warnings:
+        warning_path = extra_roots[0] if extra_roots else DEFAULT_PATH
+        return [source(
+            warning_path,
+            key="antigravity-discovery",
+            discovery_warnings=tuple(dict.fromkeys(discovery_warnings)),
+        )]
     return list(sources.values())
 
 
@@ -450,6 +464,9 @@ def _parse_legacy(item: UsageSource, stop_event=None) -> ParseBatch:
 
 
 def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
+    discovery_warnings = tuple(item.context.get("discovery_warnings") or ())
+    if discovery_warnings:
+        return batch([], 0, skipped=True, warnings=discovery_warnings)
     if item.context.get("legacy"):
         return _parse_legacy(item, stop_event)
     db = item.path

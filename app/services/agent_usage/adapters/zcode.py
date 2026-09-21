@@ -1,6 +1,7 @@
 """ZCode SQLite message adapter."""
 
 import json
+import os
 from pathlib import Path
 
 from ..common import batch, configured_root, make_event, project_name, source, sqlite_rows, timestamp
@@ -13,7 +14,9 @@ DEFAULT_PATH = Path.home() / ".zcode" / "cli" / "db" / "db.sqlite"
 
 
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
-    root = configured_root(software, DEFAULT_PATH)
+    root = Path(configured_root(
+        software, Path(os.environ.get("VIBE_USAGE_ZCODE_DB", DEFAULT_PATH)),
+    ))
     path = root if root.suffix in {".db", ".sqlite", ".sqlite3"} or root.is_file() else root / "db.sqlite"
     return [source(path)] if path.is_file() else []
 
@@ -22,7 +25,8 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
     rows = sqlite_rows(item.path, """SELECT m.rowid AS message_rowid,
         m.session_id AS session_id, m.time_created AS created,
         json_extract(m.data,'$.role') AS role,
-        json_extract(m.data,'$.modelID') AS model_id,
+        COALESCE(json_extract(m.data,'$.modelID'),
+                 json_extract(m.data,'$.modelId')) AS model_id,
         json_extract(m.data,'$.tokens') AS tokens,
         json_extract(m.data,'$.path.root') AS path_root,
         json_extract(m.data,'$.path.cwd') AS path_cwd,

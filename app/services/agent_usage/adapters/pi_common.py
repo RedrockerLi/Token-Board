@@ -245,6 +245,20 @@ def pi_roots(software: dict, kind: str) -> list[Path]:
 
 
 def discover_pi(software: dict, kind: str) -> list[UsageSource]:
+    extra_roots = configured_extra_roots(software, kind)
+    invalid_extra = [
+        root for root in extra_roots
+        if _resolve_pi_sessions_root(root) is None
+    ]
+    if invalid_extra:
+        return [source(
+            invalid_extra[0],
+            key=f"{kind}-discovery",
+            discovery_warnings=tuple(
+                f"{kind}: 额外会话根目录不可用，已保留上次同步状态: {root}"
+                for root in invalid_extra
+            ),
+        )]
     files = []
     for root in pi_roots(software, kind):
         files.extend((path, root) for path in walk_files(root, (".jsonl",)))
@@ -283,6 +297,9 @@ def _project_from_path(path: Path, sessions_root: Path) -> str:
 
 
 def parse_pi(item: UsageSource, kind: str, stop_event=None) -> ParseBatch:
+    discovery_warnings = tuple(item.context.get("discovery_warnings") or ())
+    if discovery_warnings:
+        return batch([], 0, skipped=True, warnings=discovery_warnings)
     events = []
     session_id = item.path.stem
     project = _project_from_path(item.path, Path(item.context.get("sessions_root") or item.path.parent))

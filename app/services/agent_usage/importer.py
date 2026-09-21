@@ -110,6 +110,17 @@ def _import_software(pdb, software: dict, stop_event=None,
             try:
                 before = source_item.path.stat()
             except OSError:
+                discovery_warnings = tuple(
+                    str(value) for value in
+                    (source_item.context.get("discovery_warnings") or ())
+                    if value
+                )
+                if discovery_warnings:
+                    conn.execute(
+                        "UPDATE agent_software_runtime SET last_error=? WHERE software_id=?",
+                        ("; ".join(discovery_warnings)[:500], software_id),
+                    )
+                    conn.commit()
                 continue
             state_key = source_item.state_key
             previous = states.get(state_key)

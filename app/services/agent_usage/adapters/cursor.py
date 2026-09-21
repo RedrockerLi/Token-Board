@@ -98,7 +98,10 @@ def _cookie_values(token: str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
-DEFAULT_FETCH_TIMEOUT_MS = 30_000
+# Cursor computes the export over the whole account. Large accounts can take
+# over a minute; the reference parser raised its default to 120s so a timeout
+# is not mistaken for an empty usage snapshot.
+DEFAULT_FETCH_TIMEOUT_MS = 120_000
 MAX_FETCH_TIMEOUT_MS = 2_147_483_647
 
 

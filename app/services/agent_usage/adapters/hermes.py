@@ -3,10 +3,12 @@
 import os
 import logging
 import sqlite3
+import sys
 from pathlib import Path
 
 from ..common import (
     batch,
+    config_value,
     configured_root,
     make_event,
     safe_int,
@@ -25,10 +27,22 @@ log = logging.getLogger(__name__)
 
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
     env_root = os.environ.get("HERMES_HOME")
-    root = configured_root(software, Path(env_root).expanduser() if env_root else DEFAULT_PATH)
+    if config_value(software, "data_root", "path") or env_root:
+        root = configured_root(software, Path(env_root).expanduser() if env_root else DEFAULT_PATH)
+    elif sys.platform == "win32":
+        # Hermes Desktop/CLI uses LOCALAPPDATA on Windows. Keep the legacy
+        # ~/.hermes store only when the native home does not exist yet.
+        local_app_data = Path(os.environ.get(
+            "LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        native = local_app_data / "hermes"
+        legacy = Path.home() / ".hermes"
+        root = legacy if not native.is_dir() and legacy.is_dir() else native
+    else:
+        root = DEFAULT_PATH
     if root.suffix.lower() in {".db", ".sqlite", ".sqlite3"} or root.is_file():
         return [source(root, profile="default")] if root.is_file() else []
     out = []
+    warnings = []
     default = root / "state.db"
     if default.is_file():
         out.append(source(default, profile="default"))
@@ -36,14 +50,32 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
     try:
         for child in profiles.iterdir():
             path = child / "state.db"
-            if child.is_dir() and path.is_file():
-                out.append(source(path, profile=child.name))
-    except OSError:
-        log.debug("Hermes discovery root is unavailable", exc_info=True)
+            if not child.is_dir():
+                continue
+            try:
+                if path.is_file():
+                    out.append(source(path, profile=child.name))
+            except OSError as exc:
+                warnings.append(f"hermes: 无法读取 profile {child}: {exc}")
+    except OSError as exc:
+        if not isinstance(exc, FileNotFoundError):
+            warnings.append(f"hermes: 无法读取 profiles 目录 {profiles}: {exc}")
+            log.debug("Hermes discovery root is unavailable", exc_info=True)
+    if warnings:
+        # A profile discovery failure invalidates the complete multi-profile
+        # snapshot. Return one warning source so the importer protects every
+        # Hermes profile's prior cursor instead of advancing the readable
+        # subset and silently dropping the unreadable one.
+        warning_path = root if root.is_dir() else (out[0].path if out else root)
+        return [source(warning_path, key="hermes-discovery",
+                       discovery_warnings=tuple(warnings))]
     return out
 
 
 def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
+    discovery_warnings = tuple(item.context.get("discovery_warnings") or ())
+    if discovery_warnings:
+        return batch([], 0, skipped=True, warnings=discovery_warnings)
     if not item.path.is_file():
         return batch([], 0)
     try:

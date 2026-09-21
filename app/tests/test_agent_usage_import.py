@@ -95,6 +95,45 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         self.assertEqual(tuple(row), (
             "gpt-5.1-codex", 10, 20, 5, 35, "2026-08-13T01:00:00Z"))
 
+    def test_claude_import_preserves_cache_read_as_a_hit(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        root = Path(self._sessions.name) / "claude"
+        session = root / "projects" / "-work-project" / "session.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(json.dumps({
+            "type": "assistant",
+            "uuid": "claude-call-1",
+            "timestamp": "2026-08-13T01:00:00Z",
+            "cwd": "/work/project",
+            "message": {
+                "id": "claude-message-1",
+                "model": "claude-opus-4-8",
+                "usage": {
+                    "input_tokens": 11,
+                    "cache_read_input_tokens": 13,
+                    "cache_creation_input_tokens": 17,
+                    "output_tokens": 7,
+                },
+            },
+        }) + "\n", encoding="utf-8")
+        software_id = database.create_agent_software({
+            "name": "claude-agent", "agent_kind": "claude-code",
+            "config": {"data_root": str(root)},
+        })
+
+        self.assertEqual(import_once(database), 1)
+        with sqlite3.connect(self.proxy_path) as connection:
+            row = connection.execute(
+                "SELECT model,prompt_tokens,cache_read_tokens,"
+                "completion_tokens,total_tokens,agent_software_id "
+                "FROM request_log WHERE agent_software_id=?",
+                (software_id,),
+            ).fetchone()
+        self.assertEqual(row, (
+            "claude-opus-4-8", 41, 13, 7, 48, software_id))
+
     def test_hermes_history_stays_deduplicated_after_log_retention(self) -> None:
         from app.db.proxy_db import ProxyDatabase
 

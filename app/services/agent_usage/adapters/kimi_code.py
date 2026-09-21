@@ -4,9 +4,21 @@ import hashlib
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 
-from ..common import batch, config_value, iter_jsonl, make_event, project_name, read_json, source, timestamp, walk_files
+from ..common import (
+    batch,
+    config_value,
+    configured_extra_roots,
+    iter_jsonl,
+    make_event,
+    project_name,
+    read_json,
+    source,
+    timestamp,
+    walk_files,
+)
 from ..ir import ParseBatch, UsageSource
 
 KIND = "kimi-code"
@@ -15,23 +27,61 @@ DEFAULT_PATH = Path.home() / ".kimi-code"
 log = logging.getLogger(__name__)
 
 
-def _roots(software: dict) -> tuple[Path, Path]:
+def _kimi_work_home() -> Path:
+    if os.name == "nt":
+        user_data = Path(os.environ.get(
+            "APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        user_data = Path.home() / "Library" / "Application Support"
+    else:
+        user_data = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return user_data / "kimi-desktop" / "daimon-share" / "daimon" / "runtime" / "kimi-code" / "home"
+
+
+def _roots(software: dict) -> tuple[list[Path], Path]:
     configured = (config_value(software, "data_root", "path")
                   or os.environ.get("VIBE_USAGE_KIMI_CODE_DIR"))
-    root = Path(configured).expanduser() if configured else Path(
-        os.environ.get("KIMI_CODE_HOME", Path.home() / ".kimi-code")).expanduser()
+    if configured:
+        current = [Path(configured).expanduser()]
+    else:
+        current = [Path(os.environ.get(
+            "KIMI_CODE_HOME", Path.home() / ".kimi-code")).expanduser(),
+                   _kimi_work_home()]
+    current.extend(configured_extra_roots(software, KIND))
+    unique = []
+    seen = set()
+    for root in current:
+        try:
+            key = root.resolve()
+        except OSError:
+            key = root
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
     legacy = Path(os.environ.get(
         "KIMI_USAGE_LEGACY_ROOT", os.environ.get(
             "VIBE_USAGE_KIMI_DIR", Path.home() / ".kimi"))).expanduser()
-    return root, legacy
+    return unique, legacy
 
 
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
-    current, legacy = _roots(software)
-    current_sessions = current if current.name == "sessions" else current / "sessions"
+    current_roots, legacy = _roots(software)
     legacy_sessions = legacy if legacy.name == "sessions" else legacy / "sessions"
-    out = [source(path, layout="current", session_dir=path.parents[2], root=current)
-           for path in walk_files(current_sessions, ("wire.jsonl",))]
+    out = []
+    seen = set()
+    for current in current_roots:
+        current_sessions = current if current.name == "sessions" else current / "sessions"
+        for path in walk_files(current_sessions, ("wire.jsonl",)):
+            try:
+                identity = path.resolve()
+            except OSError:
+                identity = path
+            if identity in seen:
+                continue
+            seen.add(identity)
+            out.append(source(
+                path, layout="current", session_dir=path.parents[2], root=current,
+            ))
     out.extend(source(path, layout="legacy", work_dir_hash=path.parents[1].name, root=legacy)
                for path in walk_files(legacy_sessions, ("wire.jsonl",)))
     return list(dict.fromkeys(out))
