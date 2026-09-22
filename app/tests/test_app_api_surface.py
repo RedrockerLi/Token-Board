@@ -144,7 +144,8 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
         self.assertEqual(set(summary), {
             "total_output_tokens", "total_input_cache_hit_tokens",
             "total_input_cache_miss_tokens", "total_input_tokens", "total_tokens",
-            "total_requests", "actual_cost", "theoretical_total_cost",
+            "weighted_total_tokens", "total_requests", "actual_cost",
+            "theoretical_total_cost",
             "model_breakdown", "users", "models", "available_months",
         })
         daily = self.client.get("/api/daily?year=2026&month=8").get_json()

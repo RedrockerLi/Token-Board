@@ -12,8 +12,8 @@
 // ── Global state ──
 var currentUserId = '';        // '' = overview (all users)
 var summaryData = null;        // cached /api/summary response
-var summaryRequest = null;     // in-flight/cached summary request for current user
-var summaryRequestKey = null;  // currentUserId used by summaryRequest
+var summaryRequest = null;     // in-flight/cached summary request for current scope
+var summaryRequestKey = null;  // user + current natural month
 var dashboardDataGeneration = 0;
 
 var calendarState = {
@@ -23,49 +23,9 @@ var calendarState = {
     days: [],
 };
 var calendarLoadSequence = 0;
-var currentMonthUsedModels = null;
-var currentMonthUsedModelsKey = null;
-var currentMonthUsedModelsRequest = null;
-var currentMonthUsedModelsRequestKey = null;
 var dailyDataCache = Object.create(null);
 var dailyDataRequests = Object.create(null);
 var dailyDataCacheGeneration = 0;
-// A sub-1% model is kept only when its current browser-local natural month
-// usage exceeds this strict token threshold.
-var CURRENT_MONTH_MODEL_TOKEN_THRESHOLD = 50 * 1000 * 1000;
-
-// ── Model alias helpers ──
-
-/** Build alias lookup maps from displayConfig.model_aliases.
- *  Each alias entry: { name: "Display Name", models: ["model-a", "model-b"] }
- *  apiModels: list of actual model names from the API (used for case-sensitive resolution).
- *  Returns { aliasToModels: { displayName: [actual_model_names] }, modelToAlias: { lowercase_model: displayName } } */
-function buildAliasMaps(apiModels) {
-    var aliases = displayConfig.model_aliases || [];
-    var aliasToModels = {};
-    var modelToAlias = {};
-
-    // Build case-insensitive lookup: lowercase → actual API model name
-    var apiModelLookup = {};
-    (apiModels || []).forEach(function (m) {
-        apiModelLookup[m.toLowerCase()] = m;
-    });
-
-    aliases.forEach(function (a) {
-        if (a.name && a.models && a.models.length > 0) {
-            var resolvedModels = [];
-            a.models.forEach(function (m) {
-                var lower = m.toLowerCase();
-                // Resolve to actual case from API data (backend matching is case-sensitive)
-                var actual = apiModelLookup[lower] || m;
-                resolvedModels.push(actual);
-                modelToAlias[lower] = a.name;
-            });
-            aliasToModels[a.name] = resolvedModels;
-        }
-    });
-    return { aliasToModels: aliasToModels, modelToAlias: modelToAlias };
-}
 
 // Full sorted user list (backend order: most-recent call month → month volume),
 // used by the "更多用户" picker. The dropdown itself shows the top 5.
@@ -285,11 +245,6 @@ async function deleteMoreUser(userId, button) {
     }
 }
 
-// All-history token share by display unit for the current user scope. Both the
-// model cards and the model pie use this same calculation.
-let globalTokenShares = null;
-let globalTokenSharesKey = null;
-
 function getBrowserCurrentMonth() {
     var now = new Date();
     return { year: now.getFullYear(), month: now.getMonth() + 1 };
@@ -320,167 +275,85 @@ function mergeModelStat(target, source) {
 
 function aggregateModelBreakdown(data) {
     var breakdown = data && data.model_breakdown || {};
-    var aliasMaps = buildAliasMaps(Object.keys(breakdown));
     var units = Object.create(null);
     Object.keys(breakdown).forEach(function (modelName) {
-        var lower = String(modelName).toLowerCase();
-        var displayName = aliasMaps.modelToAlias[lower] || modelName;
-        if (!units[displayName]) units[displayName] = {
+        var modelData = breakdown[modelName] || {};
+        if (!units[modelName]) units[modelName] = {
             tokens: 0,
+            weighted_tokens: 0,
             theoretical_cost: 0,
         };
-        units[displayName].tokens += modelTokenCount(breakdown[modelName]);
-        units[displayName].theoretical_cost += Number(
-            breakdown[modelName] && breakdown[modelName].theoretical_cost || 0);
+        units[modelName].tokens += modelTokenCount(modelData);
+        var weighted = Number(modelData.weighted_total_tokens);
+        units[modelName].weighted_tokens += isFinite(weighted)
+            ? Math.max(0, weighted) : modelTokenCount(modelData);
+        units[modelName].theoretical_cost += Number(
+            modelData.theoretical_cost || 0);
     });
     return units;
 }
 
-function calculateGlobalTokenShares(data) {
-    var units = aggregateModelBreakdown(data);
-
-    var total = Object.keys(units).reduce(function (sum, unit) {
-        return sum + units[unit].tokens;
-    }, 0);
-    var shares = {};
-    if (total > 0) {
-        Object.keys(units).forEach(function (unit) {
-            shares[unit] = units[unit].tokens / total;
-        });
-    }
-    return shares;
-}
-
-function isVisibleModel(modelName, shares, currentMonthModels) {
-    var share = Number(shares && shares[modelName] || 0);
-    var usedThisMonth = currentMonthModels && currentMonthModels.has
-        ? currentMonthModels.has(modelName) : false;
-    return share >= 0.01 || usedThisMonth;
-}
-
 /**
- * Build the one model set shared by the model pie, calendar bars and legend.
- * Rank is assigned before the visibility filter, so colors remain tied to a
- * model's global token position even when small models are hidden.
+ * Build the model set shared by the model pie and calendar.
+ *
+ * The full weighted total is the visibility denominator.  Once the strict
+ * >1% filter is applied, visibleShare is recalculated against the visible
+ * weighted total so the pie itself always sums to 100%.
  */
-function buildVisibleModelEntries(data, currentMonthModels) {
+function buildModelEntries(data) {
     var units = aggregateModelBreakdown(data);
-    var used = currentMonthModels && currentMonthModels.has
-        ? currentMonthModels : new Set();
-    used.forEach(function (name) {
-        if (!units[name]) units[name] = { tokens: 0, theoretical_cost: 0 };
-    });
-
-    var total = Object.keys(units).reduce(function (sum, name) {
-        return sum + units[name].tokens;
+    var weightedTotal = Object.keys(units).reduce(function (sum, name) {
+        return sum + units[name].weighted_tokens;
     }, 0);
-    var shares = {};
-    Object.keys(units).forEach(function (name) {
-        shares[name] = total > 0 ? units[name].tokens / total : 0;
-    });
-    return Object.keys(units)
+
+    var ranked = Object.keys(units)
+        .filter(function (name) { return units[name].tokens > 0; })
         .map(function (name) {
             return {
                 name: name,
                 tokens: units[name].tokens,
+                weighted_tokens: units[name].weighted_tokens,
                 theoretical_cost: units[name].theoretical_cost,
-                share: shares[name],
+                fullShare: weightedTotal > 0
+                    ? units[name].weighted_tokens / weightedTotal : 0,
             };
         })
         .sort(function (a, b) {
-            return b.tokens - a.tokens || String(a.name).localeCompare(String(b.name));
-        })
-        .map(function (entry, rank) {
-            entry.rank = rank;
-            entry.color = generateChartColor(rank);
-            entry.visible = isVisibleModel(entry.name, shares, used);
-            return entry;
-        })
-        .filter(function (entry) { return entry.visible; });
-}
+            return b.weighted_tokens - a.weighted_tokens ||
+                String(a.name).localeCompare(String(b.name));
+        });
 
-function collectCurrentMonthModelUnits(data) {
-    var days = data && data.days || [];
-    var modelNames = [];
-    days.forEach(function (day) {
-        Object.keys(day.by_model || {}).forEach(function (name) {
-            if (modelNames.indexOf(name) < 0) modelNames.push(name);
-        });
+    var visible = ranked.filter(function (entry) {
+        return entry.fullShare > 0.01;
     });
-    var aliasMaps = buildAliasMaps(modelNames);
-    var tokenTotals = Object.create(null);
-    days.forEach(function (day) {
-        Object.keys(day.by_model || {}).forEach(function (modelName) {
-            var tokens = modelTokenCount(day.by_model[modelName]);
-            if (tokens <= 0) return;
-            var displayName = aliasMaps.modelToAlias[String(modelName).toLowerCase()]
-                || modelName;
-            tokenTotals[displayName] = (tokenTotals[displayName] || 0) + tokens;
-        });
-    });
-    var used = new Set();
-    Object.keys(tokenTotals).forEach(function (displayName) {
-        // Request-only rows and models at exactly 50M do not qualify.
-        if (tokenTotals[displayName] > CURRENT_MONTH_MODEL_TOKEN_THRESHOLD) {
-            used.add(displayName);
+    var visibleTotal = visible.reduce(function (sum, entry) {
+        return sum + entry.weighted_tokens;
+    }, 0);
+    var visibleNames = new Set(visible.map(function (entry) { return entry.name; }));
+    ranked.forEach(function (entry) {
+        entry.visible = visibleNames.has(entry.name);
+        if (entry.visible) {
+            entry.rank = visible.indexOf(entry);
+            entry.color = generateChartColor(entry.rank);
+            entry.visibleShare = visibleTotal > 0
+                ? entry.weighted_tokens / visibleTotal : 0;
+        } else {
+            entry.rank = null;
+            entry.color = '#716B65';
+            entry.visibleShare = 0;
         }
     });
-    return used;
-}
-
-function resetCurrentMonthModelCache() {
-    currentMonthUsedModels = null;
-    currentMonthUsedModelsKey = null;
-    currentMonthUsedModelsRequest = null;
-    currentMonthUsedModelsRequestKey = null;
-}
-
-function fetchCurrentMonthUsedModels() {
-    var current = getBrowserCurrentMonth();
-    var requestKey = (currentUserId || '') + '|' + current.year + '-' + current.month;
-    if (currentMonthUsedModels instanceof Set &&
-        currentMonthUsedModelsKey === requestKey) {
-        return Promise.resolve(currentMonthUsedModels);
-    }
-    if (currentMonthUsedModelsRequest && currentMonthUsedModelsRequestKey === requestKey) {
-        return currentMonthUsedModelsRequest;
-    }
-
-    currentMonthUsedModelsRequestKey = requestKey;
-    currentMonthUsedModelsRequest = fetchDashboardDaily(current.year, current.month)
-        .then(function (data) {
-            var used = collectCurrentMonthModelUnits(data);
-            if (currentMonthUsedModelsRequestKey === requestKey) {
-                currentMonthUsedModels = used;
-                currentMonthUsedModelsKey = requestKey;
-            }
-            return used;
-        })
-        .catch(function (error) {
-            console.error('Failed to load current-month model usage:', error);
-            if (currentMonthUsedModelsRequestKey === requestKey) {
-                currentMonthUsedModels = new Set();
-                currentMonthUsedModelsKey = requestKey;
-            }
-            return new Set();
-        });
-    return currentMonthUsedModelsRequest;
-}
-
-function updateGlobalTokenShares(summaryDataForCurrentUser) {
-    var scopeKey = currentUserId || '';
-    if (globalTokenSharesKey === scopeKey && globalTokenShares !== null) return;
-    globalTokenShares = calculateGlobalTokenShares(summaryDataForCurrentUser);
-    globalTokenSharesKey = scopeKey;
+    return { all: ranked, visible: visible, weightedTotal: weightedTotal };
 }
 
 function fetchDashboardSummary() {
-    var requestKey = currentUserId || '';
+    var current = getBrowserCurrentMonth();
+    var requestKey = (currentUserId || '') + '|' + current.year + '-' + current.month;
     if (summaryRequest && summaryRequestKey === requestKey) return summaryRequest;
 
     var requestGeneration = dashboardDataGeneration;
     summaryRequestKey = requestKey;
-    summaryRequest = fetchSummary().then(function (data) {
+    summaryRequest = fetchSummary(current.year, current.month).then(function (data) {
         if (summaryRequestKey === requestKey &&
             dashboardDataGeneration === requestGeneration) summaryData = data;
         return data;
@@ -497,7 +370,6 @@ function fetchDashboardSummary() {
 // ── Summary loader ──
 
 async function loadSummary() {
-    await loadDisplayConfig();  // Load alias config before calculating pie shares
     var requestKey = currentUserId || '';
     var requestGeneration = dashboardDataGeneration;
     var data = await fetchDashboardSummary();
@@ -538,7 +410,6 @@ async function loadSummary() {
         }
     }
 
-    updateGlobalTokenShares(data);
     populateCalendarSelectors(months);
 
     var lastUpdatedEl = document.getElementById('lastUpdated');
@@ -668,36 +539,6 @@ function fillCalendarDateRange(days, year, mode, month) {
     });
 }
 
-/** Merge raw API model keys into the same display units used by the summary. */
-function mergeCalendarAliases(days) {
-    var modelNames = [];
-    (days || []).forEach(function (day) {
-        Object.keys(day.by_model || {}).forEach(function (name) {
-            if (modelNames.indexOf(name) < 0) modelNames.push(name);
-        });
-    });
-    var aliasMaps = buildAliasMaps(modelNames);
-    return (days || []).map(function (day) {
-        var copy = Object.assign({}, day, { by_model: {} });
-        Object.keys(day.by_model || {}).forEach(function (modelName) {
-            var displayName = aliasMaps.modelToAlias[String(modelName).toLowerCase()]
-                || modelName;
-            if (!copy.by_model[displayName]) copy.by_model[displayName] = {
-                output_tokens: 0,
-                input_cache_hit_tokens: 0,
-                input_cache_miss_tokens: 0,
-                input_tokens: 0,
-                total_tokens: 0,
-                requests: 0,
-                cost: 0,
-                theoretical_cost: 0,
-            };
-            mergeModelStat(copy.by_model[displayName], day.by_model[modelName]);
-        });
-        return copy;
-    });
-}
-
 function setCalendarLoading(message) {
     var dom = document.getElementById('chartCalendar3D');
     var loader = document.getElementById('loadingCalendar3D');
@@ -808,9 +649,8 @@ async function loadCalendarData() {
     setCalendarLoading();
 
     try {
-        await loadDisplayConfig();
         var summary = await fetchDashboardSummary();
-        var currentModels = await fetchCurrentMonthUsedModels();
+        var modelEntries = buildModelEntries(summary).all;
         if (!isCurrentCalendarRequest(sequence, scopeKey, mode, year, month, dataGeneration)) return;
 
         var responses;
@@ -825,10 +665,8 @@ async function loadCalendarData() {
 
         var rawDays = mergeDailyResponses(responses);
         var days = fillCalendarDateRange(rawDays, year, mode, month);
-        days = mergeCalendarAliases(days);
-        var entries = buildVisibleModelEntries(summary, currentModels);
         calendarState.days = days;
-        renderCalendar3D('chartCalendar3D', days, entries, {
+        renderCalendar3D('chartCalendar3D', days, modelEntries, {
             mode: mode,
             year: year,
             month: month,
@@ -854,33 +692,51 @@ async function loadCalendarData() {
 
 // ── Pie charts ──
 
+function showModelPieEmptyState(message) {
+    var dom = document.getElementById('chartModelPie');
+    var loader = document.getElementById('loadingModelPie');
+    if (dom) {
+        var chart = typeof echarts !== 'undefined' && echarts.getInstanceByDom
+            ? echarts.getInstanceByDom(dom) : null;
+        if (chart) chart.dispose();
+        dom.style.display = 'none';
+    }
+    if (loader) {
+        loader.classList.add('loading--text');
+        loader.textContent = message || '暂无模型占比超过 1%';
+        loader.style.display = 'flex';
+    }
+}
+
 async function loadModelPie() {
-    await loadDisplayConfig();  // Ensure config is loaded (may race with loadSummary)
     var requestKey = currentUserId || '';
     var requestGeneration = dashboardDataGeneration;
     var loader = document.getElementById('loadingModelPie');
     if (!loader) return;
     try {
         var data = await fetchDashboardSummary();
-        var currentModels = await fetchCurrentMonthUsedModels();
         if (requestKey !== (currentUserId || '') ||
             requestGeneration !== dashboardDataGeneration) return;
-        updateGlobalTokenShares(data);
-        var modelEntries = buildVisibleModelEntries(data, currentModels);
-        var pieData = modelEntries.filter(function (entry) {
-            return entry.tokens > 0;
-        }).map(function (entry) {
+        var modelEntries = buildModelEntries(data).visible;
+        var pieData = modelEntries.map(function (entry) {
             return {
                 name: entry.name,
-                value: entry.tokens,
+                value: entry.weighted_tokens,
+                real_tokens: entry.tokens,
                 theoretical_cost: entry.theoretical_cost,
                 rank: entry.rank,
                 color: entry.color,
             };
         });
 
-        // The color is carried by the ranked entry so the pie and 3D calendar
-        // remain identical even when hidden models leave rank gaps.
+        if (!pieData.length) {
+            showModelPieEmptyState('暂无模型占比超过 1%');
+            return;
+        }
+
+        var dom = document.getElementById('chartModelPie');
+        if (dom) dom.style.display = 'block';
+        loader.classList.remove('loading--text');
         renderPieChart('chartModelPie', pieData);
         loader.style.display = 'none';
     } catch (err) {
@@ -927,10 +783,7 @@ function invalidateDashboardData() {
     summaryData = null;
     summaryRequest = null;
     summaryRequestKey = null;
-    globalTokenShares = null;
-    globalTokenSharesKey = null;
     resetDailyDataCache();
-    resetCurrentMonthModelCache();
 }
 
 // ── Event handlers ──

@@ -238,7 +238,9 @@ function renderPieChart(domId, pieData, colors) {
             trigger: 'item',
             textStyle: { color: '#24211F' },
             formatter: function (p) {
-                var html = p.name + '<br/>Tokens: ' + fmtNum(p.value) +
+                var realTokens = p.data && p.data.real_tokens != null
+                    ? p.data.real_tokens : p.value;
+                var html = p.name + '<br/>Tokens: ' + fmtNum(realTokens) +
                     ' (' + p.percent + '%)';
                 if (p.data && p.data.theoretical_cost != null) {
                     html += '<br/>理论花费: ' +
@@ -571,10 +573,9 @@ function _buildCalendarFrameSeries(days, entries, layout, barSize, gridWidth, gr
 /**
  * Render the interactive stacked WebGL calendar.
  *
- * `days` must contain display-unit `by_model` values.  Dashboard orchestration
- * performs alias merging and filtering before calling this renderer, which
- * keeps the renderer independent from the API and makes the same color/rank
- * entries usable by the pie chart and its legend.
+ * `days` must contain the original API model names in `by_model`. Dashboard
+ * orchestration supplies all token-using models, including gray entries that
+ * were filtered out of the model pie.
  */
 function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
     var options = calendarOptions || {};
@@ -674,7 +675,7 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
                 formatter: function (params) {
                     var date = params && params.data && params.data.date;
                     return date && dayByDate[date]
-                        ? _calendarTooltip(dayByDate[date], entries) : '';
+                        ? _calendarTooltip(dayByDate[date], activeEntries) : '';
                 },
             }, TOOLTIP_STYLE),
             legend: {
@@ -682,7 +683,7 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
                 bottom: 0,
                 left: 8,
                 right: 8,
-                data: entries.map(function (entry) {
+                data: activeEntries.map(function (entry) {
                     return { name: entry.name, itemStyle: { color: entry.color } };
                 }),
                 icon: 'roundRect',
@@ -775,7 +776,7 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
         chart.__tokenBoardCalendar = {
             layout: layout,
             days: normalizedDays,
-            entries: entries,
+            entries: activeEntries,
         };
 
         var loader = document.getElementById(loaderId);

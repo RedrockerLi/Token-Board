@@ -94,7 +94,7 @@ SPA 是 `templates/index.html` + `static/js/` 下的模块,hash 路由,`app.js` 
 - `utils.js`:UTC 时间戳到浏览器当地时间的显示、当地日期筛选、UTC/当地分钟换算、`fmtNum`、`esc`,最先加载。
 - `api.js`:fetch 封装 + 各 API 包装。
 - `charts.js`:ECharts 渲染层(SVG 2D + 可选 WebGL 3D 日历)。
-- `dashboard.js`:用量仪表板(模型别名分组与 3D 日历)。模型显示条件:当前用户跨月份 Token 占比 >=1%，或浏览器当前自然月累计 Token >50,000,000;该集合随用户、刷新和重新进入仪表板重算。
+- `dashboard.js`:用量仪表板(按月衰减的模型分布与 3D 日历)。模型分布按当前自然月向前每月乘以 `0.9`，以全部模型的加权 Token 总量为分母，严格大于 `1%` 的模型按加权顺序展示；日历使用所有模型的真实 Token 用量，未进入饼图的模型使用中性灰。
 - `proxy_manager.js`:账户/聚合/密钥/定价管理页,含模型定价拖放排序、按浏览器当地时间输入的峰谷时段编辑器;档位以 UTC+0 分钟存储。
 - `proxy_billing.js`:消费报告 + 请求日志页。
 - `agent_manager.js`:智能体订阅与软件来源管理页。
@@ -108,12 +108,6 @@ Agent 订阅的实时配置（订阅、实例、价格事件、绑定）与历�
 `UNIQUE(name)`、名称主键/外键或按名称保存历史关联；业务代码必须使用 `id`/`uuid`。
 - `proxy_perf.js`:性能监控页(15s 自动刷新)。
 - `proxy_settings.js`:代理设置页(超时三档配置、WebDAV 同步设置)。
-
-前端显示过滤配置在 `static/display_config.json`(后端不读),当前支持 `model_aliases` 把多个模型合并为一个展示单位,如:
-
-```json
-{ "model_aliases": [ { "name": "Minimax-M2.7", "models": ["minimax-m27", "minimax-m27-eic"] } ] }
-```
 
 ## 约定与注意事项
 

@@ -5,22 +5,6 @@
  * and thin wrappers around each backend API endpoint.
  */
 
-// ── Display filter config (loaded from /static/display_config.json) ──
-var displayConfig = { model_aliases: [] };
-var _displayConfigLoaded = false;
-
-async function loadDisplayConfig() {
-    if (_displayConfigLoaded) return;
-    try {
-        displayConfig = await requestJSON('/static/display_config.json');
-        _displayConfigLoaded = true;
-    } catch (e) {
-        console.warn('Failed to load display config, using defaults:', e);
-        displayConfig = { model_aliases: [] };
-        _displayConfigLoaded = true;
-    }
-}
-
 // ── Number formatters (defined in utils.js, used globally) ──
 
 function fmtCost(n) {
@@ -120,8 +104,8 @@ function buildParams(baseUrl, extraParams) {
 
 // ── API wrappers ──
 
-async function fetchSummary() {
-    return requestJSON(buildParams('/api/summary'));
+async function fetchSummary(year, month) {
+    return requestJSON(buildParams('/api/summary', { year, month }));
 }
 
 /** Fetch one calendar month, optionally narrowed to a backend model name. */

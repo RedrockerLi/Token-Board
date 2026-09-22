@@ -110,6 +110,74 @@ class DashboardReportsTest(AppDatabaseTestCase):
             summary["model_breakdown"]["plan-model"]["theoretical_cost"], 9.0)
         self.assertAlmostEqual(summary["model_breakdown"]["plan-model"]["cost"], 9.0)
 
+    def test_summary_monthly_decay_uses_explicit_baseline_without_writing(self) -> None:
+        before = self.client.get("/api/summary?year=2026&month=9").get_json()
+        with sqlite_connection(self.dashboard_path) as conn:
+            conn.executemany(
+                "INSERT INTO daily_model_usage("
+                "user_id,usage_date,model,input_tokens,cache_read_tokens,"
+                "output_tokens,request_count,api_equivalent_cost_micro_cny) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    (self.api_account_id, "2026-09-09", "recent-model", 0, 0, 100, 0, 0),
+                    (self.api_account_id, "2026-08-09", "previous-model", 0, 0, 100, 0, 0),
+                    (self.api_account_id, "2026-07-09", "older-model", 0, 0, 100, 0, 0),
+                    (self.api_account_id, "2026-10-09", "future-model", 0, 0, 100, 0, 0),
+                    (self.api_account_id, "2025-09-09", "year-old-model", 0, 0, 100, 0, 0),
+                ],
+            )
+            conn.commit()
+            before_db = conn.execute(
+                "SELECT count(*), COALESCE(sum(output_tokens), 0) "
+                "FROM daily_model_usage"
+            ).fetchone()
+
+        self.app.config["DATA_STORE"].load()
+        summary = self.client.get("/api/summary?year=2026&month=9").get_json()
+
+        self.assertEqual(summary["total_tokens"] - before["total_tokens"], 500)
+        self.assertAlmostEqual(
+            summary["weighted_total_tokens"] - before["weighted_total_tokens"],
+            100 + 100 * 0.9 + 100 * 0.9 ** 2 + 100 + 100 * 0.9 ** 12,
+        )
+        self.assertEqual(summary["total_requests"], before["total_requests"])
+        self.assertAlmostEqual(
+            summary["theoretical_total_cost"], before["theoretical_total_cost"])
+        self.assertAlmostEqual(
+            summary["model_breakdown"]["recent-model"]["weighted_total_tokens"],
+            100,
+        )
+        self.assertAlmostEqual(
+            summary["model_breakdown"]["previous-model"]["weighted_total_tokens"],
+            90,
+        )
+        self.assertAlmostEqual(
+            summary["model_breakdown"]["older-model"]["weighted_total_tokens"],
+            81,
+        )
+        self.assertAlmostEqual(
+            summary["model_breakdown"]["future-model"]["weighted_total_tokens"],
+            100,
+        )
+        self.assertAlmostEqual(
+            summary["model_breakdown"]["year-old-model"]["weighted_total_tokens"],
+            100 * 0.9 ** 12,
+        )
+
+        filtered = self.client.get(
+            f"/api/summary?year=2026&month=9&user_id={self.plan_account_id}"
+        ).get_json()
+        self.assertEqual(filtered["total_tokens"], 10)
+        self.assertAlmostEqual(filtered["weighted_total_tokens"], 9)
+        self.assertNotIn("recent-model", filtered["model_breakdown"])
+
+        with sqlite_connection(self.dashboard_path) as conn:
+            after_db = conn.execute(
+                "SELECT count(*), COALESCE(sum(output_tokens), 0) "
+                "FROM daily_model_usage"
+            ).fetchone()
+        self.assertEqual(tuple(after_db), tuple(before_db))
+
     def test_daily_and_breakdown_keep_token_grains_separate(self) -> None:
         daily = self.client.get("/api/daily?year=2026&month=8").get_json()
         self.assertEqual(daily["year"], 2026)
