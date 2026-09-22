@@ -618,14 +618,21 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
     var activeEntries = entries.filter(function (entry) {
         return normalizedDays.some(function (day) { return _calendarModelTokens(day, entry) > 0; });
     });
+    // Keep the horizontal footprint of each view, then derive its depth from
+    // the number of calendar rows. This gives every calendar cell the same
+    // width and depth, so both the month and year views have square bar bases
+    // instead of stretching the bars along one calendar axis.
     var gridWidth = options.mode === 'year' ? 270 : 150;
-    var gridDepth = options.mode === 'year' ? 80 : 112;
+    var xCategoryCount = Math.max(layout.xLabels.length, 1);
+    var yCategoryCount = Math.max(layout.zLabels.length, 1);
+    var calendarCellSize = gridWidth / xCategoryCount;
+    var gridDepth = calendarCellSize * yCategoryCount;
     // bar3D's barSize is expressed in grid coordinates, not as a fraction of
     // a category band. Keep the bars within the cell so the frame has room to
     // read around each column.
     var barSize = [
-        gridWidth / Math.max(layout.xLabels.length, 1) * CALENDAR_FRAME_STYLE.barSizeRatio,
-        gridDepth / Math.max(layout.zLabels.length, 1) * CALENDAR_FRAME_STYLE.barSizeRatio,
+        calendarCellSize * CALENDAR_FRAME_STYLE.barSizeRatio,
+        calendarCellSize * CALENDAR_FRAME_STYLE.barSizeRatio,
     ];
     var chart;
 
