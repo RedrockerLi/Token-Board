@@ -346,6 +346,36 @@ function buildModelEntries(data) {
     return { all: ranked, visible: visible, weightedTotal: weightedTotal };
 }
 
+/**
+ * Collapse models hidden from the pie into one calendar entry.  The entry
+ * keeps its source names so the calendar can retain per-model tooltip detail
+ * while exposing only one neutral-gray `Other` item in the legend.
+ */
+function buildCalendarModelEntries(data) {
+    var modelSet = buildModelEntries(data);
+    var entries = modelSet.visible.slice();
+    var hidden = modelSet.all.filter(function (entry) { return !entry.visible; });
+    if (hidden.length) {
+        entries.push({
+            name: 'Other',
+            models: hidden.map(function (entry) { return entry.name; }),
+            tokens: hidden.reduce(function (sum, entry) {
+                return sum + entry.tokens;
+            }, 0),
+            weighted_tokens: hidden.reduce(function (sum, entry) {
+                return sum + entry.weighted_tokens;
+            }, 0),
+            theoretical_cost: hidden.reduce(function (sum, entry) {
+                return sum + entry.theoretical_cost;
+            }, 0),
+            visible: false,
+            rank: null,
+            color: '#716B65',
+        });
+    }
+    return entries;
+}
+
 function fetchDashboardSummary() {
     var current = getBrowserCurrentMonth();
     var requestKey = (currentUserId || '') + '|' + current.year + '-' + current.month;
@@ -650,7 +680,7 @@ async function loadCalendarData() {
 
     try {
         var summary = await fetchDashboardSummary();
-        var modelEntries = buildModelEntries(summary).all;
+        var modelEntries = buildCalendarModelEntries(summary);
         if (!isCurrentCalendarRequest(sequence, scopeKey, mode, year, month, dataGeneration)) return;
 
         var responses;

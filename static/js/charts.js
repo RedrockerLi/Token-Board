@@ -445,9 +445,19 @@ function _initCalendarChart(domId) {
     return chart;
 }
 
+function _calendarEntryModelNames(entry) {
+    if (entry && Array.isArray(entry.models) && entry.models.length) {
+        return entry.models;
+    }
+    return entry && entry.name ? [entry.name] : [];
+}
+
 function _calendarModelTokens(day, entry) {
-    var model = day && day.by_model && day.by_model[entry.name];
-    return _calendarNumber(model && model.total_tokens);
+    var byModel = day && day.by_model || {};
+    return _calendarEntryModelNames(entry).reduce(function (sum, modelName) {
+        var model = byModel[modelName];
+        return sum + _calendarNumber(model && model.total_tokens);
+    }, 0);
 }
 
 function _calendarTooltip(day, modelEntries) {
@@ -456,11 +466,14 @@ function _calendarTooltip(day, modelEntries) {
         '请求数: <b>' + _calendarFormatNumber(day.requests) + '</b>';
     var rows = [];
     (modelEntries || []).forEach(function (entry) {
-        var tokens = _calendarModelTokens(day, entry);
-        if (tokens > 0) {
+        var byModel = day && day.by_model || {};
+        _calendarEntryModelNames(entry).forEach(function (modelName) {
+            var model = byModel[modelName];
+            var tokens = _calendarNumber(model && model.total_tokens);
+            if (tokens <= 0) return;
             rows.push('<span style="color:' + entry.color + '">●</span> ' +
-                _calendarEscape(entry.name) + ': <b>' + _calendarFormatNumber(tokens) + '</b>');
-        }
+                _calendarEscape(modelName) + ': <b>' + _calendarFormatNumber(tokens) + '</b>');
+        });
     });
     if (rows.length) html += '<br/>' + rows.join('<br/>');
     return html;
