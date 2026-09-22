@@ -109,16 +109,13 @@ class ProxyRoutingMixin:
     def _insert_agent_usage_row(conn, software_id: int, model: str,
                                 prompt_tokens: int, completion_tokens: int,
                                 cache_read_tokens: int, total_tokens: int,
-                                requested_at: str, event_id: str,
-                                project: str | None = None,
-                                session_id: str | None = None) -> bool:
+                                requested_at: str, event_id: str) -> bool:
         """Insert one imported software usage row on the caller's connection.
 
         A pending V1 event lets SQLite select the current write-time price and FX.  A
         permanent receipt makes INSERT OR IGNORE idempotent even after the
         request_log retention window; `requested_at` must be a SQLite UTC timestamp
-        "YYYY-MM-DD HH:MM:SS".  The legacy ``project`` and ``session_id`` arguments
-        are accepted for caller compatibility but are intentionally not persisted.
+        "YYYY-MM-DD HH:MM:SS".
         Returns True when a row was inserted.
         """
         receipt = conn.execute(
@@ -142,9 +139,7 @@ class ProxyRoutingMixin:
     def insert_agent_usage(self, software_id: int, model: str,
                            prompt_tokens: int, completion_tokens: int,
                            cache_read_tokens: int, total_tokens: int,
-                           requested_at: str, event_id: str,
-                           project: str | None = None,
-                           session_id: str | None = None) -> bool:
+                           requested_at: str, event_id: str) -> bool:
         """Insert one imported software usage row into request_log.
 
         Convenience wrapper opening its own connection (for manual/API use);
@@ -156,7 +151,7 @@ class ProxyRoutingMixin:
             ok = self._insert_agent_usage_row(
                 conn, software_id, model, prompt_tokens, completion_tokens,
                 cache_read_tokens, total_tokens, requested_at, event_id,
-                project, session_id)
+            )
             conn.commit()
             return ok
         finally:
