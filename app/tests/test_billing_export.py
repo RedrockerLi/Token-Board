@@ -10,7 +10,7 @@ from app.services.sync.dashboard_sync import sync_dashboard
 from app.services.sync.dashboard_user_delete import delete_dashboard_users
 from app.services.sync.state import get_sync_state
 
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class BillingExportTest(AppDatabaseTestCase):
@@ -26,7 +26,7 @@ class BillingExportTest(AppDatabaseTestCase):
             "upstream_keys": ["sk-immutable"],
             "new_valid_froms": ["2026-07-01"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE billing_rate_events SET effective_at=?",
                 ("2026-06-01T00:00:00Z",),
@@ -35,7 +35,7 @@ class BillingExportTest(AppDatabaseTestCase):
         return account_id
 
     def _dashboard_charge_count(self, account_id: int) -> int:
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             return conn.execute(
                 "SELECT COALESCE((SELECT 1 FROM users "
                 "WHERE id=? AND actual_cost_micro_cny > 0), 0)",
@@ -66,7 +66,7 @@ class BillingExportTest(AppDatabaseTestCase):
         )
         self.assertEqual(deleted["status"], "ok", deleted)
         self.assertEqual(self._dashboard_charge_count(account_id), 0)
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='billing_export_receipts'"
@@ -152,7 +152,7 @@ class BillingExportTest(AppDatabaseTestCase):
         self.assertEqual(self._dashboard_charge_count(account_id), 0)
 
         self.assertEqual(self._dashboard_charge_count(account_id), 0)
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='billing_export_receipts'"
@@ -172,7 +172,7 @@ class BillingExportTest(AppDatabaseTestCase):
             "name": "legacy-event-agent", "agent_kind": "codex",
             "subscription_ids": [subscription_id],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE agent_subscription_bindings SET valid_from=? "
                 "WHERE subscription_id=? AND software_id=?",
@@ -184,7 +184,7 @@ class BillingExportTest(AppDatabaseTestCase):
             self.proxy_path,
             datetime(2026, 7, 2, tzinfo=timezone.utc),
         )
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.row_factory = sqlite3.Row
             event = conn.execute(
                 "SELECT id,source_key,billing_unit_id FROM billing_export_events "
@@ -202,7 +202,7 @@ class BillingExportTest(AppDatabaseTestCase):
             )
             conn.commit()
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.row_factory = sqlite3.Row
             created = ensure_billing_export_events_conn(conn)
             self.assertEqual(created, 0)

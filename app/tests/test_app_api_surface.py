@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 from app import create_app
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class AppApiSurfaceTest(AppDatabaseTestCase):
@@ -26,7 +26,7 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
             "cache_read_price": 0.5,
             "output_price": 2,
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log"
                 "(event_id,source_kind,account_id,model,prompt_tokens,"

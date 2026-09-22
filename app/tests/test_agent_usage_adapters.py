@@ -20,6 +20,7 @@ from app.services.agent_usage.adapters import (
 from app.services.agent_usage import cindy_ledger
 from app.services.agent_usage.ir import UsageEvent, UsageSource
 from app.services.agent_usage.registry import ADAPTERS
+from app.tests.support import sqlite_connection
 
 
 class AgentUsageAdapterTestCase(unittest.TestCase):
@@ -562,7 +563,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
     def test_antigravity_sqlite_total_includes_cached_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "conversation.db"
-            with sqlite3.connect(path) as connection:
+            with sqlite_connection(path) as connection:
                 connection.execute(
                     "CREATE TABLE gen_metadata (idx INTEGER, data BLOB)"
                 )
@@ -600,7 +601,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
     def test_mcode_reads_allowlisted_runtime_usage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime-state.sqlite"
-            with sqlite3.connect(path) as connection:
+            with sqlite_connection(path) as connection:
                 connection.execute("""CREATE TABLE local_runtime_sessions (
                     session_id TEXT PRIMARY KEY, workspace_dir TEXT,
                     project_workspace_dir TEXT
@@ -634,7 +635,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
     def test_hermes_total_includes_cached_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.db"
-            with sqlite3.connect(path) as connection:
+            with sqlite_connection(path) as connection:
                 connection.execute("""CREATE TABLE sessions (
                     id TEXT, model TEXT, started_at TEXT, input_tokens INTEGER,
                     output_tokens INTEGER, cache_read_tokens INTEGER,
@@ -695,7 +696,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.vscdb"
-            with sqlite3.connect(path) as connection:
+            with sqlite_connection(path) as connection:
                 connection.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
                 connection.execute(
                     "INSERT INTO ItemTable VALUES(?, ?)",
@@ -720,7 +721,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             hermes_root = root / "hermes"
             hermes_root.mkdir()
             hermes_db = hermes_root / "state.db"
-            with sqlite3.connect(hermes_db) as connection:
+            with sqlite_connection(hermes_db) as connection:
                 connection.execute("""CREATE TABLE sessions (
                     id TEXT, model TEXT, started_at TEXT, input_tokens INTEGER,
                     output_tokens INTEGER, cache_read_tokens INTEGER,
@@ -1243,7 +1244,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             root = Path(directory) / "CindyGlobal"
             root.mkdir()
             path = root / "cindy-owner.db"
-            with sqlite3.connect(path) as connection:
+            with sqlite_connection(path) as connection:
                 connection.execute("""
                     CREATE TABLE daily_model_usage (
                         day TEXT, agent_kind TEXT, model TEXT,

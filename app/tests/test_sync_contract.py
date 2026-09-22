@@ -26,6 +26,7 @@ from app.services.sync.config_merge import merge_config_tables
 from app.services.sync.config_sync import sync_config_pull, sync_config_upload
 from app.services.sync.dashboard_sync import sync_dashboard
 from app.services.sync.state import config_hash_of_db
+from app.tests.support import sqlite_connection
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -117,7 +118,7 @@ class SyncContractTest(unittest.TestCase):
                 conn.close()
 
             local_db = ProxyDatabase(local, str(Path(temp) / "schema"))
-            with sqlite3.connect(local) as conn:
+            with sqlite_connection(local) as conn:
                 conn.execute(
                     "INSERT INTO pricing_rules"
                     "(id,model_pattern,priority,input_price,cache_read_price,"
@@ -133,7 +134,7 @@ class SyncContractTest(unittest.TestCase):
 
             merge_config_tables(remote, local)
 
-            with sqlite3.connect(local) as conn:
+            with sqlite_connection(local) as conn:
                 current = conn.execute(
                     "SELECT id,input_price,output_price FROM pricing_rules "
                     "WHERE id=1"
@@ -141,7 +142,7 @@ class SyncContractTest(unittest.TestCase):
             # Configuration downloads are cloud-authoritative: the remote
             # current value wins and a local-only rule is physically removed.
             self.assertEqual(current, [(1, 1.0, 2.0)])
-            with sqlite3.connect(local) as conn:
+            with sqlite_connection(local) as conn:
                 self.assertEqual(conn.execute(
                     "SELECT count(*) FROM pricing_rules WHERE id=2"
                 ).fetchone()[0], 0)
@@ -168,7 +169,7 @@ class SyncContractTest(unittest.TestCase):
                 "name": "cloud-removed-agent", "agent_kind": "codex",
                 "subscription_ids": [subscription_id],
             })
-            with sqlite3.connect(local) as conn:
+            with sqlite_connection(local) as conn:
                 charge_count = conn.execute(
                     "SELECT count(*) FROM agent_subscription_period_charges "
                     "WHERE subscription_id=?", (subscription_id,)
@@ -177,7 +178,7 @@ class SyncContractTest(unittest.TestCase):
 
             merge_config_tables(remote, local)
 
-            with sqlite3.connect(local) as conn:
+            with sqlite_connection(local) as conn:
                 self.assertIsNone(conn.execute(
                     "SELECT 1 FROM agent_subscriptions WHERE id=?",
                     (subscription_id,)).fetchone())
@@ -211,7 +212,7 @@ class SyncContractTest(unittest.TestCase):
             schema = str(Path(temp) / "schema")
             apply_sql_migrations(
                 local, schema, "token-board", SchemaVersion(1, 13))
-            with sqlite3.connect(local) as conn:
+            with sqlite_connection(local) as conn:
                 conn.execute(
                     "INSERT INTO pricing_rules(id,model_pattern,priority) "
                     "VALUES(1,'migration-demo',0)"
@@ -238,12 +239,13 @@ class SyncContractTest(unittest.TestCase):
                 )
                 conn.execute("UPDATE pricing_rules SET enabled=0 WHERE id=2")
                 conn.commit()
-            before = sqlite3.connect(local).execute(
-                "SELECT count(*),sum(equivalent_cost),sum(billed_usage_cost) FROM request_log"
-            ).fetchone()
+            with sqlite_connection(local) as conn:
+                before = conn.execute(
+                    "SELECT count(*),sum(equivalent_cost),sum(billed_usage_cost) FROM request_log"
+                ).fetchone()
             from app.db.schema_upgrade import upgrade_downloaded_artifact
             upgrade_downloaded_artifact(local, "token-board", schema)
-            with sqlite3.connect(local) as conn:
+            with sqlite_connection(local) as conn:
                 self.assertEqual(conn.execute(
                     "SELECT id,model_pattern,priority,input_price,output_price "
                     "FROM pricing_rules"
@@ -268,7 +270,7 @@ class SyncContractTest(unittest.TestCase):
         published_path = Path(temp) / "remote-v114.db"
         apply_sql_migrations(
             str(remote_path), schema, "token-board", SchemaVersion(1, 13))
-        with sqlite3.connect(remote_path) as conn:
+        with sqlite_connection(remote_path) as conn:
             conn.execute(
                 "INSERT INTO pricing_rules(id,model_pattern,priority) "
                 "VALUES(1,'remote-model',0)"
@@ -295,7 +297,7 @@ class SyncContractTest(unittest.TestCase):
             state["artifact"] = RemoteArtifact(
                 "token-board_config_20260903_000000.db.gz")
             state["path"] = published_path
-            with sqlite3.connect(source) as conn:
+            with sqlite_connection(source) as conn:
                 self.assertFalse(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='pricing_rates'"
                 ).fetchone())
@@ -388,7 +390,7 @@ class SyncContractTest(unittest.TestCase):
         try:
             from app.services.sync.snapshot import snapshot_config
 
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 conn.execute(
                     "INSERT INTO accounts(id,uuid,name) VALUES(1,'acct','agent')")
                 conn.execute(
@@ -423,7 +425,7 @@ class SyncContractTest(unittest.TestCase):
 
             def capture(config, path):
                 del config
-                with sqlite3.connect(path) as uploaded:
+                with sqlite_connection(path) as uploaded:
                     captured["period_charges"] = uploaded.execute(
                         "SELECT count(*) FROM agent_subscription_period_charges"
                     ).fetchone()[0]
@@ -448,7 +450,7 @@ class SyncContractTest(unittest.TestCase):
             self.assertEqual(captured["allocations"], 0)
             self.assertEqual(captured["agent_receipts"], 0)
             self.assertEqual(captured["foreign_key_check"], [])
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 self.assertEqual(conn.execute(
                     "SELECT count(*) FROM agent_subscription_period_charges"
                 ).fetchone()[0], 1)
@@ -467,18 +469,18 @@ class SyncContractTest(unittest.TestCase):
             self._webdav_mocks()
             from app.services.sync.snapshot import snapshot_config
             snapshot_config(proxy)
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 conn.execute("INSERT INTO accounts(id,uuid,name) VALUES(1,'a','base')")
                 conn.commit()
             snapshot_config(proxy)
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 conn.execute("UPDATE accounts SET name='changed' WHERE id=1")
                 conn.commit()
             with patch("app.services.sync.config_sync.publish_config_artifact",
                        side_effect=WebDAVError("put failed")):
                 result = sync_config_upload(proxy)
             self.assertEqual(result["status"], "error", result)
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 self.assertEqual(conn.execute(
                     "SELECT name FROM accounts WHERE id=1").fetchone()[0], "changed")
         finally:
@@ -489,7 +491,7 @@ class SyncContractTest(unittest.TestCase):
         temp, proxy, _ = self._repo_layout()
         try:
             from app.services.sync.snapshot import snapshot_config
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 conn.execute("INSERT INTO accounts(id,uuid,name) VALUES(1,'acct','agent')")
                 conn.execute(
                     "INSERT INTO agent_subscriptions(id,uuid,name,valid_from) "
@@ -506,10 +508,10 @@ class SyncContractTest(unittest.TestCase):
                     "(period_charge_id,software_id) VALUES(1,1)")
                 conn.commit()
             snapshot_config(proxy)
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 self.assertEqual(conn.execute(
                     "PRAGMA foreign_key_check").fetchall(), [])
-            with sqlite3.connect(str(Path(temp) / "data/token-board_config_snapshot.db")) as conn:
+            with sqlite_connection(str(Path(temp) / "data/token-board_config_snapshot.db")) as conn:
                 self.assertEqual(conn.execute(
                     "PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(conn.execute(
@@ -656,7 +658,7 @@ class SyncContractTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "ok", result)
             self.assertFalse(result["uploaded"])
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 self.assertEqual(
                     conn.execute(
                         "SELECT value FROM sync_state "

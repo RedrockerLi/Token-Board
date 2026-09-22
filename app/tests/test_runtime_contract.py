@@ -15,6 +15,7 @@ from app.core.time import (
     parse_runtime_timestamp,
 )
 from app.services.fx import FxRateResolver
+from app.tests.support import sqlite_connection
 
 
 class RuntimeContractTest(unittest.TestCase):
@@ -65,6 +66,29 @@ class RuntimeContractTest(unittest.TestCase):
         conn.rollback()
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM item").fetchone()[0], 0)
         conn.close()
+
+    def test_test_sqlite_connection_commits_rolls_back_and_closes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "test-helper.db"
+            with sqlite_connection(path) as connection:
+                connection.execute("CREATE TABLE item (id INTEGER)")
+
+            with sqlite_connection(path) as connection:
+                connection.execute("INSERT INTO item VALUES (1)")
+
+            with self.assertRaises(RuntimeError):
+                with sqlite_connection(path) as connection:
+                    connection.execute("INSERT INTO item VALUES (2)")
+                    raise RuntimeError("rollback probe")
+
+            with sqlite_connection(path) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT id FROM item").fetchall(),
+                    [(1,)],
+                )
+
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
 
     def test_fx_resolution_distinguishes_locked_and_provisional(self):
         conn = sqlite_runtime.connect(":memory:", "billing_write")

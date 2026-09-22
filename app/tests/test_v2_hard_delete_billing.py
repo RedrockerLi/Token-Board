@@ -14,7 +14,7 @@ from app.db.schema_upgrade import ensure_local_databases
 from app.db.schema_upgrade.engine_core import latest_version
 from app.services.billing_report import actual_cost
 
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class V2MigrationTest(unittest.TestCase):
@@ -36,7 +36,7 @@ class V2MigrationTest(unittest.TestCase):
             self.assertFalse(second["token-board"].upgraded)
             self.assertFalse(second["dashboard"].upgraded)
 
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 expected = latest_version(root / "schema", "token-board", 2)
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
                                  expected.user_version)
@@ -96,7 +96,7 @@ class V2MigrationTest(unittest.TestCase):
                                  "token-board", SchemaVersion(2, 0))
             apply_sql_migrations(str(dashboard), str(root / "schema"),
                                  "dashboard", SchemaVersion(2, 0))
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 conn.execute(
                     "INSERT INTO agent_subscriptions(uuid,name,valid_from) "
                     "VALUES('invalid-agent','invalid','not-a-date')"
@@ -105,9 +105,9 @@ class V2MigrationTest(unittest.TestCase):
 
             with self.assertRaises(sqlite3.IntegrityError):
                 ensure_local_databases(str(proxy), str(dashboard), root / "schema")
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_000)
-            with sqlite3.connect(dashboard) as conn:
+            with sqlite_connection(dashboard) as conn:
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_000)
 
     def test_terminal_v1_graph_is_deleted_while_history_is_detached(self) -> None:
@@ -122,7 +122,7 @@ class V2MigrationTest(unittest.TestCase):
                                  "token-board", SchemaVersion(1, 21))
             apply_sql_migrations(str(dashboard), str(root / "schema"),
                                  "dashboard", SchemaVersion(1, 7))
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 conn.executescript(
                     """
                     INSERT INTO accounts
@@ -171,7 +171,7 @@ class V2MigrationTest(unittest.TestCase):
                 conn.commit()
 
             ensure_local_databases(str(proxy), str(dashboard), root / "schema")
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 self.assertIsNone(conn.execute(
                     "SELECT 1 FROM accounts WHERE id=42").fetchone())
                 self.assertIsNone(conn.execute(
@@ -189,7 +189,7 @@ class V2MigrationTest(unittest.TestCase):
                     "WHERE account_identity_id=42"
                 ).fetchone()[0], 1)
                 self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
-            with sqlite3.connect(dashboard) as conn:
+            with sqlite_connection(dashboard) as conn:
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 20_002)
                 self.assertIsNone(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -215,7 +215,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertIsNone(result["effective_ends_at"])
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone())
             self.assertEqual(conn.execute(
@@ -235,7 +235,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
             "currency": "CNY", "base_url": "https://example.test",
             "upstream_keys": ["first", "second"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM billing_period_charges "
                 "WHERE account_identity_id=? AND finalized_at IS NOT NULL",
@@ -250,7 +250,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
         result = db.delete_account(account_id, mode="immediate")
         self.assertTrue(result["ok"], result)
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone())
             self.assertEqual(conn.execute(
@@ -272,7 +272,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
         })
         now = datetime.now(timezone.utc).replace(microsecond=0)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,"
                 "account_identity_id,model,status_code,requested_at,total_tokens,"
@@ -282,7 +282,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
             )
             conn.commit()
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             costs = actual_cost(conn, now=now)
         self.assertEqual(costs["metered_cost"], 7)
         self.assertEqual(costs["total_cost"],
@@ -301,7 +301,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
             normalized_recurring_cost=10, currency="CNY", base_currency="CNY",
             fx_rate_date=None, frozen_on=timestamp[:10])
         self.assertEqual(dashboard.purge_accounts({account_id}), 1)
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM users WHERE id=?", (account_id,)
             ).fetchone()[0], 0)
@@ -327,7 +327,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
         })
         now = datetime.now(timezone.utc).replace(microsecond=0)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.executemany(
                 "INSERT INTO request_log(event_id,source_kind,account_id,"
                 "account_identity_id,model,status_code,requested_at,total_tokens,"
@@ -344,7 +344,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
         # This keeps the old finalized charge and identity for audit while
         # removing the live configuration graph.
         self.assertTrue(db.delete_account(deleted_id, mode="immediate")["ok"])
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             costs = actual_cost(conn, now=now)
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) FROM billing_period_charges "

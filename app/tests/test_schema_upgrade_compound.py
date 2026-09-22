@@ -13,6 +13,7 @@ from unittest.mock import patch
 from app.db.migrations import SchemaVersion, apply_sql_migrations
 from app.db.schema_upgrade import ensure_local_databases
 from app.db.schema_upgrade.engine_core import latest_version
+from app.tests.support import sqlite_connection
 
 
 class CompoundSchemaUpgradeTest(unittest.TestCase):
@@ -28,11 +29,11 @@ class CompoundSchemaUpgradeTest(unittest.TestCase):
         apply_sql_migrations(
             str(self.dashboard), str(self.root / "schema"), "dashboard",
             SchemaVersion(1, 3))
-        with sqlite3.connect(self.proxy) as conn:
+        with sqlite_connection(self.proxy) as conn:
             conn.execute(
                 "INSERT INTO agent_software(id,uuid,name,agent_kind) "
                 "VALUES(100,'agent-uuid','codex','codex')")
-        with sqlite3.connect(self.dashboard) as conn:
+        with sqlite_connection(self.dashboard) as conn:
             conn.execute(
                 "INSERT INTO agent_software(software_id,name,agent_kind) "
                 "VALUES(1,'codex','codex')")
@@ -47,14 +48,14 @@ class CompoundSchemaUpgradeTest(unittest.TestCase):
         result = ensure_local_databases(
             str(self.proxy), str(self.dashboard), self.root / "schema")
         self.assertIsNotNone(result["token-board"].manifest)
-        with sqlite3.connect(self.dashboard) as conn:
+        with sqlite_connection(self.dashboard) as conn:
             self.assertEqual(
                 conn.execute("SELECT id FROM users WHERE id=100").fetchone()[0], 100)
             marker = conn.execute(
                 "SELECT checksum,generation_id FROM schema_transitions "
                 "WHERE transition_id='v1-agent-identity'"
             ).fetchone()
-        with sqlite3.connect(self.proxy) as conn:
+        with sqlite_connection(self.proxy) as conn:
             expected = latest_version(self.root / "schema", "token-board", 2)
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
                              expected.user_version)

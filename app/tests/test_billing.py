@@ -13,7 +13,7 @@ from app.services.cost_allocator import (
     compute_proportional_cost_by_month,
 )
 
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class BillingTest(AppDatabaseTestCase):
@@ -44,7 +44,7 @@ class BillingTest(AppDatabaseTestCase):
 
         all_ids = api_ids + aggregate_ids + agent_ids
         self.assertEqual(len(set(all_ids)), len(all_ids))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM accounts WHERE id IN (%s)"
                 % ",".join("?" for _ in api_ids + agent_ids),
@@ -84,7 +84,7 @@ class BillingTest(AppDatabaseTestCase):
             "agent_kind": "codex",
             "subscription_ids": [subscription_id],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT valid_from FROM agent_subscriptions WHERE id=?",
                 (subscription_id,)).fetchone()[0], "2099-09-06")
@@ -115,7 +115,7 @@ class BillingTest(AppDatabaseTestCase):
             "upstream_keys": ["sk-date-only-plan"],
             "new_valid_froms": ["2099-09-06T06:56:13Z"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT valid_from FROM billing_contracts WHERE account_id=?",
                 (account_id,)).fetchone()[0], "2099-09-06")
@@ -128,7 +128,7 @@ class BillingTest(AppDatabaseTestCase):
         })
         result = db.delete_account(account_id, mode="immediate")
         self.assertTrue(result["ok"], result)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone())
             self.assertEqual(conn.execute(
@@ -147,7 +147,7 @@ class BillingTest(AppDatabaseTestCase):
             "monthly_price": 12, "currency": "CNY",
             "base_url": "http://example.test", "upstream_keys": ["sk-export"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,model,"
                 "prompt_tokens,completion_tokens,total_tokens,status_code,requested_at) "
@@ -158,7 +158,7 @@ class BillingTest(AppDatabaseTestCase):
 
         result = db.export_to_dashboard(str(self.dashboard_path), 0, db.get_max_log_id())
         self.assertGreaterEqual(result["dashboard_records"], 1)
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertGreater(conn.execute(
                 "SELECT count(*) FROM daily_model_usage WHERE user_id=?",
                 (account_id,)).fetchone()[0], 0)
@@ -202,7 +202,7 @@ class BillingTest(AppDatabaseTestCase):
         second_agent = db.create_agent_software({
             "name": "second-owner-agent", "agent_kind": "codex",
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             first_charge = conn.execute(
                 "SELECT software_id FROM agent_subscription_period_charges "
                 "WHERE subscription_id=? ORDER BY period_start LIMIT 1",
@@ -219,7 +219,7 @@ class BillingTest(AppDatabaseTestCase):
             self.proxy_path, utc_now() + timedelta(days=31))
         self.assertTrue(db.update_agent_software(
             second_agent, {"subscription_ids": []}))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             owners = [row[0] for row in conn.execute(
                 "SELECT software_id FROM agent_subscription_period_charges "
                 "WHERE subscription_id=? ORDER BY period_start",
@@ -232,7 +232,7 @@ class BillingTest(AppDatabaseTestCase):
 
     def test_agent_subscription_delete_keeps_history_and_allows_name_reuse(self) -> None:
         db = self.proxy_database()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_settings(key,value) VALUES(?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -248,7 +248,7 @@ class BillingTest(AppDatabaseTestCase):
             "name": "reusable-agent-source", "agent_kind": "codex",
             "subscription_ids": [subscription_id],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE agent_subscription_bindings SET valid_from=? "
                 "WHERE subscription_id=? AND software_id=?",
@@ -264,7 +264,7 @@ class BillingTest(AppDatabaseTestCase):
         self.assertFalse(result["deferred"], result)
         self.assertIsNone(result["effective_ends_on"])
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT 1 FROM agent_subscriptions WHERE id=?",
                 (subscription_id,)).fetchone())
@@ -295,7 +295,7 @@ class BillingTest(AppDatabaseTestCase):
         # resolve the stable identity tables, not the deleted parent rows.
         from app.db.proxy.billing import materialize_agent_subscription_charges
         materialize_agent_subscription_charges(self.proxy_path)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             source_keys = [row[0] for row in conn.execute(
                 "SELECT CAST(id AS TEXT) FROM agent_subscription_period_charges "
                 "WHERE subscription_id=?", (subscription_id,)
@@ -311,7 +311,7 @@ class BillingTest(AppDatabaseTestCase):
         # this materialization happens, and therefore cannot create a second
         # Dashboard event.
         materialize_agent_subscription_charges(self.proxy_path)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM billing_export_events "
                 "WHERE source_table='agent_subscription_period_charges' "
@@ -327,7 +327,7 @@ class BillingTest(AppDatabaseTestCase):
 
     def test_expired_agent_subscription_purges_live_shell_but_keeps_identity(self) -> None:
         db = self.proxy_database()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_settings(key,value) VALUES(?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -347,7 +347,7 @@ class BillingTest(AppDatabaseTestCase):
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["deferred"], result)
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             instance_id = conn.execute(
                 "SELECT id FROM agent_subscription_instances "
                 "WHERE subscription_id=?", (subscription_id,)
@@ -363,7 +363,7 @@ class BillingTest(AppDatabaseTestCase):
             conn.commit()
 
         db.finalize_deferred_deletions()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT 1 FROM agent_subscriptions WHERE id=?",
                 (subscription_id,)).fetchone())
@@ -389,7 +389,7 @@ class BillingTest(AppDatabaseTestCase):
                 {"label": "default", "monthly_price": 2},
             ],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM agent_subscription_instances "
                 "WHERE subscription_id=? AND label='default'",
@@ -425,7 +425,7 @@ class BillingTest(AppDatabaseTestCase):
         })
         key_value = db.create_key({"account_id": account_id})
         key_id = db.get_keys()[0]["id"]
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,"
                 "route_set_id,client_key_id,model,status_code,requested_at) "
@@ -435,7 +435,7 @@ class BillingTest(AppDatabaseTestCase):
             conn.commit()
 
         self.assertTrue(db.delete_key(key_id))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM client_keys WHERE id=?", (key_id,)
             ).fetchone()[0], 0)
@@ -457,7 +457,7 @@ class BillingTest(AppDatabaseTestCase):
         })
         key_value = db.create_key({"account_id": aggregate_id})
         key_id = next(k["id"] for k in db.get_keys() if k["key_value"] == key_value)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,"
                 "route_set_id,client_key_id,model,status_code,requested_at) "
@@ -467,7 +467,7 @@ class BillingTest(AppDatabaseTestCase):
             conn.commit()
 
         self.assertTrue(db.delete_aggregate(aggregate_id))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM route_sets WHERE id=?", (aggregate_id,)
             ).fetchone()[0], 0)
@@ -497,7 +497,7 @@ class BillingTest(AppDatabaseTestCase):
 
         result = db.delete_account(account_id, mode="immediate")
         self.assertTrue(result["ok"], result)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM route_rules WHERE route_set_id=?",
                 (aggregate_id,)).fetchone()[0], 0)
@@ -514,7 +514,7 @@ class BillingTest(AppDatabaseTestCase):
             "base_url": "http://example.test",
             "upstream_keys": ["sk-expired", "sk-live"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             expired_uuid = conn.execute(
                 "SELECT c.uuid FROM upstream_credentials c "
                 "JOIN upstreams u ON u.id=c.upstream_id "
@@ -528,7 +528,7 @@ class BillingTest(AppDatabaseTestCase):
             conn.commit()
 
         db.finalize_deferred_deletions()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM upstream_secrets WHERE credential_uuid=?",
                 (expired_uuid,)).fetchone()[0], 0)
@@ -574,7 +574,7 @@ class BillingTest(AppDatabaseTestCase):
         })
         requested_at = datetime.now(timezone.utc).isoformat(
             timespec="seconds").replace("+00:00", "Z")
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,model,"
                 "prompt_tokens,completion_tokens,cache_read_tokens,total_tokens,"
@@ -610,7 +610,7 @@ class BillingTest(AppDatabaseTestCase):
             "cache_read_price": 0.5, "output_price": 2.0,
             "currency": "USD",
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,model,"
                 "prompt_tokens,completion_tokens,total_tokens,status_code,"
@@ -640,7 +640,7 @@ class BillingTest(AppDatabaseTestCase):
                          ["model-a", "model-*"])
         requested_at = datetime.now(timezone.utc).isoformat(
             timespec="seconds").replace("+00:00", "Z")
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,model,"
                 "prompt_tokens,completion_tokens,cache_read_tokens,total_tokens,"
@@ -662,7 +662,7 @@ class BillingTest(AppDatabaseTestCase):
         # costs remain frozen, while a newly inserted row uses the new price.
         self.assertTrue(db.update_pricing(specific, {"input_price": 6,
                                                      "output_price": 12}))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,model,"
                 "prompt_tokens,completion_tokens,total_tokens,status_code,"
@@ -691,7 +691,7 @@ class BillingTest(AppDatabaseTestCase):
                               "input_price": 2}],
         })
         self.assertTrue(db.delete_pricing(pricing_id))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM pricing_rules WHERE id=?", (pricing_id,)
             ).fetchone()[0], 0)
@@ -708,7 +708,7 @@ class BillingTest(AppDatabaseTestCase):
         db = self.proxy_database()
         now = datetime.now(timezone.utc)
         valid_from = now.replace(day=1).strftime("%Y-%m-%d")
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_settings(key,value) "
                 "VALUES('billing.cancellation_mode','immediate')")
@@ -722,7 +722,7 @@ class BillingTest(AppDatabaseTestCase):
         # runs into next month; materializing twice stays idempotent.
         materialize_period_charges(str(self.proxy_path), now)
         materialize_period_charges(str(self.proxy_path), now)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             rows = conn.execute(
                 "SELECT recurring_charge,base_currency "
                 "FROM billing_period_charges bc JOIN billing_contracts c "
@@ -736,14 +736,14 @@ class BillingTest(AppDatabaseTestCase):
         self.assertTrue(result["ok"], result)
         self.assertFalse(result["deferred"], result)
         self.assertNotIn(account_id, [a["id"] for a in db.get_accounts()])
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM route_sets WHERE id=? AND enabled=1",
                 (account_id,)).fetchone()[0], 0)
 
     def test_account_delete_uses_current_global_mode(self) -> None:
         db = self.proxy_database()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_settings(key,value) VALUES(?,?)",
                 ("billing.cancellation_mode", "immediate"),
@@ -756,7 +756,7 @@ class BillingTest(AppDatabaseTestCase):
         })
 
         # The deletion mode is read from the global setting at deletion time.
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE sync_settings SET value='period_end' "
                 "WHERE key='billing.cancellation_mode'"
@@ -771,7 +771,7 @@ class BillingTest(AppDatabaseTestCase):
         self.assertTrue(result["deferred"], result)
         self.assertEqual(result["cancellation_mode"], "end_of_period")
         self.assertIn(account_id, [a["id"] for a in db.get_accounts()])
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             account = conn.execute(
                 "SELECT id FROM accounts WHERE id=?",
                 (account_id,),
@@ -792,7 +792,7 @@ class BillingTest(AppDatabaseTestCase):
 
     def test_account_delete_uses_latest_key_expiry(self) -> None:
         db = self.proxy_database()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_settings(key,value) VALUES(?,?)",
                 ("billing.cancellation_mode", "end_of_period"),
@@ -804,7 +804,7 @@ class BillingTest(AppDatabaseTestCase):
             "upstream_keys": ["sk-early"],
         })
         fixed_now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             upstream_id = conn.execute(
                 "SELECT id FROM upstreams WHERE account_id=?", (account_id,)
             ).fetchone()[0]
@@ -839,7 +839,7 @@ class BillingTest(AppDatabaseTestCase):
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["deferred"], result)
         self.assertEqual(result["effective_ends_at"], "2026-09-14T23:59:59Z")
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             contract_ends_at = conn.execute(
                 "SELECT ends_at FROM billing_contracts WHERE account_id=?", (account_id,)
             ).fetchone()[0]
@@ -853,7 +853,7 @@ class BillingTest(AppDatabaseTestCase):
 
     def test_pending_account_deletion_can_be_cancelled(self) -> None:
         db = self.proxy_database()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_settings(key,value) VALUES(?,?)",
                 ("billing.cancellation_mode", "end_of_period"),
@@ -877,7 +877,7 @@ class BillingTest(AppDatabaseTestCase):
 
         self.assertTrue(cancelled["ok"], cancelled)
         self.assertEqual(cancelled["restored_credentials"], 1)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNotNone(conn.execute(
                 "SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone())
             self.assertIsNone(conn.execute(
@@ -891,7 +891,7 @@ class BillingTest(AppDatabaseTestCase):
 
     def test_expired_account_deletion_cannot_be_cancelled(self) -> None:
         db = self.proxy_database()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_settings(key,value) VALUES(?,?)",
                 ("billing.cancellation_mode", "end_of_period"),
@@ -916,7 +916,7 @@ class BillingTest(AppDatabaseTestCase):
             self.assertFalse(cancelled["ok"], cancelled)
             self.assertEqual(db.finalize_deferred_deletions(), 1)
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone())
             self.assertIsNotNone(conn.execute(

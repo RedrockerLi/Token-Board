@@ -14,13 +14,13 @@ from app.services.sync.state import get_sync_state, set_sync_state_many
 from app.services.sync.webdav import RemoteArtifact, WebDAVConflict, WebDAVError
 from app.services.sync.storage import safe_copy_db
 from app.db.proxy_db import ProxyDatabase
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class DashboardUserDeleteTest(AppDatabaseTestCase):
     def setUp(self) -> None:
         super().setUp()
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             conn.executemany(
                 "INSERT INTO users(id,name,actual_cost_micro_cny) VALUES(?,?,?)",
                 [(7, "remove-me", 3_000_000), (8, "keep-me", 4_000_000)],
@@ -70,7 +70,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         self.assertEqual(self._names(), ["keep-me"])
 
     def test_archive_does_not_export_or_clean_local_usage(self) -> None:
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,account_kind) "
                 "VALUES(7,'archive-agent','remove-me','agent')"
@@ -102,7 +102,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             )
 
         self.assertEqual(result["status"], "ok", result)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(
                 conn.execute(
                     "SELECT count(*) FROM request_log "
@@ -142,7 +142,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         published_rows = []
 
         def capture(_config, path, _base, _remote):
-            with sqlite3.connect(path) as conn:
+            with sqlite_connection(path) as conn:
                 published_rows.append({
                     "remove": conn.execute(
                         "SELECT count(*) FROM users WHERE name='remove-me'"
@@ -184,7 +184,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         published_rows = []
 
         def capture(_config, path, _base, _remote):
-            with sqlite3.connect(path) as conn:
+            with sqlite_connection(path) as conn:
                 published_rows.append(conn.execute(
                     "SELECT count(*) FROM users WHERE name='remove-me'"
                 ).fetchone()[0])
@@ -226,7 +226,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         responses = [WebDAVConflict("race"), RemoteArtifact("result.db")]
 
         def capture(_config, path, _base, _remote):
-            with sqlite3.connect(path) as conn:
+            with sqlite_connection(path) as conn:
                 published_rows.append(conn.execute(
                     "SELECT count(*) FROM users WHERE name='remove-me'"
                 ).fetchone()[0])
@@ -287,7 +287,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         self.assertCountEqual(self._names(), ["keep-me", "remove-me"])
 
     def test_deleted_account_can_accept_later_usage_export(self) -> None:
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,account_kind) "
                 "VALUES(7,'remove-me-account','remove-me','agent')"
@@ -299,7 +299,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         )
         self.assertEqual(result["status"], "ok", result)
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log"
                 "(event_id,source_kind,account_id,model,prompt_tokens,"
@@ -316,7 +316,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         self.assertCountEqual(self._names(), ["keep-me", "remove-me"])
 
     def test_opencode_zen_and_lm_studio_do_not_return_after_export(self) -> None:
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             conn.executemany(
                 "INSERT INTO users(id,name,actual_cost_micro_cny) VALUES(?,?,?)",
                 [(14, "OpenCode Zen", 0), (17, "LM studio", 0)],
@@ -347,7 +347,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             recurring_charge=20, normalized_recurring_cost=20,
             currency="CNY", base_currency="CNY", fx_rate_date=None,
             frozen_on="2026-08-02"), 1)
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT actual_cost_micro_cny FROM users WHERE id=8"
             ).fetchone(), (34_000_000,))
@@ -361,7 +361,7 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
             "upstream_keys": ["sk-free-plan"],
             "new_valid_froms": ["2026-07-01"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE billing_rate_events SET effective_at='1990-01-01T00:00:00Z'"
             )
@@ -369,13 +369,13 @@ class DashboardUserDeleteTest(AppDatabaseTestCase):
         source = ProxyDatabase(
             str(self.proxy_path), schema_dir=str(self.root / "schema"))
         source.export_to_dashboard(str(self.dashboard_path), 0, 0)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertGreater(conn.execute(
                 "SELECT count(*) FROM billing_period_charges "
                 "WHERE contract_id IN (SELECT id FROM billing_contracts WHERE account_id=?)",
                 (account_id,)
             ).fetchone()[0], 0)
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM users WHERE id=?",
                 (account_id,)

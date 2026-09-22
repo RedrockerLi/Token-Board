@@ -1,12 +1,29 @@
 from __future__ import annotations
 
+import sqlite3
 import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+@contextmanager
+def sqlite_connection(path: str | Path) -> Iterator[sqlite3.Connection]:
+    """Own a test connection and make its transaction outcome explicit."""
+    connection = sqlite3.connect(path)
+    try:
+        yield connection
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 class AppDatabaseTestCase(unittest.TestCase):

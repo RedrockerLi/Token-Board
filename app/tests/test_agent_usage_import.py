@@ -6,17 +6,14 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 from unittest.mock import patch
 
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 from app.services.agent_usage.adapters import codex as codex_adapter
 from app.services.agent_usage.importer import import_once
 from app.services.agent_usage.ir import ParseBatch, UsageEvent
@@ -41,21 +38,6 @@ SESSION_LINES = [
                     "cached_input_tokens": 0, "total_tokens": 3}}}}),
 ]
 
-
-@contextmanager
-def _sqlite_connection(path: str | Path) -> Iterator[sqlite3.Connection]:
-    """Own a test connection and make its transaction outcome explicit."""
-    connection = sqlite3.connect(path)
-    try:
-        yield connection
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
 class AgentUsageImportTestCase(AppDatabaseTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -79,7 +61,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         })
 
     def _codex_rows(self) -> int:
-        with _sqlite_connection(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             return conn.execute(
                 "SELECT count(*) FROM request_log WHERE event_id LIKE 'codex:%'"
             ).fetchone()[0]
@@ -102,7 +84,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         self.assertEqual(self._run_import(), 0)
         self.assertEqual(self._codex_rows(), 2)
 
-        with _sqlite_connection(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             row = conn.execute(
                 "SELECT model,prompt_tokens,completion_tokens,"
                 "cache_read_tokens,total_tokens,requested_at "
@@ -140,7 +122,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         })
 
         self.assertEqual(import_once(database), 1)
-        with _sqlite_connection(self.proxy_path) as connection:
+        with sqlite_connection(self.proxy_path) as connection:
             row = connection.execute(
                 "SELECT model,prompt_tokens,cache_read_tokens,"
                 "completion_tokens,total_tokens,agent_software_id "
@@ -157,7 +139,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         hermes_root = Path(self._sessions.name) / "hermes"
         hermes_root.mkdir()
         hermes_db = hermes_root / "state.db"
-        with _sqlite_connection(hermes_db) as connection:
+        with sqlite_connection(hermes_db) as connection:
             connection.execute("""CREATE TABLE sessions (
                 id TEXT, model TEXT, started_at TEXT, input_tokens INTEGER,
                 output_tokens INTEGER, cache_read_tokens INTEGER,
@@ -174,14 +156,14 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         })
 
         self.assertEqual(import_once(database), 1)
-        with _sqlite_connection(self.proxy_path) as connection:
+        with sqlite_connection(self.proxy_path) as connection:
             max_id = connection.execute(
                 "SELECT max(id) FROM request_log"
             ).fetchone()[0]
         self.assertGreater(max_id, 0)
         self.assertEqual(database.cleanup_exported_logs(max_id), 1)
         self.assertEqual(import_once(database), 0)
-        with _sqlite_connection(self.proxy_path) as connection:
+        with sqlite_connection(self.proxy_path) as connection:
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM request_log WHERE agent_software_id=?",
                 (software_id,),
@@ -190,7 +172,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                 "SELECT count(*) FROM agent_usage_receipts"
             ).fetchone()[0], 1)
         self.assertTrue(database.delete_agent_software(software_id))
-        with _sqlite_connection(self.proxy_path) as connection:
+        with sqlite_connection(self.proxy_path) as connection:
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM agent_usage_receipts"
             ).fetchone()[0], 1)
@@ -221,7 +203,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                 software_id, "rejected-context", 1, 1, 0, 2,
                 "2026-08-13T01:02:00Z", "codex:rejected-context",
                 project="private-project", session_id="private-session")
-        with _sqlite_connection(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             columns = {row[1] for row in conn.execute(
                 "PRAGMA table_info(request_log)")}
             row = conn.execute(
@@ -251,7 +233,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
             )
 
         self.assertEqual(import_once(database, parser_overrides={"codex": parser}), 1)
-        with _sqlite_connection(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             cursor = conn.execute(
                 "SELECT cursor_json,last_error FROM agent_software_runtime"
             ).fetchone()
@@ -264,7 +246,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         database = ProxyDatabase(str(self.proxy_path))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "opencode-data.sqlite"
-            with _sqlite_connection(path) as connection:
+            with sqlite_connection(path) as connection:
                 connection.execute("CREATE TABLE message(data TEXT, session_id TEXT)")
                 connection.execute(
                     "INSERT INTO message(data,session_id) VALUES(?,?)",
@@ -283,7 +265,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
             })
 
             self.assertEqual(import_once(database), 1)
-            with _sqlite_connection(self.proxy_path) as connection:
+            with sqlite_connection(self.proxy_path) as connection:
                 row = connection.execute(
                     "SELECT model,prompt_tokens,completion_tokens,"
                     "cache_read_tokens,total_tokens "
@@ -331,7 +313,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         ])
 
         self.assertEqual(self._run_import(), 3)
-        with _sqlite_connection(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             prompt, completion = conn.execute(
                 "SELECT SUM(prompt_tokens),SUM(completion_tokens) "
                 "FROM request_log WHERE event_id LIKE 'codex:%'"
@@ -384,7 +366,7 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                 thread.join(timeout=5)
                 self.assertFalse(thread.is_alive())
 
-        with _sqlite_connection(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             cursor = conn.execute(
                 "SELECT cursor_json FROM agent_software_runtime "
                 "LIMIT 1").fetchone()[0]

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from app.db.migrations import SchemaVersion, apply_sql_migrations
 from app.db.schema_upgrade import ensure_local_databases
+from app.tests.support import sqlite_connection
 
 
 class LiveResourceHardDeleteTransitionTest(unittest.TestCase):
@@ -27,7 +28,7 @@ class LiveResourceHardDeleteTransitionTest(unittest.TestCase):
             apply_sql_migrations(str(dashboard), str(root / "schema"),
                                  "dashboard", target=SchemaVersion(1, 7))
 
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 conn.executescript(
                     """
                     INSERT INTO accounts
@@ -84,7 +85,7 @@ class LiveResourceHardDeleteTransitionTest(unittest.TestCase):
 
             ensure_local_databases(str(proxy), str(dashboard), root / "schema")
 
-            with sqlite3.connect(proxy) as conn:
+            with sqlite_connection(proxy) as conn:
                 self.assertIsNone(conn.execute(
                     "SELECT 1 FROM accounts WHERE id=42").fetchone())
                 self.assertIsNotNone(conn.execute(

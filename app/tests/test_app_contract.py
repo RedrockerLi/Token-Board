@@ -11,7 +11,7 @@ from app.db.proxy_db import ProxyDatabase
 from app.db.schema_upgrade.engine_core import latest_version
 from app.core.time import parse_runtime_timestamp
 
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class AppContractTest(AppDatabaseTestCase):
@@ -59,7 +59,7 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertEqual(account["account_type"], "api")
         self.assertEqual(account["is_aggregate"], 0)
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             expected = latest_version(self.root / "schema", "token-board", 2)
             self.assertEqual(conn.execute(
                 "SELECT major,minor FROM schema_version WHERE id=1"
@@ -138,7 +138,7 @@ class AppContractTest(AppDatabaseTestCase):
     def test_dashboard_facade_uses_v1_grain(self) -> None:
         dashboard = DashboardDatabase(
             str(self.dashboard_path), str(self.root / "schema"))
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             conn.execute(
                 "INSERT INTO users(id,name,actual_cost_micro_cny) "
                 "VALUES(7,'archive-account',0)")
@@ -160,12 +160,12 @@ class AppContractTest(AppDatabaseTestCase):
             "name": "dated", "account_type": "api",
             "base_url": "http://dated.test", "valid_from": "2025-01-15",
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT valid_from FROM billing_contracts WHERE account_id=?",
                 (dated,)).fetchone()[0], "2025-01-15T00:00:00Z")
         self.assertTrue(database.update_account(dated, {"valid_from": "2025-02-01"}))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT valid_from FROM billing_contracts WHERE account_id=?",
                 (dated,)).fetchone()[0], "2025-02-01T00:00:00Z")
@@ -196,7 +196,7 @@ class AppContractTest(AppDatabaseTestCase):
             "key_value": "tb-combined", "label": "combined",
             "account_id": aggregate,
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT charge_type FROM billing_contracts WHERE account_id=?",
                 (metered,)).fetchone()[0], "metered")
@@ -220,7 +220,7 @@ class AppContractTest(AppDatabaseTestCase):
 
     def test_pending_account_deletion_can_be_cancelled_over_http(self) -> None:
         database = self.proxy_database()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_settings(key,value) VALUES(?,?)",
                 ("billing.cancellation_mode", "end_of_period"),
@@ -270,7 +270,7 @@ class AppContractTest(AppDatabaseTestCase):
             "base_url": "http://dedup.test", "monthly_price": 20,
             "upstream_keys": ["sk-dedup-local"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             upstream_id = conn.execute(
                 "SELECT id FROM upstreams WHERE account_id=?", (account_id,)
             ).fetchone()[0]
@@ -290,7 +290,7 @@ class AppContractTest(AppDatabaseTestCase):
             "name": "cost-account", "account_type": "api",
             "base_url": "http://cost.test", "upstream_keys": ["sk-cost"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,model,"
                 "equivalent_cost,billed_usage_cost,status_code,requested_at,"
@@ -316,7 +316,7 @@ class AppContractTest(AppDatabaseTestCase):
             "name": "generation-account", "account_type": "api",
             "base_url": "http://generation.test", "upstream_keys": ["sk-generation"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             before = conn.execute(
                 "SELECT generation FROM config_state WHERE id=1").fetchone()[0]
             conn.execute(
@@ -339,7 +339,7 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertIn("transport", payload)
         self.assertEqual(payload["sync_health"], "unconfigured")
 
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO sync_state(key,value) VALUES('sync_health',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -369,7 +369,7 @@ class AppContractTest(AppDatabaseTestCase):
 
     def test_perf_realtime_ignores_imported_usage(self) -> None:
         db = self.proxy_database()
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             for event_id, source_kind in (
                 ("rpm-proxy-1", "proxy"),
                 ("rpm-proxy-2", "proxy"),
@@ -402,7 +402,7 @@ class AppContractTest(AppDatabaseTestCase):
             "name": "iso-filter", "account_type": "api",
             "base_url": "http://iso.test", "upstream_keys": ["sk-iso"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             for ts in ("2026-08-04T01:00:00Z", "2026-08-04T12:00:00Z",
                        "2026-08-05T01:00:00Z"):
                 conn.execute(
@@ -425,7 +425,7 @@ class AppContractTest(AppDatabaseTestCase):
             "name": "iso-perf", "account_type": "api",
             "base_url": "http://perf.test", "upstream_keys": ["sk-perf"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log(event_id,source_kind,account_id,"
                 "model,status_code,requested_at,pricing_status) "
@@ -445,7 +445,7 @@ class AppContractTest(AppDatabaseTestCase):
             "name": "crud", "account_type": "api",
             "base_url": "http://crud.test", "upstream_keys": ["sk-crud-1"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM upstream_credentials c JOIN upstreams u "
                 "ON u.id=c.upstream_id WHERE u.account_id=?", (account_id,)
@@ -457,7 +457,7 @@ class AppContractTest(AppDatabaseTestCase):
         # Account metadata update keeps the contract and credentials.
         self.assertTrue(database.update_account(account_id, {
             "name": "crud-renamed", "base_url": "http://crud2.test"}))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT name FROM accounts WHERE id=?",
                 (account_id,)).fetchone()[0], "crud-renamed")
@@ -479,7 +479,7 @@ class AppContractTest(AppDatabaseTestCase):
         # Immediate deletion removes the live row but retains the identity.
         result = database.delete_account(account_id, mode="immediate")
         self.assertTrue(result["ok"], result)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone())
             self.assertIsNotNone(conn.execute(
@@ -499,7 +499,7 @@ class AppContractTest(AppDatabaseTestCase):
         software_id = database.create_agent_software({
             "name": "codex-agent", "agent_kind": "codex",
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM upstreams WHERE account_id=?",
                 (software_id,)).fetchone()[0], 0)
@@ -522,7 +522,7 @@ class AppContractTest(AppDatabaseTestCase):
             software_id, {"subscription_ids": [subscription_id]}))
 
         self.assertTrue(database.delete_agent_software(software_id))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(conn.execute(
                 "SELECT id FROM accounts WHERE id=?", (software_id,)).fetchone())
             self.assertIsNone(conn.execute(
@@ -555,7 +555,7 @@ class AppContractTest(AppDatabaseTestCase):
         agg = next(a for a in aggregates if a["id"] == aggregate)
         self.assertEqual(len(agg["entries"]), 2)
         self.assertEqual(agg["entries"][0]["upstream_model"], "model-target")
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT account_id FROM route_sets WHERE id=?",
                 (aggregate,)).fetchone()[0], None)

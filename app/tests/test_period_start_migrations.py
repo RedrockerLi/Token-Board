@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from app.db.migrations import SchemaVersion, apply_sql_migrations
+from app.tests.support import sqlite_connection
 
 
 class PeriodStartMigrationTest(unittest.TestCase):
@@ -22,7 +23,7 @@ class PeriodStartMigrationTest(unittest.TestCase):
             path = temp / "token-board.db"
             apply_sql_migrations(str(path), str(root), "token-board",
                                  target=SchemaVersion(1, 11))
-            with sqlite3.connect(path) as conn:
+            with sqlite_connection(path) as conn:
                 conn.execute(
                     "INSERT INTO accounts(id,uuid,name,valid_from) "
                     "VALUES(1,'account-1','open-plan','2026-07-15')")
@@ -45,7 +46,7 @@ class PeriodStartMigrationTest(unittest.TestCase):
                 )
                 conn.commit()
             apply_sql_migrations(str(path), str(root), "token-board")
-            with sqlite3.connect(path) as conn:
+            with sqlite_connection(path) as conn:
                 charge = conn.execute(
                     "SELECT recurring_charge,normalized_recurring_cost,"
                     "finalized_at FROM billing_period_charges"
@@ -60,7 +61,7 @@ class PeriodStartMigrationTest(unittest.TestCase):
             path = temp / "dashboard.db"
             apply_sql_migrations(str(path), str(root), "dashboard",
                                  target=SchemaVersion(1, 4))
-            with sqlite3.connect(path) as conn:
+            with sqlite_connection(path) as conn:
                 conn.executemany(
                     "INSERT INTO accounts(account_id,name,account_kind) "
                     "VALUES(?,?,?)",
@@ -78,7 +79,7 @@ class PeriodStartMigrationTest(unittest.TestCase):
                     "VALUES('2026-08',2,'unit-charge',10,0,10)")
                 conn.commit()
             apply_sql_migrations(str(path), str(root), "dashboard")
-            with sqlite3.connect(path) as conn:
+            with sqlite_connection(path) as conn:
                 zero = conn.execute(
                     "SELECT count(*) FROM monthly_recurring_costs "
                     "WHERE account_id=1").fetchone()[0]

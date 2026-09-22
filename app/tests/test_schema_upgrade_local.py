@@ -13,6 +13,7 @@ from pathlib import Path
 from app.db.migrations import SchemaVersion, apply_sql_migrations, migrate
 from app.db.schema_upgrade import ensure_local_databases
 from app.db.schema_upgrade import upgrade_shadow
+from app.tests.support import sqlite_connection
 
 
 class LocalSchemaUpgradeTest(unittest.TestCase):
@@ -27,7 +28,8 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.temp.cleanup()
 
     def _version(self, path: Path) -> tuple[int, int]:
-        value = sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0]
+        with sqlite_connection(path) as conn:
+            value = conn.execute("PRAGMA user_version").fetchone()[0]
         return divmod(int(value), 10_000)
 
     def _latest(self, database: str) -> tuple[int, int]:
@@ -55,7 +57,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         (legacy_schema / "token-board/v2/2-4_agent_usage_receipts.sql").unlink()
 
         ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             columns = {row[1] for row in conn.execute(
                 "PRAGMA table_info(request_log)")}
             self.assertIn("project", columns)
@@ -69,7 +71,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
             )
 
         ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             columns = {row[1] for row in conn.execute(
                 "PRAGMA table_info(request_log)")}
             self.assertNotIn("project", columns)
@@ -89,7 +91,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         dashboard = self.root / "data/dashboard.db"
         ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
         for database in (proxy, dashboard):
-            with sqlite3.connect(database) as conn:
+            with sqlite_connection(database) as conn:
                 tables = [row[0] for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
                     "AND name NOT LIKE 'sqlite_%'"
@@ -114,7 +116,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
             str(proxy), str(self.root / "schema"), "token-board",
             target=SchemaVersion(1, 18),
         )
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,account_kind) "
                 "VALUES(1,'agent-account','date-agent','agent')"
@@ -149,7 +151,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
 
         apply_sql_migrations(str(proxy), str(self.root / "schema"), "token-board")
 
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             self.assertEqual(conn.execute(
                 "SELECT uuid,name,currency FROM agent_subscription_identities "
                 "WHERE id=7").fetchone(),
@@ -179,7 +181,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
             str(proxy), str(self.root / "schema"), "token-board",
             target=SchemaVersion(1, 19),
         )
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,account_kind) "
                 "VALUES(7,'account-7','same-display-name','proxy')"
@@ -197,7 +199,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
 
         apply_sql_migrations(str(proxy), str(self.root / "schema"), "token-board")
 
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             for table in ("accounts", "route_sets", "agent_software"):
                 unique_name_indexes = []
                 for index in conn.execute(f"PRAGMA index_list({table})"):
@@ -225,7 +227,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
             str(proxy), str(self.root / "schema"), "token-board",
             target=SchemaVersion(1, 20),
         )
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             conn.execute(
                 "INSERT INTO agent_subscriptions"
                 "(id,uuid,name,currency,valid_from,created_at,updated_at) "
@@ -254,7 +256,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
 
         apply_sql_migrations(str(proxy), str(self.root / "schema"), "token-board")
 
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             self.assertEqual(conn.execute(
                 "SELECT valid_from FROM agent_subscriptions WHERE id=7"
             ).fetchone()[0], "2026-09-06")
@@ -278,14 +280,14 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
             str(dashboard), str(self.root / "schema"), "dashboard",
             target=SchemaVersion(1, 5),
         )
-        with sqlite3.connect(dashboard) as conn:
+        with sqlite_connection(dashboard) as conn:
             conn.execute(
                 "INSERT INTO account_exclusions(account_id) VALUES(24)")
             conn.commit()
 
         apply_sql_migrations(str(dashboard), str(self.root / "schema"), "dashboard")
 
-        with sqlite3.connect(dashboard) as conn:
+        with sqlite_connection(dashboard) as conn:
             self.assertEqual(self._version(dashboard), (1, 7))
             self.assertIsNone(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -303,7 +305,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
             str(dashboard), str(self.root / "schema"), "dashboard",
             target=SchemaVersion(1, 6),
         )
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             conn.execute(
                 "INSERT INTO accounts(id,uuid,name,account_kind) "
                 "VALUES(7,'account-7','legacy-plan','proxy')"
@@ -325,7 +327,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                 "'contract:contract-3')"
             )
             conn.commit()
-        with sqlite3.connect(dashboard) as conn:
+        with sqlite_connection(dashboard) as conn:
             conn.execute(
                 "INSERT INTO accounts(account_id,name,account_kind) "
                 "VALUES(7,'legacy-plan','proxy')"
@@ -342,7 +344,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         apply_sql_migrations(str(proxy), str(self.root / "schema"), "token-board")
         apply_sql_migrations(str(dashboard), str(self.root / "schema"), "dashboard")
 
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             self.assertEqual(conn.execute(
                 "SELECT event_key,event_kind,source_key FROM billing_export_events"
             ).fetchall(), [
@@ -353,7 +355,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                 "SELECT value FROM sync_state "
                 "WHERE key='last_exported_billing_event_id'"
             ).fetchone()[0], "1")
-        with sqlite3.connect(dashboard) as conn:
+        with sqlite_connection(dashboard) as conn:
             self.assertIsNotNone(conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='billing_export_receipts'"
@@ -376,7 +378,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         self.assertEqual(self._version(proxy), self._latest("token-board"))
         self.assertEqual(self._version(dashboard), self._latest("dashboard"))
         self.assertTrue(list((self.root / "data").glob("auto-v0-to-v1-*.manifest.json")))
-        with sqlite3.connect(proxy) as proxy_conn, sqlite3.connect(dashboard) as dash_conn:
+        with sqlite_connection(proxy) as proxy_conn, sqlite_connection(dashboard) as dash_conn:
             proxy_marker = proxy_conn.execute(
                 "SELECT generation_id FROM schema_transitions WHERE transition_id='V0-update-to-V1'"
             ).fetchone()
@@ -391,7 +393,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         dashboard = self.root / "data/dashboard.db"
         migrate(str(proxy), str(self.root / "schema/token-board/v0"), "token-board")
         migrate(str(dashboard), str(self.root / "schema/dashboard/v0"), "dashboard")
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             conn.execute(
                 "INSERT INTO model_pricing"
                 "(id,model_pattern,input_price,output_price,cache_read_price,currency) "
@@ -403,7 +405,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
             )
             conn.commit()
         ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             self.assertEqual(conn.execute(
                 "SELECT id,model_pattern,priority,input_price,output_price "
                 "FROM pricing_rules"
@@ -445,9 +447,10 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         result = ensure_local_databases(
             str(proxy), str(dashboard), self.root / "schema")
         self.assertTrue(result["token-board"].upgraded)
-        row = sqlite3.connect(proxy).execute(
-            "SELECT event_id,total_tokens,equivalent_cost,pricing_status "
-            "FROM request_log WHERE event_id=?", (record["event_id"],)).fetchone()
+        with sqlite_connection(proxy) as conn:
+            row = conn.execute(
+                "SELECT event_id,total_tokens,equivalent_cost,pricing_status "
+                "FROM request_log WHERE event_id=?", (record["event_id"],)).fetchone()
         self.assertEqual(row, ("local-spool-event", 5, 1.25, "frozen"))
         self.assertFalse(Path(str(proxy) + ".request-log.spool").exists())
 
@@ -456,7 +459,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         dashboard = self.root / "data/dashboard.db"
         migrate(str(proxy), str(self.root / "schema/token-board/v0"), "token-board")
         migrate(str(dashboard), str(self.root / "schema/dashboard/v0"), "dashboard")
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             account_id = conn.execute(
                 "INSERT INTO upstream_accounts(name,base_url,account_type) "
                 "VALUES('rotated','https://old.example','api') RETURNING id"
@@ -472,7 +475,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                 (account_id, "sk-same999999tail"),
             )
         ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             rows = conn.execute(
                 "SELECT c.uuid,c.key_masked FROM upstream_credentials c "
                 "JOIN upstreams u ON u.id=c.upstream_id WHERE u.account_id=? "

@@ -5,14 +5,14 @@ import unittest
 
 from app.services.sync.common import V1_CONFIG_TABLES
 
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class PricingLengthTest(AppDatabaseTestCase):
     def _insert_pending(self, event_id: str, model: str, prompt: int,
                         cache: int, completion: int,
                         requested_at: str) -> tuple:
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO request_log"
                 "(event_id,model,prompt_tokens,cache_read_tokens,"
@@ -102,7 +102,7 @@ class PricingLengthTest(AppDatabaseTestCase):
             "tier-history-new", "history-tiered", 1000, 0, 0,
             "2999-01-01T00:00:00Z")
         self.assertAlmostEqual(new[1], 0.0015)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM pricing_rules WHERE id=?", (pricing_id,)
             ).fetchone()[0], 1)
@@ -131,7 +131,7 @@ class PricingLengthTest(AppDatabaseTestCase):
 
     def test_length_tiers_are_part_of_synchronized_configuration(self) -> None:
         self.assertIn("pricing_length_tiers", V1_CONFIG_TABLES)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             columns = {row[1] for row in conn.execute(
                 "PRAGMA table_info(pricing_length_tiers)")}
         self.assertEqual(columns, {

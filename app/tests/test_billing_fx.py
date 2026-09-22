@@ -26,7 +26,7 @@ from app.db.dashboard_db import DashboardDatabase
 from app.db.proxy_db import ProxyDatabase
 from app.services import fx
 
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class _FakeResponse:
@@ -73,13 +73,13 @@ class BillingFxLockTest(AppDatabaseTestCase):
         # lies after the fixed timestamps these tests materialize at; move the
         # price event into the past so _rate() finds it (and a later
         # update_account can insert a fresh row with a unique effective_at).
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE billing_rate_events SET effective_at='1990-01-01T00:00:00Z'")
         return account_id
 
     def _seed_rate(self, date: str, rate: float) -> None:
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "INSERT INTO fx_rates(base_currency,quote_currency,date,rate) "
                 "VALUES('USD','CNY',?,?)", (date, rate))
@@ -90,7 +90,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
         self._seed_rate("2026-07-15", 7.0)
         with mock.patch("app.services.fx.requests.get") as get:
             materialize_period_charges(str(self.proxy_path), _at())
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-15T00:00:00Z")
                 self.assertEqual(row[:3], (10.0, "USD", 70.0))
                 self.assertEqual(row[3], "2026-07-15")  # fx_rate_date == period_start
@@ -100,7 +100,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                     "INSERT INTO fx_rates(base_currency,quote_currency,date,rate) "
                     "VALUES('USD','CNY','2026-07-18',7.2),('USD','CNY','2026-07-20',7.4)")
             materialize_period_charges(str(self.proxy_path), _at())
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 self.assertEqual(_rates(conn, "2026-07-15T00:00:00Z")[:3],
                                  (10.0, "USD", 70.0))
             get.assert_not_called()  # locked rows never touch the network
@@ -109,10 +109,10 @@ class BillingFxLockTest(AppDatabaseTestCase):
         db = self.proxy_database()
         self._usd_plan(db, keys=["sk-usd-key-1-abcdef", "sk-usd-key-2-efghij"])
         self._seed_rate("2026-07-15", 7.0)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute("DELETE FROM upstream_secrets")
         materialize_period_charges(str(self.proxy_path), _at())
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             count = conn.execute(
                 "SELECT count(*) FROM billing_period_charges "
                 "WHERE period_start='2026-07-15T00:00:00Z'").fetchone()[0]
@@ -127,13 +127,13 @@ class BillingFxLockTest(AppDatabaseTestCase):
             self.assertTrue(db.update_account(account_id, {"monthly_price": 12}))
             # A price event written after period_start belongs to the next
             # period, even if its historical rule says immediate.
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 conn.execute(
                     "UPDATE billing_rate_events "
                     "SET effective_at='2026-07-16T00:00:00Z' "
                     "WHERE recurring_price=12")
             materialize_period_charges(str(self.proxy_path), _at())
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-15T00:00:00Z")
                 self.assertEqual(row[:3], (10.0, "USD", 70.0))
                 self.assertEqual(row[3], "2026-07-15")
@@ -147,7 +147,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
         with mock.patch("app.services.fx.requests.get",
                         return_value=_FakeResponse(payload)) as get:
             materialize_period_charges(str(self.proxy_path), _at())
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 self.assertEqual(_rates(conn, "2026-07-15T00:00:00Z")[:3],
                                  (10.0, "USD", 69.0))
                 self.assertEqual(_rates(conn, "2026-07-15T00:00:00Z")[3],
@@ -171,7 +171,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                             side_effect=AssertionError("network in write transaction")):
                 with sqlite_runtime.transaction(conn, "immediate"):
                     materialize_period_charges_conn(conn, _at())
-            with sqlite3.connect(self.proxy_path) as check:
+            with sqlite_connection(self.proxy_path) as check:
                 row = _rates(check, "2026-07-15T00:00:00Z")
                 self.assertIsNone(row[2])
                 self.assertIsNone(row[4])
@@ -186,7 +186,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                         side_effect=RuntimeError("offline")):
             materialize_period_charges(str(self.proxy_path),
                                        datetime(2026, 7, 20, tzinfo=timezone.utc))
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 # Runtime materializes only the period containing the
                 # recovery timestamp. A missing exact rate uses the nearest
                 # stored rate and is frozen permanently.
@@ -200,7 +200,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                             {"date": "2026-06-15", "rate": 6.9})) as get:
             materialize_period_charges(str(self.proxy_path),
                                        datetime(2026, 7, 20, tzinfo=timezone.utc))
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-15T00:00:00Z")
                 self.assertEqual(row[:3], (10.0, "USD", 65.0))
                 self.assertNotEqual(row[3], "2026-06-15")
@@ -212,7 +212,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
         db = self.proxy_database()
         account_id = self._usd_plan(db)
         self._seed_rate("2026-07-15", 7.0)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             contract_id = conn.execute(
                 "SELECT bc.id FROM billing_contracts bc JOIN accounts a "
                 "ON a.id=bc.account_id WHERE a.id=?", (account_id,)
@@ -240,7 +240,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                  "2026-06-20", "2026-07-16T00:00:00Z"))
         with mock.patch("app.services.fx.requests.get") as get:
             materialize_period_charges(str(self.proxy_path), _at())
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 current = _rates(conn, "2026-07-15T00:00:00Z")
                 self.assertEqual(current[:3], (10.0, "USD", 70.0))
                 self.assertEqual(current[3], "2026-07-15")  # corrected + locked
@@ -258,12 +258,12 @@ class BillingFxLockTest(AppDatabaseTestCase):
             "base_url": "http://example.test", "upstream_keys": ["sk-cny"],
             "new_valid_froms": ["2026-07-15"],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE billing_rate_events SET effective_at='1990-01-01T00:00:00Z'")
         materialize_period_charges(str(self.proxy_path),
                                    datetime(2026, 8, 20, tzinfo=timezone.utc))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertIsNone(_rates(conn, "2026-07-15T00:00:00Z"))
             current = _rates(conn, "2026-08-15T00:00:00Z")
             self.assertEqual(current[:3], (20.0, "CNY", 20.0))
@@ -278,7 +278,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                         return_value=_FakeResponse(
                             {"date": "2026-07-18", "rate": 7.1})):
             materialize_period_charges(str(self.proxy_path), _at())
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-18T00:00:00Z")
                 self.assertEqual(row[:3], (10.0, "USD", 71.0))
                 self.assertEqual(row[3], "2026-07-18")
@@ -295,7 +295,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             requested = [c.kwargs["params"]["date"] for c in get.call_args_list]
             self.assertTrue(requested)  # 1999-01-15 period did try
             self.assertTrue(all(d >= "1999-01-01" for d in requested))
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "1999-02-15T00:00:00Z")
                 self.assertIsNotNone(row[4])
                 self.assertNotEqual(row[3], "1998-12-15")
@@ -307,7 +307,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
         with mock.patch("app.services.fx.requests.get",
                         side_effect=RuntimeError("offline")):
             materialize_period_charges(str(self.proxy_path), _at())
-            with sqlite3.connect(self.proxy_path) as conn:
+            with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-15T00:00:00Z")
                 # 6.8 from the earliest stored row, never 1.0, and frozen.
                 self.assertEqual(row[:3], (10.0, "USD", 68.0))
@@ -320,7 +320,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
         with mock.patch("app.services.fx.requests.get",
                         side_effect=RuntimeError("offline")):
             materialize_period_charges(str(self.proxy_path), _at())
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             row = _rates(conn, "2026-07-15T00:00:00Z")
             self.assertEqual(row[0], 10.0)
             self.assertIsNone(row[2])
@@ -340,7 +340,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 "name": "codex-agent", "agent_kind": "codex",
                 "subscription_ids": [subscription_id],
             })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE agent_subscription_bindings SET valid_from=? "
                 "WHERE subscription_id=? AND software_id=?",
@@ -348,7 +348,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             )
             conn.commit()
         materialize_agent_subscription_charges(str(self.proxy_path), _at())
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             row = conn.execute(
                 "SELECT subscription_id,software_id,recurring_charge,currency,"
                 "normalized_recurring_cost,fx_rate_date,is_finalized,finalized_on "
@@ -373,7 +373,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             "name": "direct-agent", "agent_kind": "codex",
             "subscription_ids": [subscription_id],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE agent_subscription_bindings SET valid_from=? "
                 "WHERE subscription_id=? AND software_id=?",
@@ -381,7 +381,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             )
             conn.commit()
         materialize_agent_subscription_charges(str(self.proxy_path), _at())
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             row = conn.execute(
                 "SELECT software_id,recurring_charge,is_finalized,finalized_on "
                 "FROM agent_subscription_period_charges "
@@ -392,7 +392,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
         self.assertEqual(row[1], 10.0)
         self.assertEqual(row[2], 1)
         self.assertIsNotNone(row[3])
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM agent_subscription_charge_allocations "
                 "WHERE period_charge_id=(SELECT id FROM agent_subscription_period_charges "
@@ -402,7 +402,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
 
         self.assertTrue(db.update_agent_software(
             software_id, {"subscription_ids": []}))
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT count(*) FROM agent_subscription_bindings "
                 "WHERE subscription_id=? AND software_id=? "
@@ -426,7 +426,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             "name": "export-direct-agent", "agent_kind": "codex",
             "subscription_ids": [subscription_id],
         })
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.execute(
                 "UPDATE agent_subscription_bindings SET valid_from=? "
                 "WHERE subscription_id=? AND software_id=?",
@@ -435,7 +435,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             conn.commit()
         proxy = ProxyDatabase(str(self.proxy_path), schema_dir=str(self.root / "schema"))
         first_export = proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             first = conn.execute(
                 "SELECT actual_cost_micro_cny FROM users WHERE id=?",
                 (software_id,)
@@ -449,7 +449,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
             billing_mark=first_export["billing_max_id"],
             billing_max_id=first_export["billing_max_id"],
         )
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT actual_cost_micro_cny FROM users WHERE id=?",
                 (software_id,)
@@ -470,7 +470,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                              schema_dir=str(self.root / "schema"))
         result = proxy.export_to_dashboard(str(self.dashboard_path), 0, 0)
         self.assertEqual(result["billing_event_count"], 1)
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT valid_from FROM agent_subscription_bindings "
                 "WHERE subscription_id=? AND software_id=?",
@@ -481,7 +481,7 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 "WHERE subscription_id=? AND period_start=date(?) || 'T00:00:00Z'",
                 (subscription_id, today)).fetchone()
             self.assertEqual(direct, (software_id, 10.0, 1))
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT actual_cost_micro_cny FROM users WHERE id=?",
                 (software_id,)).fetchone()[0], 10_000_000)
@@ -494,14 +494,14 @@ class BillingFxLockTest(AppDatabaseTestCase):
             billing_max_id=result["billing_max_id"],
         )
         self.assertEqual(result["billing_event_count"], 0)
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             self.assertEqual(conn.execute(
                 "SELECT actual_cost_micro_cny FROM users WHERE id=?",
                 (software_id,)).fetchone()[0], 10_000_000)
 
     def test_ensure_rate_historical_fetch_and_guards(self) -> None:
         self.proxy_database()  # initialize the schema
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             conn.row_factory = sqlite3.Row  # get_rate reads row["rate"]
             payload = {"date": "2026-07-15", "rate": 7.1}
             with mock.patch("app.services.fx.requests.get",

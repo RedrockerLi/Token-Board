@@ -4,7 +4,7 @@ import sqlite3
 
 from app import create_app
 
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class DashboardReportsTest(AppDatabaseTestCase):
@@ -27,7 +27,7 @@ class DashboardReportsTest(AppDatabaseTestCase):
             "monthly_price": 12, "valid_from": "2026-08-01",
             "upstream_keys": ["sk-report-plan"],
         })
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             conn.executemany(
                 "INSERT INTO users(id,name,actual_cost_micro_cny) VALUES(?,?,?)",
                 [(self.api_account_id, "report-account", 5_000_000),
@@ -56,7 +56,7 @@ class DashboardReportsTest(AppDatabaseTestCase):
         # The dashboard archive is not the source of truth for current
         # actual cost.  Keep matching live Token-Board facts in the fixture:
         # the archive rows above alone must not make a deleted/live decision.
-        with sqlite3.connect(self.proxy_path) as conn:
+        with sqlite_connection(self.proxy_path) as conn:
             credential_uuid = conn.execute(
                 "SELECT c.uuid FROM upstream_credentials c "
                 "JOIN upstreams u ON u.id=c.upstream_id "

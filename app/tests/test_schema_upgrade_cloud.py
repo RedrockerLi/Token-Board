@@ -10,6 +10,7 @@ from pathlib import Path
 
 from app.db.migrations import migrate
 from app.db.schema_upgrade import upgrade_shadow
+from app.tests.support import sqlite_connection
 
 
 class CloudSchemaUpgradeTest(unittest.TestCase):
@@ -25,7 +26,7 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
     def test_downloaded_v0_artifact_is_upgraded_in_place_without_source(self) -> None:
         source = self.root / "source-v0.db"
         migrate(str(source), str(self.root / "schema/token-board/v0"), "token-board")
-        with sqlite3.connect(source) as conn:
+        with sqlite_connection(source) as conn:
             conn.execute(
                 "INSERT INTO upstream_accounts(name,base_url,account_type) "
                 "VALUES('cloud-old','https://old.example','api')")
@@ -35,9 +36,11 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
         shutil.copy2(source, remote)
         result = upgrade_shadow(str(remote), "token-board", self.root / "schema")
         self.assertEqual(result.current.major, 2)
-        self.assertEqual(sqlite3.connect(source).execute(
-            "PRAGMA user_version").fetchone()[0], 19)
-        with sqlite3.connect(remote) as conn:
+        with sqlite_connection(source) as conn:
+            source_version = conn.execute(
+                "PRAGMA user_version").fetchone()[0]
+        self.assertEqual(source_version, 19)
+        with sqlite_connection(remote) as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
                              max(int(path.name.split("_", 1)[0].split("-")[0]) * 10000
                                  + int(path.name.split("_", 1)[0].split("-")[1])
@@ -49,7 +52,7 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
     def test_configuration_upgrade_drops_remote_runtime_state(self) -> None:
         source = self.root / "source-v0-full.db"
         migrate(str(source), str(self.root / "schema/token-board/v0"), "token-board")
-        with sqlite3.connect(source) as conn:
+        with sqlite_connection(source) as conn:
             conn.execute(
                 "INSERT INTO upstream_accounts(name,base_url,account_type) "
                 "VALUES('cloud-config','https://old.example','api')")
@@ -64,7 +67,7 @@ class CloudSchemaUpgradeTest(unittest.TestCase):
         shutil.copy2(source, remote)
         upgrade_shadow(str(remote), "token-board", self.root / "schema",
                        configuration_only=True)
-        with sqlite3.connect(remote) as conn:
+        with sqlite_connection(remote) as conn:
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) FROM request_log").fetchone()[0], 0)
             self.assertEqual(conn.execute(

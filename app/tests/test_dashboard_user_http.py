@@ -4,13 +4,13 @@ import sqlite3
 import unittest
 
 from app import create_app
-from app.tests.support import AppDatabaseTestCase
+from app.tests.support import AppDatabaseTestCase, sqlite_connection
 
 
 class DashboardUserHttpTest(AppDatabaseTestCase):
     def setUp(self) -> None:
         super().setUp()
-        with sqlite3.connect(self.dashboard_path) as conn:
+        with sqlite_connection(self.dashboard_path) as conn:
             conn.executemany(
                 "INSERT INTO users(id,name,actual_cost_micro_cny) VALUES(?,?,?)",
                 [(7, "remove-me", 0), (8, "keep-me", 0)],
