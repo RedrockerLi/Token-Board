@@ -11,6 +11,8 @@ import types
 from datetime import datetime, timezone
 from pathlib import Path
 
+from support import sqlite_connection
+
 
 def load(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -81,7 +83,7 @@ def main() -> None:
     })
     # This smoke test covers the subscription's full first billing period;
     # real bindings otherwise begin at the moment the software is attached.
-    with sqlite3.connect(db_path) as conn:
+    with sqlite_connection(db_path) as conn:
         conn.execute(
             "UPDATE agent_subscription_bindings SET valid_from=? "
             "WHERE subscription_id=? AND software_id=?",
@@ -134,7 +136,7 @@ def main() -> None:
     # a later worker pass must therefore be idempotent.
     assert first_agent_materialize == 0
     assert second_materialize >= 0
-    with sqlite3.connect(db_path) as conn:
+    with sqlite_connection(db_path) as conn:
         charge = conn.execute(
             "SELECT subscription_id,period_start,count(*) "
             "FROM agent_subscription_period_charges "

@@ -34,6 +34,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from support import stop_process
+
 
 def free_port() -> int:
     with socket.socket() as sock:
@@ -216,14 +218,9 @@ def main() -> None:
 
             print("cooldown probe test passed")
         finally:
-            proxy.terminate()
-            try:
-                proxy.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proxy.kill()
-                proxy.wait()
-            if proxy.returncode not in (0, -15) and proxy.stderr is not None:
-                print(proxy.stderr.read(), file=sys.stderr)
+            diagnostics = stop_process(proxy, check_returncode=False)
+            if proxy.returncode not in (0, -15):
+                print(diagnostics, file=sys.stderr)
 
     upstream.shutdown()
     upstream.server_close()

@@ -13,6 +13,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from support import stop_process
+
 
 def free_port():
     with socket.socket() as sock:
@@ -109,10 +111,7 @@ def main():
                 time.sleep(.03)
             assert row == (1, 1, 1, "credential-1", "v1-model", 200), row
         finally:
-            proxy.terminate()
-            proxy.wait(timeout=5)
-            if proxy.returncode not in (0, -15):
-                raise AssertionError(proxy.stderr.read())
+            stop_process(proxy, timeout=5)
     upstream.shutdown(); upstream.server_close(); thread.join(timeout=2)
     print("V1 normalized routing passed")
 

@@ -11,6 +11,8 @@ import importlib.util
 import re
 from pathlib import Path
 
+from support import sqlite_connection
+
 
 schema_root = Path(sys.argv[1]).resolve()
 project_root = Path(sys.argv[2]).resolve()
@@ -125,8 +127,8 @@ def main() -> None:
     # A single-database migration call never publishes a V0 file as V2;
     # compound V0/V1/V2 transitions belong to ensure_local_databases.
     migrate(str(v0), str(schema_root), "token-board")
-    assert sqlite3.connect(v0).execute(
-        "PRAGMA user_version").fetchone()[0] == 19
+    with sqlite_connection(v0) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 19
 
     print("schema version vectors passed")
 

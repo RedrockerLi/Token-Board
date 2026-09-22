@@ -6,11 +6,12 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import sqlite3
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from support import sqlite_connection
 
 
 def digest(path: Path) -> str:
@@ -18,7 +19,7 @@ def digest(path: Path) -> str:
 
 
 def version(path: Path) -> int:
-    with sqlite3.connect(path) as conn:
+    with sqlite_connection(path) as conn:
         return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
 
@@ -47,7 +48,7 @@ def main() -> None:
         dashboard = root / "dashboard.db"
         migrate(str(proxy), str(schema / "token-board/v0"), "token-board")
         migrate(str(dashboard), str(schema / "dashboard/v0"), "dashboard")
-        with sqlite3.connect(proxy) as conn:
+        with sqlite_connection(proxy) as conn:
             conn.execute(
                 "INSERT INTO upstream_accounts(name,base_url,account_type,created_at) "
                 "VALUES('transition','http://example.test','api','2026-01-01 08:00:00')"

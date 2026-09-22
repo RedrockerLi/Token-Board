@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import sqlite3
 import struct
 import subprocess
 import sys
@@ -17,6 +16,8 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+
+from support import sqlite_connection, stop_process
 
 
 def free_port() -> int:
@@ -41,7 +42,7 @@ def wait_for_health(port: int) -> None:
 def wait_for_disconnect_log(db: Path, model: str) -> tuple[int, int, int, int]:
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             row = conn.execute(
                 "SELECT status_code,prompt_tokens,completion_tokens,attempt_count "
                 "FROM request_log WHERE model=? ORDER BY id DESC LIMIT 1",
@@ -88,7 +89,7 @@ def main() -> None:
             root = Path(raw)
             db = root / "token-board.db"
             ensure_v2_database(db, schema)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 account, upstream_id, _ = add_upstream(
                     conn, "disconnect", f"http://127.0.0.1:{upstream_port}",
                     ["sk-disconnect"], max_concurrency=1)
@@ -150,14 +151,7 @@ def main() -> None:
             assert follow_up == 200, follow_up
     finally:
         if proxy is not None:
-            proxy.terminate()
-            try:
-                proxy.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proxy.kill()
-                proxy.wait()
-            if proxy.returncode not in (0, -15):
-                raise AssertionError(proxy.stderr.read())
+            stop_process(proxy)
         upstream.shutdown()
         upstream.server_close()
         upstream_thread.join(timeout=2)

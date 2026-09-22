@@ -8,7 +8,6 @@ import importlib.util
 import json
 import os
 import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -17,6 +16,8 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from support import sqlite_connection, stop_process
 
 
 started = threading.Event()
@@ -95,7 +96,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         db = Path(directory) / "token-board.db"
         ensure_v2_database(db, schema)
-        with sqlite3.connect(db) as conn:
+        with sqlite_connection(db) as conn:
             conn.executescript("""
                 INSERT INTO accounts(id,uuid,name,account_kind) VALUES(1,'a','queue','proxy');
                 INSERT INTO route_sets(id,uuid,account_id,name) VALUES(1,'r',1,'queue');
@@ -136,8 +137,7 @@ def main() -> None:
             first.join(5); second.join(5)
             assert first_result == [(200, None)] and second_result == [(200, None)]
         finally:
-            proxy.terminate()
-            proxy.wait(timeout=5)
+            stop_process(proxy, timeout=5)
     upstream.shutdown(); upstream.server_close(); thread.join(timeout=2)
     print("queue saturation returned 503 with Retry-After")
 

@@ -17,6 +17,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from support import stop_process
+
 
 BAD_AUTH = "bad-auth"
 STREAM_ERROR = "stream-error"
@@ -234,14 +236,7 @@ def main() -> None:
             finally:
                 conn.close()
         finally:
-            proxy.terminate()
-            try:
-                proxy.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proxy.kill()
-                proxy.wait()
-            if proxy.returncode not in (0, -15):
-                raise AssertionError(proxy.stderr.read())
+            stop_process(proxy)
 
     upstream.shutdown()
     upstream.server_close()

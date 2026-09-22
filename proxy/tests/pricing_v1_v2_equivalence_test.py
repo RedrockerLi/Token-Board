@@ -12,11 +12,12 @@ schema runner is restart-safe without rewriting frozen usage facts.
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+from support import sqlite_connection
 
 
 CASES = (
@@ -44,14 +45,14 @@ def _upgrade(db_path: Path, schema_root: Path, minor: int) -> None:
 
 def _clone_database(source: Path, destination: Path) -> None:
     """Clone through SQLite so WAL-resident rows are included."""
-    with sqlite3.connect(source) as src, sqlite3.connect(destination) as dst:
+    with sqlite_connection(source) as src, sqlite_connection(destination) as dst:
         src.backup(dst)
 
 
 def _seed_current_pricing(db_path: Path) -> None:
     """Seed only current V1 tables, using the public pricing shape."""
     today = datetime.now(timezone.utc).date().isoformat()
-    with sqlite3.connect(db_path) as conn:
+    with sqlite_connection(db_path) as conn:
         conn.execute(
             "INSERT INTO accounts(uuid,name,account_kind,valid_from) "
             "VALUES('pricing-account','pricing-account','proxy',?)",
@@ -91,7 +92,7 @@ def _seed_current_pricing(db_path: Path) -> None:
 
 def _insert_cases(db_path: Path, prefix: str) -> None:
     today = datetime.now(timezone.utc).date().isoformat()
-    with sqlite3.connect(db_path) as conn:
+    with sqlite_connection(db_path) as conn:
         for index, (label, model, prompt, cache, completion, _expected) in enumerate(
             CASES, start=1
         ):
@@ -117,7 +118,7 @@ def _insert_cases(db_path: Path, prefix: str) -> None:
 
 
 def _usage_rows(db_path: Path) -> list[tuple[object, ...]]:
-    with sqlite3.connect(db_path) as conn:
+    with sqlite_connection(db_path) as conn:
         return conn.execute(
             "SELECT event_id,model,prompt_tokens,cache_read_tokens,"
             "completion_tokens,pricing_status,equivalent_cost,billed_usage_cost "
@@ -183,7 +184,7 @@ def run_recovery(schema_root: Path) -> None:
         # health-check timeout or a process replacement.
         _upgrade(db_path, schema_root, 4)
         assert _usage_rows(db_path) == before
-        with sqlite3.connect(db_path) as conn:
+        with sqlite_connection(db_path) as conn:
             assert conn.execute("PRAGMA user_version").fetchone()[0] == 20004
             assert conn.execute(
                 "SELECT count(*) FROM schema_migrations WHERE major=2"

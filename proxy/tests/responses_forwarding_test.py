@@ -17,6 +17,8 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from support import stop_process
+
 
 class FakeResponsesUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -521,14 +523,7 @@ def main() -> None:
             assert status == 422, (status, file_url_result)
             assert len(FakeResponsesUpstream.requests) == before
         finally:
-            proxy.terminate()
-            try:
-                proxy.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proxy.kill()
-                proxy.wait()
-            if proxy.returncode not in (0, -15):
-                raise AssertionError(proxy.stderr.read())
+            stop_process(proxy)
     upstream.shutdown()
     upstream.server_close()
     thread.join(timeout=2)

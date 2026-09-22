@@ -37,6 +37,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from support import stop_process
+
 
 def free_port() -> int:
     with socket.socket() as sock:
@@ -208,14 +210,9 @@ def main() -> None:
 
             print("fallback matrix tests passed")
         finally:
-            proxy.terminate()
-            try:
-                proxy.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proxy.kill()
-                proxy.wait()
+            diagnostics = stop_process(proxy, check_returncode=False)
             if proxy.returncode not in (0, -15):
-                print(proxy.stderr.read(), file=sys.stderr)
+                print(diagnostics, file=sys.stderr)
 
     upstream.shutdown()
     upstream.server_close()

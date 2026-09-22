@@ -44,6 +44,8 @@ from pathlib import Path
 
 from http.server import ThreadingHTTPServer
 
+from support import stop_process
+
 
 def free_port() -> int:
     with socket.socket() as sock:
@@ -366,13 +368,7 @@ def main() -> None:
 
             print("error_shape tests passed")
         finally:
-            proxy.terminate()
-            try:
-                proxy.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proxy.kill()
-                proxy.wait()
-            stderr_output = proxy.stderr.read() if proxy.stderr is not None else ""
+            stderr_output = stop_process(proxy)
             if proxy.returncode in (0, -15):
                 assert "[ProxyError]" in stderr_output, stderr_output
                 assert "phase=upstream_attempt" in stderr_output, stderr_output

@@ -17,6 +17,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from support import stop_process
+
 
 def free_port() -> int:
     with socket.socket() as sock:
@@ -120,14 +122,7 @@ def main() -> None:
                 assert delta <= 150 * 1024 * 1024, delta
                 print(f"stream rss delta={delta / 1024 / 1024:.1f} MiB")
             finally:
-                proxy.terminate()
-                try:
-                    proxy.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proxy.kill()
-                    proxy.wait()
-                if proxy.returncode not in (0, -15):
-                    raise AssertionError(proxy.stderr.read())
+                stop_process(proxy)
     finally:
         upstream.shutdown()
         upstream.server_close()

@@ -18,6 +18,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from support import stop_process
+
 
 def free_port() -> int:
     with socket.socket() as sock:
@@ -165,14 +167,7 @@ def main() -> None:
                 print(f"soak accepted={counters['accepted']} "
                       f"errors={counters['errors']} rps={throughput:.1f}")
             finally:
-                proxy.terminate()
-                try:
-                    proxy.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proxy.kill()
-                    proxy.wait()
-                if proxy.returncode not in (0, -15):
-                    raise AssertionError(proxy.stderr.read())
+                stop_process(proxy, timeout=5)
     finally:
         upstream.shutdown()
         upstream.server_close()

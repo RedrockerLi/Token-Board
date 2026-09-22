@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -16,6 +15,8 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+
+from support import sqlite_connection, stop_process
 
 
 def free_port() -> int:
@@ -54,7 +55,7 @@ def main() -> None:
         with tempfile.TemporaryDirectory(prefix="token-board-payload-") as raw:
             db = Path(raw) / "token-board.db"
             ensure_v2_database(db, schema)
-            with sqlite3.connect(db) as conn:
+            with sqlite_connection(db) as conn:
                 account, upstream_id, _ = add_upstream(
                     conn, "payload", f"http://127.0.0.1:{upstream_port}",
                     ["sk-payload"], max_concurrency=1)
@@ -103,14 +104,7 @@ def main() -> None:
                 response.read()
     finally:
         if proxy is not None:
-            proxy.terminate()
-            try:
-                proxy.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proxy.kill()
-                proxy.wait()
-            if proxy.returncode not in (0, -15):
-                raise AssertionError(proxy.stderr.read())
+            stop_process(proxy)
         upstream.shutdown()
         upstream.server_close()
         upstream_thread.join(timeout=2)

@@ -17,6 +17,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from support import stop_process
+
 
 def free_port() -> int:
     with socket.socket() as sock:
@@ -104,9 +106,7 @@ def main() -> None:
                     time.sleep(0.05)
                 assert first.returncode == 86, first.returncode
             finally:
-                if first.poll() is None:
-                    first.kill()
-                    first.wait()
+                stop_process(first, allowed_returncodes=(0, -15, 86))
 
             spool = Path(str(db) + ".request-log.spool")
             assert spool.exists() and spool.stat().st_size > 0
@@ -138,14 +138,7 @@ def main() -> None:
                 assert attempt_count == 1, attempt_count
                 wait_for_proxy(second_port)
             finally:
-                second.terminate()
-                try:
-                    second.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    second.kill()
-                    second.wait()
-                if second.returncode not in (0, -15):
-                    raise AssertionError(second.stderr.read())
+                stop_process(second)
     finally:
         upstream.shutdown()
         upstream.server_close()
