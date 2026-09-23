@@ -1523,8 +1523,8 @@ async function loadPricingTable() {
                 </td>
                 <td><code>${esc(p.model_pattern)}</code></td>
                 <td>${sym}${p.input_price.toFixed(4)} / 1M tokens</td>
-                <td>${sym}${p.output_price.toFixed(4)} / 1M tokens</td>
                 <td>${p.cache_read_price != null ? sym + p.cache_read_price.toFixed(4) + ' / 1M tokens' : '<span style="color:var(--color-text-tertiary);">同输入价</span>'}</td>
+                <td>${sym}${p.output_price.toFixed(4)} / 1M tokens</td>
                 <td><span class="badge ${p.currency === 'USD' ? 'badge--type-plan' : 'badge--type-api'}">${esc(p.currency)}</span></td>
                 <td>
                     <button class="btn btn--sm" onclick="editPricing(${p.id})">编辑</button>
@@ -1641,7 +1641,7 @@ function initPricingPage() {
         </div>
         <div class="table-scroll">
             <table class="mgmt-table pricing-table" id="pricingTable" aria-describedby="pricingOrderHelp">
-                <thead><tr><th class="pricing-order-column">顺序</th><th>模型匹配</th><th>输入价格</th><th>输出价格</th><th>缓存命中价格</th><th>货币</th><th>操作</th></tr></thead>
+                <thead><tr><th class="pricing-order-column">顺序</th><th>模型匹配</th><th>输入价格</th><th>缓存命中价格</th><th>输出价格</th><th>货币</th><th>操作</th></tr></thead>
                 <tbody></tbody>
             </table>
         </div>
@@ -1655,8 +1655,8 @@ function initPricingPage() {
                 <form id="pricingForm" onsubmit="savePricing(event)" data-edit-id="">
                     <label>模型匹配模式 <input name="model_pattern" required placeholder="例如: deepseek-v4*"></label>
                     <label><span>输入价格 (<span class="price-sym">¥</span>/1M tokens)</span> <input name="input_price" type="number" step="0.0001" required></label>
-                    <label><span>输出价格 (<span class="price-sym">¥</span>/1M tokens)</span> <input name="output_price" type="number" step="0.0001" required></label>
                     <label><span>缓存命中价格 (<span class="price-sym">¥</span>/1M tokens，可选)</span> <input name="cache_read_price" type="number" step="0.0001" placeholder="留空 = 与输入价格相同"></label>
+                    <label><span>输出价格 (<span class="price-sym">¥</span>/1M tokens)</span> <input name="output_price" type="number" step="0.0001" required></label>
                     <label>币种
                         <select name="currency" onchange="updatePricingSymbols()">
                             <option value="CNY">CNY</option>
