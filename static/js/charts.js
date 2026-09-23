@@ -313,13 +313,37 @@ function _calendarDayOfYear(parts) {
     );
 }
 
+function _calendarAxisTickLabel(labels, value, kind) {
+    var number = Number(value);
+    var lastIndex = labels.length - 1;
+    if (lastIndex < 0) return '';
+
+    var index;
+    // The numeric 3D axes extend half a cell beyond the first and last
+    // category. ECharts can place its end ticks at those half-integer bounds.
+    if (Math.abs(number + 0.5) < 0.001 || Math.abs(number) < 0.001) {
+        index = 0;
+    } else if (Math.abs(number - (lastIndex + 0.5)) < 0.001 ||
+        Math.abs(number - lastIndex) < 0.001) {
+        index = lastIndex;
+    } else {
+        return '';
+    }
+    if (labels[index] == null) return '';
+
+    var label = String(labels[index]);
+    if (kind === 'week' && !/^第.*周$/.test(label)) label = '第' + label + '周';
+    if (kind === 'weekday' && !/^周/.test(label)) label = '周' + label;
+    return '{calendarAxisEndpoint|' + label + '}';
+}
+
 /**
  * Map each local calendar date to its 3D category coordinates.
  *
- * Month view uses seven weekday columns (Sunday first) and one depth category
- * per week. Year view uses one column per continuous seven-day slice and seven
- * depth categories for weekdays (also Sunday first), producing the familiar
- * 7 × 52/53 heat-calendar shape while retaining the 3D bar interaction.
+ * Both views use one column per week and seven weekday rows (Sunday first).
+ * Month view has four to six columns; year view has 52 to 54. Keeping the
+ * category order consistent makes the two views comparable while retaining
+ * the 3D bar interaction.
  */
 function buildCalendar3DLayout(days, mode, calendarOptions) {
     var options = calendarOptions || {};
@@ -337,21 +361,21 @@ function buildCalendar3DLayout(days, mode, calendarOptions) {
     if (viewMode === 'month') {
         if (!year || !month) {
             return { mode: viewMode, year: year, month: month, dates: [],
-                xLabels: weekdays, zLabels: [], coordinates: dateCoordinates };
+                xLabels: [], zLabels: weekdays, coordinates: dateCoordinates };
         }
         var firstWeekday = new Date(year, month - 1, 1).getDay();
         var daysInMonth = _calendarDaysInMonth(year, month);
         weekCount = Math.ceil((firstWeekday + daysInMonth) / 7);
-        xLabels = weekdays.slice();
-        zLabels = Array.from({ length: weekCount }, function (_, index) {
+        xLabels = Array.from({ length: weekCount }, function (_, index) {
             return '第' + (index + 1) + '周';
         });
+        zLabels = weekdays.slice();
         source.forEach(function (day) {
             var parts = _calendarDateParts(day.date);
             if (!parts || parts.year !== year || parts.month !== month) return;
             var weekday = new Date(parts.year, parts.month - 1, parts.day).getDay();
             var week = Math.floor((firstWeekday + parts.day - 1) / 7);
-            dateCoordinates[day.date] = { x: weekday, y: week };
+            dateCoordinates[day.date] = { x: week, y: weekday };
         });
     } else {
         if (!year) {
@@ -362,11 +386,12 @@ function buildCalendar3DLayout(days, mode, calendarOptions) {
         var lastDayOfYearParts = {
             year: year, month: 12, day: lastDayOfYear.getDate()
         };
-        // A complete year has 53 seven-day columns at most.  Starting the
-        // continuous grid at Jan 1 avoids the rare 54-column result that a
-        // Sunday-aligned calculation produces for a leap year beginning on
-        // Saturday, while every date still gets its own cell.
-        weekCount = Math.ceil((_calendarDayOfYear(lastDayOfYearParts) + 1) / 7);
+        // Align week columns with the Sunday-first weekday rows. The partial
+        // first and last weeks belong to the selected year; a leap year that
+        // begins on Saturday therefore needs 54 columns to keep every date
+        // in its actual Sunday-to-Saturday week.
+        var firstWeekday = new Date(year, 0, 1).getDay();
+        weekCount = Math.ceil((firstWeekday + _calendarDayOfYear(lastDayOfYearParts) + 1) / 7);
         xLabels = Array.from({ length: weekCount }, function (_, index) {
             return String(index + 1);
         });
@@ -375,7 +400,7 @@ function buildCalendar3DLayout(days, mode, calendarOptions) {
             var parts = _calendarDateParts(day.date);
             if (!parts || parts.year !== year) return;
             var weekday = new Date(parts.year, parts.month - 1, parts.day).getDay();
-            var week = Math.floor(_calendarDayOfYear(parts) / 7);
+            var week = Math.floor((firstWeekday + _calendarDayOfYear(parts)) / 7);
             dateCoordinates[day.date] = { x: week, y: weekday };
         });
     }
@@ -613,6 +638,13 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
         });
     });
     var layout = buildCalendar3DLayout(normalizedDays, options.mode, options);
+    var xAxisKind = 'week';
+    var yAxisKind = 'weekday';
+    var axisEndpointStyle = {
+        color: '#51463E',
+        fontSize: 9,
+        fontWeight: 'normal',
+    };
     var dayByDate = {};
     normalizedDays.forEach(function (day) { dayByDate[day.date] = day; });
     var activeEntries = entries.filter(function (entry) {
@@ -738,34 +770,42 @@ function renderCalendar3D(domId, days, modelEntries, calendarOptions) {
                 // fractional edges of each category cell. The formatter
                 // preserves the original calendar labels.
                 type: 'value',
-                name: options.mode === 'year' ? '周' : '星期',
+                name: '周',
+                nameLocation: 'middle',
+                nameGap: 28,
                 min: -0.5,
                 max: Math.max(layout.xLabels.length - 1, 0) + 0.5,
                 interval: 1,
                 axisLabel: {
                     color: '#716B65',
                     fontSize: options.mode === 'year' ? 9 : 11,
+                    margin: 10,
+                    showMinLabel: true,
+                    showMaxLabel: true,
+                    rich: { calendarAxisEndpoint: axisEndpointStyle },
                     formatter: function (value) {
-                        var index = Math.round(Number(value));
-                        return Math.abs(Number(value) - index) < 0.001 &&
-                            layout.xLabels[index] != null ? layout.xLabels[index] : '';
+                        return _calendarAxisTickLabel(layout.xLabels, value, xAxisKind);
                     },
                 },
                 nameTextStyle: { color: '#716B65', fontSize: 11 },
             },
             yAxis3D: {
                 type: 'value',
-                name: options.mode === 'year' ? '星期' : '周',
+                name: '星期',
+                nameLocation: 'middle',
+                nameGap: 28,
                 min: -0.5,
                 max: Math.max(layout.zLabels.length - 1, 0) + 0.5,
                 interval: 1,
                 axisLabel: {
                     color: '#716B65',
                     fontSize: 10,
+                    margin: 10,
+                    showMinLabel: true,
+                    showMaxLabel: true,
+                    rich: { calendarAxisEndpoint: axisEndpointStyle },
                     formatter: function (value) {
-                        var index = Math.round(Number(value));
-                        return Math.abs(Number(value) - index) < 0.001 &&
-                            layout.zLabels[index] != null ? layout.zLabels[index] : '';
+                        return _calendarAxisTickLabel(layout.zLabels, value, yAxisKind);
                     },
                 },
                 nameTextStyle: { color: '#716B65', fontSize: 11 },
