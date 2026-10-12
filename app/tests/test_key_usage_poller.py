@@ -351,6 +351,61 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
                 service.stop(join_timeout=2.0)
                 loop.join(timeout=2.0)
 
+    def test_shape_deviations_are_logged(self) -> None:
+        """A reshaped usage endpoint must be visible at warning level."""
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            server.state["response"] = (200, {"usage": {
+                "rolling": {"percent": 37},  # resetsAt became unparseable
+                "weekly": {"resetsAt": format_utc(T0)},  # percent unusable
+                # "monthly" window disappeared entirely
+            }})
+            with self.assertLogs("app.services.key_usage",
+                                 level="WARNING") as captured:
+                poll_usage_once(db, now=T0)
+
+        joined = "\n".join(captured.output)
+        self.assertIn("window 'rolling' has an unparseable resetsAt", joined)
+        self.assertIn("window 'weekly' has an unusable percent", joined)
+        self.assertIn("window 'monthly' missing or not an object", joined)
+        self.assertIn("no usable monthly reset", joined)
+        # The degraded response still stores a snapshot (defensive parsing
+        # is unchanged); the logs are the change-detection surface.
+        snapshot = next(iter(self._snapshots().values()))
+        self.assertIsNone(snapshot["monthly_period"])
+        self.assertIsNone(snapshot["windows"]["5h"]["resets_at"])
+
+    def test_poll_failures_log_the_credential_and_reason(self) -> None:
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            server.state["response"] = (500, {"error": "boom"})
+            with self.assertLogs("app.services.key_usage",
+                                 level="WARNING") as captured:
+                poll_usage_once(db, now=T0)
+
+        credential_uuid = next(iter(self._snapshots()))
+        joined = "\n".join(captured.output)
+        self.assertIn(f"credential {credential_uuid}", joined)
+        self.assertIn("HTTP 500", joined)
+        self.assertIn("1/1 credentials failed", joined)
+
+    def test_healthy_poll_logs_no_warnings(self) -> None:
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            server.state["response"] = (200, {"usage": {
+                "rolling": {"percent": 37, "resetsAt": format_utc(
+                    T0 + timedelta(hours=5))},
+                "weekly": {"percent": 12, "resetsAt": format_utc(
+                    T0 + timedelta(days=7))},
+                "monthly": {"percent": 4, "resetsAt": format_utc(
+                    T0 + timedelta(days=31))},
+            }})
+            with self.assertNoLogs("app.services.key_usage", level="WARNING"):
+                poll_usage_once(db, now=T0)
+
 
 if __name__ == "__main__":
     import unittest

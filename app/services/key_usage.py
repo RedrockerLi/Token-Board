@@ -13,6 +13,12 @@ string, so a failed poll never advances the observed monthly chain.  Billing
 treats a snapshot older than 48 hours, one carrying an error, or one without
 a complete observed monthly period as absent and falls back to the account's
 anchor day.
+
+The usage route is first-party but undocumented, so every deviation from the
+expected shape — a missing window, an unparseable percent or resetsAt, a
+missing monthly boundary, transport or HTTP failures — is logged at warning
+level with the credential and a body preview.  An upstream shape change must
+be visible in the logs instead of only degrading the snapshot.
 """
 
 from __future__ import annotations
@@ -61,14 +67,28 @@ def _resets_at(value: object) -> datetime | None:
         return None
 
 
-def parse_usage_body(body: object) -> tuple[dict, datetime | None]:
+def _preview(value: object, limit: int = 80) -> str:
+    """A size-bounded render of any JSON-ish value for log messages."""
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def parse_usage_body(body: object, *, context: str = "") -> tuple[dict, datetime | None]:
     """Extract stored windows and the raw monthly reset from a response body.
 
     The raw monthly ``resetsAt`` is returned separately because the observed
     billing period chain needs it even when the reported percentage is zero
     (the upstream then returns a now+duration placeholder that must not be
     stored as a window reset).
+
+    Structural deviations never abort the poll, but each one is logged so a
+    shape change at the undocumented upstream surface is noticeable; without
+    the log a reshaping endpoint would silently degrade the snapshot.
     """
+    prefix = f"usage poll: {context} " if context else "usage poll: "
     usage = body.get("usage") if isinstance(body, dict) else None
     if not isinstance(usage, dict):
         raise ValueError("响应缺少 usage 字段")
@@ -76,11 +96,18 @@ def parse_usage_body(body: object) -> tuple[dict, datetime | None]:
     for source, name in WINDOW_SOURCES:
         raw = usage.get(source)
         if not isinstance(raw, dict):
+            log.warning("%swindow '%s' missing or not an object: %s",
+                        prefix, source, _preview(raw))
             continue
         percent = _percent(raw.get("percent"))
         if percent is None:
+            log.warning("%swindow '%s' has an unusable percent: %s",
+                        prefix, source, _preview(raw.get("percent")))
             continue
         resets = _resets_at(raw.get("resetsAt"))
+        if resets is None and percent > 0:
+            log.warning("%swindow '%s' has an unparseable resetsAt: %s",
+                        prefix, source, _preview(raw.get("resetsAt")))
         # A zero percentage reports a now+duration placeholder, not a reset.
         windows[name] = {
             "percent": percent,
@@ -150,7 +177,8 @@ def _failure(prior: object, moment: datetime, message: str) -> dict:
     }
 
 
-def _query_usage(url: str, key: str, *, moment: datetime, prior: object) -> dict:
+def _query_usage(url: str, key: str, *, moment: datetime, prior: object,
+                 context: str = "") -> dict:
     """Query one credential and build the payload stored for it."""
     try:
         response = requests.get(
@@ -166,9 +194,15 @@ def _query_usage(url: str, key: str, *, moment: datetime, prior: object) -> dict
     except ValueError:
         return _failure(prior, moment, "响应不是有效 JSON")
     try:
-        windows, resets = parse_usage_body(body)
+        windows, resets = parse_usage_body(body, context=context)
     except ValueError as exc:
         return _failure(prior, moment, str(exc))
+    if not windows:
+        log.warning("usage poll: %s response carried no usable windows: %s",
+                    context, _preview(body, 300))
+    if resets is None:
+        log.warning("usage poll: %s response carried no usable monthly reset: %s",
+                    context, _preview(body, 300))
     prior_month = prior.get("monthly_period") if isinstance(prior, dict) else None
     return {
         "checked_at": format_utc(moment),
@@ -194,12 +228,15 @@ def poll_usage_once(proxy_db, *, now: datetime | None = None) -> dict:
     errors = 0
     for target in targets:
         for credential in target["credentials"]:
+            context = f"credential {credential['uuid']} ({target['url']})"
             payload = _query_usage(
                 target["url"], credential["secret_value"], moment=moment,
-                prior=_prior_payload(credential["usage_json"]))
+                prior=_prior_payload(credential["usage_json"]), context=context)
             snapshots[credential["uuid"]] = payload
             if payload["error"] is not None:
                 errors += 1
+                log.warning("usage poll: %s failed: %s", context,
+                            payload["error"])
     record_usage_snapshots(proxy_db.db_path, snapshots)
     if errors:
         # Billing silently reverts to the anchor calendar for a key whose
