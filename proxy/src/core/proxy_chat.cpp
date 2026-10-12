@@ -193,6 +193,16 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         }
         cands = std::move(compatible);
     }
+    // Session id forwarded to "opencode-go" upstreams, resolved once per
+    // request after the candidate set is final (a rejected request never pays
+    // for the conversation fingerprint) and captured by value by every
+    // attempt.  Routes without such an account carry no value at all.
+    const bool opencode_route =
+        std::any_of(cands.begin(), cands.end(), [](const UpstreamCandidate &c) {
+            return c.account().opencode_session;
+        });
+    const std::string opencode_session =
+        opencode_route ? opencode_session_value(req, context) : std::string();
     RequestBodyCache body_cache(req.body, context.parsed_json, context.model,
                                 ir::to_string(harness));
 
@@ -248,7 +258,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                              ? std::make_shared<const std::vector<json>>(
                                    context.state_current_input)
                              : nullptr,
-                         reservation, anthropic_beta, req, res, t0);
+                         reservation, opencode_session, anthropic_beta, req, res,
+                         t0);
         return;
     }
 
@@ -329,6 +340,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         const auto configure_forward = [&](ForwardOptions &opts) {
             if (upstream == ir::ApiFormat::Anthropic)
                 opts.anthropic_beta = anthropic_beta;
+            configure_opencode_session(opts, c, opencode_session);
         };
         if (harness == upstream && !responses_item_adapter) {
             if (harness == ir::ApiFormat::OpenAIResponses && conversion_needed) {

@@ -1,7 +1,9 @@
 #include "proxy_server.h"
 
 #include <cassert>
+#include <cstdint>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 int main() {
@@ -53,6 +55,89 @@ int main() {
             std::vector<size_t>{0, 1, 2, 3}));
     assert((candidate_order(two_group, 2, 1) ==
             std::vector<size_t>{1, 0, 2, 3}));
+
+    // ── V2.5 usage-aware scheduling ────────────────────────────────────
+    // usage_ref is a per-credential usage snapshot (windows are
+    // {percent, resets_at}); nullptr means "no usage data", which adds no
+    // reordering of its own.
+    auto usage_of = [](std::initializer_list<std::pair<int, std::int64_t>>
+                           windows) {
+        auto usage = std::make_shared<routing::CredentialUsage>();
+        for (const auto &window : windows) {
+            routing::UsageWindow entry;
+            entry.percent = window.first;
+            entry.resets_at = window.second;
+            if (entry.percent >= kExhaustedPercent) usage->exhausted = true;
+            usage->windows.push_back(entry);
+        }
+        return std::shared_ptr<const routing::CredentialUsage>(usage);
+    };
+
+    // The key whose usable quota resets soonest leads when it is at least
+    // kUsageLeadGap (30 min) ahead of the next distinct reset: 10 min vs 2 h
+    // wins, so the rotation starts at it instead of the affinity choice.
+    std::vector<UpstreamCandidate> lead(3);
+    lead[0].usage_ref = usage_of({{20, 7200}});
+    lead[1].usage_ref = usage_of({{20, 600}});
+    assert(usage_lead_start(lead, 0) == 1);
+    assert((candidate_order(lead, usage_lead_start(lead, 0), 0) ==
+            std::vector<size_t>{1, 2, 0}));
+
+    // A window above kUsablePercent (70) has nothing worth spending early, so
+    // it supplies no deadline; only windows <= 70 compete.
+    std::vector<UpstreamCandidate> unusable(2);
+    unusable[0].usage_ref = usage_of({{85, 600}});
+    unusable[1].usage_ref = usage_of({{20, 7200}});
+    assert(usage_lead_start(unusable, 0) == 0);
+
+    // Gap gate: exactly 30 min leads, one second less does not.
+    std::vector<UpstreamCandidate> gap(2);
+    gap[0].usage_ref = usage_of({{20, 2400}});
+    gap[1].usage_ref = usage_of({{20, 600}});
+    assert(usage_lead_start(gap, 0) == 1);
+    gap[0].usage_ref = usage_of({{20, 2399}});
+    assert(usage_lead_start(gap, 0) == 0);
+
+    // Ties (one shared deadline, or a single deadline-bearing candidate) leave
+    // the affinity-preferred start untouched.
+    std::vector<UpstreamCandidate> tied(2);
+    tied[0].usage_ref = usage_of({{20, 600}});
+    tied[1].usage_ref = usage_of({{40, 600}});
+    assert(usage_lead_start(tied, 1) == 1);
+    std::vector<UpstreamCandidate> single(2);
+    single[0].usage_ref = usage_of({{20, 600}});
+    assert(usage_lead_start(single, 1) == 1);
+
+    // Exhausted candidates (any window >= 100) move to the END of the order
+    // without being dropped; the relative order inside both halves is stable
+    // and usage-free candidates keep their position.
+    std::vector<UpstreamCandidate> mixed(4);
+    mixed[0].usage_ref = usage_of({{100, 600}});
+    mixed[1].usage_ref = usage_of({{20, 600}});
+    mixed[2].usage_ref = usage_of({{100, 600}});
+    assert((candidate_order(mixed, 0, 0) == std::vector<size_t>{1, 3, 0, 2}));
+    assert(mixed[3].usage() == nullptr);
+
+    // The partition spans priority groups: the whole point of a group order is
+    // to pick the cheapest usable key, and here the cheap group's only key is
+    // reported spent, so the paid group goes first.  A credential with an
+    // exhausted window never leads, even when another window still has quota.
+    std::vector<UpstreamCandidate> groups(2);
+    groups[0].priority_group = 0;
+    groups[0].usage_ref = usage_of({{100, 600}, {20, 600}});
+    groups[1].priority_group = 1;
+    assert(candidate_usage_deadline(groups[0]) == 0);
+    assert(usage_lead_start(groups, 0) == 0);
+    assert((candidate_order(groups, 0, 0) == std::vector<size_t>{1, 0}));
+
+    // A credential with no usage data is ordered by the rotation alone.
+    std::vector<UpstreamCandidate> legacy(3);
+    legacy[0].priority_group = 0;
+    legacy[1].priority_group = 0;
+    legacy[2].priority_group = 0;
+    assert(usage_lead_start(legacy, 0) == 0);
+    assert((candidate_order(legacy, 2, 0) == std::vector<size_t>{2, 0, 1}));
+    assert((candidate_order(legacy, 99, 1) == std::vector<size_t>{1, 2, 0}));
 
     // A binding to a key outside the supplied slots cannot return an
     // out-of-range index: preferred_index falls back to rendezvous within the

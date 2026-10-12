@@ -8,30 +8,32 @@
  本地密钥 tb-xxxx                代理转发                       真实上游
  local_keys                    (C++ proxy)                 upstream_accounts
  ──────────                    ──────────                 ──────────────────
- 客户端拿到的                    认证 → 一级路由 →             account_type:
- 一把钥匙,绑定一个               (聚合? 按模型二次解析)          api / plan
- 上游账户(或聚合)                → 候选链(账户×密钥)            is_aggregate=0|1
-                                并发闸门 → 转发 → 记账          upstream_keys(多把密钥)
+ 客户端拿到的                    认证 → 一级路由 →              account_type:
+ 一把钥匙,绑定一个               (聚合? 按模型二次解析)         api / plan
+ 上游账户(或聚合)                → 候选链(账户×密钥)            subtype(如 opencode-go)
+                                并发闸门 → 转发 → 记账          is_aggregate=0|1
+                                                                upstream_keys(多把密钥)
 ```
 
-- **账户(account)** 是唯一身份，`id` 永不复用，删除是软删(`deleted_at`)。
-- **账户类型 `account_type`**：`api`(按量)或 `plan`(订阅套餐)。它决定**怎么计费**和**能不能路由**；Codex 等智能体不再是上游账户。
+- **账户(account)** 是唯一身份，`id` 永不复用。实时配置没有 tombstone：`immediate` 删除直接物理清理整张 live 图；`end_of_period` 只把结束时刻写进 `billing_contracts.ends_at`（各把密钥的 `upstream_credentials.ends_at` 是各自的本期期末），到期前仍可路由，到期后由删除 finalizer 物理清理，历史身份和冻结账目继续留在 `account_identities` 与计费事实表中。
+- **账户类型 `account_type`**：`api`(按量)或 `plan`(订阅套餐)。它决定**怎么计费**和**能不能路由**；类型下还可以有**子分类 `subtype`**（如 plan 的 `opencode-go`），只影响新建预设与少量类型内特殊行为。Codex 等智能体不再是上游账户。
 - **单上游多密钥(`upstream_keys`)**：一个真实上游账户名下可以挂多把上游 Key，每把 Key 是独立的并发槽位、独立的冷却单元、独立的订阅周期。
 - **聚合账户(`is_aggregate=1`)**：不是真实上游，只是**按模型名的路由分组**。它把多个真实账户合并成一个模型目录暴露给客户端，同一个模型可以配多个账户自动回退。
 
 ## 二、账户类型：api / plan
 
-两种类型在 `upstream_accounts.account_type` 上区分，默认为 `api`。**类型的行为语义（能不能路由、怎么计费、429 冷却、删除语义等）统一收敛在规格表 `app/domain/account_types.py` 的 `ACCOUNT_TYPES`**（[app/domain/account_types.py:47](app/domain/account_types.py#L47)），创建/修改账户的类型校验也以该表为准。智能体订阅与软件来源由“智能体管理”单独维护。
+两种类型在应用层以 `account_type` 区分，默认为 `api`（兼容视图 `upstream_accounts.account_type` 由合同的 `charge_type` 派生：`recurring` → `plan`，其余 → `api`）。**类型的行为语义（能不能路由、怎么计费、429 冷却、删除语义等）统一收敛在规格表 `app/domain/account_types.py` 的 `ACCOUNT_TYPES`**（[app/domain/account_types.py:67](app/domain/account_types.py#L67)），创建/修改账户的类型校验也以该表为准。智能体订阅与软件来源由“智能体管理”单独维护。
 
 | 维度 | api(按量) | plan(订阅套餐) |
 |------|-----------|----------------|
-| 计费方式 | 按调用量×单价(`pricing_rules`) | 订阅费：月费 × 每把密钥的订阅周期，与调用量无关 | 同 plan：月费 × 每账户一个「订阅」 |
+| 计费方式 | 按调用量×单价(`pricing_rules`) | 订阅费：月费 × 每把密钥的订阅周期，与调用量无关 |
 | 是否持有上游密钥 | 是 | 是（**每把密钥 = 一个订阅**） |
 | 是否可被本地密钥路由 | 是 | 是 |
 | 调用量来源 | 代理转发自动记账 | 代理转发自动记账 |
+| 子分类 | 无 | 有（如 `opencode-go`）：预设 + 用量查询 + 上游会话头 |
 | `request_log.api_cost` 含义 | 真实账单 | 虚拟/理论消费(套餐省下的钱) |
 | 真实成本存档 | 进 `cost_entry` | 进 `proxy_plan_summary.subscription_cost` |
-| 429 处理 | 瞬时退避(5s/30s/2min) | 每把密钥**冷却 5 小时** |
+| 429 处理 | 本次请求回退到下一候选，不记忆冷却 | 配额耗尽的密钥**冷却 5 小时** |
 
 ### api 账户（按量计费）
 
@@ -45,6 +47,14 @@
 - 调用照常被代理转发、照常记 `request_log`，但 `api_cost` 记的是**虚拟消费**（不买套餐按量算要花多少钱），用于衡量套餐划不划算。
 - 429 冷却也是**按密钥**：一把 plan 密钥被限流只冷却它自己，同账户其他密钥立即接管（[proxy/src/core/account_gate.h:18-21](proxy/src/core/account_gate.h#L18-L21)）。冷却期内代理每 1 小时向 `{base_url}/models` 探测一次（auth scheme 按 `api_format` 推导：anthropic 用 x-api-key、其余 Bearer），2xx 提前解除冷却，见 [proxy-internals.md](proxy-internals.md)「冷却探测」。
 - 订阅周期、价格历史、删除默认操作见 [billing-pricing.md](billing-pricing.md)「plan 账户与虚拟消费」。
+
+### 订阅计费与周期滚动（plan）
+
+- 订阅账户在**添加时**就为当前周期计一次费：创建事务内物化当期 `billing_period_charges`；之后由维护服务的**账单物化 worker 每 60 秒**自动滚动，到期即生成下一期费用，不需要人工续订。
+- 每把密钥的周期锚点是自己的 `valid_from`（留空 = 创建日）——锚点日为起始日的日号，短月取月末；同一账户的多把密钥各自切周期。
+- 带**用量查询**的子分类（`opencode-go`）跟随**观测到的月度重置**：用量轮询写下的 `monthly_period.start/end` 在**新鲜（≤48 小时）**时就是周期边界，滚动出的新周期 `period_start` 接在上一期 `period_end` 上。观测只决定**尚未生成**的周期起点，既有周期费用与冻结账目绝不改写。
+- 观测缺失或已超过 **48 小时**时，周期回退到 `valid_from` 锚点的行政月；跨过整个周期都没拿到观测时该周期只计一笔，不补缴。
+- `end_of_period` 取消也跟随观测：观测新鲜时结束时刻取观测边界 **−1 秒**，否则取锚点周期的期末。
 
 ### 智能体管理（统一 IR + 可扩展 adapter registry）
 
@@ -60,12 +70,13 @@
 ### 多密钥带来的行为
 
 - **每把 Key 一个并发槽位**：`max_concurrency` 按 Key 计数，一把 Key 打满后请求溢流到下一把（[proxy/src/core/account_gate.h:13-16](proxy/src/core/account_gate.h#L13-L16)）。
-- **每把 Key 一个冷却单元**：plan 的 429 冷却、瞬时失败退避都按 `key_slot_id` 隔离，兄弟 Key 不受连坐。
-- **固定填充顺序**：`upstream_keys.position` 决定优先顺序，会话亲和与溢流都按 `(position, id)` 走（[proxy/src/core/proxy_server.cpp:462-496](proxy/src/core/proxy_server.cpp#L462-L496)）。
-- **会话亲和(session affinity)**：同一会话（`x-session-id` / OpenAI `user` / Anthropic `metadata.user_id` / Responses `previous_response_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/proxy_server.h:42-138](proxy/src/core/proxy_server.h#L42-L138)）。
+- **每把 Key 一个冷却单元**：plan 的配额 429 冷却按 `key_slot_id` 隔离，兄弟 Key 不受连坐。
+- **候选顺序**：同一账户的密钥按 `(position, runtime_id)` 排列，起点依次取**会话亲和**（该会话上次成功服务的 Key）→ **成本台账**（累计花费最小的 Key，见下）→ **轮转**，再沿固定顺序环绕尝试（[proxy/src/core/candidate_selection.h:27-46](proxy/src/core/candidate_selection.h#L27-L46)）。带用量快照的账户另做用量感知微调：**可用窗口（percent ≤ 70）的重置时刻比其它候选都早至少 30 分钟**的 Key 排到最前，**任一窗口 ≥100%** 的 Key 排到最后尝试，没有用量快照的候选不受影响。
+- **会话亲和(session affinity)**：同一会话（请求头 `x-session-id` / `x-claude-code-session-id` / `x-conversation-id`，否则取 body 的 OpenAI `user` 或 Anthropic `metadata.user_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/session_affinity.h:19-50](proxy/src/core/session_affinity.h#L19-L50)）。
 - **冷启动成本平衡**：新会话没有绑定记录时，优先选**累计消费最少**的 Key（进程内 `KeyCostLedger`，由记账线程异步喂数据），让多把 Key 按花费磨损得更均匀（[proxy/src/core/key_cost_ledger.h](proxy/src/core/key_cost_ledger.h)）。
-- **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `deleted_at`，其中 `valid_from` 只保存 UTC 日期并固定从 `00:00Z` 生效，月费按「锚点日」各自切周期。删除密钥/账户按设置页「删除默认操作」执行：`immediate`（本期立即删除，本期计费）或 `end_of_period`（到期立即删除，本期计费、下期不计费——每把 Key 的 `deleted_at` 设为自己的本期期末，到期前仍保持可路由；账户的 `deleted_at` 取所有仍有效 Key 到期时间的最大值）。api 始终立即删除。
-- **观测**：会话→密钥分配记在本地 `session_key_log`（7 天滚动，不上云）。
+- **上游会话头与 User-Agent**：带 OpenCode-Go 子分类的账户注入 `x-opencode-session`，取值依次为下游透传的该头 → 请求解析出的会话标识 → 稳定会话指纹（`tb-` + SHA-256(system 指令 + 首条 user 消息，去掉 cache_control) 的前 32 位）→ 随机值；这些上游请求另带固定 `User-Agent: token-board/1.0`（代理不转发下游的 User-Agent，普通账户不加这两个头）。
+- **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `ends_at`，其中 `valid_from` 只保存 UTC 日期并固定从 `00:00Z` 生效，月费按「锚点日」各自切周期。删除密钥/账户按设置页「删除默认操作」执行：`immediate`（本期立即删除，本期计费）或 `end_of_period`（到期立即删除，本期计费、下期不计费——每把 Key 的 `ends_at` 设为自己的本期期末，到期前仍保持可路由；账户合同的 `ends_at` 取所有仍有效 Key 到期时间的最大值）。api 始终立即删除。
+- **观测**：会话→密钥的绑定只存在于进程内的 `SessionAffinity`（上限 10 万条、24 小时过期、不落库）；持久记录是 `request_log.upstream_key_id` 与 `request_attempts`。
 
 ### 兼容旧形态
 
@@ -89,10 +100,11 @@
                     候选链 = (匹配的每条 entry × 该账户的每把密钥)
                                                        ▼
         按优先级组逐个尝试: 冷却跳过 → 并发满跳过 → 429/5xx 回退
+        (组内起点: 会话亲和 → 成本台账 → 轮转,再按用量快照微调)
 ```
 
 - **候选展开**：一条 entry 指向一个真实账户，该账户名下每把 Key 又是一个候选；一个模型配了 2 个账户、各 2 把 Key，就是 4 个候选。
-- **优先级组**：`priority_group` 来自 `aggregate_entries.id`，组间**严格按 sort_order 顺序**尝试（更便宜/更靠前的先用），组内多把 Key 轮转磨损（[proxy/src/core/proxy_server.h:157-183](proxy/src/core/proxy_server.h#L157-L183)）。
+- **优先级组**：`priority_group` 来自 `aggregate_entries.id`，组间**严格按 sort_order 顺序**尝试（更便宜/更靠前的先用）；组内多把 Key 按候选顺序轮转，起点为会话亲和 → 成本台账 → 轮转，带用量快照的 Key 再做「最早重置优先、已耗尽最后」的微调（[proxy/src/core/candidate_selection.h:27-46](proxy/src/core/candidate_selection.h#L27-L46)）。
 - **模型改写**：转发前把请求体里的模型名替换成 `upstream_model`（`apply_body_model` / 转换路径 `cReq.model`）。
 - **回退时机**：候选在**尚未向客户端发出任何数据**时失败（429/5xx/超时/401/403）才回退；流式请求的响应头延迟到首次写出才提交，因此流式也能在首字节前换下一个候选。
 - **全部不可用**：返回 429（忙/冷却/全失败）；若最后是超时则 504（[proxy/src/core/proxy_server.cpp:1162-1211](proxy/src/core/proxy_server.cpp#L1162-L1211)）。
@@ -112,7 +124,7 @@
 2. **模型解析**：从请求体取模型名，剥掉 Claude Code 的 `[1m]`/`[1M]` 后缀 → `resolve_candidates_cached` 按账户形态展开候选链（普通账户=每把 Key 一个候选；聚合=匹配 entry × 每把 Key）。无候选返回 400「模型不可用」。
 3. **候选循环**：每个候选先过 `try_acquire_eligible`（冷却检查 + 并发槽），成功才占用槽位转发。
 4. **转发**：客户端线格式与账户 `api_format` 相同走直通(passthrough)，不同走 IR 转换；超时按客户端线格式分三档。
-5. **失败处理**：429/5xx/401/403 且未向客户端发数据 → 记一次 attempt，标记失败（plan+429 → 5h 冷却；其余瞬时退避）→ 试下一个候选。
+5. **失败处理**：429/5xx/401/403 且未向客户端发数据 → 记一次 attempt，标记失败（合同声明 `subscription_5h` 的账户收到明确的配额耗尽 429 → 该密钥 5h 冷却；其余失败不记忆）→ 试下一个候选。
 6. **成功绑定**：成功后会话亲和绑定到该 Key；记账线程把结果入队写 `request_log`。
 
 ## 六、保存入库链路行为
@@ -173,7 +185,7 @@
 | 聚合账户和 plan/api 是一类吗？ | 不是。聚合是路由分组（`is_aggregate=1`），plan/api 是上游计费类型。智能体由独立的订阅/软件表管理。聚合永远不入账。 |
 | 智能体为什么不能发代理请求？ | 智能体软件不是上游账户，不参与本地密钥路由；它只读取本机软件日志并导入用量。 |
 | 一把 plan 密钥 429 了，整个 plan 账户停摆？ | 不会。冷却按密钥，同账户其他密钥立即接管。 |
-| 一个聚合模型配了 3 个账户，请求先试哪个？ | 先试 `sort_order` 最小的 entry（及其账户的多把 Key，按 position），该 entry 全不可用才轮到下一个。 |
+| 一个聚合模型配了 3 个账户，请求先试哪个？ | 先试 `sort_order` 最小的 entry（及其账户的多把 Key）；同一账户内的起点按会话亲和 → 成本台账 → 轮转定，带用量快照的 Key 再按「最早重置优先、已耗尽最后」微调。该 entry 全不可用才轮到下一个。 |
 | 请求日志里 account_id 是谁？ | 实际服务的**真实账户**；只有「全候选都忙/冷却」的零 token 失败行才挂在聚合账户下，导出时会排除。 |
 | 真实上游 Key 会上云吗？ | 不会。`upstream_secrets` 和 WebDAV 密码只保存在本机；普通配置、本地代理密钥和请求聚合存档按各自同步规则上传。 |
 
@@ -183,9 +195,9 @@
 
 | 声明位置 | 内容 | 加类型时 |
 |---------|------|---------|
-| `app/domain/account_types.py` 的 `ACCOUNT_TYPES`（[app/domain/account_types.py:47](app/domain/account_types.py#L47)） | **唯一权威**：`billing` / `routable` / `holds_keys` / `deletion` / `cooldown` / `subscription_unit` / `label` | 加一行 |
-| `proxy/src/core/account_types.h`（[proxy/src/core/account_types.h:22-50](proxy/src/core/account_types.h#L22-L50)） | C++ 请求时行为镜像：`non_routable_types()`（路由排除）+ `cooldown_class()`（429 冷却类别） | 同步两个列表 |
-| `GET /api/proxy/account-types` | 前端拉取整个规格表；账户弹窗左栏的类型选择卡、徽章、价格字段显隐、删除流全部由它驱动，**前端不再硬编码类型** | 自动，无需改前端 |
+| `app/domain/account_types.py` 的 `ACCOUNT_TYPES`（[app/domain/account_types.py:67](app/domain/account_types.py#L67)） | **唯一权威**：`billing` / `routable` / `holds_keys` / `deletion` / `cooldown` / `subscription_unit` / `label`（以及类型下的 `subtypes`） | 加一行 |
+| 建账户时的合同写入（[app/db/proxy/accounts_write.py](app/db/proxy/accounts_write.py)） | C++ 不镜像类型表：建账户把规格的 `cooldown` 写进 `billing_contracts.cooldown_policy_json`，代理路由快照只从中读出 `extended_usage_limit_cooldown` | 自动，无需改 C++ |
+| `GET /api/proxy/account-types` | 前端拉取整个规格表；账户弹窗左栏的类型选择卡（及其子分类卡片）、徽章、价格字段显隐、删除流全部由它驱动，**前端不再硬编码类型** | 自动，无需改前端 |
 
 ### 一个上游类型的 7 个属性
 
@@ -197,17 +209,32 @@
 | `routable` | true / false | 本地密钥能否绑它、代理能否转发给它 | `_assert_routable_account`、C++ 路由快照 SQL、前端 `routableAccounts`/并发测试 |
 | `holds_keys` | true / false | 建不建上游密钥；编辑弹窗显不显示密钥区 | `create_account`/`update_account` 的 key 分支、前端字段隐藏 |
 | `deletion` | `immediate` / `configurable` | 删除是永远立即（api）还是跟随设置页「删除默认操作」 | `_cancellation_end`、`delete_account`、前端删除流 |
-| `cooldown` | `transient` / `subscription_5h` | 429 走 5s/30s/2min 瞬时退避还是该密钥冷却 5 小时 | C++ `account_gate::mark_failure` 的冷却类别 |
+| `cooldown` | `subscription_5h` / None | 配额耗尽的 429 是否让该密钥冷却 5 小时 | 建账户时写入合同 `cooldown_policy_json`，C++ 经路由快照读出 `extended_usage_limit_cooldown` |
 | `subscription_unit` | `per_key` / `per_account` | 订阅按每把密钥算一个生命周期（plan），还是每账户一条 | `_plan_key_billing_meta` 合成生命周期 |
+
+### 上游子分类（subtypes）
+
+类型之下还可以声明**子分类**：同一种 `account_type` 的预设与少数特殊行为收敛在 `AccountTypeSpec.subtypes`（[app/domain/account_types.py:48](app/domain/account_types.py#L48)），每个子分类是一个 `AccountSubtypeSpec`（[app/domain/account_types.py:18](app/domain/account_types.py#L18)）：
+
+| 字段 | 取值 | 它决定什么 |
+|------|------|-----------|
+| `label` | 形如 `<名称> — <说明>` | 账户弹窗左栏子卡片文案 |
+| `presets` | `base_url` / `monthly_price` / `currency` / `api_format` | 选中该子分类时新建表单的预填值 |
+| `session_header` | true / false | 转发时是否注入 `x-opencode-session`（每对话稳定） |
+| `usage_path` | 相对路径 / null | 用量查询路径（`GET` + Bearer 认证）；null = 无用量查询 |
+
+当前只有 `plan` 带子分类，仅一项 `opencode-go`：`label` 为 `OpenCode Go — $10/月 · 含用量查询`，预设 `base_url=https://opencode.ai/zen/go`、月费 $10（USD）、`anthropic` 线格式，用量查询 `/v1/usage`。子分类写在账户上游行的 `upstreams.subtype`（NULL = 普通账户），只影响预设、上游会话头与用量轮询：计费、路由、删除语义继续跟随 `plan` 类型，类型徽章也仍是类型的 `short_label`（opencode-go 账户显示 `Plan`）。
+
+前端据此渲染账户弹窗左栏：类型卡片来自 `ACCOUNT_TYPES` 的 `label` / `short_label`，选中带子分类的类型后再在其下渲染子分类卡片，子分类名不硬编码在前端；轮询写入的用量快照由密钥用量表展示。
 
 ### 添加步骤（三步 + 两个按需）
 
 1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label`（形如 `<type> — <说明>`，破折号后的说明进左栏卡片正文）是账户弹窗左栏类型选择卡文案、`short_label` 是类型徽章文案（账户列表与左栏卡片共用）。
-2. **`account_types.h` 同步两个列表**：若新类型不可路由，加进 `non_routable_types()`；若 429 应冷却 5 小时，在 `cooldown_class()` 加分支。
+2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path` 填进 `AccountSubtypeSpec`；左栏子卡片、代理的上游会话头注入和用量轮询都从它派生。C++ 不需要同步——类型在代理里没有镜像列表，唯一进入请求路径的类型派生量是合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
 3. **智能体扩展另走智能体管理**：在 `agent_software` 增加 `agent_kind`，为该类型注册一个返回统一 UsageEvent 的解析器；订阅继续保存在独立的 `agent_subscriptions`，通过绑定表连接到软件，不把订阅误当成代理上游。
 
 两个按需的 if：
-- **schema**：`account_type` 列无 CHECK 约束，新取值天然兼容，**一般不需要迁移**；仅当上游需要新列时才添加迁移。智能体新增字段应在智能体管理迁移中维护。
+- **schema**：类型本身不落列（由合同的 `charge_type` 派生），加类型**一般不需要迁移**；只有子分类需要新字段时才加迁移（如 V2.5 的 `upstreams.subtype`、`upstream_credentials.label` 与 `usage_json`）。智能体新增字段应在智能体管理迁移中维护。
 - **前端徽章配色**：`badge--type-<type>` 的 CSS 类缺省落到默认样式，想要专属配色就在 `static/css/dashboard.css` 加一个类。
 
-前端账户弹窗左栏的类型选择卡、价格字段显隐、删除提示、并发测试守卫都经 `/api/proxy/account-types` 读规格自动适配。校验也以规格表为准：`create_account` / `update_account` 拒绝未知类型；智能体软件类型则经 `/api/proxy/agent-types` 校验。
+前端账户弹窗左栏的类型选择卡与子分类卡片、价格字段显隐、删除提示、并发测试守卫都经 `/api/proxy/account-types` 读规格自动适配。校验也以规格表为准：`create_account` / `update_account` 拒绝未知类型；智能体软件类型则经 `/api/proxy/agent-types` 校验。

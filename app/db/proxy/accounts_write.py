@@ -1,10 +1,37 @@
 """ProxyDatabase methods for ProxyAccountWriteMixin."""
 
-from app.core.time import billing_period, utc_now
+from app.core.time import utc_now
 from app.db.proxy.common import (
     ACCOUNT_TYPES, _parse_iso_date, _subscription_date, is_subscription, json,
     spec, sqlite3, uuid,
 )
+
+
+def _validated_subtype(value: object, type_spec) -> str | None:
+    """Validate a requested subtype against the type's declarative spec.
+
+    Empty/absent input clears the subtype.  A non-empty value must be listed
+    by the account type's ``subtypes`` table — the check asks the spec, never
+    the raw string, so a type without subtypes only accepts empty/null.
+    """
+    if value in (None, ""):
+        return None
+    subtype = str(value).strip()
+    if not subtype:
+        return None
+    if subtype not in type_spec.subtypes:
+        if not type_spec.subtypes:
+            raise ValueError("该账户类型不支持子类型")
+        raise ValueError("账户子类型必须是 " + " / ".join(type_spec.subtypes))
+    return subtype
+
+
+def _carried_subtype(stored: object, type_spec) -> str | None:
+    """Keep a stored subtype only while the type's spec still declares it."""
+    if stored in (None, ""):
+        return None
+    subtype = str(stored)
+    return subtype if subtype in type_spec.subtypes else None
 
 
 class ProxyAccountWriteMixin:
@@ -15,8 +42,9 @@ class ProxyAccountWriteMixin:
         currency = data.get("currency", "CNY")
         if currency not in ("CNY", "USD"):
             raise ValueError("币种必须是 CNY / USD")
-        keys = self._normalize_keys(data)
+        keys, new_labels = self._normalize_keys_and_labels(data)
         type_spec = spec(account_type)
+        subtype = _validated_subtype(data.get("subtype"), type_spec)
         raw_valid_from = data.get("valid_from")
         valid_from = (_parse_iso_date(_subscription_date(raw_valid_from))
                       if raw_valid_from not in (None, "") else None)
@@ -65,11 +93,13 @@ class ProxyAccountWriteMixin:
                 )
             upstream_id = conn.execute(
                 "INSERT INTO upstreams"
-                "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,max_concurrency) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,"
+                "max_concurrency,subtype) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (shared_id, data["name"], data.get("base_url", ""),
                  data.get("api_format", "openai"), data.get("auth_header", "bearer"),
-                 data.get("endpoint_path", ""), int(data.get("max_concurrency") or 0)),
+                 data.get("endpoint_path", ""), int(data.get("max_concurrency") or 0),
+                 subtype),
             ).lastrowid
             conn.execute(
                 "INSERT INTO route_sets(id,uuid,account_id,name) VALUES(?,?,?,?)",
@@ -83,15 +113,13 @@ class ProxyAccountWriteMixin:
                 self._set_upstream_keys(
                     conn, shared_id, [], keys,
                     new_valid_froms=data.get("new_valid_froms"),
+                    new_labels=new_labels,
                     account_type=account_type)
-            # Freeze at creation only when the configured start is the
-            # current billing boundary. Backdated subscriptions are caught up
-            # by the period-start worker; creation must not fabricate a row
-            # for an old period that tests/operators may still be importing.
-            creation_boundary = billing_period(
-                now, (valid_from or now.date()).day).start.date()
-            if is_subscription(account_type) and (
-                    valid_from is None or creation_boundary == valid_from):
+            # A subscription account owns its current charge from the moment
+            # it exists. The materializer resolves that period itself (a fresh
+            # observed reset, else the anchor day) and a future-dated start
+            # yields no period yet.
+            if is_subscription(account_type):
                 from app.db.proxy.billing import materialize_period_charges_conn
                 materialize_period_charges_conn(conn, now, current_only=True)
             conn.commit()
@@ -132,6 +160,21 @@ class ProxyAccountWriteMixin:
         if final_type not in ACCOUNT_TYPES:
             raise ValueError("账户类型必须是 " + " / ".join(ACCOUNT_TYPES))
         final_spec = spec(final_type)
+        upstream = conn.execute(
+            "SELECT id,subtype FROM upstreams WHERE account_id=? ORDER BY id LIMIT 1",
+            (real_id,)
+        ).fetchone()
+        stored_subtype = upstream["subtype"] if upstream else None
+        if "subtype" in data:
+            final_subtype = _validated_subtype(data.get("subtype"), final_spec)
+        elif "account_type" in data:
+            # Only an explicit type change can drop the stored sub-category
+            # (when the new type's spec no longer declares it).  The column is
+            # written explicitly, never COALESCE, so NULL persists.
+            final_subtype = _carried_subtype(stored_subtype, final_spec)
+        else:
+            # An update that does not touch the type keeps its sub-category.
+            final_subtype = stored_subtype
         currency = data.get("currency", original["currency"] or "CNY")
         if currency not in ("CNY", "USD"):
             raise ValueError("币种必须是 CNY / USD")
@@ -171,18 +214,16 @@ class ProxyAccountWriteMixin:
              json.dumps({"kind": final_spec.cooldown or "none"}),
              contract_start, anchor_day, original["contract_id"]),
         )
-        upstream = conn.execute(
-            "SELECT id FROM upstreams WHERE account_id=? ORDER BY id LIMIT 1", (real_id,)
-        ).fetchone()
         if final_spec.routable:
             if upstream is None:
                 upstream_id = conn.execute(
                     "INSERT INTO upstreams"
-                    "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,max_concurrency) "
-                    "VALUES(?,?,?,?,?,?,?)",
+                    "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,"
+                    "max_concurrency,subtype) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
                     (real_id, name, data.get("base_url", ""), data.get("api_format", "openai"),
                      data.get("auth_header", "bearer"), data.get("endpoint_path", ""),
-                     int(data.get("max_concurrency") or 0)),
+                     int(data.get("max_concurrency") or 0), final_subtype),
                 ).lastrowid
             else:
                 upstream_id = upstream["id"]
@@ -190,10 +231,10 @@ class ProxyAccountWriteMixin:
                     "UPDATE upstreams SET name=?,base_url=COALESCE(?,base_url),"
                     "api_format=COALESCE(?,api_format),auth_scheme=COALESCE(?,auth_scheme),"
                     "endpoint_path=COALESCE(?,endpoint_path),max_concurrency=COALESCE(?,max_concurrency),"
-                    "enabled=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+                    "subtype=?,enabled=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
                     (name, data.get("base_url"), data.get("api_format"),
                      data.get("auth_header"), data.get("endpoint_path"),
-                     data.get("max_concurrency"), upstream_id),
+                     data.get("max_concurrency"), final_subtype, upstream_id),
                 )
             route_row = conn.execute("SELECT id FROM route_sets WHERE id=?", (external_id,)).fetchone()
             if route_row is None:
@@ -210,10 +251,13 @@ class ProxyAccountWriteMixin:
             if data.get("keys_edited") and final_spec.holds_keys:
                 keep_ids = [int(value) for value in (data.get("keep_key_ids") or [])
                             if str(value).isdigit()]
+                keys, new_labels = self._normalize_keys_and_labels(data)
                 self._set_upstream_keys(
-                    conn, external_id, keep_ids, self._normalize_keys(data),
+                    conn, external_id, keep_ids, keys,
                     keep_valid_froms=data.get("keep_valid_froms"),
-                    new_valid_froms=data.get("new_valid_froms"), account_type=final_type)
+                    new_valid_froms=data.get("new_valid_froms"),
+                    keep_labels=data.get("keep_labels"),
+                    new_labels=new_labels, account_type=final_type)
         if is_subscription(final_type) and ("monthly_price" in data or
                                              original_type != final_type):
             conn.execute(

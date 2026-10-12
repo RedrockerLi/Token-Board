@@ -106,6 +106,21 @@ struct AuthResult {
     std::string error_json;
 };
 
+/// Mark an attempt to an "opencode-go" upstream: those gateways route by
+/// session and drop clients that do not identify one, so the session header
+/// and the proxy User-Agent are set together.  Callers with a conversation of
+/// their own pass its session id; callers without one (model catalog,
+/// embeddings, cooldown probe) pass an empty `session` and get a one-off
+/// random id.  Candidates on any other sub-type are left untouched.
+inline void configure_opencode_session(ForwardOptions &opts,
+                                       const UpstreamCandidate &candidate,
+                                       const std::string &session) {
+    if (!candidate.account().opencode_session) return;
+    opts.opencode_upstream = true;
+    opts.opencode_session =
+        session.empty() ? opencode_random_session_value() : session;
+}
+
 std::string affinity_scope(int local_key_id, ir::ApiFormat harness);
 bool strict_terminal_enabled();
 size_t affinity_start(SessionAffinity &affinity, const std::string &scope,

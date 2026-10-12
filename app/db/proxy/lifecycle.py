@@ -59,7 +59,7 @@ class ProxyLifecycleMixin:
                 effective = None
             else:
                 rows = conn.execute(
-                    "SELECT c.uuid,c.valid_from,c.created_at,c.ends_at "
+                    "SELECT c.uuid,c.valid_from,c.created_at,c.ends_at,c.usage_json "
                     "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
                     "WHERE u.account_id=? AND (c.ends_at IS NULL OR c.ends_at>?)",
                     (real_id, now_text),
@@ -70,7 +70,8 @@ class ProxyLifecycleMixin:
                     if end is None or end <= now:
                         anchor = (_parse_iso_date(row["valid_from"]) or
                                   parse_runtime_timestamp(row["created_at"]).date())
-                        end = _cancellation_end(config, now, anchor.day, "plan")
+                        end = _cancellation_end(config, now, anchor.day, "plan",
+                                                usage_json=row["usage_json"])
                         conn.execute("UPDATE upstream_credentials SET ends_at=? WHERE uuid=?",
                                      (end.strftime("%Y-%m-%dT%H:%M:%SZ"), row["uuid"]))
                     expiries.append(end)

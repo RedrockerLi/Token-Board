@@ -99,6 +99,14 @@ void ProxyServer::run_cooldown_probe_cycle() {
         opts.non_streaming_total_timeout = 10;
         opts.auth_scheme = resolve_auth_scheme(target->api_format,
                                                target->auth_header);
+        // An "opencode-go" gateway rejects a session-less probe (400), which
+        // would read as "still cooling" forever.  The probe carries no
+        // conversation, so it identifies itself with a one-off session (the
+        // handler-path helper takes a candidate, which a probe has none of).
+        if (target->opencode_session) {
+            opts.opencode_upstream = true;
+            opts.opencode_session = opencode_random_session_value();
+        }
         UpstreamClient::ForwardResult fwd;
         try {
             fwd = upstream_.forward("GET", target->base_url, target->key_value,

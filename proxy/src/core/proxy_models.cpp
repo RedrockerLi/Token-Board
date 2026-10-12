@@ -83,7 +83,11 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         return forward_endpoint_attempt(
             upstream_, policy, candidate, "", "application/json",
             static_cast<int>(attempt.remaining_budget_ms), catalog_timeouts,
-            req.client_socket);
+            req.client_socket, nullptr,
+            // A catalog fetch carries no conversation of its own.
+            [&](ForwardOptions &opts) {
+                configure_opencode_session(opts, candidate, std::string());
+            });
         },
         [&](const UpstreamClient::ForwardResult &result) {
             return result.client_disconnected ||

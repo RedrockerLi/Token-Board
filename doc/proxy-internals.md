@@ -39,7 +39,8 @@ transition→解析 C++ CLI 参数→打开并校验已准备好的 V1 schema→
   转换前的上游数据和转换后实际写给下游的数据都能逐段对照。
 
 `Authorization`、`x-api-key`、Cookie、名称中带 `api-key` 或 `token` 的头值会显示为
-`<redacted>`；body 不做脱敏，可能包含 prompt、工具参数或 provider 返回内容。因此
+`<redacted>`；会话标识头（`x-opencode-session`、`x-session-id` 等）与 `User-Agent` 不是凭据，
+按原值输出。body 不做脱敏，可能包含 prompt、工具参数或 provider 返回内容。因此
 这组日志只在需要时以前台 `--debug` 查看，不应作为长期日志保存。
 
 ### systemd 常驻模式
@@ -89,6 +90,8 @@ bash start.sh --debug
 
 认证同时接受两种头:`Authorization: Bearer <密钥>` 与 `x-api-key: <密钥>`,与客户端用什么格式无关,密钥只用来选账户。
 
+转发到上游的请求头由代理自己组装:认证头(anthropic 线格式用 `x-api-key` + `anthropic-version`,其余用 `Authorization: Bearer`)、`Content-Type`,以及下游带来的 `anthropic-beta`;下游的 User-Agent 不转发。带 OpenCode-Go 子分类(规格里 `session_header=true`)的账户另注入 `x-opencode-session`(下游透传 → 会话标识 → 稳定会话指纹 → 随机),并带固定 `User-Agent: token-board/1.0`。
+
 ## 候选选择与回退
 
 `resolve_candidates` 先给模型名剥掉 Claude Code 的 `[1m]` / `[1M]` 后缀,再按路由结果取候选:
@@ -96,20 +99,22 @@ bash start.sh --debug
 - 普通账户:一个或多个候选(账户的每把上游密钥一个槽位)。
 - 聚合账户:按精确模型名匹配 `aggregate_entries`,同一模型可能命中多条,按 `sort_order, id` 排序,构成候选链。
 
-会话带 `session_id` 时,起点由 `SessionAffinity::preferred_index` 决定(见下),否则从头开始。随后 `pick_candidate` 沿顺序挑:跳过处于冷却期的槽位、占用并发槽失败(达到 `max_concurrency`)的也跳过,选中即返回。
+组内顺序由 `candidate_order` 生成:起点由 `SessionAffinity::preferred_index` 与轮转偏移决定(见下),再沿固定顺序环绕。尝试循环沿顺序挑:跳过处于冷却期的槽位,占用并发槽失败(达到 `max_concurrency`)的也跳过,选中即发起转发。
 
 请求分两种走法:
 
 - **流式**:chunked 响应头**故意延迟到首个数据块写出前才提交**,所以上游在首字节前返回 429/5xx 时可以在当前请求内换下一候选重试;一旦 `committed`(任何字节已发给客户端)则不再切换,剩余部分按上游流原样转发。首个错误帧仍可触发回退。
-- **非流式**:循环候选。上游返回 429 或 5xx、且还没向客户端发任何数据时,释放当前密钥槽的并发槽,试下一个。plan 密钥收到 429 会触发该密钥 5 小时冷却(只冷却这一把)。全部候选失败返回 429。
+- **非流式**:循环候选。上游返回 429 或 5xx、且还没向客户端发任何数据时,释放当前密钥槽的并发槽,试下一个。plan 密钥收到上游明确的配额耗尽 429 会触发该密钥 5 小时冷却(只冷却这一把)。全部候选失败返回 429。
 
 超时(`is_timeout`,504)与 429/5xx 一样参与回退——上游卡死不吐数据视为 provider 故障,换下一个账户(对齐 cc-switch 把超时归为 Retryable);全部候选失败时,若最后失败是超时则返回 504,否则 429。每次尝试都会写一行 `request_attempts`,失败的上游不会从监控里消失。嵌入端点 `/v1/embeddings` 也是非流式,走同样的候选循环,但没有格式转换。
 
 ## 会话亲和与成本平衡
 
-`SessionAffinity`(core/proxy_server.h)是进程内的"会话 → 上游密钥"亲和:同一 `session_id` 的请求倾向复用上次成功服务的密钥槽(成功才绑定、回退会重绑),避免一次会话在多个套餐密钥之间跳来跳去。亲和映射是内存 LRU(上限 10 万条、24 小时过期),不写库——不在请求热路径上加任何同步 SQLite 写。
+`SessionAffinity`(core/session_affinity.h)是进程内的"会话 → 上游密钥"亲和:同一 `session_id` 的请求倾向复用上次成功服务的密钥槽(成功才绑定、回退会重绑),避免一次会话在多个套餐密钥之间跳来跳去。亲和映射是内存 LRU(上限 10 万条、24 小时过期),不写库——不在请求热路径上加任何同步 SQLite 写。
 
-**新会话**(冷启动)按累计成本选密钥:`KeyCostLedger`(core/key_cost_ledger.h)由记账线程异步喂"每个密钥槽累计花费",新会话选择累计花费**最小**的密钥槽,让各密钥按花费大致均匀磨损;台账不落盘、重启清零,新密钥读作 0.0 会被优先选中。无台账(单元测试路径)退化为 rendezvous hashing。空 `session_id` 或单候选时走普通的顺序填充。
+**起点选择**依次是会话亲和 → 成本台账 → 轮转:命中会话绑定时从绑定的密钥槽开始;**新会话**(冷启动)按累计成本选密钥——`KeyCostLedger`(core/key_cost_ledger.h)由记账线程异步喂"每个密钥槽累计花费",选择累计花费**最小**的密钥槽,让各密钥按花费大致均匀磨损(台账不落盘、重启清零,新密钥读作 0.0 会被优先选中;无台账时退化为 rendezvous hashing);空 `session_id`、亲和不在当前优先级组或单候选时,由进程内轮转偏移决定组内起点,再按固定顺序环绕。
+
+**用量感知微调**针对带用量快照(`upstream_credentials.usage_json`)的候选:某密钥存在 percent ≤ 70 的可用窗口、且其重置时刻比其它候选都早至少 30 分钟时,该密钥排到顺序最前;**任一窗口 ≥100%** 的密钥排到最后尝试;没有用量快照的候选取向不变。
 
 ## 并发闸门:AccountGate
 
@@ -117,8 +122,8 @@ bash start.sh --debug
 
 - `acquire(key_slot_id, max_concurrency)`:`max_concurrency <= 0` 视为不限,直接放行。一把密钥打满并发,同账户的下一把密钥可立即接管。
 - 槽位回收:正常每个 `acquire` 配一个 `release`;客户端断连处理与响应结束都会释放。没有按年龄强回收的 `SLOT_TTL`——健康的长时间流必须保住自己的槽位。
-- `mark_cooldown`:plan 密钥槽收到 429 后冷却 `PLAN_COOLDOWN`(5 小时),期间 `in_cooldown` 返回 true,路由跳过该槽位而非整账户——同账户其他密钥不受影响,可继续接管。冷却态不落库,重启即清。
-- `mark_failure` 短熔断:401/403/其他 429/5xx/网络失败按失败次数指数退避 **5s → 30s → 2min**,成功清除。plan 429 走上面的 5h 冷却。
+- `mark_subscription_cooldown`:plan 密钥槽收到**上游明确的配额耗尽** 429(响应带 `usage_limit`,且合同声明 `subscription_5h`)后冷却 `PLAN_COOLDOWN`(5 小时),期间 `in_cooldown` 返回 true,路由跳过该槽位而非整账户——同账户其他密钥不受影响,可继续接管。冷却态不落库,重启即清。
+- 闸门只持有并发与订阅冷却两件事:401/403/普通 `429`/5xx/网络失败都不写冷却态,只影响当前这次请求的回退;冷却期的恢复由下面的探测负责。
 
 实时并发不写库:请求热路径只更新进程内计数器,`GET /health` 的 `concurrency` 字段暴露它;`in_flight_requests` 表是旧版本的遗留,当前代理不再写入(启动与周期清理仍会清它的残留)。
 
@@ -128,7 +133,7 @@ plan 密钥进入 5h 冷却后,后台线程**每隔 `cooldown_probe_interval_sec
 
 - 探测线程在 `setup_routes` 启动(`start_cooldown_probe`,幂等),`shutdown()` 内 join(仿 `accounting_thread_` 生命周期);循环按 200ms 切片睡眠,退出迅速。
 - 探测目标按 `upstream_keys.id` 查 `lookup_probe_target`(read_db_ 连接,JOIN 账户取 base_url/key/auth),已删密钥/账户直接跳过。
-- **纪律**:探测不写 `request_log`、不 `acquire`/`release`(不占 `max_concurrency`)、不动 `mark_failure` 计数——只观察冷却态并清除它。冷却状态依旧纯内存,重启即清。
+- **纪律**:探测不写 `request_log`、不 `acquire`/`release`(不占 `max_concurrency`)、不新增冷却态——只观察并在 2xx 时 `clear_cooldown`。冷却状态依旧纯内存,重启即清。
 
 ## 超时与客户端断连
 

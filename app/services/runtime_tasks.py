@@ -175,6 +175,21 @@ def trigger_agent_usage_import(flask_app) -> bool:
         return False
 
 
+def trigger_usage_refresh(flask_app) -> bool:
+    """Wake the standalone usage poller after a usage-tracked account changed."""
+    socket_path = flask_app.config.get("MAINTENANCE_SOCKET")
+    if not socket_path:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.settimeout(0.2)
+            client.sendto(b"USAGE_REFRESH", socket_path)
+        return True
+    except (OSError, socket.timeout):
+        log.debug("maintenance usage socket is unavailable: %s", socket_path)
+        return False
+
+
 def stop_dashboard_tasks(flask_app, join_timeout: float = 2.0) -> None:
     """Stop dashboard-owned workers without touching proxy maintenance."""
     stop = flask_app.config.get("DELETION_FINALIZER_STOP")

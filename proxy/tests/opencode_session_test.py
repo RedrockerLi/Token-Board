@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""OpenCode Go session header + usage-aware key scheduling (end-to-end).
+
+Drives the real proxy against mock_upstream with "opencode-go" upstreams
+(upstreams.subtype='opencode-go', schema V2.5) and asserts:
+
+  S1  a request without any downstream session identity still reaches the
+      upstream with a `tb-…` x-opencode-session and User-Agent token-board/1.0
+      (mock_require_session turns a missing header into a hard 400).  The
+      conversation fingerprint repeats identically for the same prompt, and a
+      request with no identifiable conversation gets a fresh random id.
+  S2  a downstream x-claude-code-session-id is forwarded verbatim, while an
+      explicit downstream x-opencode-session outranks it.
+  S3  seeded usage_json scheduling: the soonest-resetting usable credential is
+      tried FIRST and a credential with an exhausted window is tried LAST.
+  S4  429 on one key with a healthy sibling → downstream 200 with both keys
+      recorded, on the non-streaming and the streaming path.
+  S5  every key 429 → the downstream client receives the error.
+  S6  the cooldown probe (GET /models) carries the session header too: a cooled
+      key is cleared early while the mock demands the header on every GET.
+  S7  the /v1/models passthrough reaches the same session-policed upstream.
+  S8  embeddings requests carry the session header as well.
+
+Usage:
+  python3 opencode_session_test.py <token_proxy> <schema_dir> <project_root>
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+from support import stop_process
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for_health(port: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health",
+                                        timeout=0.2) as r:
+                if r.status == 200:
+                    return
+        except OSError:
+            time.sleep(0.03)
+    raise AssertionError("proxy did not become healthy")
+
+
+def iso_after(seconds: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+
+
+def usage_snapshot(percent: int, resets_in: float) -> str:
+    """The frozen usage_json shape the Python poller writes."""
+    return json.dumps({
+        "checked_at": iso_after(0),
+        "error": None,
+        "windows": {
+            "5h": {"percent": percent, "resets_at": iso_after(resets_in)},
+            "week": {"percent": 3, "resets_at": iso_after(3 * 86400)},
+            "month": {"percent": 2, "resets_at": iso_after(20 * 86400)},
+        },
+        "monthly_period": {"start": iso_after(-86400),
+                           "end": iso_after(29 * 86400)},
+    })
+
+
+def send(proxy_port, local_key, body, headers=None, timeout=30,
+         path="/v1/chat/completions"):
+    request_headers = {"Authorization": f"Bearer {local_key}",
+                       "Content-Type": "application/json"}
+    request_headers.update(headers or {})
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{proxy_port}{path}",
+        data=json.dumps(body).encode(),
+        headers=request_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")
+
+
+def read_log(log_path, marker):
+    """Mock request records whose body carries the given marker."""
+    if not Path(log_path).exists():
+        return []
+    records = []
+    for line in Path(log_path).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if (record.get("body") or {}).get("mock_marker") == marker:
+            records.append(record)
+    return records
+
+
+def ctrl(upstream_port, method, path, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(f"http://127.0.0.1:{upstream_port}{path}",
+                                 data=data,
+                                 headers={"Content-Type": "application/json"})
+    req.get_method = lambda: method
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+
+def wait_probe(upstream_port, key, after_count):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if ctrl(upstream_port, "GET", "/__ctrl/status")["probes"].get(
+                key, 0) > after_count:
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"cooldown probe for {key} never fired")
+
+
+def latest_attempts(db_path, model, min_id=0):
+    """(row_id, attempt_count, [statuses], [upstream_key_ids]) for the newest row."""
+    conn = sqlite3.connect(db_path)
+    try:
+        for _ in range(120):
+            row = conn.execute(
+                "SELECT id, attempt_count FROM request_log "
+                "WHERE model=? AND id>? ORDER BY id DESC LIMIT 1",
+                (model, min_id),
+            ).fetchone()
+            if row:
+                attempts = conn.execute(
+                    "SELECT status_code, upstream_key_id FROM request_attempts "
+                    "WHERE request_log_id=? ORDER BY attempt_index", (row[0],),
+                ).fetchall()
+                return (row[0], row[1],
+                        [a[0] for a in attempts], [a[1] for a in attempts])
+            time.sleep(0.05)
+        return None
+    finally:
+        conn.close()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("token_proxy", type=str)
+    ap.add_argument("schema_dir", type=str)
+    ap.add_argument("project_root", type=str)
+    args = ap.parse_args()
+
+    proxy_binary = Path(args.token_proxy).resolve()
+    schema_dir = Path(args.schema_dir).resolve()
+    project_root = Path(args.project_root).resolve()
+    sys.path.insert(0, str(project_root))
+    import scripts.mock_upstream as mock_upstream
+    from scripts.mock_upstream import Handler, ThreadingHTTPServer
+    from v1_fixture import (add_plain_route, add_upstream,
+                            build_aggregate_scenario, ensure_v2_database)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "mock_upstream.log"
+        mock_upstream.LOG_FILE = str(log_path)
+        upstream_port = free_port()
+        upstream = ThreadingHTTPServer(("127.0.0.1", upstream_port), Handler)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+
+        db_path = Path(tmp) / "token-board.db"
+        ensure_v2_database(db_path, schema_dir)
+        conn = sqlite3.connect(db_path)
+        base_url = f"http://127.0.0.1:{upstream_port}"
+        try:
+            # Declaration order is [exhausted, lead, late] so a correct run has
+            # to reorder all three by usage.
+            _, ordering_keys, _ = build_aggregate_scenario(
+                conn, "tb-oc1", "oc1-model",
+                ["sk-oc1-exhausted", "sk-oc1-lead", "sk-oc1-late"], None,
+                subtype="opencode-go")
+            build_aggregate_scenario(
+                conn, "tb-oc2", "oc2-model", ["sk-oc2-p1", "sk-oc2-p2"],
+                None, subtype="opencode-go")
+            build_aggregate_scenario(
+                conn, "tb-oc3", "oc3-model", ["sk-oc3-p1"], None,
+                subtype="opencode-go")
+            # Cooldown-probe scenario (cooled key) and a plain account whose
+            # catalog/embeddings calls hit the upstream directly.
+            _, probe_keys, _ = build_aggregate_scenario(
+                conn, "tb-oc4", "oc4-model", ["sk-oc4-p1", "sk-oc4-p2"], None,
+                subtype="opencode-go")
+            plain_id, plain_upstream, _ = add_upstream(
+                conn, "tb-oc5", "", ["sk-oc5-p1"], subtype="opencode-go")
+            add_plain_route(conn, "tb-oc5", "tb-oc5-route", plain_upstream,
+                            plain_id, "*")
+            conn.execute("UPDATE upstreams SET base_url=?", (base_url,))
+            for runtime_id, (percent, resets_in) in zip(
+                    ordering_keys, [(100, 300), (20, 600), (20, 7200)]):
+                conn.execute(
+                    "UPDATE upstream_credentials SET usage_json=? "
+                    "WHERE runtime_id=?",
+                    (usage_snapshot(percent, resets_in), runtime_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        proxy_port = free_port()
+        # Short probe interval so S6 reaches the cooldown probe within the run.
+        env = {**os.environ, "TB_COOLDOWN_PROBE_SECS": "2"}
+        proxy = subprocess.Popen(
+            [str(proxy_binary), "--db", str(db_path), "--host", "127.0.0.1",
+             "--port", str(proxy_port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            env=env)
+        try:
+            wait_for_health(proxy_port)
+
+            # ── S1: session id injected upstream, fingerprint stable ─────
+            body = {"stream": False, "model": "oc3-model",
+                    "messages": [{"role": "user", "content": "hello session"}],
+                    "mock_require_session": True, "mock_marker": "s1a"}
+            status, _ = send(proxy_port, "tb-oc3", body)
+            assert status == 200, \
+                f"S1: a session-less client must still be routable (got {status})"
+            send(proxy_port, "tb-oc3", body)
+            records = read_log(log_path, "s1a")
+            assert len(records) == 2, f"S1: expected 2 mock hits, got {len(records)}"
+            sessions = [r.get("x_opencode_session") or "" for r in records]
+            assert all(s.startswith("tb-") and len(s) == 35 for s in sessions), \
+                f"S1: upstream session id shape {sessions}"
+            assert sessions[0] == sessions[1], \
+                f"S1: the same conversation must fingerprint identically: {sessions}"
+            agents = {r.get("user_agent") for r in records}
+            assert agents == {"token-board/1.0"}, f"S1: upstream User-Agent {agents}"
+            print(f"S1 OK: session-less request injected {sessions[0]} "
+                  f"with User-Agent token-board/1.0 (stable fingerprint)")
+
+            # A body with no system prompt and no user turn carries no
+            # conversation identity: each request gets its own session.
+            random_body = {"stream": False, "model": "oc3-model",
+                           "messages": [{"role": "assistant", "content": "x"}],
+                           "mock_require_session": True, "mock_marker": "s1b"}
+            send(proxy_port, "tb-oc3", random_body)
+            send(proxy_port, "tb-oc3", random_body)
+            randoms = [r.get("x_opencode_session") or ""
+                       for r in read_log(log_path, "s1b")]
+            assert len(randoms) == 2 and all(
+                s.startswith("tb-") and len(s) == 35 for s in randoms), randoms
+            assert randoms[0] != randoms[1], \
+                f"S1: an unidentified conversation must not share a session {randoms}"
+            print("S1 OK: no identifiable conversation -> per-request random session")
+
+            # ── S2: downstream session headers are forwarded verbatim ───
+            body = {"stream": False, "model": "oc3-model",
+                    "messages": [{"role": "user", "content": "session s2"}],
+                    "mock_marker": "s2a"}
+            send(proxy_port, "tb-oc3", body,
+                 headers={"x-claude-code-session-id": "cc-session-77"})
+            forwarded = read_log(log_path, "s2a")[0].get("x_opencode_session")
+            assert forwarded == "cc-session-77", forwarded
+
+            send(proxy_port, "tb-oc3", {**body, "mock_marker": "s2b"},
+                 headers={"x-claude-code-session-id": "cc-session-77",
+                          "x-opencode-session": "explicit-abc"})
+            forwarded = read_log(log_path, "s2b")[0].get("x_opencode_session")
+            assert forwarded == "explicit-abc", forwarded
+            print("S2 OK: x-claude-code-session-id forwarded verbatim; "
+                  "x-opencode-session outranks it")
+
+            # ── S3/S4: usage ordering + sibling fallback (non-streaming) ─
+            exhausted, lead, late = ordering_keys
+            flags = {"mock_status_by_key": {"sk-oc1-lead": 429,
+                                            "sk-oc1-late": 429,
+                                            "sk-oc1-exhausted": 200}}
+            common = {"model": "oc1-model",
+                      "messages": [{"role": "user", "content": "order"}]}
+            status, _ = send(proxy_port, "tb-oc1",
+                             {**common, "stream": False, **flags})
+            assert status == 200, f"S3: sibling fallback must succeed ({status})"
+            rid, _, statuses, keys = latest_attempts(db_path, "oc1-model")
+            assert statuses == [429, 429, 200], f"S3 attempts {statuses}"
+            assert keys == [lead, late, exhausted], \
+                f"S3 must try lead first and the exhausted key last: {keys} " \
+                f"(lead={lead} late={late} exhausted={exhausted})"
+            print(f"S3 OK: usage order lead->late->exhausted "
+                  f"(attempts={statuses}, keys={keys})")
+
+            status, text = send(proxy_port, "tb-oc1",
+                                {**common, "stream": True, **flags})
+            rid, _, statuses, keys = latest_attempts(db_path, "oc1-model", rid)
+            assert status == 200 and "[DONE]" in text, f"S4 streaming status {status}"
+            assert statuses == [429, 429, 200], f"S4 streaming attempts {statuses}"
+            assert keys == [lead, late, exhausted], f"S4 streaming keys {keys}"
+            print(f"S4 OK: streaming 429 pre-commit falls back to the healthy "
+                  f"sibling (attempts={statuses})")
+
+            # ── S5: every key 429 → the client receives the error ───────
+            status, text = send(proxy_port, "tb-oc2", {
+                "stream": False, "model": "oc2-model",
+                "messages": [{"role": "user", "content": "all fail"}],
+                "mock_status_by_key": {"sk-oc2-p1": 429, "sk-oc2-p2": 429}})
+            assert status == 429, f"S5 downstream status {status}"
+            assert "error" in text, text[:200]
+            _, _, statuses, _ = latest_attempts(db_path, "oc2-model")
+            assert statuses == [429, 429], f"S5 attempts {statuses}"
+            print(f"S5 OK: all keys 429 -> downstream 429 (attempts={statuses})")
+
+            # ── S1 (streaming): the session reaches the SSE forward too ──
+            stream_body = {"stream": True, "model": "oc3-model",
+                           "messages": [{"role": "user", "content": "stream s1"}],
+                           "mock_require_session": True, "mock_marker": "s1c"}
+            status, text = send(proxy_port, "tb-oc3", stream_body)
+            assert status == 200 and "[DONE]" in text, f"S1 streaming {status}"
+            stream_record = read_log(log_path, "s1c")[0]
+            assert (stream_record.get("x_opencode_session") or "").startswith("tb-"), \
+                stream_record.get("x_opencode_session")
+            print("S1 OK: the streaming forward carries the session header too")
+
+            # ── S6: cooldown probe carries the session header ────────────
+            # Every GET now demands the header, so a probe without one is a
+            # 400 and the cooled key never comes back early.
+            ctrl(upstream_port, "POST", "/__ctrl", {"require_session": True})
+            cooled, sibling = probe_keys
+            send(proxy_port, "tb-oc4", {
+                "stream": False, "model": "oc4-model",
+                "messages": [{"role": "user", "content": "cool p1"}],
+                "mock_status_by_key": {"sk-oc4-p1": 429},
+                "mock_error_type_by_key": {"sk-oc4-p1": "GoUsageLimitError"}})
+            rid, _, statuses, keys = latest_attempts(db_path, "oc4-model")
+            assert statuses == [429, 200] and keys[1] == sibling, (statuses, keys)
+            wait_probe(upstream_port, "sk-oc4-p1", 0)
+            time.sleep(0.5)  # let the cleared cooldown land before asking again
+            send(proxy_port, "tb-oc4", {
+                "stream": False, "model": "oc4-model",
+                "messages": [{"role": "user", "content": "cool p1 again"}]})
+            _, _, statuses, keys = latest_attempts(db_path, "oc4-model", rid)
+            assert keys == [cooled], \
+                f"S6: the probed key must serve again (attempts={statuses}, {keys})"
+            print(f"S6 OK: session-carrying probe cleared the cooldown "
+                  f"(attempts={statuses}, keys={keys})")
+
+            # ── S7: /v1/models passthrough reaches a session-policed upstream ──
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{proxy_port}/v1/models",
+                headers={"Authorization": "Bearer tb-oc5"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                models_status, models_body = r.status, r.read().decode()
+            assert models_status == 200 and models_body == "{}", \
+                f"S7: models passthrough {models_status} {models_body[:120]}"
+            print("S7 OK: /v1/models passthrough satisfied the session gate")
+
+            # ── S8: embeddings carries the session header ────────────────
+            status, _ = send(proxy_port, "tb-oc5", {
+                "model": "text-embedding-mock", "input": "hello",
+                "mock_require_session": True, "mock_marker": "s8"},
+                path="/v1/embeddings")
+            record = read_log(log_path, "s8")[0]
+            assert (record.get("x_opencode_session") or "").startswith("tb-"), \
+                (status, record.get("x_opencode_session"))
+            print("S8 OK: embeddings carries the session header")
+
+            print("opencode session tests passed")
+        finally:
+            diagnostics = stop_process(proxy, check_returncode=False)
+            if proxy.returncode not in (0, -15):
+                print(diagnostics, file=sys.stderr)
+
+        upstream.shutdown()
+        upstream.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -4,6 +4,10 @@
 This process owns only local/runtime work. Configuration mutation remains in
 the manually started dashboard, and schema upgrades remain in ``start.sh
 --all``.
+
+Owned periodic workers: daily FX prewarm, billing materialization (60s), the
+Agent usage importer (1800s, also woken by the ``IMPORT`` datagram) and the
+upstream usage poller (300s, also woken by the ``USAGE_REFRESH`` datagram).
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from app.db.proxy_db import ProxyDatabase
 from app.db.proxy.billing import materialize_all_period_charges
 from app.services import fx
 from app.services.agent_usage.importer import import_once
+from app.services.key_usage import poll_usage_once
 from app.services.runtime_tasks import (
     AGENT_USAGE_IMPORT_INTERVAL_SECONDS,
     AgentUsageImportWorker,
@@ -32,7 +37,7 @@ log = logging.getLogger(__name__)
 
 
 class MaintenanceService:
-    """Own three periodic workers and a local importer wake socket."""
+    """Own four periodic workers and the local wake socket."""
 
     def __init__(self, db_path: str, schema_dir: str, socket_path: str,
                  health_path: str):
@@ -52,6 +57,7 @@ class MaintenanceService:
         self.proxy_db: ProxyDatabase | None = None
         self.importer: AgentUsageImportWorker | None = None
         self.sock: socket.socket | None = None
+        self.usage_refresh_lock = threading.Lock()
 
     def _write_health(self) -> None:
         self.health_path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,6 +96,29 @@ class MaintenanceService:
         os.chmod(self.socket_path, 0o600)
         self.sock.settimeout(1.0)
 
+    def _trigger_usage_refresh(self) -> None:
+        """Run one usage poll, dropping wakes that arrive while it runs."""
+        if self.proxy_db is None or not self.usage_refresh_lock.acquire(
+                blocking=False):
+            return
+
+        def run() -> None:
+            try:
+                poll_usage_once(self.proxy_db)
+            except Exception:
+                log.exception("usage refresh poll failed")
+            finally:
+                self.usage_refresh_lock.release()
+
+        try:
+            threading.Thread(target=run, daemon=True,
+                             name="key-usage-refresh").start()
+        except RuntimeError:
+            # Without this the lock would stay held and every later wake-up
+            # would be dropped silently.
+            self.usage_refresh_lock.release()
+            log.exception("failed to start the usage refresh thread")
+
     def _socket_loop(self) -> None:
         assert self.sock is not None
         while not self.stop_event.is_set():
@@ -99,8 +128,11 @@ class MaintenanceService:
                 continue
             except OSError:
                 break
-            if message.strip() == b"IMPORT" and self.importer is not None:
+            command = message.strip()
+            if command == b"IMPORT" and self.importer is not None:
                 self.importer.trigger()
+            elif command == b"USAGE_REFRESH":
+                self._trigger_usage_refresh()
 
     def start(self) -> None:
         self.proxy_db = ProxyDatabase(self.db_path, schema_dir=self.schema_dir)
@@ -124,6 +156,8 @@ class MaintenanceService:
             ("fx-prewarm", 86400, prewarm_fx),
             ("billing-materializer", 60,
              lambda: materialize_all_period_charges(self.db_path)),
+            ("key-usage-poller", 300,
+             lambda: poll_usage_once(self.proxy_db)),
         ]
         for name, interval, action in workers:
             thread = threading.Thread(

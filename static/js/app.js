@@ -347,7 +347,10 @@ function applyConfigSyncState() {
             const connectionControl = id === 'page-settings-general' &&
                 (el.id === 'btnTestSync' || el.id === 'btnSaveSync' ||
                  el.closest('#syncConfigForm'));
-            el.disabled = connectionControl ? ConfigSync.state === 'syncing' : !editable;
+            // 视图切换（如账户页 API/Plan 页签）不改配置，只读态下仍可用。
+            const viewControl = !!el.closest('.view-switch');
+            el.disabled = viewControl ? false
+                : (connectionControl ? ConfigSync.state === 'syncing' : !editable);
         });
     });
 }

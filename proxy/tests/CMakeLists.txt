@@ -458,6 +458,17 @@ add_test(
             ${CMAKE_SOURCE_DIR}/../schema
             ${CMAKE_SOURCE_DIR}/..
 )
+# OpenCode Go sub-type: session-header injection (fingerprint / downstream
+# pass-through / random fallback) and usage_json-aware key scheduling
+# (lead key first, exhausted key last, sibling fallback).
+add_test(
+    NAME opencode_session
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/opencode_session_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
 
 # Keep CI selection explicit without maintaining a second test manifest.
 set_tests_properties(upstream_client_perf_reuse PROPERTIES LABELS "performance")
@@ -472,7 +483,7 @@ set_tests_properties(format_conversion session_affinity endpoint_policy source_s
 set_tests_properties(upstream_client PROPERTIES LABELS "integration")
 set_tests_properties(
     proxy_forwarding v1_routing model_accounting responses_forwarding v1_admin cooldown_discrimination
-    fallback_matrix cooldown_probe error_shape
+    fallback_matrix cooldown_probe error_shape opencode_session
     PROPERTIES LABELS "integration"
 )
 set_tests_properties(v1_sync transition_recovery
@@ -492,5 +503,5 @@ set_tests_properties(
     proxy_forwarding v1_routing model_accounting responses_forwarding v1_admin v1_sync
     transition_recovery queue_saturation accounting_recovery stream_rss_100
     accounting_soak_60s perf_stress perf_gate_1000_64 cooldown_discrimination
-    fallback_matrix cooldown_probe error_shape
+    fallback_matrix cooldown_probe error_shape opencode_session
     PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/..")

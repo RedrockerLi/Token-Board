@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import tempfile
@@ -326,6 +327,14 @@ class SyncContractTest(unittest.TestCase):
         temp, proxy, _ = self._repo_layout()
         try:
             self._seed_credential(proxy, "credential-local", "sk-local-secret")
+            conn = sqlite3.connect(proxy)
+            conn.execute(
+                "UPDATE upstream_credentials SET label='local label',usage_json=? "
+                "WHERE uuid='credential-local'",
+                (json.dumps({"checked_at": "2026-10-12T04:00:00Z",
+                             "windows": {"5h": {"percent": 10}}}),))
+            conn.commit()
+            conn.close()
             before = config_hash_of_db(proxy)
             conn = sqlite3.connect(proxy)
             conn.execute(
@@ -333,9 +342,24 @@ class SyncContractTest(unittest.TestCase):
                 "WHERE credential_uuid='credential-local'")
             conn.execute(
                 "UPDATE sync_settings SET value='another-password' WHERE key='password'")
+            # The poller rewrites the observation every few minutes; it must
+            # not keep moving the hash the way real configuration does.
+            conn.execute(
+                "UPDATE upstream_credentials SET usage_json=? "
+                "WHERE uuid='credential-local'",
+                (json.dumps({"checked_at": "2026-10-12T04:05:00Z",
+                             "windows": {"5h": {"percent": 90}}}),))
             conn.commit()
             conn.close()
             self.assertEqual(before, config_hash_of_db(proxy))
+            # Per-key labels are synchronized configuration, so they do move it.
+            conn = sqlite3.connect(proxy)
+            conn.execute(
+                "UPDATE upstream_credentials SET label='renamed' "
+                "WHERE uuid='credential-local'")
+            conn.commit()
+            conn.close()
+            self.assertNotEqual(before, config_hash_of_db(proxy))
         finally:
             shutil.rmtree(temp, ignore_errors=True)
 
@@ -588,6 +612,10 @@ class SyncContractTest(unittest.TestCase):
             conn.execute(
                 "INSERT INTO client_keys(uuid,key_value,label,route_set_id) "
                 "VALUES('client-1','tb-local-key','local key',1)")
+            conn.execute(
+                "UPDATE upstream_credentials SET label='local label',usage_json=? "
+                "WHERE uuid='credential-local'",
+                (json.dumps({"checked_at": "2026-10-12T04:00:00Z"}),))
             conn.commit()
             conn.close()
 
@@ -601,6 +629,9 @@ class SyncContractTest(unittest.TestCase):
                     "SELECT value FROM sync_settings WHERE key='password'").fetchone()
                 captured["client_key"] = check.execute(
                     "SELECT key_value FROM client_keys WHERE uuid='client-1'").fetchone()[0]
+                captured["label"], captured["usage_json"] = check.execute(
+                    "SELECT label,usage_json FROM upstream_credentials "
+                    "WHERE uuid='credential-local'").fetchone()
                 check.close()
                 return RemoteArtifact("token-board_config_20260824_120000.db",
                                       etag='"etag"')
@@ -612,6 +643,8 @@ class SyncContractTest(unittest.TestCase):
             self.assertEqual(captured["secret_count"], 0)
             self.assertIsNone(captured["password"])
             self.assertEqual(captured["client_key"], "tb-local-key")
+            self.assertEqual(captured["label"], "local label")
+            self.assertIsNone(captured["usage_json"])
 
             conn = sqlite3.connect(proxy)
             self.assertEqual(
@@ -620,6 +653,11 @@ class SyncContractTest(unittest.TestCase):
             self.assertEqual(
                 conn.execute("SELECT value FROM sync_settings WHERE key='password'").fetchone()[0],
                 "pass")
+            self.assertEqual(
+                conn.execute("SELECT label,usage_json FROM upstream_credentials "
+                             "WHERE uuid='credential-local'").fetchone(),
+                ("local label",
+                 json.dumps({"checked_at": "2026-10-12T04:00:00Z"})))
             conn.close()
         finally:
             patch.stopall()

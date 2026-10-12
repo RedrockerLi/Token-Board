@@ -645,7 +645,8 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
             str(self.proxy_path), str(self.root / "schema"),
             str(socket_path), str(health_path))
         with patch("maintenance.fx.ensure_rate"), patch(
-                "maintenance.materialize_all_period_charges"):
+                "maintenance.materialize_all_period_charges"), patch(
+                "maintenance.poll_usage_once"):
             service.start()
             app = create_app(str(self.proxy_path), testing=True,
                              start_background_tasks=False,

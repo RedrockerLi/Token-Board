@@ -25,6 +25,31 @@ def list_accounts():
     return jsonify(_proxy_db().get_accounts())
 
 
+def _trigger_usage_refresh_after_write(account_id: int) -> None:
+    """Eagerly wake the maintenance-owned usage poller for this account.
+
+    Only accounts whose final subtype declares a usage query path need the
+    refresh.  The write already committed, so a missing socket or a failed
+    read must never turn the successful API call into an error.
+    """
+    try:
+        from app.domain.account_types import spec
+        from app.services.runtime_tasks import trigger_usage_refresh
+
+        account = next((item for item in _proxy_db().get_accounts()
+                        if item["id"] == account_id), None)
+        if account is None:
+            return
+        subtype_spec = spec(account.get("account_type")).subtypes.get(
+            account.get("subtype") or "")
+        if subtype_spec is None or not subtype_spec.usage_path:
+            return
+        trigger_usage_refresh(current_app)
+    except Exception as exc:
+        current_app.logger.warning(
+            "usage refresh trigger failed for account %s: %s", account_id, exc)
+
+
 @bp_proxy.route("/accounts", methods=["POST"])
 @require_config_writable
 def create_account():
@@ -33,10 +58,11 @@ def create_account():
         return api_error("name is required", 400)
     try:
         account_id = _proxy_db().create_account(data)
-        return jsonify({"id": account_id}), status_for(
-            "resource_create", {"status": "ok"})
     except Exception as e:
         return api_error(str(e), 400)
+    _trigger_usage_refresh_after_write(account_id)
+    return jsonify({"id": account_id}), status_for(
+        "resource_create", {"status": "ok"})
 
 
 @bp_proxy.route("/accounts/<int:account_id>", methods=["PUT"])
@@ -50,6 +76,7 @@ def update_account(account_id):
         return api_error(str(exc), 409 if isinstance(exc, ConflictError) else 400)
     if not ok:
         return api_error("No fields to update or account not found", 400)
+    _trigger_usage_refresh_after_write(account_id)
     return jsonify({"status": "ok"})
 
 

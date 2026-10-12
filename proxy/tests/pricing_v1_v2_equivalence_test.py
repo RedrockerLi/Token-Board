@@ -149,7 +149,7 @@ def run_equivalence(schema_root: Path) -> None:
         _migrate_v1(v1, schema_root)
         _seed_current_pricing(v1)
         _clone_database(v1, v2)
-        _upgrade(v2, schema_root, 4)
+        _upgrade(v2, schema_root, 5)
 
         _insert_cases(v1, "v1")
         _insert_cases(v2, "v2")
@@ -177,18 +177,18 @@ def run_recovery(schema_root: Path) -> None:
         # later process must continue at the next file, not rebuild facts.
         _upgrade(db_path, schema_root, 0)
         assert _usage_rows(db_path) == before
-        _upgrade(db_path, schema_root, 4)
+        _upgrade(db_path, schema_root, 5)
         assert _usage_rows(db_path) == before
 
         # Re-running the completed upgrade is the restart path used after a
         # health-check timeout or a process replacement.
-        _upgrade(db_path, schema_root, 4)
+        _upgrade(db_path, schema_root, 5)
         assert _usage_rows(db_path) == before
         with sqlite_connection(db_path) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 20004
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 20005
             assert conn.execute(
                 "SELECT count(*) FROM schema_migrations WHERE major=2"
-            ).fetchone()[0] == 5
+            ).fetchone()[0] == 6
     print("V1/V2 pricing recovery passed")
 
 

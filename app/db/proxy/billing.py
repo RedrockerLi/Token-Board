@@ -9,11 +9,18 @@ daily rate movements never touch it.  Missing historical rates are fetched
 on demand via fx.ensure_rate(?date=period_start); on failure the nearest
 stored rate is frozen as the permanent fallback.  Recurring rows are finalized
 as soon as their period-start amount is known.
+
+Which period is "current" is decided by one resolver
+(:func:`resolve_unit_period`): the recorded ledger wins while it still covers
+the moment, otherwise the unit rolls from the previous period's end — driven
+by a fresh observed monthly reset (:mod:`app.services.key_usage`) when the
+upstream reports one, and by the anchor-day calendar otherwise.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from datetime import date, datetime
 
 from app.core import sqlite_runtime
@@ -23,7 +30,7 @@ from app.core.time import (
 )
 from app.db.proxy.billing_export import ensure_billing_export_events_conn
 from app.services import fx
-from app.services.billing_units import BillingUnitResolver
+from app.services.billing_units import BillingUnit, BillingUnitResolver
 
 
 def _period(moment: datetime, anchor: int) -> tuple[datetime, datetime]:
@@ -41,8 +48,67 @@ def _next_period(start: datetime, anchor: int) -> tuple[datetime, datetime]:
     return period.start, period.end
 
 
+def _period_chain(start_dt: datetime, end_dt: datetime,
+                  anchor: int) -> Iterator[tuple[datetime, datetime]]:
+    """Yield the anchor periods of one stream, starting with the first."""
+    while True:
+        yield start_dt, end_dt
+        start_dt, end_dt = _next_period(start_dt, anchor)
+
+
 def _current_period_start(moment: datetime, anchor: int) -> str:
     return format_utc(billing_period(moment, anchor).start)
+
+
+def _timestamp(value: object) -> datetime | None:
+    """Parse one optional runtime timestamp, ignoring malformed values."""
+    try:
+        return parse_runtime_timestamp(value)
+    except ValueError:
+        return None
+
+
+def resolve_unit_period(conn: sqlite3.Connection, unit: BillingUnit,
+                        moment: datetime) -> tuple[datetime, datetime] | None:
+    """Resolve the billable period of one proxy unit at *moment*.
+
+    The ledger is authoritative: while a recorded charge covers *moment* its
+    period is returned unchanged.  Otherwise the unit rolls forward from the
+    previous period's end, driven by the observed monthly reset when the
+    upstream usage snapshot is fresh and by the anchor day otherwise.  A unit
+    whose billing start lies in the future has no period yet.
+    """
+    moment = as_utc(moment).replace(microsecond=0)
+    if moment < as_utc(unit.valid_from):
+        return None
+    row = conn.execute(
+        "SELECT period_start,period_end FROM billing_period_charges "
+        "WHERE contract_id=? AND credential_uuid IS ? AND period_start<=? "
+        "ORDER BY period_start DESC LIMIT 1",
+        (unit.contract_id, unit.credential_uuid, format_utc(moment)),
+    ).fetchone()
+    previous_end = _timestamp(row["period_end"]) if row is not None else None
+    if previous_end is not None and moment < previous_end:
+        previous_start = _timestamp(row["period_start"])
+        if previous_start is not None:
+            return previous_start, previous_end
+    anchor = billing_period(moment, unit.anchor_day)
+    observed = unit.observed_period
+    if observed is None or not unit.observed_fresh(moment):
+        # The anchor calendar: a rolling start lands exactly on the previous
+        # period's end, otherwise on the boundary containing the moment.
+        return previous_end or anchor.start, anchor.end
+    start = previous_end or observed.start
+    # An upstream window can begin before this machine knew the subscription;
+    # the valid_from floor must hold for the first observed period too, or the
+    # row would start before the paid term and find no price event.
+    valid_from = as_utc(unit.valid_from)
+    if start < valid_from:
+        start = valid_from
+    end = observed.end
+    if end <= start:
+        end = billing_period(start, unit.anchor_day).end
+    return start, end
 
 
 def proxy_billing_ready(conn: sqlite3.Connection, account_id: int,
@@ -52,11 +118,14 @@ def proxy_billing_ready(conn: sqlite3.Connection, account_id: int,
     units = [u for u in BillingUnitResolver.proxy_units(conn, at=moment)
              if u.account_id == account_id]
     for unit in units:
-        start = _current_period_start(moment, unit.anchor_day)
+        period = resolve_unit_period(conn, unit, moment)
+        if period is None:
+            continue
         row = conn.execute(
             "SELECT 1 FROM billing_period_charges WHERE contract_id=? "
             "AND credential_uuid IS ? AND period_start=? LIMIT 1",
-            (unit.contract_id, unit.credential_uuid, start)).fetchone()
+            (unit.contract_id, unit.credential_uuid,
+             format_utc(period[0]))).fetchone()
         if row is None:
             return False
     return True
@@ -124,20 +193,26 @@ def prewarm_period_fx_rates_conn(conn: sqlite3.Connection,
     for unit in units:
         if unit.currency == "CNY":
             continue
-        target = _current_period_start(moment, unit.anchor_day)[:10]
+        if agent:
+            start_stamp = _current_period_start(moment, unit.anchor_day)
+        else:
+            period = resolve_unit_period(conn, unit, moment)
+            if period is None:
+                continue
+            start_stamp = format_utc(period[0])
+        target = start_stamp[:10]
         if agent:
             frozen = conn.execute(
                 "SELECT 1 FROM agent_subscription_period_charges "
                 "WHERE instance_id=? AND period_start=? AND is_finalized=1 LIMIT 1",
-                (unit.owner_id, f"{target}T00:00:00Z"),
+                (unit.owner_id, start_stamp),
             ).fetchone()
         else:
             frozen = conn.execute(
                 "SELECT 1 FROM billing_period_charges "
                 "WHERE contract_id=? AND credential_uuid IS ? AND period_start=? "
                 "AND finalized_at IS NOT NULL LIMIT 1",
-                (unit.contract_id, unit.credential_uuid,
-                 f"{target}T00:00:00Z"),
+                (unit.contract_id, unit.credential_uuid, start_stamp),
             ).fetchone()
         if frozen is not None:
             # A failed historical fetch may have frozen a nearest stored rate
@@ -172,8 +247,14 @@ def _materialize_period_stream(
         charge_owner_column: str, credential_uuid: str | None,
         charge_subscription_id: int | None = None,
         charge_software_id: int | None = None,
-        current_only: bool = False) -> int:
-    """Materialize one recurring stream using the shared Plan algorithm."""
+        current_only: bool = False,
+        period: tuple[datetime, datetime] | None = None) -> int:
+    """Materialize one recurring stream using the shared Plan algorithm.
+
+    ``period`` overrides the anchoring rules with one already resolved
+    ``(start, end)`` period (the reset-driven path); it is materialized alone,
+    because an observed period does not advance on the anchor calendar.
+    """
     ended = None
     if ends_at:
         ended = parse_runtime_timestamp(ends_at)
@@ -182,11 +263,16 @@ def _materialize_period_stream(
         ended = ended.replace(microsecond=0)
     cutoff = min(moment, ended) if ended else moment
     anchor_day = anchor.day
-    start_dt, end_dt = (_period(_as_utc_datetime(moment), anchor_day)
-                        if current_only else
-                        _period(_as_utc_datetime(anchor), anchor_day))
+    if period is not None:
+        periods = (period,)
+    else:
+        first = (_period(_as_utc_datetime(moment), anchor_day) if current_only else
+                 _period(_as_utc_datetime(anchor), anchor_day))
+        periods = _period_chain(*first, anchor_day)
     changed = 0
-    while start_dt <= cutoff:
+    for start_dt, end_dt in periods:
+        if start_dt > cutoff:
+            break
         if ends_on is not None and start_dt.date() >= ends_on:
             break
         start, end = format_utc(start_dt), format_utc(end_dt)
@@ -214,7 +300,6 @@ def _materialize_period_stream(
             existing["finalized_at"] is not None if has_credential else
             bool(existing["is_finalized"])))
         if already_finalized:
-            start_dt, end_dt = _next_period(start_dt, anchor_day)
             continue
 
         if existing is not None:
@@ -293,7 +378,6 @@ def _materialize_period_stream(
                         (normalized, "CNY", fx_date, now, existing["id"]),
                     )
                 changed += 1
-        start_dt, end_dt = _next_period(start_dt, anchor_day)
     return changed
 
 def _finalize_period_stream(conn: sqlite3.Connection, table: str,
@@ -336,7 +420,13 @@ def materialize_period_charges_conn(conn: sqlite3.Connection,
     changed = 0
     period_starts: set[str] = set()
     for unit in BillingUnitResolver.proxy_units(conn, at=moment):
-        period_starts.add(_current_period_start(moment, unit.anchor_day))
+        period = resolve_unit_period(conn, unit, moment)
+        if period is None:
+            continue
+        if current_only:
+            period_starts.add(format_utc(period[0]))
+        else:
+            period_starts.add(_current_period_start(moment, unit.anchor_day))
         changed += _materialize_period_stream(
             conn, owner_id=unit.owner_id, anchor=unit.valid_from,
             currency=unit.currency,
@@ -347,7 +437,8 @@ def materialize_period_charges_conn(conn: sqlite3.Connection,
             charge_table="billing_period_charges",
             charge_owner_column="contract_id",
             credential_uuid=unit.credential_uuid,
-            current_only=current_only)
+            current_only=current_only,
+            period=period if current_only else None)
     changed += _finalize_period_stream(
         conn, "billing_period_charges", now, period_starts)
     changed += ensure_billing_export_events_conn(conn)

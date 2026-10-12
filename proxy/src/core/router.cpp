@@ -1,15 +1,85 @@
 #include "router.h"
+#include "candidate_selection.h"
 #include "db.h"
 #include "upstream_client.h"
 #include "logging.h"
+#include "json.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace {
+
+// "YYYY-MM-DDThh:mm:ss[.fff]Z" → epoch seconds; 0 when unparseable.  The
+// usage poller writes UTC timestamps only, so a missing designator is read as
+// UTC rather than as local time.
+std::int64_t parse_utc_timestamp(const std::string &value) {
+    std::tm tm{};
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    if (std::sscanf(value.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d", &year, &month,
+                    &day, &hour, &minute, &second) != 6)
+        return 0;
+    if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 ||
+        minute > 59 || second > 60 || year < 1970)
+        return 0;
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second < 60 ? second : 59;
+    tm.tm_isdst = 0;
+    const std::time_t epoch = timegm(&tm);
+    return epoch > 0 ? static_cast<std::int64_t>(epoch) : 0;
+}
+
+// Parse one credential's usage_json into the frozen snapshot shape:
+//   {"checked_at": …, "error": null|"…", "windows": {"5h": {...}, "week": …,
+//    "month": …}, "monthly_period": {...}}
+// Unusable input means "no usage data" (a null result), so the credential then
+// has no deadline and is never treated as exhausted.  Fields are read one at a
+// time: a single window with a bad payload must not discard the others.
+std::shared_ptr<const routing::CredentialUsage> parse_credential_usage(
+    int key_slot_id, const std::string &text) {
+    if (text.empty()) return nullptr;
+    routing::CredentialUsage usage;
+    try {
+        const auto root = nlohmann::json::parse(text);
+        if (!root.is_object()) return nullptr;
+        const auto windows = root.find("windows");
+        if (windows == root.end() || !windows->is_object()) return nullptr;
+        for (const char *name : {"5h", "week", "month"}) {
+            const auto window = windows->find(name);
+            if (window == windows->end() || !window->is_object()) continue;
+            const auto percent = window->find("percent");
+            if (percent == window->end() || !percent->is_number()) continue;
+            routing::UsageWindow entry;
+            entry.name = name;
+            entry.percent = static_cast<int>(
+                std::clamp(percent->get<double>(), 0.0, 100.0));
+            const auto reset = window->find("resets_at");
+            if (reset != window->end() && reset->is_string())
+                entry.resets_at = parse_utc_timestamp(reset->get<std::string>());
+            if (entry.percent >= kExhaustedPercent) usage.exhausted = true;
+            usage.windows.push_back(std::move(entry));
+        }
+    } catch (const std::exception &e) {
+        TB_LOG_WARN("[Router] credential %d has an unreadable usage snapshot "
+                    "(%s); scheduling it without usage data\n",
+                    key_slot_id, e.what());
+        return nullptr;
+    } catch (...) {
+        TB_LOG_WARN("[Router] credential %d has an unreadable usage snapshot; "
+                    "scheduling it without usage data\n", key_slot_id);
+        return nullptr;
+    }
+    if (usage.windows.empty()) return nullptr;
+    return std::make_shared<const routing::CredentialUsage>(std::move(usage));
+}
 
 bool glob_match(const std::string &pattern, const std::string &value) {
     size_t p = 0, v = 0, star = std::string::npos, retry = 0;
@@ -107,6 +177,8 @@ bool Router::reload() {
                 routing::CredentialRuntime cred;
                 cred.key_slot_id = key_ref->id;
                 cred.key_ref = key_ref;
+                cred.usage_ref =
+                    parse_credential_usage(key_ref->id, key_ref->usage_json);
                 cred_index = static_cast<std::uint32_t>(next->credentials.size());
                 credential_by_id.emplace(key_ref->id, cred_index);
                 next->credentials.push_back(std::move(cred));

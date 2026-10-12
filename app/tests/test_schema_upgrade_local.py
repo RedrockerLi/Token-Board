@@ -55,6 +55,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         shutil.copytree(self.root / "schema", legacy_schema)
         (legacy_schema / "token-board/v2/2-3_remove_agent_request_context.sql").unlink()
         (legacy_schema / "token-board/v2/2-4_agent_usage_receipts.sql").unlink()
+        (legacy_schema / "token-board/v2/2-5_opencode_go_subtype.sql").unlink()
 
         ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
         with sqlite_connection(proxy) as conn:
@@ -84,6 +85,13 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                 "SELECT event_id FROM agent_usage_receipts "
                 "WHERE event_id='v23-context'"
             ).fetchone(), ("v23-context",))
+            credential_columns = {row[1] for row in conn.execute(
+                "PRAGMA table_info(upstream_credentials)")}
+            self.assertIn("label", credential_columns)
+            self.assertIn("usage_json", credential_columns)
+            upstream_columns = {row[1] for row in conn.execute(
+                "PRAGMA table_info(upstreams)")}
+            self.assertIn("subtype", upstream_columns)
         self.assertEqual(self._version(proxy), self._latest("token-board"))
 
     def test_current_proxy_schema_treats_every_business_name_as_display_data(self) -> None:

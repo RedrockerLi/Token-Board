@@ -8,10 +8,78 @@ choose the transaction/profile that owns the read.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
-from app.core.time import format_utc, parse_runtime_timestamp, utc_now
+from app.core.time import as_utc, format_utc, parse_runtime_timestamp, utc_now
 from app.db.proxy.common import _parse_iso_date
+
+
+# A usage snapshot older than this cannot drive a reset-driven period: the
+# upstream may have rolled since, so billing falls back to the anchor day.
+OBSERVED_PERIOD_MAX_AGE_SECONDS = 48 * 3600
+
+
+@dataclass(frozen=True)
+class ObservedPeriod:
+    """Complete monthly period reported by the upstream usage endpoint."""
+
+    start: datetime
+    end: datetime
+    checked_at: datetime
+
+    def fresh(self, moment: datetime,
+              max_age: int = OBSERVED_PERIOD_MAX_AGE_SECONDS) -> bool:
+        """Whether this observation is recent enough to drive billing."""
+        age = (as_utc(moment) - self.checked_at).total_seconds()
+        return abs(age) <= max_age
+
+
+def _optional_timestamp(value: object) -> datetime | None:
+    """Parse one optional runtime timestamp, ignoring malformed values."""
+    if value in (None, ""):
+        return None
+    try:
+        return parse_runtime_timestamp(value)
+    except ValueError:
+        return None
+
+
+def parse_observed_period(raw: object) -> ObservedPeriod | None:
+    """Parse ``upstream_credentials.usage_json`` into its observed period.
+
+    An errored, malformed or incomplete-monthly snapshot yields None, which
+    makes the unit fall back to its anchor-day period.  Both ends of the
+    monthly period are required: a snapshot that names only a start would
+    otherwise pin the first billing period to the moment it was taken.
+    """
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("error"):
+        return None
+    monthly = payload.get("monthly_period")
+    checked_at = _optional_timestamp(payload.get("checked_at"))
+    if checked_at is None or not isinstance(monthly, dict):
+        return None
+    start = _optional_timestamp(monthly.get("start"))
+    end = _optional_timestamp(monthly.get("end"))
+    if start is None or end is None:
+        return None
+    return ObservedPeriod(start=start, end=end, checked_at=checked_at)
+
+
+def observed_period_end(raw: object, moment: datetime, *,
+                        max_age: int = OBSERVED_PERIOD_MAX_AGE_SECONDS
+                        ) -> datetime | None:
+    """A fresh observation's monthly end, or None for the anchor fallback."""
+    observed = parse_observed_period(raw)
+    if observed is None or not observed.fresh(moment, max_age):
+        return None
+    return observed.end
 
 
 @dataclass(frozen=True)
@@ -33,10 +101,17 @@ class BillingUnit:
     key_masked: str | None = None
     contract_id: int | None = None
     subscription_id: int | None = None
+    observed_period: ObservedPeriod | None = None
 
     @property
     def anchor_day(self) -> int:
         return self.valid_from.day
+
+    def observed_fresh(self, moment: datetime,
+                       max_age: int = OBSERVED_PERIOD_MAX_AGE_SECONDS) -> bool:
+        """Whether this unit carries a usable observed monthly period."""
+        return (self.observed_period is not None
+                and self.observed_period.fresh(moment, max_age))
 
 
 def _parsed_ends_at(value: object) -> datetime | None:
@@ -66,7 +141,8 @@ class BillingUnitResolver:
             if contract["billing_scope"] == "credential":
                 seen: set[tuple[int, str]] = set()
                 credentials = conn.execute(
-                    "SELECT c.runtime_id,c.uuid,c.key_masked,c.valid_from,c.created_at,c.ends_at "
+                    "SELECT c.runtime_id,c.uuid,c.key_masked,c.valid_from,c.created_at,"
+                    "c.ends_at,c.usage_json "
                     "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
                     "WHERE u.account_id=? "
                     "AND (c.ends_at IS NULL OR c.ends_at>?) "
@@ -98,6 +174,8 @@ class BillingUnitResolver:
                         credential_runtime_id=credential["runtime_id"],
                         key_masked=credential["key_masked"],
                         contract_id=int(contract["id"]),
+                        observed_period=parse_observed_period(
+                            credential["usage_json"]),
                     ))
             else:
                 valid_from = (
@@ -167,4 +245,7 @@ class BillingUnitResolver:
         return format_utc(unit.ends_at) if unit.ends_at else None
 
 
-__all__ = ["BillingUnit", "BillingUnitResolver"]
+__all__ = [
+    "OBSERVED_PERIOD_MAX_AGE_SECONDS", "BillingUnit", "BillingUnitResolver",
+    "ObservedPeriod", "observed_period_end", "parse_observed_period",
+]

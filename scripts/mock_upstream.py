@@ -40,6 +40,11 @@ Response selection:
     "GoUsageLimitError"); "mock_error_type_by_key" keys that by Authorization
     key; "mock_error_body" is a verbatim body override; "mock_retry_after" adds
     a Retry-After header; "mock_limit_name" sets metadata.limitName.
+  - "mock_require_session": true makes the mock behave like the opencode.ai
+    gateway: a request without an `x-opencode-session` header is answered with
+    400 {"error":{"code":400,"type":"MissingSessionID",…},"type":"error"}.
+    GET requests (which carry no body flag) opt in via POST /__ctrl
+    {"require_session": true} instead.  Default OFF.
   - Streaming timing: "mock_chunk_delay" sleeps between SSE frames;
     "mock_stall_after" pauses after that frame index (post-commit stall);
     "mock_stall_secs" the pause length; "mock_stall_forever" stalls forever.
@@ -48,6 +53,15 @@ Response selection:
   - "mock_simple_stream": true returns the plain content-only stream (no
     reasoning_content / cost frames).
   - Streaming: request body "stream": true returns an SSE stream.
+
+GET endpoints:
+  - /__ctrl/status and POST /__ctrl drive the test control surface (per-key GET
+    status, the `usage` override of the /v1/usage fixture, and a session
+    requirement for GETs).
+  - /v1/usage answers the quota fixture the "opencode-go" usage poller reads:
+    {"usage":{"rolling":{…},"weekly":{…},"monthly":{…}}}.  It is NOT counted as
+    a cooldown probe (those are GET /models only) and can be overridden by
+    setting `usage` through POST /__ctrl or by a "mock_usage" body key.
 
 Usage:
     python3 scripts/mock_upstream.py --port 9100 [--log /tmp/mock.log]
@@ -68,8 +82,45 @@ LOG_FILE = "/tmp/mock_upstream.log"
 # overrides the response status for GETs (429 → GoUsageLimitError envelope);
 # `default_get_status` is the fallback (200 = existing behavior).
 CONTROL_LOCK = threading.Lock()
-CONTROL = {"status_by_key": {}, "default_get_status": 200}
+CONTROL = {"status_by_key": {}, "default_get_status": 200, "usage": None,
+           "require_session": False}
 PROBES = {}  # auth key → GET /models count (the proxy's probe hits this path)
+
+
+def iso_after(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+
+
+# Body of GET /v1/usage, the quota endpoint the "opencode-go" usage poller
+# reads.  Callers care about the rolling/weekly/monthly percentages and their
+# reset instants; the windows are named the way the real gateway reports them
+# (rolling = the 5h window).
+def usage_fixture(override=None):
+    if override is not None:
+        return override
+    return {
+        "usage": {
+            "rolling": {"status": "ok", "percent": 37,
+                        "resetsAt": iso_after(5 * 3600)},
+            "weekly": {"status": "ok", "percent": 12,
+                       "resetsAt": iso_after(3 * 86400)},
+            "monthly": {"status": "ok", "percent": 4,
+                        "resetsAt": iso_after(20 * 86400)},
+        }
+    }
+
+
+# Body returned for a session-less request when "mock_require_session" is set,
+# mirroring the opencode.ai gateway's "cannot be routed efficiently" rejection.
+MISSING_SESSION_BODY = {
+    "error": {
+        "code": 400,
+        "message": ("Request is missing x-opencode-session and cannot be "
+                    "routed efficiently."),
+        "type": "MissingSessionID",
+    },
+    "type": "error",
+}
 
 # Exact error body returned by the real opencode.ai "Console Go" backend for
 # request-validation failures (observed 2026-08).
@@ -128,6 +179,22 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(length) if length else b""
 
+    def _usage_body(self):
+        """The /v1/usage fixture, overridable per request or via /__ctrl."""
+        override = None
+        raw = self._read_body()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and "mock_usage" in parsed:
+                override = parsed["mock_usage"]
+        with CONTROL_LOCK:
+            if override is None:
+                override = CONTROL.get("usage")
+        return usage_fixture(override)
+
     def do_GET(self):
         # Control introspection: polled by the probe test to wait until the
         # proxy's background probe actually reached the upstream.
@@ -143,12 +210,40 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        # Quota fixture for the "opencode-go" usage poller.  Handled before the
+        # generic catch-all (and before the probe counter) because it is a
+        # plain read, not a health probe: cooldown probes count GET /models.
+        if self.path.split("?")[0].endswith("/v1/usage"):
+            payload = json.dumps(self._usage_body()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         auth_key = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
         if not auth_key:
             auth_key = self.headers.get("x-api-key") or ""
         if self.path.endswith("/models"):
             with CONTROL_LOCK:
                 PROBES[auth_key] = PROBES.get(auth_key, 0) + 1
+
+        # GET requests carry no body, so the session requirement is driven by
+        # POST /__ctrl {"require_session": true} instead of a body flag.  The
+        # request is counted as a probe even when it is rejected here: callers
+        # observe the header discipline through the response, not the counter.
+        with CONTROL_LOCK:
+            require_session = bool(CONTROL.get("require_session"))
+        if require_session and not (
+                self.headers.get("x-opencode-session") or "").strip():
+            payload = json.dumps(MISSING_SESSION_BODY).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         with CONTROL_LOCK:
             status = CONTROL["status_by_key"].get(
                 auth_key, CONTROL["default_get_status"])
@@ -180,6 +275,13 @@ class Handler(BaseHTTPRequestHandler):
                     CONTROL["status_by_key"].pop(str(k), None)
                 if "default_get_status" in ctrl:
                     CONTROL["default_get_status"] = int(ctrl["default_get_status"])
+                if "usage" in ctrl:
+                    # None restores the built-in fixture.
+                    CONTROL["usage"] = ctrl["usage"]
+                if "require_session" in ctrl:
+                    # Applies to GETs (see do_GET); POSTs opt in per request
+                    # with the mock_require_session body flag.
+                    CONTROL["require_session"] = bool(ctrl["require_session"])
             body = b'{"ok": true}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -226,8 +328,22 @@ class Handler(BaseHTTPRequestHandler):
             "x_api_key": self.headers.get("x-api-key"),
             "anthropic_version": self.headers.get("anthropic-version"),
             "content_type": self.headers.get("Content-Type"),
+            "x_opencode_session": self.headers.get("x-opencode-session"),
+            "user_agent": self.headers.get("User-Agent"),
             "body": req,
         })
+
+        # The real opencode.ai gateway refuses to route a session-less request.
+        # Opt-in per request (mock_require_session); default OFF.
+        if req.get("mock_require_session") and not (
+                self.headers.get("x-opencode-session") or "").strip():
+            payload = json.dumps(MISSING_SESSION_BODY).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         stream = bool(req.get("stream")) and status == 200
         request_model = req.get("model", "mock-model")

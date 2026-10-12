@@ -9,6 +9,7 @@ void ProxyServer::handle_streaming(
     const std::string &resolved_model, std::shared_ptr<const json> parsed_json,
     std::shared_ptr<const ir::ChatRequest> parsed_request, std::shared_ptr<const ir::ConversionContext> conversion_context,
     std::shared_ptr<const std::vector<json>> state_current_input, std::shared_ptr<UsageReservation> reservation,
+    const std::string &opencode_session,
     const std::string &anthropic_beta, const httplib::Request &req,
     httplib::Response &res, std::chrono::steady_clock::time_point t0) {
     const FormatCodec &harness_codec = codecs_.get(harness);
@@ -26,7 +27,7 @@ void ProxyServer::handle_streaming(
          local_key_id,
          endpoint_kind, harness, resolved_model, parsed_json, parsed_request, conversion_context,
          state_current_input, reservation,
-         anthropic_beta,
+         opencode_session, anthropic_beta,
          base_timeouts, deadline, budget_seconds,
          content_type, t0, &res,
          client_sock = req.client_socket,
@@ -325,6 +326,8 @@ void ProxyServer::handle_streaming(
                         opts.streaming_body_buffer_limit = 256 * 1024;
                         if (upstream == ir::ApiFormat::Anthropic)
                             opts.anthropic_beta = anthropic_beta;
+                        configure_opencode_session(opts, candidate,
+                                                   opencode_session);
                         if (strict_terminal_enabled())
                             opts.terminal_seen = attempt_terminal_seen;
                     });

@@ -24,8 +24,15 @@ async function ensureTypeSpecs() {
 function typeSpec(type) {
     return (TYPE_SPECS && TYPE_SPECS[type]) || (TYPE_SPECS && TYPE_SPECS.api)
         || { billing: 'usage', routable: true, holds_keys: true,
-             usage_source: 'proxy', deletion: 'immediate', cooldown: 'transient',
-             subscription_unit: null, label: '', short_label: '' };
+             usage_source: 'proxy', deletion: 'immediate', cooldown: null,
+             subscription_unit: null, label: '', short_label: '', subtypes: {} };
+}
+
+/** Subtype spec under a type (same fetched table); null when the subtype is
+ *  unknown or absent — payloads without subtypes must degrade to null here. */
+function subtypeSpec(type, subtype) {
+    const subs = typeSpec(type).subtypes || {};
+    return (subtype && subs[subtype]) || null;
 }
 
 /** Spec labels read "<type> — <说明>"; the clause after the dash becomes the
@@ -36,8 +43,17 @@ function _typeRailDesc(spec) {
     return dash === -1 ? label : label.slice(dash + 1).trim();
 }
 
+/** The part before the dash names the card itself (types carry short_label,
+ *  subtype cards fall back to this clause). */
+function _typeRailName(spec) {
+    const label = String((spec && spec.label) || '');
+    const dash = label.indexOf('—');
+    return dash === -1 ? label : label.slice(0, dash).trim();
+}
+
 /** Render the account-type rail (left column of the account modal) from the
- *  spec table — labels and badges only, never hard-coded type strings. */
+ *  spec table — labels and badges only, never hard-coded type strings.  Each
+ *  subtype renders as an indented child card under its type. */
 function _populateTypeOptions() {
     const rail = document.getElementById('accountTypeRail');
     if (!rail || !TYPE_SPECS) return;
@@ -47,32 +63,93 @@ function _populateTypeOptions() {
             <span class="badge badge--type-${esc(t)}">${esc(s.short_label || t)}</span>
             <span class="type-rail__desc">${esc(_typeRailDesc(s))}</span>
         </button>
+        ${Object.entries(s.subtypes || {}).map(([name, sub]) => {
+            const subName = _typeRailName(sub);
+            const subDesc = _typeRailDesc(sub);
+            // 无破折号的 label：名称与说明相同，避免重复渲染描述行。
+            return `
+            <button type="button" class="type-rail__subitem" data-type="${esc(t)}"
+                    data-subtype="${esc(name)}" aria-pressed="false">
+                <span class="type-rail__connector" aria-hidden="true">└</span>
+                <span class="type-rail__sub-body">
+                    <span class="type-rail__sub-name">${esc(subName)}</span>
+                    ${subDesc === subName ? '' : `<span class="type-rail__sub-desc">${esc(subDesc)}</span>`}
+                </span>
+            </button>
+        `;
+        }).join('')}
     `).join('');
     rail.querySelectorAll('.type-rail__item').forEach((btn) => {
         btn.addEventListener('click', () => selectAccountType(btn.dataset.type));
     });
-}
-
-/** Highlight the rail item matching the form's current account_type. */
-function syncAccountTypeRail() {
-    const input = document.querySelector('#accountForm [name="account_type"]');
-    const current = input ? input.value : '';
-    document.querySelectorAll('#accountTypeRail .type-rail__item').forEach((btn) => {
-        const active = btn.dataset.type === current;
-        btn.classList.toggle('is-active', active);
-        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    rail.querySelectorAll('.type-rail__subitem').forEach((btn) => {
+        btn.addEventListener('click', () => selectAccountSubtype(btn.dataset.type, btn.dataset.subtype));
     });
 }
 
+/** Highlight the rail card matching the form's current account_type /
+ *  account_subtype: a plain type lights the parent card, a subtype lights the
+ *  child card. */
+function syncAccountTypeRail() {
+    const form = document.querySelector('#accountForm');
+    const typeInput = form && form['account_type'];
+    const subInput = form && form['account_subtype'];
+    const type = typeInput ? typeInput.value : '';
+    const subtype = subInput ? subInput.value : '';
+    document.querySelectorAll('#accountTypeRail .type-rail__item, #accountTypeRail .type-rail__subitem')
+        .forEach((btn) => {
+            const active = btn.classList.contains('type-rail__subitem')
+                ? (btn.dataset.type === type && btn.dataset.subtype === subtype)
+                : (btn.dataset.type === type && !subtype);
+            btn.classList.toggle('is-active', active);
+            btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+}
+
+/** Store the hidden account_subtype ('' = plain type, cleared on every plain
+ *  type pick). */
+function _setAccountSubtype(subtype) {
+    const input = document.querySelector('#accountForm [name="account_subtype"]');
+    if (input) input.value = subtype || '';
+}
+
 /** Pick an account type from the rail: store it on the form (the hidden
- *  account_type input feeds saveAccount / collectKeyRows), repaint the rail
- *  selection, and re-apply the type-dependent field visibility. */
+ *  account_type input feeds saveAccount / collectKeyRows), clear any subtype,
+ *  repaint the rail selection, and re-apply the field visibility. */
 function selectAccountType(type) {
     const input = document.querySelector('#accountForm [name="account_type"]');
     if (!input || !TYPE_SPECS || !TYPE_SPECS[type]) return;
     input.value = type;
+    _setAccountSubtype('');
     syncAccountTypeRail();
     toggleTypeFields(input);
+}
+
+/** Fill the form from a subtype's spec presets (base_url / monthly_price /
+ *  currency / api_format …); field names come from the spec, never from
+ *  hard-coded subtype strings. */
+function applySubtypePresets(type, subtype) {
+    const sub = subtypeSpec(type, subtype);
+    const form = document.querySelector('#accountForm');
+    if (!sub || !form) return;
+    Object.entries(sub.presets || {}).forEach(([field, value]) => {
+        const el = form[field];
+        if (el && value != null) el.value = value;
+    });
+    updatePlanPriceSymbol();
+}
+
+/** Pick a subtype child card: same flow as its parent type plus the spec
+ *  presets (presets apply on this explicit click only — never on modal open). */
+function selectAccountSubtype(type, subtype) {
+    const input = document.querySelector('#accountForm [name="account_type"]');
+    if (!input || !TYPE_SPECS || !TYPE_SPECS[type]) return;
+    if (!subtypeSpec(type, subtype)) return;
+    input.value = type;
+    _setAccountSubtype(subtype);
+    syncAccountTypeRail();
+    toggleTypeFields(input);
+    applySubtypePresets(type, subtype);
 }
 
 function showToast(msg, type = 'success') {
@@ -86,6 +163,12 @@ function showToast(msg, type = 'success') {
         toast.style.transition = 'opacity 0.3s';
         setTimeout(() => toast.remove(), 300);
     }, 3000);
+}
+
+/** Escape a value for a single-quoted JS argument inside an HTML onclick
+ *  attribute: esc() covers the HTML layer and ' must not close the string. */
+function jsArg(value) {
+    return esc(value).replace(/'/g, '\\x27');
 }
 
 function maskKey(key) {
@@ -223,10 +306,17 @@ function addKeyRow(value, validFrom) {
     const list = document.getElementById('keyList');
     if (!list) return;
     const div = document.createElement('div');
-    div.style.cssText = 'display:flex; gap:6px; margin:6px 0; align-items:center;';
+    div.style.cssText = 'display:flex; gap:6px; margin:6px 0; align-items:center; flex-wrap:wrap;';
+    const label = document.createElement('input');
+    label.type = 'text';
+    label.className = 'key-label-input';
+    label.name = 'upstream_labels[]';
+    label.placeholder = '密钥名称（可选）';
+    label.addEventListener('input', () => { _keyRowsEdited = true; });
     const input = document.createElement('input');
     input.type = 'text';
     input.name = 'upstream_keys[]';
+    input.style.cssText = 'flex:1 1 160px; min-width:0;';
     input.placeholder = 'sk-...（新密钥）';
     input.value = value || '';
     input.addEventListener('input', () => { _keyRowsEdited = true; });
@@ -245,21 +335,28 @@ function addKeyRow(value, validFrom) {
     del.className = 'btn btn--sm';
     del.textContent = '删除';
     del.onclick = () => { _keyRowsEdited = true; div.remove(); };
+    div.appendChild(label);
     div.appendChild(input);
     div.appendChild(date);
     div.appendChild(del);
     list.appendChild(div);
 }
 
-function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion) {
+function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion, label) {
     const list = document.getElementById('keyList');
     if (!list) return;
     const div = document.createElement('div');
-    div.style.cssText = 'display:flex; gap:6px; margin:6px 0; align-items:center;';
+    div.style.cssText = 'display:flex; gap:6px; margin:6px 0; align-items:center; flex-wrap:wrap;';
     div.className = 'existing-key';
     div.dataset.keepId = keepId;
+    const labelInput = document.createElement('input');
+    labelInput.type = 'text';
+    labelInput.className = 'existing-key-label key-label-input';
+    labelInput.placeholder = '密钥名称（可选）';
+    labelInput.value = label ? String(label) : '';
+    labelInput.addEventListener('input', () => { _keyRowsEdited = true; });
     const span = document.createElement('span');
-    span.style.cssText = 'flex:1; font-family:monospace; background:var(--color-surface-sunken, #eeebe5); padding:4px 8px; border-radius:4px; color:var(--color-text-secondary, #716b65);';
+    span.style.cssText = 'flex:1 1 90px; min-width:0; font-family:monospace; background:var(--color-surface-sunken, #eeebe5); padding:4px 8px; border-radius:4px; color:var(--color-text-secondary, #716b65);';
     span.textContent = masked + (pendingDeletion
         ? '（已安排本期期末自动删除）'
         : '（已配置，如需删除点“移除”）');
@@ -282,6 +379,7 @@ function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion) {
         del.textContent = '移除';
         del.onclick = () => { _keyRowsEdited = true; div.remove(); };
     }
+    div.appendChild(labelInput);
     div.appendChild(span);
     div.appendChild(date);
     div.appendChild(del);
@@ -348,47 +446,137 @@ function collectKeyRows(form) {
     const useKeyDates = typeSpec(type).subscription_unit === 'per_key';
     const keyInputs = [...form.querySelectorAll('#keyList input[name="upstream_keys[]"]')];
     const upstream_keys = [];
+    const new_labels = [];
     const new_valid_froms = [];
     keyInputs.forEach((input) => {
         if (!input.value.trim()) return;
         upstream_keys.push(input.value.trim());
+        // labels align 1:1 with upstream_keys（无论类型，名称都随密钥一起提交）。
+        const labelInput = input.parentElement.querySelector('[name="upstream_labels[]"]');
+        new_labels.push(labelInput && labelInput.value.trim() ? labelInput.value.trim() : null);
         new_valid_froms.push(useKeyDates
             ? (input.parentElement.querySelector('[name="upstream_valid_froms[]"]').value || null)
             : null);
     });
     const keepRows = [...form.querySelectorAll('#keyList .existing-key')];
     const keep_key_ids = keepRows.map(r => r.dataset.keepId);
+    const keep_labels = Object.fromEntries(keepRows.map(r => {
+        const labelInput = r.querySelector('.existing-key-label');
+        return [r.dataset.keepId, labelInput && labelInput.value.trim() ? labelInput.value.trim() : null];
+    }));
     const keep_valid_froms = Object.fromEntries(keepRows.map(r => [
         r.dataset.keepId,
         useKeyDates
             ? (r.querySelector('.existing-key-valid-from').value || null)
             : null,
     ]));
-    return { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms };
+    return { upstream_keys, new_labels, new_valid_froms, keep_key_ids, keep_labels, keep_valid_froms };
 }
 
-async function loadAccountsTable() {
+// The accounts page shows one account type at a time; the switch is rendered
+// from the spec table so a new type appears without touching this file.
+let _accountsCache = null;      // last GET /api/proxy/accounts payload
+let _accountsTabType = 'api';   // selected type tab
+
+/** Render the account-type switch (below the page header) from the spec
+ *  table — one tab per type, short_label only. */
+function renderAccountsViewSwitch() {
+    const bar = document.getElementById('accountsViewSwitch');
+    if (!bar || !TYPE_SPECS) return;
+    if (!TYPE_SPECS[_accountsTabType]) _accountsTabType = Object.keys(TYPE_SPECS)[0] || 'api';
+    bar.innerHTML = Object.keys(TYPE_SPECS).map((t) => `
+        <button type="button" class="view-switch__btn${t === _accountsTabType ? ' is-active' : ''}"
+                data-type="${esc(t)}" aria-pressed="${t === _accountsTabType}">${esc(TYPE_SPECS[t].short_label || t)}</button>
+    `).join('');
+    bar.querySelectorAll('.view-switch__btn').forEach((btn) => {
+        btn.addEventListener('click', () => selectAccountsTab(btn.dataset.type));
+    });
+}
+
+/** Switch the visible account-type tab (rows are filtered client-side from
+ *  the cached payload; no refetch needed).  Without a cache (last load
+ *  failed) the switch retries the fetch instead of rendering stale rows. */
+function selectAccountsTab(type) {
+    if (!TYPE_SPECS || !TYPE_SPECS[type] || type === _accountsTabType) return;
+    _accountsTabType = type;
+    renderAccountsViewSwitch();
+    if (_accountsCache) renderAccountsTable();
+    else loadAccountsTable();
+}
+
+/** One usage window cell ("37%" / "100% 限流" / "—").  The title carries the
+ *  window reset time, or the error / 暂无数据 note when there is no data. */
+function usageWindowCell(win, usage) {
+    const note = usage ? (usage.error ? String(usage.error) : '') : '（暂无数据）';
+    let title = note;
+    if (!note && win && win.resets_at) title = `重置：${fmtLocal(win.resets_at)}`;
+    const titleAttr = title ? ` title="${esc(title)}"` : '';
+    const percent = win && win.percent != null ? Math.round(Number(win.percent)) : NaN;
+    if (!note && Number.isFinite(percent)) {
+        return percent >= 100
+            ? `<td${titleAttr}><span class="badge badge--warn">${percent}% 限流</span></td>`
+            : `<td${titleAttr}>${percent}%</td>`;
+    }
+    return `<td${titleAttr}>—</td>`;
+}
+
+/** 「密钥用量」区：当前标签页的类型若存在带 usage_path 的子类型，则在账户表
+ *  下方按密钥逐行渲染 5h/周/月 用量；无任何符合条件的行时整块隐藏。 */
+function renderAccountUsageSection() {
+    const section = document.getElementById('accountUsageSection');
+    const tbody = document.querySelector('#accountUsageTable tbody');
+    if (!section || !tbody) return;
+    const tracksUsage = Object.values(typeSpec(_accountsTabType).subtypes || {})
+        .some((s) => s && s.usage_path);
+    const rows = [];
+    if (tracksUsage) {
+        (_accountsCache || []).forEach((a) => {
+            if (a.is_aggregate || (a.account_type || 'api') !== _accountsTabType) return;
+            const sub = subtypeSpec(a.account_type, a.subtype);
+            if (!sub || !sub.usage_path) return;
+            (a.keys || []).forEach((k) => {
+                const usage = k.usage || null;   // 无 usage 数据 → 三个窗口显示 —
+                const windows = (usage && usage.windows) || {};
+                rows.push(`
+                    <tr>
+                        <td>${esc(a.name)}</td>
+                        <td>${k.label ? esc(k.label) : `<code>${esc(k.masked || '')}</code>`}</td>
+                        ${usageWindowCell(windows['5h'], usage)}
+                        ${usageWindowCell(windows.week, usage)}
+                        ${usageWindowCell(windows.month, usage)}
+                    </tr>
+                `);
+            });
+        });
+    }
+    tbody.innerHTML = rows.join('');
+    section.style.display = rows.length ? '' : 'none';
+}
+
+/** Render the current tab's account rows from the cached payload. */
+function renderAccountsTable() {
     const tbody = document.querySelector('#accountsTable tbody');
-    if (!tbody) return;
-    tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
-    try {
-        await ensureTypeSpecs();
-        const accounts = await proxyApi('/api/proxy/accounts');
-        const real = accounts.filter(a => !a.is_aggregate);
-        if (!real.length) {
-            tbody.innerHTML = '<tr><td colspan="8" class="td-empty">暂无账户，请点击"添加账户"（聚合账户请到"上游账户聚合"管理）</td></tr>';
-            return;
-        }
-        tbody.innerHTML = real.map((a) => {
+    if (!tbody || !_accountsCache) return;
+    const rows = _accountsCache.filter((a) =>
+        !a.is_aggregate && (a.account_type || 'api') === _accountsTabType);
+    if (!rows.length) {
+        const label = typeSpec(_accountsTabType).short_label || _accountsTabType;
+        tbody.innerHTML = `<tr><td colspan="8" class="td-empty">暂无${esc(label)}类型账户，请点击"添加账户"（聚合账户请到"上游账户聚合"管理）</td></tr>`;
+    } else {
+        tbody.innerHTML = rows.map((a) => {
             const keyEntries = [...(a.keys || []), ...(a.cloud_keys || [])];
             const uniqueMasks = [...new Set(keyEntries.map((key) => key.masked).filter(Boolean))];
             const keyCount = Number(a.key_count || uniqueMasks.length || 0);
             const firstMask = uniqueMasks[0] || '';
+            const keyNames = keyEntries.map((key) => key.label).filter(Boolean);
+            const keyTitle = keyNames.length
+                ? ` title="${esc(`${keyCount} 把密钥：${keyNames.join('、')}`)}"`
+                : '';
             const pendingDeletion = isPendingAccountDeletion(a);
             return `
             <tr>
-                <td>${esc(a.name)}${a.deleted_at ? ` <span class="badge" style="color:#8F5C2D;background:#FBF1DF;border-color:#DFBF86;" title="到期删除：${esc(fmtLocal(a.deleted_at))}">到期 ${esc(fmtLocal(a.deleted_at).slice(0, 10))}</span>` : ''}</td>
-                <td><code>${esc(firstMask)}</code>${keyCount > 1 ? ` <span class="badge" title="${keyCount} 把密钥（同一配置的多个并发槽位）">×${keyCount}</span>` : ''}${!firstMask && !keyCount ? ' <span class="badge" style="color:#8F5C2D;background:#FBF1DF;border-color:#DFBF86;" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
+                <td>${esc(a.name)}${a.ends_at ? ` <span class="badge badge--warn" title="到期删除：${esc(fmtLocal(a.ends_at))}">到期 ${esc(fmtLocal(a.ends_at).slice(0, 10))}</span>` : ''}</td>
+                <td${keyTitle}><code>${esc(firstMask)}</code>${keyCount > 1 ? ` <span class="badge" title="${keyCount} 把密钥（同一配置的多个并发槽位）">×${keyCount}</span>` : ''}${!firstMask && !keyCount ? ' <span class="badge badge--warn" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
                 <td>${accountTypeBadge(a.account_type)}</td>
@@ -399,24 +587,41 @@ async function loadAccountsTable() {
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
                     ${pendingDeletion ? `<button class="btn btn--sm" onclick="cancelAccountDeletion(${a.id})" title="恢复账户及尚未到期的上游密钥">取消删除</button>` : ''}
-                    <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${esc(a.name)}')">更新模型</button>
+                    <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${jsArg(a.name)}')">更新模型</button>
                     ${typeSpec(a.account_type).holds_keys
                         ? (a.max_concurrency
-                            ? `<button class="btn btn--sm" onclick="testConcurrency(${a.id}, '${esc(a.name)}')" title="按当前并发限额向真实上游并发测试">测试并发</button>`
+                            ? `<button class="btn btn--sm" onclick="testConcurrency(${a.id}, '${jsArg(a.name)}')" title="按当前并发限额向真实上游并发测试">测试并发</button>`
                             : `<button class="btn btn--sm" disabled title="该账户无并发限额（无限制），无需测试">测试并发</button>`)
                         : `<button class="btn btn--sm" disabled title="该账户类型无直连上游密钥，不支持并发测试">测试并发</button>`}
                 </td>
             </tr>
         `;
         }).join('');
+    }
+    renderAccountUsageSection();
+}
+
+async function loadAccountsTable() {
+    const tbody = document.querySelector('#accountsTable tbody');
+    if (!tbody) return;
+    tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
+    try {
+        await ensureTypeSpecs();
+        // 标签页只依赖类型规格表：账户列表拉取失败时仍可切换并重试。
+        renderAccountsViewSwitch();
+        _accountsCache = await proxyApi('/api/proxy/accounts');
+        renderAccountsTable();
     } catch (err) {
+        _accountsCache = null;   // 刷新失败时不留旧数据，避免切标签后误显示
         tbody.innerHTML = `<tr><td colspan="8" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
+        const section = document.getElementById('accountUsageSection');
+        if (section) section.style.display = 'none';
     }
 }
 
 function isPendingAccountDeletion(account) {
-    if (!account || !account.deleted_at) return false;
-    const deadline = Date.parse(String(account.deleted_at));
+    if (!account || !account.ends_at) return false;
+    const deadline = Date.parse(String(account.ends_at));
     return Number.isFinite(deadline) && deadline > Date.now();
 }
 
@@ -439,11 +644,13 @@ async function saveAccount(e) {
     const id = form.dataset.editId;
     const type = form['account_type'].value || 'api';
     const s = typeSpec(type);
-    const { upstream_keys, new_valid_froms, keep_key_ids, keep_valid_froms } = collectKeyRows(form);
+    const { upstream_keys, new_labels, new_valid_froms,
+            keep_key_ids, keep_labels, keep_valid_froms } = collectKeyRows(form);
     // 按类型组装 payload：非路由类型不带 Base URL 等路由字段。
     const common = {
         name: form['name'].value,
         account_type: type,
+        subtype: form['account_subtype'] ? (form['account_subtype'].value || null) : null,
         monthly_price: form['monthly_price'] ? (form['monthly_price'].value || 0) : 0,
         currency: form['currency'] ? form['currency'].value : 'CNY',
     };
@@ -461,8 +668,10 @@ async function saveAccount(e) {
             // rename-only save must never wipe the existing keys.
             if (_keyRowsEdited) {
                 payload.upstream_keys = upstream_keys;
+                payload.new_labels = new_labels;
                 payload.new_valid_froms = new_valid_froms;
                 payload.keep_key_ids = keep_key_ids;
+                payload.keep_labels = keep_labels;
                 payload.keep_valid_froms = keep_valid_froms;
                 payload.keys_edited = true;
             }
@@ -478,6 +687,7 @@ async function saveAccount(e) {
                 body: JSON.stringify({
                     ...common,
                     upstream_keys,
+                    new_labels,
                     new_valid_froms,
                 }),
             });
@@ -517,16 +727,17 @@ async function editAccount(id) {
         form['monthly_price'].value = typeSpec(acc.account_type).billing === 'subscription' ? (acc.monthly_price || 0) : '';
         if (form['currency']) form['currency'].value = acc.currency || 'CNY';
         form['max_concurrency'].value = acc.max_concurrency || '';
-        selectAccountType(form['account_type'].value);
+        // 恢复类型/子类型选择并刷新可见性；presets 只在点击子类型卡片时套用。
+        _setAccountSubtype(acc.subtype || '');
+        syncAccountTypeRail();
+        toggleTypeFields(form['account_type']);
         // Existing keys → masked keep-rows; user adds new rows as needed.
-        resetKeyList();
-        // Existing keys → masked keep-rows; user adds new rows as needed.
-        // 已安排本期期末删除的 key（deleted_at 在未来）移除键灰置。
+        // 已安排本期期末删除的 key（ends_at 在未来）移除键灰置。
         resetKeyList();
         const nowUtc = new Date().toISOString();
         (acc.keys || []).forEach((k) => {
             addExistingKeyRow(k.id, k.masked, k.valid_from,
-                              !!(k.deleted_at && k.deleted_at > nowUtc));
+                              !!(k.ends_at && k.ends_at > nowUtc), k.label);
         });
         // cloud-only 密钥（云端有、本机无明文）→ 补填明文的输入框。
         (acc.cloud_keys || []).forEach((ck) => addCloudKeyRow(id, ck));
@@ -598,8 +809,8 @@ async function _doDeleteAccount(id, mode, isSubscription) {
     try {
         const resp = await proxyApi(`/api/proxy/accounts/${id}?mode=${mode}`, { method: 'DELETE' });
         if (resp && resp.deferred) {
-            const until = resp.effective_deleted_at
-                ? fmtLocal(resp.effective_deleted_at).slice(0, 10) : '';
+            const until = resp.effective_ends_at
+                ? fmtLocal(resp.effective_ends_at).slice(0, 10) : '';
             showToast(`已安排到期删除，可继续使用至 ${until}（本期仍计费，下期不计费）`);
         } else if (isSubscription) {
             showToast('账户已删除（本期已计费）');
@@ -699,11 +910,23 @@ function initAccountsPage() {
             <p class="page-subtitle">支持 OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 的上游服务</p>
             <button class="btn btn--primary" onclick="openAddAccountModal()">+ 添加账户</button>
         </div>
+        <!-- 账户类型标签页由 /api/proxy/account-types 的规格表渲染 -->
+        <div class="view-switch" id="accountsViewSwitch" role="group" aria-label="账户类型"></div>
         <div class="table-scroll">
             <table class="mgmt-table" id="accountsTable">
                 <thead><tr><th>名称</th><th>上游密钥</th><th>Base URL</th><th>API 格式</th><th>类型</th><th>订阅月费</th><th>并发限额</th><th>操作</th></tr></thead>
                 <tbody></tbody>
             </table>
+        </div>
+        <!-- 子类型带用量查询时渲染（见 renderAccountUsageSection） -->
+        <div class="usage-section" id="accountUsageSection" style="display:none">
+            <h2 class="usage-section__title">密钥用量</h2>
+            <div class="table-scroll">
+                <table class="mgmt-table usage-table" id="accountUsageTable">
+                    <thead><tr><th>账户</th><th>名称</th><th>5小时</th><th>本周</th><th>本月</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
         </div>
         <div class="modal-overlay" id="accountModal" style="display:none">
             <div class="modal modal--account">
@@ -712,8 +935,9 @@ function initAccountsPage() {
                     <button class="modal__close" onclick="closeModal('accountModal')">&times;</button>
                 </div>
                 <form id="accountForm" onsubmit="saveAccount(event)" data-edit-id="">
-                    <!-- 账户类型由左栏选择卡驱动；隐藏值保持表单字段语义 -->
+                    <!-- 账户类型/子类型由左栏选择卡驱动；隐藏值保持表单字段语义 -->
                     <input type="hidden" name="account_type" value="api">
+                    <input type="hidden" name="account_subtype" value="">
                     <div class="account-form-grid">
                         <aside class="type-rail">
                             <div class="type-rail__title" id="accountTypeRailTitle">账户类型</div>
@@ -805,14 +1029,14 @@ async function loadKeysTable() {
         }
         tbody.innerHTML = keys.map((k) => `
             <tr>
-                <td><code class="key-display" title="${esc(k.key_value)}">${esc(k.key_masked)}</code> <button class="btn btn--sm" onclick="copyKey('${esc(k.key_value)}')">复制</button></td>
+                <td><code class="key-display" title="${esc(k.key_value)}">${esc(k.key_masked)}</code> <button class="btn btn--sm" onclick="copyKey('${jsArg(k.key_value)}')">复制</button></td>
                 <td>${esc(k.label || '-')}</td>
                 <td>${k.account_id == null ? '<span style="color:var(--color-text-tertiary);">未分配</span>' : esc(k.account_name || `ID:${k.account_id}`)}</td>
                 <td>${k.last_used_at ? esc(fmtLocal(k.last_used_at)) : '从未使用'}</td>
                 <td>${k.created_at ? esc(fmtLocal(k.created_at)) : ''}</td>
                 <td>
                     <button class="btn btn--sm" onclick="openEditKeyModal(${k.id})">编辑</button>
-                    <button class="btn btn--sm" onclick="deleteKey(${k.id}, '${esc(k.label || k.key_masked)}')" style="color:var(--color-danger);">删除</button>
+                    <button class="btn btn--sm" onclick="deleteKey(${k.id}, '${jsArg(k.label || k.key_masked)}')" style="color:var(--color-danger);">删除</button>
                 </td>
             </tr>
         `).join('');
@@ -1004,7 +1228,7 @@ async function loadAggregatesTable() {
                 ).join('') : ''}</div></td>
                 <td>
                     <button class="btn btn--sm" onclick="openAggregateModal(${a.id})">编辑</button>
-                    <button class="btn btn--sm" onclick="deleteAggregate(${a.id}, '${esc(a.name)}')" style="color:var(--color-danger);">删除</button>
+                    <button class="btn btn--sm" onclick="deleteAggregate(${a.id}, '${jsArg(a.name)}')" style="color:var(--color-danger);">删除</button>
                 </td>
             </tr>
         `).join('');

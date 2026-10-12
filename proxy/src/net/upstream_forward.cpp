@@ -149,6 +149,10 @@ UpstreamClient::forward(const std::string &method,
     }
     if (!opts.anthropic_beta.empty())
         headers.emplace("anthropic-beta", opts.anthropic_beta);
+    if (opts.opencode_upstream) {
+        headers.emplace("x-opencode-session", opts.opencode_session);
+        headers.emplace("User-Agent", "token-board/1.0");
+    }
 
     if (streaming) {
         watch->set_initial_deadlines(deadline_started_ms,

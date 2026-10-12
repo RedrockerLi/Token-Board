@@ -87,7 +87,7 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
             self.assertTrue({
                 "billing", "routable", "holds_keys", "usage_source",
                 "deletion", "cooldown", "subscription_unit", "label",
-                "short_label",
+                "short_label", "subtypes",
             } <= payload.keys())
 
         timeout = self.client.get("/api/proxy/timeout-config").get_json()
@@ -105,9 +105,9 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
         self.assertEqual(len(accounts), 1)
         self.assertTrue({
             "id", "name", "base_url", "api_format", "endpoint_path",
-            "auth_header", "is_aggregate", "account_type", "monthly_price",
-            "currency", "valid_from", "max_concurrency", "created_at",
-            "ends_at", "key_count", "keys", "cloud_keys",
+            "auth_header", "is_aggregate", "account_type", "subtype",
+            "monthly_price", "currency", "valid_from", "max_concurrency",
+            "created_at", "ends_at", "key_count", "keys", "cloud_keys",
         } <= accounts[0].keys())
         keys = self.client.get("/api/proxy/keys").get_json()
         self.assertEqual(len(keys), 1)

@@ -54,7 +54,8 @@ bool Database::prepare_statements() {
             "?11,?12,?13,?14,?15,?16)",
             stmt_insert_attempt_);
         PREPARE_ON(read_db_,
-            "SELECT u.base_url,s.secret_value,u.api_format,u.auth_scheme "
+            "SELECT u.base_url,s.secret_value,u.api_format,u.auth_scheme,"
+            "CASE WHEN u.subtype='opencode-go' THEN 1 ELSE 0 END "
             "FROM upstream_credentials c JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
             "JOIN upstreams u ON u.id=c.upstream_id JOIN accounts a ON a.id=u.account_id "
             "WHERE c.runtime_id=?1 AND a.account_kind='proxy' "

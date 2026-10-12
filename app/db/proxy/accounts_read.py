@@ -3,9 +3,28 @@
 from app.core.time import utc_now
 from app.db.proxy.common import (
     _parse_iso_date, _subscription_date, ConflictError,
-    mask_key, sqlite3, uuid,
+    json, mask_key, sqlite3, uuid,
 )
 from app.domain.account_template import AccountTemplate, AccountTemplateAdapter
+
+
+def _parse_usage_json(raw: object) -> dict | None:
+    """Decode a stored per-key usage snapshot; anything else reads as null."""
+    if raw in (None, ""):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalized_label(value: object) -> str | None:
+    """Trim a display label; only strings qualify, blank reads as NULL."""
+    if not isinstance(value, str):
+        return None
+    label = value.strip()
+    return label or None
 
 
 class ProxyAccountReadMixin:
@@ -13,7 +32,7 @@ class ProxyAccountReadMixin:
         conn = self._connect()
         try:
             rows = conn.execute(
-                    "SELECT 1 routed,rs.id,a.name,u.base_url,u.api_format,"
+                    "SELECT 1 routed,rs.id,a.name,u.base_url,u.api_format,u.subtype,"
                     "COALESCE(u.endpoint_path,'') endpoint_path,"
                     "COALESCE(u.auth_scheme,'bearer') auth_header,"
                     "COALESCE((SELECT recurring_price FROM billing_rate_events "
@@ -55,7 +74,8 @@ class ProxyAccountReadMixin:
                 cloud_keys: list[dict] = []
                 if route and route["upstream_id"] is not None:
                     rows = conn.execute(
-                        "SELECT c.runtime_id,s.secret_value,c.key_masked,c.valid_from,c.ends_at "
+                        "SELECT c.runtime_id,s.secret_value,c.key_masked,c.valid_from,"
+                        "c.ends_at,c.label,c.usage_json "
                         "FROM upstream_credentials c LEFT JOIN upstream_secrets s "
                         "ON s.credential_uuid=c.uuid WHERE c.upstream_id=? "
                         "AND (c.ends_at IS NULL OR c.ends_at>"
@@ -72,6 +92,8 @@ class ProxyAccountReadMixin:
                                 "masked": key["key_masked"],
                                 "valid_from": key["valid_from"],
                                 "ends_at": key["ends_at"],
+                                "label": key["label"],
+                                "usage": _parse_usage_json(key["usage_json"]),
                             })
                         else:
                             cloud_keys.append({
@@ -100,16 +122,30 @@ class ProxyAccountReadMixin:
             conn.close()
 
     @staticmethod
-    def _normalize_keys(data: dict) -> list[str]:
-        """Collect the intended upstream key list, dropping empty entries.
+    def _normalize_keys_and_labels(data: dict) -> tuple[list[str], list[object]]:
+        """Collect the intended upstream key list and its aligned labels.
 
         `upstream_keys` is the only key source since the legacy single-column
-        `upstream_key` was removed.  Empty strings are dropped (留空=保持).
+        `upstream_key` was removed.  Empty strings are dropped (留空=保持), and
+        `new_labels` is read in the same walk so a label can never shift onto a
+        neighbouring key when the request contains blank slots.
         """
         raw = data.get("upstream_keys") or []
         if isinstance(raw, str):
             raw = [raw]
-        return [k for k in raw if isinstance(k, str) and k.strip()]
+        labels = data.get("new_labels")
+        if isinstance(labels, str):
+            labels = [labels]
+        if not isinstance(labels, list):
+            labels = []
+        keys: list[str] = []
+        aligned: list[object] = []
+        for index, key in enumerate(raw):
+            if not isinstance(key, str) or not key.strip():
+                continue
+            keys.append(key)
+            aligned.append(labels[index] if index < len(labels) else None)
+        return keys, aligned
 
     @staticmethod
     def _billing_config_conn(conn: sqlite3.Connection) -> sqlite3.Row:
@@ -131,6 +167,8 @@ class ProxyAccountReadMixin:
                            keep_ids: list[int], new_keys: list[str],
                            keep_valid_froms: dict[str, object] | None = None,
                            new_valid_froms: list[object] | None = None,
+                           keep_labels: dict[str, object] | None = None,
+                           new_labels: list[object] | None = None,
                            account_type: str = "api") -> list[str]:
         """Diff an account's local keys using physical deletion.
 
@@ -138,11 +176,25 @@ class ProxyAccountReadMixin:
         retain its first active fallback key.  This function is called inside
         the same transaction that updates the cloud-safe metadata mirror.
 
+        ``keep_labels`` maps ``str(runtime_id)`` and ``new_labels`` is aligned
+        index-wise with ``new_keys``; labels are trimmed and stored as NULL
+        when absent/blank.  An explicit ``keep_labels`` map is authoritative
+        (a missing entry clears that key's label); when the request carries no
+        label map at all the stored names survive the key edit untouched.
+
         Removing a key is a live-configuration operation.  Its request rows
         retain their identity snapshot while the credential row is deleted.
+        Cloud-mirror credentials without a local secret never take part in
+        this diff; config sync owns their reconciliation.
         """
         keep_valid_froms = keep_valid_froms or {}
         new_valid_froms = new_valid_froms or []
+        keep_labels = keep_labels if isinstance(keep_labels, dict) else None
+        label_assignment = ("label=COALESCE(?,label)" if keep_labels is None
+                            else "label=?")
+        if isinstance(new_labels, str):
+            new_labels = [new_labels]
+        new_labels = new_labels if isinstance(new_labels, list) else []
         route = self._v1_route_account(conn, account_id)
         if route is None or route["upstream_id"] is None:
             raise ValueError("账户没有可写入密钥的上游")
@@ -165,7 +217,9 @@ class ProxyAccountReadMixin:
         }
         retained = [key_id for key_id in keep_ids if key_id in active]
         for key_id, row in active.items():
-            if key_id not in retained:
+            # 无本机明文的云端镜像行不参与本地密钥编辑的删除集合：
+            # 编辑本地密钥不得抹掉云端的补填行，镜像归云同步对账。
+            if key_id not in retained and row["secret_value"] is not None:
                 conn.execute(
                     "UPDATE request_log SET credential_uuid=NULL,upstream_key_id=NULL "
                     "WHERE credential_uuid=?", (row["uuid"],))
@@ -184,8 +238,11 @@ class ProxyAccountReadMixin:
             valid = (_parse_iso_date(_subscription_date(raw_valid))
                      if raw_valid not in (None, "") else None)
             conn.execute(
-                "UPDATE upstream_credentials SET position=?,valid_from=? WHERE runtime_id=?",
-                (position, valid.isoformat() if valid else None, key_id),
+                "UPDATE upstream_credentials SET position=?,valid_from=?,"
+                f"{label_assignment} WHERE runtime_id=?",
+                (position, valid.isoformat() if valid else None,
+                 (None if keep_labels is None else
+                  _normalized_label(keep_labels.get(str(key_id)))), key_id),
             )
             if active[key_id]["secret_value"]:
                 active_values.append(active[key_id]["secret_value"])
@@ -202,13 +259,15 @@ class ProxyAccountReadMixin:
                          if index < len(new_valid_froms) else None)
             valid = (_parse_iso_date(_subscription_date(raw_valid))
                      if raw_valid not in (None, "") else None)
+            raw_label = new_labels[index] if index < len(new_labels) else None
             credential_uuid = str(uuid.uuid4())
             conn.execute(
                 "INSERT INTO upstream_credentials"
-                "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,enabled) "
-                "VALUES(?,?,?,?,?,?,1)",
+                "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,enabled,label) "
+                "VALUES(?,?,?,?,?,?,1,?)",
                 (credential_uuid, next_runtime, upstream_id, position,
-                 mask_key(key), valid.isoformat() if valid else None),
+                 mask_key(key), valid.isoformat() if valid else None,
+                 _normalized_label(raw_label)),
             )
             conn.execute(
                 "INSERT INTO upstream_secrets(credential_uuid,secret_value) VALUES(?,?)",

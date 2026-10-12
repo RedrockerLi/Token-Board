@@ -27,7 +27,10 @@ def config_hash_of_db(db_path: str) -> str:
             columns = [row[0] for row in conn.execute(
                 f"SELECT * FROM {table} LIMIT 0").description]
             if table == "upstream_credentials":
-                columns = [column for column in columns if column != "runtime_id"]
+                # runtime_id is local ordering; usage_json is a machine-local
+                # observation the usage poller rewrites, never cloud config.
+                columns = [column for column in columns
+                           if column not in ("runtime_id", "usage_json")]
             elif table == "account_importers":
                 columns = [column for column in columns if column != "cursor_json"]
             if not columns:

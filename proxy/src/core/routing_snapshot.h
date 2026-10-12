@@ -20,10 +20,28 @@ struct UpstreamRuntime {
     std::shared_ptr<const Database::AccountInfo> account_ref;  // single copy
 };
 
+// One quota window of an "opencode-go" credential, parsed from the usage
+// snapshot the Python poller writes into upstream_credentials.usage_json.
+struct UsageWindow {
+    std::string name;                         // "5h" / "week" / "month"
+    int percent = 0;                          // 0..100 used
+    std::int64_t resets_at = 0;               // epoch seconds; 0 == unknown
+};
+
+// Parsed usage of one credential.  The snapshot owns at most one instance per
+// credential and shares it with every candidate referencing that credential.
+struct CredentialUsage {
+    std::vector<UsageWindow> windows;
+    bool exhausted = false;                   // any window >= 100%
+};
+
 struct CredentialRuntime {
     int key_slot_id = 0;                      // upstream_credentials.runtime_id
     std::string uuid;                         // credential UUID (identity across reloads)
     std::shared_ptr<const Database::KeySlot> key_ref;          // single copy
+    // Null when the credential carries no usable usage_json; scheduling then
+    // sees no deadline and no exhausted window for its candidates.
+    std::shared_ptr<const CredentialUsage> usage_ref;
 };
 
 struct RouteRuleRuntime {

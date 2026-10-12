@@ -21,9 +21,11 @@ from dataclasses import dataclass, field
 class AccountTemplate:
     """The API-facing projection of one account record.
 
-    All fields mirror the existing HTTP contract exactly; the adapter adds
-    nothing new, it simply centralizes the derivation that previously lived in
-    SQL ``CASE`` blocks and route-set joins.
+    Fields mirror the HTTP contract; the adapter centralizes the derivation
+    that previously lived in SQL ``CASE`` blocks and route-set joins.  The
+    ``subtype`` is the upstream sub-category stored on the routing row
+    (``upstreams.subtype``) — ``None`` when the account has no upstream
+    subtype, e.g. every aggregate route set.
     """
 
     id: int
@@ -34,6 +36,7 @@ class AccountTemplate:
     auth_header: str = "auto"
     is_aggregate: bool = False
     account_type: str = "api"
+    subtype: str | None = None
     monthly_price: float = 0.0
     currency: str = "CNY"
     valid_from: str = ""
@@ -54,6 +57,7 @@ class AccountTemplate:
             "auth_header": self.auth_header,
             "is_aggregate": 1 if self.is_aggregate else 0,
             "account_type": self.account_type,
+            "subtype": self.subtype,
             "monthly_price": self.monthly_price,
             "currency": self.currency,
             "valid_from": self.valid_from,
@@ -91,6 +95,7 @@ class AccountTemplateAdapter:
             auth_header=row.get("auth_header") or "auto",
             is_aggregate=False,
             account_type=account_type,
+            subtype=row.get("subtype"),
             monthly_price=float(row.get("recurring_price") or 0),
             currency=row.get("currency") or "CNY",
             valid_from=row.get("valid_from") or "",

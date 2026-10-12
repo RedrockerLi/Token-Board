@@ -14,13 +14,23 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V2.4 当前增量
+## V2.5 当前增量
+
+V2.5 给上游增加一类子分类标识与密钥级展示/观测字段。`upstreams.subtype` 保存 plan 账户
+的子分类（NULL = 普通账户，当前取值 `opencode-go`）；`upstream_credentials.label` 是密钥
+名称；`upstream_credentials.usage_json` 是该密钥的用量快照，由用量轮询按子分类的用量查询
+路径探测上游后写入本机，不进入配置同步，云端不含这些观测。快照形状为
+`{checked_at,error,windows{5h,week,month:{percent,resets_at}},monthly_period{start,end}}`：
+`checked_at` 是观测时刻，`error` 是查询失败原因，`windows` 是各窗口的用量百分比与重置
+时刻，`monthly_period` 是观测到的月度周期边界。
+
+## V2.4 历史增量
 
 V2.4 增加本机运行时表 `agent_usage_receipts`，永久保存 Agent 导入事件的去重回执；它与
 `request_log` 分离，因此请求日志按 30 天保留策略清理后，Hermes 等全量扫描适配器仍不会
 重放已经接受的事件。回执表不进入配置同步，也不会随 Agent 软件删除而级联删除。
 
-## V2.3 当前增量
+## V2.3 历史增量
 
 V2.3 删除 `request_log.project` 与 `request_log.session_id`。Agent adapter 仍可在导入时
 读取这些值并用于内存中的事件解析和去重，但它们不再写入本机数据库，也不会进入导出数据。

@@ -95,7 +95,12 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         return forward_endpoint_attempt(
             upstream_, policy, c, body_cache.for_candidate(c), content_type,
             static_cast<int>(attempt.remaining_budget_ms), embedding_timeouts,
-            req.client_socket);
+            req.client_socket, nullptr,
+            // Like the model catalog, an embedding request carries no
+            // conversation of its own.
+            [&](ForwardOptions &opts) {
+                configure_opencode_session(opts, c, std::string());
+            });
         },
         [&](const UpstreamClient::ForwardResult &result) {
             return result.client_disconnected ||

@@ -15,6 +15,12 @@ struct ForwardOptions {
     // Allowlisted Anthropic beta features from the client request.  The
     // proxy rebuilds upstream headers, so this must be carried explicitly.
     std::string anthropic_beta;
+    // "opencode-go" upstreams route every request by session: the gateway
+    // rejects clients that do not identify one, and it filters on the client
+    // User-Agent (which the proxy never forwards downstream).  Callers set
+    // both fields together and must supply a non-empty opencode_session.
+    bool opencode_upstream = false;
+    std::string opencode_session;
     bool path_is_full = false;           // true → use `path` verbatim (skip base_url path prepend)
 
     // Upstream timeouts, in seconds (0 = disabled).

@@ -49,6 +49,10 @@ public:
         int id;
         std::string key_value;
         int position = 0;
+        // Raw upstream_credentials.usage_json snapshot written by the usage
+        // poller (V2.5).  Empty when the credential has no usage data; the
+        // routing snapshot parses it into routing::CredentialUsage.
+        std::string usage_json;
     };
 
     struct AccountInfo {
@@ -61,6 +65,9 @@ public:
         int upstream_id = 0;
         bool extended_usage_limit_cooldown = false;
         int max_concurrency = 0;
+        // upstreams.subtype == 'opencode-go': the gateway routes by session id
+        // and rejects clients that do not identify one.
+        bool opencode_session = false;
         bool deleted = false;
     };
 
@@ -74,6 +81,9 @@ public:
         std::string key_value;
         std::string api_format;
         std::string auth_header;
+        // The upstream belongs to the "opencode-go" sub-type: its gateway
+        // requires the session header, so the cooldown probe must send one.
+        bool opencode_session = false;
         bool valid = false;
     };
     std::optional<ProbeTarget> lookup_probe_target(int key_slot_id);

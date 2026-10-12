@@ -23,7 +23,8 @@ def _id(conn, table: str) -> int:
 
 def add_upstream(conn, name: str, base_url: str, keys: list[str], *,
                  recurring: bool = False, api_format: str = "openai",
-                 auth_scheme: str = "bearer", max_concurrency: int = 64):
+                 auth_scheme: str = "bearer", max_concurrency: int = 64,
+                 subtype: str | None = None):
     account_id = _id(conn, "accounts")
     conn.execute(
         "INSERT INTO accounts(id,uuid,name,account_kind,valid_from) "
@@ -40,8 +41,9 @@ def add_upstream(conn, name: str, base_url: str, keys: list[str], *,
     )
     upstream_id = conn.execute(
         "INSERT INTO upstreams(account_id,name,base_url,api_format,auth_scheme,"
-        "max_concurrency) VALUES(?,?,?,?,?,?)",
-        (account_id, name, base_url, api_format, auth_scheme, max_concurrency),
+        "max_concurrency,subtype) VALUES(?,?,?,?,?,?,?)",
+        (account_id, name, base_url, api_format, auth_scheme, max_concurrency,
+         subtype),
     ).lastrowid
     runtime = int(conn.execute(
         "SELECT COALESCE(MAX(runtime_id),0)+1 FROM upstream_credentials"
@@ -85,14 +87,16 @@ def add_plain_route(conn, local_key: str, name: str, upstream_id: int,
 
 def build_aggregate_scenario(conn, local_key: str, model: str,
                              recurring_keys: list[str], fallback_key: str | None,
-                             base_url: str = ""):
+                             base_url: str = "", subtype: str | None = None):
     plan_id, plan_upstream, plan_key_ids = add_upstream(
-        conn, f"{local_key}-plan", base_url, recurring_keys, recurring=True)
+        conn, f"{local_key}-plan", base_url, recurring_keys, recurring=True,
+        subtype=subtype)
     targets = [(plan_upstream, 0)]
     fallback_ids = []
     if fallback_key:
         _, fallback_upstream, fallback_ids = add_upstream(
-            conn, f"{local_key}-metered", base_url, [fallback_key])
+            conn, f"{local_key}-metered", base_url, [fallback_key],
+            subtype=subtype)
         targets.append((fallback_upstream, 1))
     route_set_id = _id(conn, "route_sets")
     conn.execute(

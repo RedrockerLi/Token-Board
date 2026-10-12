@@ -120,16 +120,25 @@ def _iter_months(first: str, last: str):
 
 
 def _cancellation_end(config: sqlite3.Row, now: datetime, anchor_day: int,
-                      account_type: str) -> datetime:
+                      account_type: str,
+                      usage_json: str | None = None) -> datetime:
     """Return a confirmed future ``ends_at`` for a subscription unit.
 
     API accounts are always terminated immediately. For subscriptions, the
     configured policy chooses immediate hard deletion or the current period's
     end boundary. The latter keeps the unit live and billable until the
-    lifecycle finalizer physically deletes it.
+    lifecycle finalizer physically deletes it: a fresh observed monthly reset
+    owns that boundary, and the anchor-day calendar is only the fallback.
     """
     if deletion_policy(account_type) == "immediate" or config["cancellation_mode"] == "immediate":
         return now
+    if usage_json:
+        from app.services.billing_units import observed_period_end
+        observed = observed_period_end(usage_json, now)
+        # A period that already ended cannot confirm a future ``ends_at``;
+        # fall back to the calendar instead of scheduling a past deletion.
+        if observed is not None and observed - timedelta(seconds=1) > now:
+            return observed - timedelta(seconds=1)
     current = _billing_period_month(now, anchor_day)
     return _period_start(_next_month(current), anchor_day) - timedelta(seconds=1)
 

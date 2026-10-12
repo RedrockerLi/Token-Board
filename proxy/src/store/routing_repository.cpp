@@ -76,7 +76,11 @@ bool Database::load_routing_config(RoutingConfig &config) {
         "COALESCE(u.auth_scheme,'auto'),"
         "CASE WHEN json_extract(COALESCE(bc.cooldown_policy_json,'{}'),'$.kind')="
         "'subscription_5h' THEN 1 ELSE 0 END,"
-        "u.max_concurrency,c.runtime_id,s.secret_value,c.position "
+        "u.max_concurrency,c.runtime_id,s.secret_value,c.position,"
+        // V2.5 columns are appended (never inserted): the row reader indexes
+        // every field positionally.
+        "CASE WHEN u.subtype='opencode-go' THEN 1 ELSE 0 END,"
+        "COALESCE(c.usage_json,'') "
         "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
         "JOIN accounts a ON a.id=u.account_id "
         "LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
@@ -130,6 +134,7 @@ bool Database::load_routing_config(RoutingConfig &config) {
             a.upstream_id = upstream_id;
             a.extended_usage_limit_cooldown = sqlite3_column_int(stmt, 11) != 0;
             a.max_concurrency = sqlite3_column_int(stmt, 12);
+            a.opencode_session = sqlite3_column_int(stmt, 16) != 0;
             a.deleted = false;
             auto account_it = account_refs.try_emplace(
                 upstream_id, std::make_shared<const AccountInfo>(account)).first;
@@ -159,6 +164,8 @@ bool Database::load_routing_config(RoutingConfig &config) {
             key.id = sqlite3_column_int(stmt, 13);
             key.key_value = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 14));
             key.position = sqlite3_column_int(stmt, 15);
+            key.usage_json = reinterpret_cast<const char *>(
+                sqlite3_column_text(stmt, 17));
             auto key_it = key_refs.try_emplace(
                 key.id, std::make_shared<const KeySlot>(key)).first;
             next.rules.back().target.key_refs.push_back(key_it->second);
@@ -214,6 +221,7 @@ std::optional<Database::ProbeTarget> Database::lookup_probe_target(
             sqlite3_column_text(stmt_lookup_probe_target_, 2));
         t.auth_header = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_lookup_probe_target_, 3));
+        t.opencode_session = sqlite3_column_int(stmt_lookup_probe_target_, 4) != 0;
         t.valid = !t.base_url.empty() && !t.key_value.empty();
     }
     sqlite3_reset(stmt_lookup_probe_target_);

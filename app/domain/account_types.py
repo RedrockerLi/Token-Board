@@ -11,7 +11,25 @@ The C++ proxy consumes the prepared SQLite routing snapshot; this module is
 the only account-type behavior specification.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class AccountSubtypeSpec:
+    """Behavioral contract of one upstream sub-category under a type."""
+
+    label: str  # 账户弹窗左栏子卡片文案（"<名称> — <说明>"，与类型同约定）
+    presets: dict  # 新建表单预填：base_url / monthly_price / currency / api_format
+    session_header: bool  # 转发时注入 x-opencode-session 会话头（每对话稳定）
+    usage_path: str | None  # 用量查询相对路径（GET + Bearer）；None = 无用量查询
+
+    def to_dict(self) -> dict:
+        return {
+            "label": self.label,
+            "presets": dict(self.presets),
+            "session_header": self.session_header,
+            "usage_path": self.usage_path,
+        }
 
 
 @dataclass(frozen=True)
@@ -27,6 +45,7 @@ class AccountTypeSpec:
     subscription_unit: str | None  # "per_key" | "per_account" | None（非订阅类型）
     label: str  # 设置页类型下拉文案
     short_label: str  # 账户列表徽章文案
+    subtypes: dict[str, AccountSubtypeSpec] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -39,6 +58,7 @@ class AccountTypeSpec:
             "subscription_unit": self.subscription_unit,
             "label": self.label,
             "short_label": self.short_label,
+            "subtypes": {name: sub.to_dict() for name, sub in self.subtypes.items()},
         }
 
 
@@ -66,6 +86,19 @@ ACCOUNT_TYPES: dict[str, AccountTypeSpec] = {
         subscription_unit="per_key",
         label="plan — 订阅套餐，调用免费",
         short_label="Plan",
+        subtypes={
+            "opencode-go": AccountSubtypeSpec(
+                label="OpenCode Go — $10/月 · 含用量查询",
+                presets={
+                    "base_url": "https://opencode.ai/zen/go",
+                    "monthly_price": 10,
+                    "currency": "USD",
+                    "api_format": "anthropic",
+                },
+                session_header=True,
+                usage_path="/v1/usage",
+            ),
+        },
     ),
 }
 

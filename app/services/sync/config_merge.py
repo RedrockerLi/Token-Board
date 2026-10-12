@@ -139,14 +139,15 @@ def _merge_v2_config(remote_path: str, local_path: str) -> None:
                         next_runtime += 1
                     local.execute(
                         "INSERT INTO upstream_credentials"
-                        "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,created_at,enabled,ends_at) "
-                        "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET "
+                        "(uuid,runtime_id,upstream_id,position,key_masked,valid_from,created_at,enabled,ends_at,label) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET "
                         "upstream_id=excluded.upstream_id,position=excluded.position,"
                         "key_masked=excluded.key_masked,valid_from=excluded.valid_from,"
-                        "enabled=excluded.enabled,ends_at=excluded.ends_at",
+                        "enabled=excluded.enabled,ends_at=excluded.ends_at,"
+                        "label=excluded.label",
                         (row["uuid"], runtime_id, row["upstream_id"], row["position"],
                          row["key_masked"], row["valid_from"], row["created_at"],
-                         row["enabled"], row["ends_at"]),
+                         row["enabled"], row["ends_at"], row["label"]),
                     )
 
             merge_table("account_importers", {"cursor_json"})
@@ -360,6 +361,11 @@ def sanitize_upload_columns(dst: sqlite3.Connection) -> None:
         dst.execute("UPDATE account_importers SET cursor_json='{}'")
     if table_exists(dst, "upstream_secrets"):
         dst.execute("DELETE FROM upstream_secrets")
+    if table_exists(dst, "upstream_credentials"):
+        # Per-key usage snapshots are machine-local observations written by the
+        # usage poller (same side as the key plaintext), never cloud config.
+        # Labels are ordinary synchronized configuration and stay.
+        dst.execute("UPDATE upstream_credentials SET usage_json=NULL")
     if (table_exists(dst, "billing_contracts") and
             table_exists(dst, "account_importers")):
         legacy_contract_ids = [row[0] for row in dst.execute(

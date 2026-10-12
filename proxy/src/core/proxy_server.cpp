@@ -51,7 +51,12 @@ size_t affinity_start(SessionAffinity &affinity,
     if (cands.empty()) return 0;
     slots.reserve(cands.size());
     for (const auto &cand : cands) slots.push_back(cand.key_slot_id);
-    return affinity.preferred_index(scope, session_id, slots);
+    // Usage-aware preference: a credential whose usable quota expires clearly
+    // sooner than the next one starts the rotation, so that quota is spent
+    // before it resets.  Candidates without usage data keep the session
+    // affinity / cheapest-key order unchanged.
+    return usage_lead_start(
+        cands, affinity.preferred_index(scope, session_id, slots));
 }
 
 /// Build a JSON error response.
@@ -196,6 +201,7 @@ resolve_candidates_uncached(Router &router, const Router::RouteResult &route,
         UpstreamCandidate c;
         c.account_ref = account_ref;
         c.key_slot_ref = cred.key_ref;
+        c.usage_ref = cred.usage_ref;
         c.key_slot_id = cred.key_slot_id;
         c.upstream_model_ref =
             fixed_model ? snapshot->target_models[ref.model_index]
