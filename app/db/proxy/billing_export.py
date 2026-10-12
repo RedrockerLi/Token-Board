@@ -12,9 +12,14 @@ _PAYLOAD_FIELDS = (
     "fx_rate_date", "frozen_on",
 )
 
+# 账户名是可变的展示属性（V2 起刻意非唯一），重命名不得被当作账目载荷变更：
+# 事件保留首次冻结时的名字，比较时跳过该字段。
+_MUTABLE_PAYLOAD_FIELDS = ("account_name",)
+
 
 def _same_payload(existing: sqlite3.Row, row: dict) -> bool:
-    return all(existing[field] == row[field] for field in _PAYLOAD_FIELDS)
+    return all(existing[field] == row[field] for field in _PAYLOAD_FIELDS
+               if field not in _MUTABLE_PAYLOAD_FIELDS)
 
 
 def _same_payload_with_legacy_agent_unit(existing: sqlite3.Row,

@@ -83,6 +83,53 @@ class BillingExportTest(AppDatabaseTestCase):
             first_mark,
         )
 
+    def test_rename_does_not_poison_the_export_snapshot(self) -> None:
+        """Renaming a billed account must not look like a payload mutation."""
+        account_id = self._create_plan()
+        materialize_period_charges(
+            self.proxy_path,
+            datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+        with sqlite_connection(self.proxy_path) as conn:
+            event_before = conn.execute(
+                "SELECT account_name FROM billing_export_events "
+                "WHERE source_table='billing_period_charges' "
+                "AND account_id=? ORDER BY id LIMIT 1",
+                (account_id,)).fetchone()[0]
+            conn.execute("UPDATE accounts SET name='renamed-plan' WHERE id=?",
+                         (account_id,))
+            conn.commit()
+
+        # Re-running the export scan after the rename must not raise.
+        materialize_period_charges(
+            self.proxy_path,
+            datetime(2026, 7, 3, tzinfo=timezone.utc),
+        )
+
+        # A second plan account can still be created afterwards.
+        database = self.proxy_database()
+        second_id = database.create_account({
+            "name": "second-plan",
+            "account_type": "plan",
+            "currency": "CNY",
+            "monthly_price": 5,
+            "base_url": "http://example.test",
+            "upstream_keys": ["sk-second"],
+        })
+        self.assertNotEqual(second_id, account_id)
+
+        with sqlite_connection(self.proxy_path) as conn:
+            # The rename reaches the identity row...
+            self.assertEqual(conn.execute(
+                "SELECT name FROM account_identities WHERE id=?",
+                (account_id,)).fetchone()[0], "renamed-plan")
+            # ...while the frozen event keeps the name seen at first export.
+            self.assertEqual(conn.execute(
+                "SELECT account_name FROM billing_export_events "
+                "WHERE source_table='billing_period_charges' "
+                "AND account_id=? ORDER BY id LIMIT 1",
+                (account_id,)).fetchone()[0], event_before)
+
     def test_billing_mark_waits_for_local_commit(self) -> None:
         account_id = self._create_plan()
         materialize_period_charges(
