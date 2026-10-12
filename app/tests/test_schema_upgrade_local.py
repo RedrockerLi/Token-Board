@@ -109,14 +109,21 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                     name_columns = [row for row in columns if row[1] == "name"]
                     if not name_columns:
                         continue
+                    # name 是 id 的属性：带 name 的表必须有 id 列，且 name
+                    # 不进主键、不进任何唯一索引、不作外键的任一侧。
+                    self.assertIn("id", [row[1] for row in columns],
+                                  f"{database}: {table} 缺 id 列")
                     self.assertEqual(name_columns[0][5], 0, f"{database}: {table}")
                     for index in conn.execute(f"PRAGMA index_list({table})"):
                         if not index[2]:
                             continue
                         indexed_columns = [row[2] for row in conn.execute(
                             f"PRAGMA index_info({index[1]})")]
-                        self.assertNotEqual(indexed_columns, ["name"],
-                                            f"{database}: {table}: {index[1]}")
+                        self.assertNotIn("name", indexed_columns,
+                                         f"{database}: {table}: {index[1]}")
+                    for fk in conn.execute(f"PRAGMA foreign_key_list({table})"):
+                        self.assertNotIn("name", (fk[3], fk[4]),
+                                         f"{database}: {table}: 外键涉及 name")
 
     def test_agent_subscription_identity_migration_preserves_frozen_charge(self) -> None:
         proxy = self.root / "data/token-board.db"

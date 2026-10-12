@@ -10,7 +10,7 @@ Proxy V1 将历史身份、实时转发与计费拆开：`account_identities` �
 
 计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；冻结后的周期账单会产生一条不可变的 `billing_export_events`，供 dashboard 独立增量导出；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
 
-Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存直接归属或历史分摊后的实际周期费用。实时软件配置和 Agent 订阅配置可以物理删除，历史 identity、请求归属和冻结账务继续保留。所有名称字段（账户、路由、软件、订阅、实例标签）都只是展示属性，不能作为关联键、主键、外键或唯一生命周期键。
+Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存直接归属或历史分摊后的实际周期费用。实时软件配置和 Agent 订阅配置可以物理删除，历史 identity、请求归属和冻结账务继续保留。所有名称字段（账户、路由、软件、订阅、实例标签）都只是展示属性，不能作为关联键、主键、外键或唯一生命周期键；这条规则由 schema 不变量测试逐表强制（name 必须伴随 id 列，不进主键、不进唯一索引、不作外键任一侧）。
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
