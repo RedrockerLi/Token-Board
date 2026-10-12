@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 from ..common import (
@@ -14,6 +15,7 @@ from ..common import (
     make_event,
     project_name,
     safe_float,
+    safe_int,
     source,
     sqlite_rows_snapshot,
     timestamp,
@@ -30,6 +32,22 @@ DEFAULT_PATH = Path.home() / ".local" / "share" / "opencode"
 ALWAYS_SCAN = True
 
 
+def _default_roots() -> list[Path]:
+    """默认根:XDG 优先,Windows 上追加 LOCALAPPDATA 原生存储。
+
+    只展开当前存在的原生目录;不存在的候选根在发现阶段也不会命中,
+    因此 XDG 结果不受影响。
+    """
+    roots = [DEFAULT_PATH]
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            native = Path(local_app_data).expanduser() / "opencode"
+            if native.is_dir():
+                roots.append(native)
+    return roots
+
+
 def _roots(software: dict) -> list[Path]:
     configured = config_value(software, "data_root", "path")
     if configured:
@@ -38,7 +56,7 @@ def _roots(software: dict) -> list[Path]:
         override = os.environ.get("VIBE_USAGE_OPENCODE_DIRS", "").strip()
         roots = ([Path(value).expanduser() for value in override.split(os.pathsep)
                   if value.strip()]
-                 if override else [DEFAULT_PATH])
+                 if override else _default_roots())
     roots.extend(configured_extra_roots(software, KIND))
     return list(dict.fromkeys(roots))
 
@@ -131,13 +149,14 @@ def _token_size(row: dict) -> float:
         + safe_float(cache.get("read")) + safe_float(cache.get("write"))
 
 
-def _read_sqlite(path: Path) -> list[dict]:
+def _read_legacy_messages(path: Path) -> list[dict]:
+    """读取 1.x 的 message 表。"""
     schema = sqlite_rows_snapshot(
         path, "PRAGMA table_info(message)", raise_on_error=True,
     )
     has_id = any(str(row[1]) == "id" for row in schema)
     identity = "id" if has_id else "rowid"
-    rows = sqlite_rows_snapshot(path, f"""SELECT rowid AS message_rowid,
+    rows = sqlite_rows_snapshot(path, f"""SELECT
         {identity} AS message_id, session_id AS session_id,
         json_extract(data,'$.role') AS role,
         json_extract(data,'$.time.created') AS created,
@@ -147,6 +166,65 @@ def _read_sqlite(path: Path) -> list[dict]:
         json_extract(data,'$.path.root') AS path_root
         FROM message ORDER BY rowid""", raise_on_error=True)
     return [dict(row) for row in rows]
+
+
+def _read_session_messages(path: Path, tables: set[str]) -> list[dict]:
+    """读取 2.x 的事件投影 session_message。
+
+    2.x 把同样的计价数据写进 session_message:``type`` 是角色,``data.model.id``
+    是模型,``data.tokens`` 是计数器。消息数据里没有 ``path``,项目改取会话表的
+    ``directory``;会话表名为 session_v2 或 session,均可作为 LEFT JOIN 目标,
+    两者都不存在时只做占位。只选列/JSON 表达式,不读消息正文与工具负载。
+    """
+    if "session_v2" in tables:
+        session_table = "session_v2"
+    elif "session" in tables:
+        session_table = "session"
+    else:
+        session_table = None
+    join = (f"LEFT JOIN {session_table} s ON s.id = m.session_id"
+            if session_table else "")
+    directory = "s.directory AS directory" if session_table else "NULL AS directory"
+    rows = sqlite_rows_snapshot(path, f"""SELECT
+        m.id AS message_id, m.session_id AS session_id,
+        m.type AS role,
+        COALESCE(json_extract(m.data,'$.time.created'),
+                 m.time_created) AS created,
+        COALESCE(json_extract(m.data,'$.model.id'),
+                 json_extract(m.data,'$.modelID')) AS model_id,
+        json_extract(m.data,'$.tokens') AS tokens,
+        {directory}
+        FROM session_message m
+        {join}
+        WHERE m.type IN ('user', 'assistant')
+        ORDER BY m.rowid""", raise_on_error=True)
+    return [dict(row) for row in rows]
+
+
+def _read_sqlite(path: Path) -> list[dict]:
+    """读取一个 SQLite 存储,兼容 1.x 与 2.x 两种表结构。
+
+    同一库内两种表示同时存在时,legacy 行先出:按 (session, message id) 合并
+    同一条消息只计一次,等量副本保留 legacy 行,project 名沿用旧表示的取值。
+    """
+    if not path.is_file():
+        return []
+    # 标识符在 SQLite 里不区分大小写,表名探测同样按小写匹配,避免大小写
+    # 变体被误判成不认识的表结构。
+    tables = {str(row[0]) for row in sqlite_rows_snapshot(
+        path,
+        "SELECT lower(name) FROM sqlite_master WHERE type = 'table' "
+        "AND lower(name) IN ('message', 'session_message', 'session', 'session_v2')",
+        raise_on_error=True,
+    )}
+    if "message" not in tables and "session_message" not in tables:
+        raise ValueError("不认识的表结构(没有 message / session_message 表)")
+    rows: list[dict] = []
+    if "message" in tables:
+        rows.extend(_read_legacy_messages(path))
+    if "session_message" in tables:
+        rows.extend(_read_session_messages(path, tables))
+    return rows
 
 
 def _read_json(directory: Path) -> list[dict]:
@@ -170,25 +248,28 @@ def _read_json(directory: Path) -> list[dict]:
     return rows
 
 
-def _event(item: UsageSource, row: dict, physical_key: str):
+def _event(item: UsageSource, row: dict, record_identity: str):
     tokens = _row_tokens(row)
     if not tokens or row.get("role") != "assistant":
         return None
     cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
     session_id = str(row.get("session_id") or "unknown")
-    ordinal = row.get("message_id") or row.get("message_rowid") or physical_key
     return make_event(
         kind=KIND,
         source_key=f"session:{session_id}",
-        ordinal=ordinal,
+        ordinal=record_identity,
         model=row.get("model_id") or "unknown",
         requested_at=row.get("created") if isinstance(row.get("created"), str)
         else timestamp(row.get("created")),
-        input_tokens=tokens.get("input", 0),
+        # 该存储只写一个未分类的 cache.write 总量,IR 没有单独的写缓存列,
+        # 按仓库惯例折进 input(与 mcode/alma/claude-code 相同);否则每个
+        # Claude/Anthropic run 都会漏计写缓存 token。
+        input_tokens=safe_int(tokens.get("input")) + safe_int(cache.get("write")),
         output_tokens=tokens.get("output", 0),
         cached_input_tokens=cache.get("read", 0),
         reasoning_output_tokens=tokens.get("reasoning", 0),
-        project=project_name(row.get("path_root")),
+        # 2.x 消息行没有 path,项目回退到 session 行的 directory。
+        project=project_name(row.get("path_root") or row.get("directory")),
         session_id=session_id,
         input_includes_cache=True,
     )
@@ -219,10 +300,11 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             row = {**row, "created": created}
             session_id = str(row.get("session_id") or "unknown")
             message_id = row.get("message_id")
-            if message_id:
-                key = (session_id, str(message_id))
-            else:
-                key = (session_id, f"{path}:{index}")
+            # 记录身份同时是合并键与事件序号:同一 session 内消息 id 唯一;没有
+            # id 的行用存储路径加行下标兜底,保证不同物理行(两代表示、不同
+            # 存储)永远不会落到同一个 event_id 上被静默去重。
+            record_identity = str(message_id) if message_id else f"{path}:{index}"
+            key = (session_id, record_identity)
             old = records.get(key)
             if old is None or _token_size(row) > _token_size(old):
                 records[key] = row
@@ -230,8 +312,8 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
     if warnings:
         return batch([], record_count, skipped=True, warnings=warnings)
     events = []
-    for row in records.values():
-        event = _event(item, row, str(row.get("message_id") or "unknown"))
+    for key, row in records.items():
+        event = _event(item, row, key[1])
         if event:
             events.append(event)
     return batch(events, record_count)

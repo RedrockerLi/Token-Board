@@ -127,6 +127,7 @@ class ProxyBillingReadMixin:
                     r.id, COALESCE(r.account_identity_id,r.account_id) AS account_id, r.agent_software_id,
                     CASE WHEN COALESCE(ai.account_kind,a.account_kind)='agent' THEN 'agent'
                          ELSE r.source_kind END AS source_kind,
+                    r.source_kind AS source_kind_raw,
                     COALESCE(ai.name, a.name, 'unknown') AS account_name,
                     r.model, r.prompt_tokens, r.cache_read_tokens,
                     r.completion_tokens,

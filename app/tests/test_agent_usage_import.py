@@ -132,6 +132,120 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
         self.assertEqual(row, (
             "claude-opus-4-8", 41, 13, 7, 48, software_id))
 
+    def _claude_session(self, prefix: str, lines) -> tuple[int, Path]:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        root = Path(self._sessions.name) / prefix
+        session = root / "projects" / "-work-project" / "session.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8")
+        software_id = database.create_agent_software({
+            "name": f"{prefix}-agent", "agent_kind": "claude-code",
+            "config": {"data_root": str(root)},
+        })
+        return software_id, session
+
+    def test_claude_import_estimates_duration_and_output_tps(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        software_id, _ = self._claude_session("claude-tps", [
+            {"type": "user", "uuid": "tps-1", "parentUuid": None,
+             "timestamp": "2026-08-13T01:00:00.000Z"},
+            {"type": "assistant", "uuid": "tps-2", "parentUuid": "tps-1",
+             "apiBlockIndex": 0, "timestamp": "2026-08-13T01:00:02.500Z",
+             "cwd": "/work/project",
+             "message": {"id": "tps-message-1", "model": "claude-opus-4-8",
+                         "usage": {"input_tokens": 10, "output_tokens": 300},
+                         "stop_reason": "end_turn"}},
+        ])
+
+        self.assertEqual(import_once(ProxyDatabase(str(self.proxy_path))), 1)
+        with sqlite_connection(self.proxy_path) as connection:
+            row = connection.execute(
+                "SELECT duration_ms,output_tps,completion_tokens "
+                "FROM request_log WHERE agent_software_id=?",
+                (software_id,),
+            ).fetchone()
+        self.assertEqual(row[0], 2500)
+        self.assertEqual(row[2], 300)
+        self.assertAlmostEqual(row[1], 300 / (2500 / 1000))
+
+        # 再导入一次幂等:不重复插行,已有耗时不变
+        self.assertEqual(import_once(ProxyDatabase(str(self.proxy_path))), 0)
+        with sqlite_connection(self.proxy_path) as connection:
+            again = connection.execute(
+                "SELECT count(*),max(duration_ms),max(output_tps) "
+                "FROM request_log WHERE agent_software_id=?",
+                (software_id,),
+            ).fetchone()
+        self.assertEqual(again, (1, 2500, 120.0))
+
+    def test_claude_import_keeps_duration_without_tps_below_threshold(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        software_id, _ = self._claude_session("claude-short", [
+            {"type": "user", "uuid": "short-1", "parentUuid": None,
+             "timestamp": "2026-08-13T02:00:00.000Z"},
+            {"type": "assistant", "uuid": "short-2", "parentUuid": "short-1",
+             "timestamp": "2026-08-13T02:00:03.000Z",
+             "message": {"id": "short-message-1", "model": "claude-opus-4-8",
+                         "usage": {"input_tokens": 10, "output_tokens": 150},
+                         "stop_reason": "end_turn"}},
+        ])
+
+        self.assertEqual(import_once(ProxyDatabase(str(self.proxy_path))), 1)
+        with sqlite_connection(self.proxy_path) as connection:
+            row = connection.execute(
+                "SELECT duration_ms,output_tps FROM request_log "
+                "WHERE agent_software_id=?",
+                (software_id,),
+            ).fetchone()
+        # 输出不到 200 token 不估速度,原生的估算耗时仍然入库
+        self.assertEqual(row, (3000, 0.0))
+
+    def test_claude_import_backfills_duration_when_the_reply_finishes_later(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        software_id, session = self._claude_session("claude-backfill", [
+            {"type": "user", "uuid": "bf-1", "parentUuid": None,
+             "timestamp": "2026-08-13T03:00:00.000Z"},
+            # 扫描瞬间回复尚未写完:没有 stop_reason,先不估耗时
+            {"type": "assistant", "uuid": "bf-2", "parentUuid": "bf-1",
+             "apiBlockIndex": 0, "timestamp": "2026-08-13T03:00:02.000Z",
+             "message": {"id": "bf-message-1", "model": "claude-opus-4-8",
+                         "usage": {"input_tokens": 10, "output_tokens": 300},
+                         "stop_reason": None}},
+        ])
+
+        self.assertEqual(import_once(ProxyDatabase(str(self.proxy_path))), 1)
+        with sqlite_connection(self.proxy_path) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT duration_ms,output_tps FROM request_log "
+                "WHERE agent_software_id=?",
+                (software_id,),
+            ).fetchone(), (0, 0.0))
+
+        # 最终块落盘后重扫:同一 message.id 不重复插行,只把耗时补上
+        with session.open("a", encoding="utf-8") as target:
+            target.write(json.dumps({
+                "type": "assistant", "uuid": "bf-3", "parentUuid": "bf-2",
+                "apiBlockIndex": 1, "timestamp": "2026-08-13T03:00:02.500Z",
+                "message": {"id": "bf-message-1", "model": "claude-opus-4-8",
+                            "usage": {"input_tokens": 10, "output_tokens": 300},
+                            "stop_reason": "end_turn"},
+            }) + "\n")
+        self.assertEqual(import_once(ProxyDatabase(str(self.proxy_path))), 0)
+        with sqlite_connection(self.proxy_path) as connection:
+            rows = connection.execute(
+                "SELECT duration_ms,output_tps FROM request_log "
+                "WHERE agent_software_id=?",
+                (software_id,),
+            ).fetchall()
+        self.assertEqual(rows, [(2500, 120.0)])
+
     def test_hermes_history_stays_deduplicated_after_log_retention(self) -> None:
         from app.db.proxy_db import ProxyDatabase
 
@@ -320,6 +434,91 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
             ).fetchone()
         self.assertEqual((prompt, completion), (35, 6))
 
+    def test_estimated_duration_and_output_speed_are_imported_idempotently(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        self._create_software(database)
+        self._write_session("rollout-20260813010000-{}.jsonl".format(SESSION_ID), [
+            json.dumps({"type": "session_meta",
+                        "payload": {"session_id": SESSION_ID}}),
+            json.dumps({"type": "turn_context",
+                        "payload": {"model": "gpt-5.1-codex"}}),
+            json.dumps({"timestamp": "2026-08-13T01:00:00.000Z",
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "user"}}),
+            json.dumps({"timestamp": "2026-08-13T01:00:05.000Z",
+                        "type": "response_item",
+                        "payload": {"type": "reasoning"}}),
+            json.dumps({"timestamp": "2026-08-13T01:00:10.000Z",
+                        "type": "event_msg",
+                        "payload": {"type": "token_count", "info": {
+                            "last_token_usage": {
+                                "input_tokens": 100, "output_tokens": 500,
+                                "cached_input_tokens": 0, "total_tokens": 600},
+                            "total_token_usage": {"total_tokens": 600}}}}),
+        ])
+
+        self.assertEqual(self._run_import(), 1)
+        with sqlite_connection(self.proxy_path) as conn:
+            row = conn.execute(
+                "SELECT duration_ms,output_tps,completion_tokens,total_tokens "
+                "FROM request_log WHERE event_id LIKE 'codex:%'").fetchone()
+        # 用户消息 01:00:00 → token_count 01:00:10:估算耗时 10 秒
+        self.assertEqual((row[0], row[2], row[3]), (10_000, 500, 600))
+        self.assertAlmostEqual(row[1], 500 * 1000.0 / 10_000, places=6)
+
+        # 第二次导入幂等:不重复插入,也不改动已估算的耗时与速度
+        self.assertEqual(self._run_import(), 0)
+        with sqlite_connection(self.proxy_path) as conn:
+            again = conn.execute(
+                "SELECT duration_ms,output_tps FROM request_log "
+                "WHERE event_id LIKE 'codex:%'").fetchone()
+        self.assertEqual(tuple(again), (10_000, 50.0))
+
+    def test_durable_usage_record_only_session_is_imported(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        self._create_software(database)
+        usage = {"input_tokens": 100, "output_tokens": 600,
+                 "cached_input_tokens": 0, "reasoning_output_tokens": 0,
+                 "total_tokens": 700}
+        self._write_session("rollout-20260813010000-{}.jsonl".format(SESSION_ID), [
+            json.dumps({"type": "session_meta",
+                        "payload": {"session_id": SESSION_ID}}),
+            json.dumps({"type": "turn_context",
+                        "payload": {"model": "gpt-5.1-codex"}}),
+            json.dumps({"timestamp": "2026-08-13T01:00:01.000Z",
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "user"}}),
+            json.dumps({"timestamp": "2026-08-13T01:00:05.000Z",
+                        "type": "response_item",
+                        "payload": {"type": "reasoning"}}),
+            # 中断的调用只留下 durable 记录,没有 UI token_count
+            json.dumps({"timestamp": "2026-08-13T01:00:09.500Z",
+                        "type": "token_usage_record",
+                        "payload": {"usage": usage,
+                                    "thread_token_usage": dict(usage)}}),
+        ])
+
+        self.assertEqual(self._run_import(), 1)
+        with sqlite_connection(self.proxy_path) as conn:
+            row = conn.execute(
+                "SELECT prompt_tokens,completion_tokens,total_tokens,"
+                "duration_ms,output_tps FROM request_log "
+                "WHERE event_id LIKE 'codex:%'").fetchone()
+        self.assertEqual(tuple(row[:3]), (100, 600, 700))
+        # 耗时按 token_usage_record 的时间戳结算(用户消息 01.000 → 记录 09.500)
+        self.assertEqual(row[3], 8_500)
+        self.assertAlmostEqual(row[4], 600 * 1000.0 / 8_500, places=6)
+
+        self.assertEqual(self._run_import(), 0)
+        with sqlite_connection(self.proxy_path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM request_log "
+                "WHERE event_id LIKE 'codex:%'").fetchone()[0], 1)
+
     def test_no_agent_account_returns_zero(self) -> None:
         # 无 codex agent 账户:干净返回 0,不报错
         self._write_session("rollout-20260813010000-{}.jsonl".format(SESSION_ID),
@@ -474,6 +673,101 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                                 "maintenance socket did not trigger another import")
             finally:
                 service.stop()
+
+
+    # ── antigravity:合成临时 .db 数据根,走真实导入路径 ──
+
+    @staticmethod
+    def _pb_varint(value: int) -> bytes:
+        out = bytearray()
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                out.append(byte | 0x80)
+            else:
+                out.append(byte)
+                return bytes(out)
+
+    @classmethod
+    def _pb_varint_field(cls, number: int, value: int) -> bytes:
+        return cls._pb_varint((number << 3) | 0) + cls._pb_varint(value)
+
+    @classmethod
+    def _pb_bytes_field(cls, number: int, payload: bytes) -> bytes:
+        return (cls._pb_varint((number << 3) | 2)
+                + cls._pb_varint(len(payload)) + payload)
+
+    @classmethod
+    def _pb_string_field(cls, number: int, text: str) -> bytes:
+        return cls._pb_bytes_field(number, text.encode("utf-8"))
+
+    def test_antigravity_import_counts_thinking_once_and_merges_both_tables(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        database = ProxyDatabase(str(self.proxy_path))
+        conversations = Path(self._sessions.name) / "antigravity" / "conversations"
+        conversations.mkdir(parents=True)
+
+        # 字段 3 是输出总量(可见 40 + thinking 80),字段 4 是未分类的
+        # cache-creation;完成量必须仍是 120,thinking 不能计两次。
+        gen_usage = b"".join([
+            self._pb_varint_field(2, 900),
+            self._pb_varint_field(3, 120),
+            self._pb_varint_field(4, 700),
+            self._pb_varint_field(5, 300),
+            self._pb_varint_field(9, 80),
+            self._pb_string_field(11, "RESP_E2E"),
+        ])
+        gen_blob = self._pb_bytes_field(1, b"".join([
+            self._pb_bytes_field(4, gen_usage),
+            self._pb_bytes_field(
+                9, self._pb_bytes_field(4, self._pb_varint_field(1, 1783508703))),
+            self._pb_string_field(21, "Gemini 3.8 Flash (High)"),
+        ]))
+        # 同一次调用(同一 response id)也被 steps 表看到:必须合并而不是第二行。
+        step_usage = b"".join([
+            self._pb_varint_field(2, 900),
+            self._pb_varint_field(3, 120),
+            self._pb_varint_field(5, 300),
+            self._pb_varint_field(9, 80),
+            self._pb_string_field(11, "RESP_E2E"),
+        ])
+        user_step = (self._pb_bytes_field(1, self._pb_varint_field(1, 1783508701))
+                     + self._pb_varint_field(3, 4))
+        assistant_step = (
+            self._pb_bytes_field(1, self._pb_varint_field(1, 1783508703))
+            + self._pb_varint_field(3, 2)
+            + self._pb_bytes_field(9, step_usage))
+        with sqlite_connection(conversations / "cascade-e2e.db") as connection:
+            connection.execute("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)")
+            connection.execute("CREATE TABLE steps (idx INTEGER, metadata BLOB)")
+            connection.execute("INSERT INTO gen_metadata VALUES (?,?)", (1, gen_blob))
+            connection.execute("INSERT INTO steps VALUES (?,?)", (1, user_step))
+            connection.execute("INSERT INTO steps VALUES (?,?)", (2, assistant_step))
+
+        software_id = database.create_agent_software({
+            "name": "antigravity-agent", "agent_kind": "antigravity",
+            "config": {"data_root": str(conversations)},
+        })
+
+        self.assertEqual(import_once(database), 1)
+        with sqlite_connection(self.proxy_path) as connection:
+            rows = connection.execute(
+                "SELECT model,prompt_tokens,completion_tokens,cache_read_tokens,"
+                "total_tokens,agent_software_id,requested_at FROM request_log "
+                "WHERE agent_software_id=? ORDER BY id", (software_id,)).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(tuple(rows[0]), (
+            "Gemini 3.8 Flash (High)", 1900, 120, 300, 2020, software_id,
+            "2026-07-08T11:05:03Z"))
+
+        # 第二次导入幂等:同一 response id 只有一行。
+        self.assertEqual(import_once(database), 0)
+        with sqlite_connection(self.proxy_path) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM request_log WHERE agent_software_id=?",
+                (software_id,)).fetchone()[0], 1)
 
 
 class AgentUsageWorkerTest(unittest.TestCase):

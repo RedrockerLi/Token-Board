@@ -127,7 +127,7 @@
 
 ### 性能监控
 
-性能数据源是 `request_log`(含 TTFT/生成耗时/输出速度列)与 `request_attempts`(每次上游尝试的明细)。
+性能数据源是 `request_log`(含 TTFT/生成耗时/输出速度列)与 `request_attempts`(每次上游尝试的明细),仅统计 `source_kind='proxy'` 的代理请求,智能体导入行不计入。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|

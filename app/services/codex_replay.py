@@ -15,7 +15,11 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from app.services.codex_segments import CodexMergeCancelled, merge_codex_records
+from app.services.codex_segments import (
+    CodexMergeCancelled,
+    merge_codex_records,
+    normalize_usage_record,
+)
 
 
 def _timestamp_ms(value) -> float | None:
@@ -102,6 +106,10 @@ def _session_index(path: Path | tuple[Path, ...],
             line_no += 1 if len(paths) > 1 else 0
             if not isinstance(obj, dict):
                 continue
+            # durable `token_usage_record` 与 UI `token_count` 是同一形状的两次
+            # 写入:计数与指纹都要先归一,才能与用量解析那一趟(parse)对齐,
+            # 重放跳过数才不会错位。
+            obj = normalize_usage_record(obj)
             record_timestamp = _timestamp_ms(obj.get("timestamp"))
             if record_timestamp is not None:
                 logical_timestamp = max(

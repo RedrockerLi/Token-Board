@@ -419,9 +419,15 @@ async function loadAllPerfData() {
                 ? '--' : realtime.latest_concurrent;
         }
         if (elRPM) elRPM.textContent = realtime.rpm;
-        if (elSuccess) elSuccess.textContent = (summary.success_rate || 0) + '%';
+        if (elSuccess) {
+            // 15 分钟窗口内没有任何代理请求时保持占位符，避免把空窗口读成 0% 失败。
+            elSuccess.textContent = summary.total_requests
+                ? summary.success_rate + '%' : '--';
+        }
         if (elLatency) {
-            elLatency.textContent = summary.avg_ttft_ms != null
+            // 窗口内没有可观测的流式成功请求时保持占位符：0 ms 不是真实的
+            // 首字延迟（非流式行写入 0）。
+            elLatency.textContent = summary.avg_ttft_ms > 0
                 ? summary.avg_ttft_ms + ' ms' : '--';
         }
 

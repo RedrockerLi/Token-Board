@@ -265,6 +265,9 @@ async function loadLogsTable() {
             return;
         }
 
+        // 导入行用 source_kind_raw 判别：智能体账户的代理行会展示为 'agent'，
+        // 历史导入行的 agent_software_id 可能为 NULL。导入行按日志时间戳估算
+        // 输出速度（含首字等待，故前缀 ≈），无真实 TTFT 可展示。
         tbody.innerHTML = data.items.map((r) => `
             <tr>
                 <td>${esc(fmtLocal(r.requested_at))}</td>
@@ -272,8 +275,8 @@ async function loadLogsTable() {
                 <td><code>${esc(r.model)}</code></td>
                 <td>${fmtNum(r.prompt_tokens)} / ${fmtNum(r.cache_read_tokens || 0)} / ${fmtNum(r.completion_tokens)} / ${fmtNum(r.total_tokens)}</td>
                 <td>¥${(r.cost || 0).toFixed(4)}</td>
-                <td>${r.ttft_ms == null ? '—' : `${r.ttft_ms}ms`}</td>
-                <td>${r.output_tps == null ? '—' : `${Number(r.output_tps).toFixed(2)} tokens/s`}</td>
+                <td>${r.source_kind_raw === 'import' ? '—' : (r.ttft_ms == null ? '—' : `${r.ttft_ms}ms`)}</td>
+                <td>${r.source_kind_raw === 'import' ? (r.output_tps > 0 ? '≈' + Number(r.output_tps).toFixed(2) + ' tokens/s' : '—') : (r.output_tps == null ? '—' : `${Number(r.output_tps).toFixed(2)} tokens/s`)}</td>
                 <td>${r.source_kind === 'agent' ? '导入' : (r.is_streaming ? 'SSE' : 'REST')}</td>
                 <td><span class="badge ${r.status_code >= 200 && r.status_code < 300 ? 'badge--active' : 'badge--inactive'}">${r.status_code}</span></td>
             </tr>

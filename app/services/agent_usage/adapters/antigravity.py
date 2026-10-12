@@ -28,6 +28,11 @@ LABEL = "Antigravity"
 DEFAULT_PATH = Path.home() / ".gemini" / "antigravity"
 ALWAYS_SCAN = True
 
+# steps.metadata 字段 3 的步骤来源枚举(与 RPC 的 CORTEX_STEP_SOURCE_* 对应):
+# 4 = 用户轮次,2 = 模型轮次,其余(系统/工具/未指定)只贡献时间戳。
+STEP_SOURCE_USER = 4
+STEP_SOURCE_MODEL = 2
+
 
 def _fields(buf: bytes) -> dict[int, list[tuple[int, object]]]:
     out = {}
@@ -79,44 +84,200 @@ def _string(fields, number):
     return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else ""
 
 
-def _metadata(blob: bytes):
-    chat = _message(_fields(blob), 1)
-    usage = _message(chat, 4)
+def _parse_usage_message(fields) -> dict:
+    """解码一条 ModelUsage 消息。
+
+    gen_metadata 的 chatModel.usage(1.4)、其重试条目(1.17.2)、steps.metadata
+    的 usage(9)与重试(28.2)是同一个线上格式,共用一个解码器:
+
+      modelId = 1, input = 2, totalOutput = 3(含 thinking), cacheCreation = 4,
+      cacheRead = 5, messageId = 7, thinking = 9, visibleOutput = 10,
+      responseId = 11, providerMessageId = 12
+
+    字段 3 是输出总量(可见部分 + thinking)。宿主会把 reasoning 折回
+    completion,所以 output 只保留可见部分,thinking 单独留给 reasoning;
+    把 thinking 留在 output 里的每个 token 都会被计两次。
+    """
+    input_tokens = _first(fields, 2, 0) or 0
+    total_output = _first(fields, 3, 0) or 0
+    cache_creation = _first(fields, 4, 0) or 0
+    cache_read = _first(fields, 5, 0) or 0
+    thinking = _first(fields, 9, 0) or 0
+    visible_output = _first(fields, 10, 0)
+    if visible_output is None:
+        output_tokens = max(0, total_output - thinking)
+    else:
+        output_tokens = min(visible_output, total_output)
+    return {
+        "model_id": _first(fields, 1, 0) or 0,
+        "input": input_tokens,
+        "output": output_tokens,
+        "cache_creation": cache_creation,
+        "cache_read": cache_read,
+        # 缺少 visible 字段时,可见部分之外的余量就是 thinking;
+        # 两者始终加回字段 3 的总量。
+        "thinking": max(thinking, total_output - output_tokens),
+        "message_id": _string(fields, 7),
+        "response_id": _string(fields, 11),
+        "provider_message_id": _string(fields, 12),
+        "total_output": total_output,
+    }
+
+
+def _has_token_usage(usage) -> bool:
+    """解码后的 usage 是否带有任何真实 token 计数。"""
     if not usage:
+        return False
+    return bool(usage.get("input") or usage.get("total_output")
+                or usage.get("cache_creation") or usage.get("cache_read")
+                or usage.get("thinking"))
+
+
+def _parse_retry_usages(fields, number: int) -> list[dict]:
+    """解码 number 字段下每个重试条目(条目字段 2 = usage)。"""
+    out = []
+    for wire, value in fields.get(number, []):
+        if wire != 2 or not isinstance(value, bytes):
+            continue
+        usage = _first(_fields(value), 2, 2)
+        if isinstance(usage, bytes):
+            out.append(_parse_usage_message(_fields(usage)))
+    return out
+
+
+def _parse_gen_metadata_blob(blob: bytes) -> dict | None:
+    """解析一行 gen_metadata;没有 token 用量(错误/规划占位)返回 None。"""
+    chat = _message(_fields(blob), 1)
+    usage = _first(chat, 4, 2)
+    if not isinstance(usage, bytes):
         return None
-    values = {
-        "input": _first(usage, 2) or 0, "output": _first(usage, 3) or 0,
-        "cache": _first(usage, 5) or 0, "reasoning": _first(usage, 9) or 0,
-        "response_id": _string(usage, 11),
+    parsed = _parse_usage_message(_fields(usage))
+    if not _has_token_usage(parsed):
+        return None
+    seconds = _first(_message(_message(chat, 9), 4), 1, 0)
+    return {
+        **parsed,
+        "timestamp": timestamp(seconds) if seconds else None,
         "display_name": _string(chat, 21),
         "response_model": _string(chat, 19),
+        "retry_usages": _parse_retry_usages(chat, 17),
     }
-    if sum(values[key] for key in ("input", "output", "cache", "reasoning")) <= 0:
+
+
+def _decode_step_usage(fields) -> dict:
+    """解码 steps.metadata 自带的用量(字段 9)、重试(字段 28)与模型信息(24)。
+
+    用量可以只写在 step 上(字段 9),generator 行可以完全没有用量。
+    """
+    usage_bytes = _first(fields, 9, 2)
+    model_info = _message(fields, 24)
+    return {
+        "usage": (_parse_usage_message(_fields(usage_bytes))
+                  if isinstance(usage_bytes, bytes) else None),
+        "retry_usages": _parse_retry_usages(fields, 28),
+        "model_name": ((_string(model_info, 12) or _string(model_info, 8))
+                       if model_info else ""),
+        "model_id": ((_first(model_info, 1, 0) or 0) if model_info else 0),
+    }
+
+
+def _step_timestamp(fields) -> str | None:
+    """取 step 自己的时钟:字段 1.1 优先,缺失时回退字段 8.1。
+
+    越界或损坏的 varint 只会让这一行没有时钟,不能让整轮导入失败。
+    """
+    seconds = None
+    for number in (1, 8):
+        message = _message(fields, number)
+        seconds = _first(message, 1, 0) if message else None
+        if seconds:
+            break
+    if not seconds:
         return None
-    start = _message(_message(chat, 9), 4)
-    seconds = _first(start, 1) if start else None
-    values["timestamp"] = timestamp(seconds)
-    return values
+    try:
+        return timestamp(seconds)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
-def _step_timestamps(db: Path, *, strict: bool = False) -> dict[int, str]:
-    result = {}
+def _row_index(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _read_usage_records(db: Path) -> list[dict]:
+    """读取一个级联 .db 的全部 gen_metadata 用量记录(带表内 idx)。"""
     rows = sqlite_rows_snapshot(
         db,
-        "SELECT idx,hex(metadata) AS blob FROM steps WHERE metadata IS NOT NULL ORDER BY idx",
+        "SELECT idx,hex(data) AS blob FROM gen_metadata ORDER BY idx",
+        raise_on_error=True,
+    )
+    records = []
+    for row in rows:
+        blob = row["blob"]
+        if not blob:
+            continue
+        try:
+            record = _parse_gen_metadata_blob(bytes.fromhex(blob))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            continue  # 单个损坏 blob 不能拖垮其余行
+        if record:
+            record["idx"] = _row_index(row["idx"])
+            records.append(record)
+    return records
+
+
+def _read_step_rows(db: Path, *, strict: bool = False) -> dict:
+    """单遍扫描 steps 表,同时取回三件事:
+
+      - usages:step 自带的用量(字段 9 + 字段 28 的重试条目);用量可以
+        只落在 step 上,generator 行没有用量的库也能读出 token;
+      - timestamps:idx → 时钟,含不产生事件的系统/工具步骤,用于补齐
+        没有内嵌 chatStartMetadata 的 gen_metadata 行;
+      - events:用户/模型轮次,按 idx 排序,供会话计时使用。
+
+    步骤来源见 STEP_SOURCE_* 常量;其余步骤只贡献时间戳。
+    """
+    rows = sqlite_rows_snapshot(
+        db,
+        "SELECT idx,hex(metadata) AS blob FROM steps "
+        "WHERE metadata IS NOT NULL ORDER BY idx",
         raise_on_error=strict,
     )
+    usages: list[dict] = []
+    timestamps: dict[int, str] = {}
+    events: list[dict] = []
     for row in rows:
-        try:
-            fields = _fields(bytes.fromhex(row["blob"] or ""))
-            created = _message(fields, 1)
-            seconds = _first(created, 1) if created else None
-            value = timestamp(seconds)
-            if value is not None:
-                result[int(row["idx"])] = value
-        except (TypeError, ValueError, KeyError, OverflowError):
+        blob = row["blob"]
+        if not blob:
             continue
-    return result
+        try:
+            fields = _fields(bytes.fromhex(blob))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            continue  # 单个损坏 blob 不能拖垮其余行
+        idx = _row_index(row["idx"])
+        value = _step_timestamp(fields)
+        if value is not None and idx is not None:
+            timestamps[idx] = value
+        source = _first(fields, 3, 0)
+        role = ("user" if source == STEP_SOURCE_USER
+                else "assistant" if source == STEP_SOURCE_MODEL else None)
+        if role and value is not None:
+            events.append({"role": role, "timestamp": value})
+        step_usage = _decode_step_usage(fields)
+        if step_usage["usage"] is None and not step_usage["retry_usages"]:
+            continue
+        usages.append({
+            "idx": idx,
+            "timestamp": value,
+            "model_name": step_usage["model_name"],
+            "model_id": step_usage["model_id"],
+            "usage": step_usage["usage"],
+            "retry_usages": step_usage["retry_usages"],
+        })
+    return {"usages": usages, "timestamps": timestamps, "events": events}
 
 
 def _workspace(db: Path) -> str | None:
@@ -391,6 +552,39 @@ _PLACEHOLDER_MODEL_MAP = {
     "MODEL_OPENAI_GPT_OSS_120B_MEDIUM": "gpt-oss-120b",
 }
 
+# 模型数字 id(gen_metadata 的 chatModel 字段 3 / ModelUsage 字段 1)到名称,
+# 对应当前构建实际提供的模型。表外的 id 回退到本条级联最近一个具名模型,
+# 而不是编造一个无法定价的占位名。
+_MODEL_ID_NAMES = {
+    246: "gemini-2.5-pro",
+    312: "gemini-2.5-flash",
+    313: "gemini-2.5-flash-thinking",
+    329: "gemini-2.5-flash-thinking",
+    330: "gemini-2.5-flash-lite",
+    281: "claude-4-sonnet",
+    282: "claude-4-sonnet",
+    290: "claude-4-opus",
+    291: "claude-4-opus",
+    333: "claude-4.5-sonnet",
+    334: "claude-4.5-sonnet",
+    340: "claude-4.5-haiku",
+    341: "claude-4.5-haiku",
+    342: "gpt-oss-120b-medium",
+    1071: "gemini-3.6-flash-high",
+    1072: "gemini-3.6-flash-medium",
+    1073: "gemini-3.6-flash-low",
+    1298: "gemini-3.7-flash-high",
+    1299: "gemini-3.7-flash-medium",
+    1300: "gemini-3.7-flash-low",
+    1318: "gemini-3.8-flash-high",
+    1319: "gemini-3.8-flash-medium",
+    1320: "gemini-3.8-flash-low",
+}
+
+
+def _normalize_model(raw: str) -> str:
+    return _MODEL_NORMALIZE_MAP.get(str(raw), str(raw))
+
 
 def _legacy_model(chat_model: dict) -> str:
     display = chat_model.get("modelDisplayName")
@@ -398,8 +592,167 @@ def _legacy_model(chat_model: dict) -> str:
         return str(display)
     response_model = str(chat_model.get("responseModel") or "")
     if response_model:
-        return _MODEL_NORMALIZE_MAP.get(response_model, response_model)
+        return _normalize_model(response_model)
     return _PLACEHOLDER_MODEL_MAP.get(str(chat_model.get("model") or ""), "unknown")
+
+
+def _model_from_record(record: dict) -> str:
+    """.db 用量记录的模型回退链:
+
+    displayName → responseModel → step modelName → 数字 id 表 → unknown。
+    displayName 是权威的人类可读名(带推理档位),原样使用;它缺失时
+    回退到 slug 与数字 id。
+    """
+    if record.get("display_name"):
+        return record["display_name"]
+    if record.get("response_model"):
+        return _normalize_model(record["response_model"])
+    if record.get("model_name"):
+        return _normalize_model(record["model_name"])
+    model_id = record.get("model_id") or 0
+    if model_id and model_id in _MODEL_ID_NAMES:
+        return _MODEL_ID_NAMES[model_id]
+    return "unknown"
+
+
+def _usage_identity_keys(record: dict) -> list[str]:
+    """命名同一次 provider 调用的身份键;共享任意一个键即视为同一条记录。"""
+    keys = []
+    if record.get("response_id"):
+        keys.append(f"response:{record['response_id']}")
+    if record.get("provider_message_id"):
+        keys.append(f"provider:{record['provider_message_id']}")
+    if record.get("message_id"):
+        keys.append(f"message:{record['message_id']}")
+    return keys
+
+
+def _usage_score(record: dict) -> int:
+    """保留负载更丰富副本时的排序分数。"""
+    return ((record.get("input") or 0) + (record.get("total_output") or 0)
+            + (record.get("cache_read") or 0) + (record.get("cache_creation") or 0))
+
+
+def _richer_usage_record(a: dict, b: dict) -> dict:
+    """保留负载更丰富的一份,借用被丢弃副本的时钟与模型名。"""
+    rich, poor = (b, a) if _usage_score(b) > _usage_score(a) else (a, b)
+    return {
+        **rich,
+        "timestamp": rich.get("timestamp") or poor.get("timestamp"),
+        "display_name": rich.get("display_name") or poor.get("display_name") or "",
+        "response_model": rich.get("response_model") or poor.get("response_model") or "",
+    }
+
+
+def _stable_identity(keys) -> str | None:
+    """从一组身份键里选一条与保留哪份副本无关的稳定代表。
+
+    优先级 response > provider > message:同一次调用无论由哪张表的副本
+    胜出,event_id 都不变,增量导入的去重凭据才不会翻倍。
+    """
+    for prefix in ("response:", "provider:", "message:"):
+        candidates = sorted(key for key in keys if key.startswith(prefix))
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def _merge_cascade_usage(gen_records: list[dict], step_usages: list[dict]) -> list[dict]:
+    """合并一条级联里两张表各自可能携带的用量记录。
+
+    gen_metadata 与 steps 都可能是同一次调用的载体,两种载体都用 provider
+    的 response id(部分构建只有 message id)标识调用,因此共享任意身份键
+    的两条记录合并、取负载更丰富的一份;两张都计数会让每个轮次重复计费。
+    重试条目按同一身份键并入其所属的调用,另一次真实尝试保留自己的 id
+    单独计数。
+
+    完全没有身份的 step 记录,只有在整条级联没有任何 generator 用量时
+    才保留;旁边有 generator 用量时丢弃,避免同一轮次计两次。
+    """
+    groups: list[dict] = []
+    by_identity: dict[str, dict] = {}
+
+    def merge(record: dict) -> None:
+        keys = _usage_identity_keys(record)
+        hits: dict[int, dict] = {}
+        for key in keys:
+            group = by_identity.get(key)
+            if group is not None:
+                hits.setdefault(id(group), group)
+        if not hits:
+            # source_idx 只服务于 event 序号的稳定性,不参与任何额度口径。
+            target = {"record": record, "keys": set(),
+                      "source_idx": record.get("source_idx", record.get("idx"))}
+            groups.append(target)
+        else:
+            target = next(iter(hits.values()))
+            for other in hits.values():
+                if other is target:
+                    continue
+                target["record"] = _richer_usage_record(target["record"], other["record"])
+                for key in other["keys"]:
+                    by_identity[key] = target
+                    target["keys"].add(key)
+                # 按对象身份移除,避免字典值相等时删错分组。
+                for position, candidate in enumerate(groups):
+                    if candidate is other:
+                        del groups[position]
+                        break
+            target["record"] = _richer_usage_record(target["record"], record)
+        for key in keys:
+            by_identity[key] = target
+            target["keys"].add(key)
+
+    for record in gen_records:
+        merge(record)
+        for retry in record.get("retry_usages") or ():
+            merge({**retry, "timestamp": record.get("timestamp"),
+                   "source_idx": record.get("idx")})
+    step_usage_stands_alone = not gen_records
+    for row in step_usages:
+        for usage in (row.get("usage"), *(row.get("retry_usages") or ())):
+            if not _has_token_usage(usage):
+                continue
+            if not step_usage_stands_alone and not _usage_identity_keys(usage):
+                continue
+            merge({
+                **usage,
+                "timestamp": row.get("timestamp"),
+                "display_name": "",
+                "response_model": "",
+                "model_name": row.get("model_name"),
+                "source_idx": row.get("idx"),
+            })
+
+    # 记录按首次出现顺序输出;解析模型,并把本条级联最近一个具名模型延续
+    # 给只带数字 id 的记录。
+    carried_model = ""
+    merged = []
+    for group in groups:
+        record = group["record"]
+        model = _model_from_record(record)
+        if model != "unknown":
+            carried_model = model
+        else:
+            model = carried_model or "unknown"
+        merged.append({
+            **record,
+            "model": model,
+            "identity": _stable_identity(group["keys"]),
+            "source_idx": group["source_idx"],
+        })
+    return merged
+
+
+def _resolve_usage_timestamp(record: dict, timestamps: dict[int, str]) -> str | None:
+    """优先记录自带 createdAt;缺失(没有 9.4 的消息)时按同 idx 的 step 回退。"""
+    value = record.get("timestamp")
+    if value:
+        return value
+    idx = record.get("idx")
+    if idx is None:
+        return None
+    return timestamps.get(idx)
 
 
 def _parse_legacy(item: UsageSource, stop_event=None) -> ParseBatch:
@@ -445,16 +798,25 @@ def _parse_legacy(item: UsageSource, stop_event=None) -> ParseBatch:
                 continue
             usage = retry["usage"]
             response_id = str(usage.get("responseId") or "").strip()
+            # language server 序列化的是与 .db 行相同的 GeneratorMetadata
+            # protobuf:outputTokens(字段 3)是总量,thinking 是其中一部分,
+            # 按输出价计一次,不能计两次。
+            total_output = safe_float(usage.get("outputTokens"))
+            thinking = safe_float(usage.get("thinkingOutputTokens"))
+            output_tokens = max(0, total_output - thinking)
             event = make_event(
                 kind=KIND,
                 source_key="response" if response_id else item.state_key,
                 ordinal=response_id or len(events),
                 model=_legacy_model(chat_model),
                 requested_at=requested_at,
-                input_tokens=safe_float(usage.get("inputTokens")),
-                output_tokens=safe_float(usage.get("outputTokens")),
+                # request_log 没有 cache-creation 列,按本仓库惯例折入 input,
+                # 与 .db 路径同一口径。
+                input_tokens=(safe_float(usage.get("inputTokens"))
+                              + safe_float(usage.get("cacheCreationTokens"))),
+                output_tokens=output_tokens,
                 cached_input_tokens=safe_float(usage.get("cacheReadTokens")),
-                reasoning_output_tokens=safe_float(usage.get("thinkingOutputTokens")),
+                reasoning_output_tokens=max(thinking, total_output - output_tokens),
                 project=project,
                 session_id=item.path.stem,
             )
@@ -474,11 +836,10 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         return batch([], 0)
     strict = bool(item.context.get("strict"))
     try:
-        rows = sqlite_rows_snapshot(
-            db, "SELECT idx,hex(data) AS blob FROM gen_metadata ORDER BY idx",
-            raise_on_error=True,
-        )
-        step_times = _step_timestamps(db, strict=strict)
+        # 一次 steps 扫描同时拿到:只落在 step 上的用量、
+        # gen_metadata 行缺失自带时间戳时的 idx → 时钟回退、会话事件。
+        step_rows = _read_step_rows(db, strict=strict)
+        records = _read_usage_records(db)
     except (OSError, sqlite3.Error):
         return batch(
             [], 0, skipped=True,
@@ -487,25 +848,41 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             ),
         )
     workspace = _workspace(db)
+    merged = _merge_cascade_usage(records, step_rows["usages"])
+    record_count = len(records) + len(step_rows["usages"])
     events = []
-    for row in rows:
+    for index, record in enumerate(merged):
         if stop_event is not None and stop_event.is_set():
-            return batch(events, len(rows), skipped=True)
-        try:
-            record = _metadata(bytes.fromhex(row["blob"] or ""))
-        except (ValueError, TypeError, IndexError, OverflowError):
-            record = None
-        if not record:
+            return batch(events, record_count, skipped=True)
+        # 时钟要么来自记录自身,要么来自同一 idx 的 steps.metadata
+        # (generator 行可以没有 chatStartMetadata,时间戳此时按 idx 回退)。
+        requested_at = _resolve_usage_timestamp(record, step_rows["timestamps"])
+        if requested_at is None:
             continue
-        requested_at = record.get("timestamp") or step_times.get(int(row["idx"]))
+        # event_id 用组级身份而不是胜出副本的字段:同一调用换一份更丰富的
+        # 副本时,增量导入的去重凭据保持不变。
+        identity = record.get("identity")
+        if identity:
+            source_key, _, ordinal = identity.partition(":")
+        else:
+            source_key = item.state_key
+            ordinal = record.get("source_idx")
+            if ordinal is None:
+                ordinal = index
         event = make_event(
-            kind=KIND, source_key="response" if record.get("response_id") else item.state_key,
-            ordinal=record.get("response_id") or row["idx"],
-            model=record.get("display_name") or record.get("response_model") or "unknown", requested_at=requested_at,
-            input_tokens=record["input"], output_tokens=record["output"], cached_input_tokens=record["cache"],
-            reasoning_output_tokens=record["reasoning"],
-            project=project_name(workspace), session_id=db.stem,
+            kind=KIND,
+            source_key=source_key,
+            ordinal=ordinal,
+            model=record.get("model"),
+            requested_at=requested_at,
+            # request_log 没有 cache-creation 列,按本仓库惯例折入 input。
+            input_tokens=record["input"] + record["cache_creation"],
+            output_tokens=record["output"],
+            cached_input_tokens=record["cache_read"],
+            reasoning_output_tokens=record["thinking"],
+            project=project_name(workspace),
+            session_id=db.stem,
         )
         if event:
             events.append(event)
-    return batch(events, len(rows))
+    return batch(events, record_count)

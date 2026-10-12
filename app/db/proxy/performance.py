@@ -9,6 +9,8 @@ class ProxyPerformanceMixin:
 
         Data source: request_log, which records every request outcome
         (including aborted/timeout/error attempts). Errors = status_code >= 400.
+        Only source_kind='proxy' rows are counted; agent-imported rows carry
+        no observed latency and would skew the averages.
         """
         conn = self._connect()
         try:
@@ -19,7 +21,9 @@ class ProxyPerformanceMixin:
                 "AVG(CASE WHEN status_code BETWEEN 200 AND 299 "
                 "              AND ttft_ms IS NOT NULL THEN ttft_ms END) "
                 "FROM request_log "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes')",
+                "WHERE source_kind='proxy' "
+                "  AND requested_at >= "
+                "      strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' minutes')",
                 (str(window_minutes),),
             ).fetchone()
             successes = successes or 0
@@ -36,13 +40,15 @@ class ProxyPerformanceMixin:
             conn.close()
 
     def get_perf_latency(self, window_minutes: int = 60) -> list[dict]:
-        """Observed streaming TTFT percentiles per bucket."""
+        """Observed streaming TTFT percentiles per bucket (proxy rows only)."""
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT strftime('%Y-%m-%dT%H:%M:00Z', requested_at) AS bucket, "
                 "ttft_ms FROM request_log "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "WHERE source_kind='proxy' "
+                "  AND requested_at >= "
+                "      strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' minutes') "
                 "  AND status_code BETWEEN 200 AND 299 "
                 "  AND ttft_ms IS NOT NULL "
                 "ORDER BY bucket, ttft_ms",
@@ -74,13 +80,18 @@ class ProxyPerformanceMixin:
             conn.close()
 
     def get_perf_speed(self, window_minutes: int = 60) -> list[dict]:
-        """Observed streaming output-speed (tokens/s) percentiles per bucket."""
+        """Observed streaming output-speed (tokens/s) percentiles per bucket.
+
+        Proxy rows only: imported rows carry estimates, not measurements.
+        """
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT strftime('%Y-%m-%dT%H:%M:00Z', requested_at) AS bucket, "
                 "output_tps FROM request_log "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "WHERE source_kind='proxy' "
+                "  AND requested_at >= "
+                "      strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' minutes') "
                 "  AND status_code BETWEEN 200 AND 299 "
                 "  AND output_tps IS NOT NULL "
                 "ORDER BY bucket, output_tps",
@@ -112,14 +123,16 @@ class ProxyPerformanceMixin:
             conn.close()
 
     def get_perf_throughput(self, window_minutes: int = 60) -> list[dict]:
-        """Request count per 1-minute bucket (from request_log)."""
+        """Request count per 1-minute bucket (proxy rows only)."""
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT strftime('%Y-%m-%dT%H:%M:00Z', requested_at) AS bucket, "
                 "COUNT(*) AS request_count "
                 "FROM request_log "
-                "WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "WHERE source_kind='proxy' "
+                "  AND requested_at >= "
+                "      strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' minutes') "
                 "GROUP BY bucket "
                 "ORDER BY bucket",
                 (str(window_minutes),)
@@ -135,7 +148,8 @@ class ProxyPerformanceMixin:
         Samples only the *max_samples* most recent request_log rows per model
         (within the window), so high-traffic models don't dominate the
         averages; `ttft_samples`/`speed_samples` report how many of those rows
-        actually carried a TTFT / speed observation.
+        actually carried a TTFT / speed observation.  Proxy rows only:
+        imported rows report estimated values, not observations.
         """
         conn = self._connect()
         try:
@@ -145,7 +159,9 @@ class ProxyPerformanceMixin:
                 "         ROW_NUMBER() OVER (PARTITION BY model "
                 "                            ORDER BY requested_at DESC, id DESC) AS rn "
                 "  FROM request_log "
-                "  WHERE requested_at >= datetime('now', '-' || ? || ' minutes')"
+                "  WHERE source_kind='proxy' "
+                "    AND requested_at >= "
+                "        strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' minutes')"
                 ") "
                 "SELECT model, COUNT(*) AS request_count, "
                 "AVG(CASE WHEN status_code BETWEEN 200 AND 299 THEN ttft_ms END) AS avg_ttft_ms, "
@@ -193,11 +209,13 @@ class ProxyPerformanceMixin:
             observations = (
                 "WITH observations(account_id, status_code, requested_at) AS ("
                 "  SELECT account_id, status_code, requested_at FROM request_attempts "
-                "  WHERE requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "  WHERE requested_at >= "
+                "        strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' minutes') "
                 "  UNION ALL "
                 "  SELECT r.account_id, r.status_code, r.requested_at FROM request_log r "
                 "  WHERE COALESCE(r.attempt_count, 1) > 0 "
-                "    AND r.requested_at >= datetime('now', '-' || ? || ' minutes') "
+                "    AND r.requested_at >= "
+                "        strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' minutes') "
                 "    AND NOT EXISTS (SELECT 1 FROM request_attempts t "
                 "                    WHERE t.request_log_id = r.id)"
                 ") "
@@ -238,7 +256,8 @@ class ProxyPerformanceMixin:
             recent_count = conn.execute(
                 "SELECT COUNT(*) FROM request_log "
                 "WHERE source_kind='proxy' "
-                "  AND requested_at >= datetime('now', '-' || ? || ' seconds')",
+                "  AND requested_at >= "
+                "      strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' seconds')",
                 (str(window_seconds),)
             ).fetchone()[0]
 

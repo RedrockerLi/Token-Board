@@ -34,6 +34,7 @@ class UsageEvent:
     event_id: str
     project: str | None = None
     session_id: str | None = None
+    duration_ms: int = 0
     metadata: Mapping[str, Any] = field(default_factory=dict, repr=False,
                                         compare=False)
 
@@ -43,6 +44,7 @@ class UsageEvent:
                      "total_tokens"):
             object.__setattr__(self, name, _non_negative_int(getattr(self, name)))
         object.__setattr__(self, "event_id", str(self.event_id))
+        object.__setattr__(self, "duration_ms", _non_negative_int(self.duration_ms))
 
     @classmethod
     def from_buckets(
@@ -57,6 +59,7 @@ class UsageEvent:
         event_id: str,
         project: str | None = None,
         session_id: str | None = None,
+        duration_ms: Any = 0,
         input_includes_cache: bool = False,
         total_tokens: Any | None = None,
         metadata: Mapping[str, Any] | None = None,
@@ -83,6 +86,7 @@ class UsageEvent:
             event_id=str(event_id),
             project=project,
             session_id=session_id,
+            duration_ms=duration_ms,
             metadata=metadata or {},
         )
 

@@ -126,6 +126,8 @@ def _usage_event(item, ordinal, model, project, ts, usage, session_id):
         output_tokens=output_tokens, cached_input_tokens=cache,
         reasoning_output_tokens=reasoning,
         project=project, session_id=session_id,
+        # Grok 自带的本轮 API 时长,是原生测量值,不需要钳制。
+        duration_ms=safe_int(usage.get("apiDurationMs")),
     )
 
 

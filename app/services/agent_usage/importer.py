@@ -10,6 +10,18 @@ from .ir import ParseBatch, UsageEvent, UsageSource
 from .registry import get_adapter, get_adapter_spec
 
 
+SPEED_ESTIMATE_MIN_OUTPUT_TOKENS = 200
+SPEED_ESTIMATE_MIN_DURATION_MS = 1000
+
+
+def _estimated_output_tps(completion_tokens: int, duration_ms: int) -> float:
+    """估算输出速度:耗时含首字等待,门槛(200/1000ms)与 ref/cc-switch 一致。"""
+    if (duration_ms < SPEED_ESTIMATE_MIN_DURATION_MS
+            or completion_tokens < SPEED_ESTIMATE_MIN_OUTPUT_TOKENS):
+        return 0.0
+    return completion_tokens * 1000.0 / duration_ms
+
+
 def _same_stat(previous: dict, stat) -> bool:
     if not isinstance(previous, dict):
         return False
@@ -147,7 +159,9 @@ def _import_software(pdb, software: dict, stop_event=None,
                     if pdb._insert_agent_usage_row(
                             conn, software_id, event.model, event.prompt_tokens,
                             event.completion_tokens, event.cache_read_tokens,
-                            event.total_tokens, event.requested_at, event.event_id):
+                            event.total_tokens, event.requested_at, event.event_id,
+                            duration_ms=event.duration_ms,
+                            output_tps=_estimated_output_tps(event.completion_tokens, event.duration_ms)):
                         file_inserted += 1
                 if stable and not parsed.skipped:
                     states[state_key] = {

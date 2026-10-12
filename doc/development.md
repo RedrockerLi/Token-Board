@@ -67,19 +67,19 @@ python3 scripts/mock_upstream.py --port 9100
 
 用量数据来自代理转发和已注册智能体软件:消费报告页点「导出数据」触发 `sync_dashboard`(见 [sync.md](sync.md)),把 `request_log`
 按 日×账户/软件(id)×模型 增量聚合写进 `dashboard.db`(纯存档,写时固化的费用直接入库,改价不回溯)。
-Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由 `token-maintenance` 的通用 importer 负责游标、幂等和写入 `request_log`；仪表板打开时通过本地 socket 异步唤醒导入。`project`、`session_id` 只在导入过程的内存中使用,不作为数据库或 API 字段。
+Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由 `token-maintenance` 的通用 importer 负责游标、幂等和写入 `request_log`；仪表板打开时通过本地 socket 异步唤醒导入。会话日志导入时按日志时间戳估算请求耗时（claude-code、codex；grok 用原生 `apiDurationMs`），不估算 TTFT：估算耗时写入 `request_log.duration_ms`（不可估时为 0），输出 ≥200 token 且耗时 ≥1000ms 的行另写估算 `output_tps`（含首字等待）。请求日志页对导入行以 `≈N.NN tokens/s` 展示估算速度（无估算显示 `—`），TTFT 显示 `—`；性能监控接口只统计 `source_kind='proxy'` 的代理流量。`project`、`session_id` 只在导入过程的内存中使用,不作为数据库或 API 字段。
 
 ### Agent 用量 ref 基准
 
-当前移植基准是 `ref/vibe-usage` 的 commit `b4a38745785a243ea23f5130285d78624f89a9f5`（短 hash：`b4a3874`，提交信息：`修复: Grok 1.0 用量账本与两类「静默变空」格式哨兵`，记录日期：2026-09-20）。下次升级 ref 后，可用下面的命令查看新增提交和代码差异：
+当前移植基准是 `ref/vibe-usage` 的 commit `415443a3e9e2af0787ab3c2a460166603258a56d`（短 hash：`415443a`，提交信息：`chore: bump version to 0.14.3`，记录日期：2026-10-12）。本次基准对齐只同步既有 34 种来源的适配器，ref 新增的来源（如 `kiki`）未移植。下次升级 ref 后，可用下面的命令查看新增提交和代码差异：
 
 ```bash
-git -C ref/vibe-usage log b4a38745785a243ea23f5130285d78624f89a9f5..HEAD --oneline
-git -C ref/vibe-usage diff b4a38745785a243ea23f5130285d78624f89a9f5..HEAD -- src/parsers
+git -C ref/vibe-usage log 415443a3e9e2af0787ab3c2a460166603258a56d..HEAD --oneline
+git -C ref/vibe-usage diff 415443a3e9e2af0787ab3c2a460166603258a56d..HEAD -- src/parsers
 ```
 
 本项目已移植全部 34 种智能体来源适配器（`app/services/agent_usage/adapters/`）：
-- **CLI / 转录文件类**：`claude-code`, `codebuddy`, `cola`, `copilot-cli`, `craft-agent`, `dimagent`, `droid`, `dsh`, `gemini-cli`, `grok`, `kimi-code`, `omp`, `openclaw`, `pi-coding-agent`, `qwen-code`, `roo-code`, `trae-cli`, `workbuddy`；
+- **CLI / 转录文件类**：`amp`, `claude-code`, `codebuddy`, `cola`, `copilot-cli`, `craft-agent`, `dimagent`, `droid`, `dsh`, `gemini-cli`, `grok`, `kimi-code`, `omp`, `openclaw`, `pi-coding-agent`, `qwen-code`, `roo-code`, `trae-cli`, `workbuddy`；
 - **本地 SQLite / WAL 数据库类**：`alma`, `codearts-agent`, `devin`, `hermes`, `kiro`, `mcode`, `mimocode`, `opencode`, `qoder`, `qoder-cn`, `zcode`（通过 `sqlite_rows_snapshot` 进行安全快照隔离读取，防御并发锁）；
 - **混合 / 平台类**：`antigravity`（离线 SQLite + protobuf 转录），`cline`（SDK 会话 + 扩展转录），`codex`（Rollout JSONL + Continuation 段重放分段去重），`cursor`（本地凭据 + CSV 导出校验）；
 - **核心设计约定**：

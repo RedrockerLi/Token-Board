@@ -21,7 +21,12 @@ from ..ir import ParseBatch, UsageSource
 KIND = "dsh"
 LABEL = "DeepSeek Harness"
 DEFAULT_PATH = Path.home() / ".dsh" / "sessions"
-MAX_SESSION_FORMAT_VERSION = 3
+# Released session formats.  V4 keeps the filename, header fields, assistant
+# usage block, and inherited cut unchanged; it lifts user-role tool results
+# into tool-role messages, adds ``forked`` to turn/end reasons, and adds
+# developer/message records, none of which carry billable usage.  Re-check the
+# upstream format before accepting another version.
+MAX_SESSION_FORMAT_VERSION = 4
 SESSION_FILENAME = re.compile(r"^session(?:\.v([1-9][0-9]*))?\.jsonl(\.zstd)?$")
 MAX_SESSION_FILE_BYTES = 256 * 1024 * 1024
 MAX_DECOMPRESSED_SESSION_BYTES = 512 * 1024 * 1024

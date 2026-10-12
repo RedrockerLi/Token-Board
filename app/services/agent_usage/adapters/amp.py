@@ -1,6 +1,8 @@
 """Amp thread JSON adapter."""
 
+import logging
 import os
+import sys
 from pathlib import Path
 
 from ..common import batch, config_value, make_event, read_json, source, timestamp, walk_files
@@ -9,6 +11,26 @@ from ..ir import ParseBatch, UsageSource
 KIND = "amp"
 LABEL = "Amp"
 DEFAULT_PATH = Path.home() / ".local" / "share" / "amp" / "threads"
+log = logging.getLogger(__name__)
+
+
+def _default_root() -> Path:
+    """The XDG-style default, or the Windows native store when it exists.
+
+    Amp on Windows keeps its threads under ``%LOCALAPPDATA%\\amp\\threads`` and
+    never writes the XDG-style default there, so without this probe the source
+    silently collected nothing.  The native store is used only when it already
+    exists; the default root stays the fallback, and POSIX hosts never probe it.
+    """
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if sys.platform == "win32" and local_app_data:
+        native = Path(local_app_data).expanduser() / "amp" / "threads"
+        try:
+            if native.is_dir():
+                return native
+        except OSError:
+            log.debug("Amp native store is unavailable", exc_info=True)
+    return DEFAULT_PATH
 
 
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
@@ -20,7 +42,7 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
     elif os.environ.get("XDG_DATA_HOME"):
         root = Path(os.environ["XDG_DATA_HOME"]).expanduser() / "amp" / "threads"
     else:
-        root = DEFAULT_PATH
+        root = _default_root()
     return [source(path) for path in walk_files(root, (".json",)) if path.name.startswith("T-")]
 
 

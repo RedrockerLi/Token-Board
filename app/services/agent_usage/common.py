@@ -267,6 +267,7 @@ def make_event(
     reasoning_output_tokens: Any = 0,
     project: str | None = None,
     session_id: str | None = None,
+    duration_ms: Any = 0,
     input_includes_cache: bool = False,
     total_tokens: Any | None = None,
 ) -> UsageEvent | None:
@@ -288,6 +289,7 @@ def make_event(
         event_id=event_id_for(kind, source_key, ordinal),
         project=project,
         session_id=session_id,
+        duration_ms=duration_ms,
         input_includes_cache=input_includes_cache,
         total_tokens=total_tokens,
     )
@@ -303,3 +305,22 @@ def batch(
     return ParseBatch.from_events(
         events, record_count, skipped=skipped, warnings=warnings,
     )
+
+
+MIN_PLAUSIBLE_LATENCY_MS = 100
+MAX_PLAUSIBLE_LATENCY_MS = 60 * 60 * 1000
+
+
+def estimated_latency_ms(start_ms: int, end_ms: int) -> int | None:
+    """按会话日志时间戳估算的一次请求耗时,区间外返回 None(与 ref/cc-switch 同口径)。"""
+    latency = int(end_ms) - int(start_ms)
+    return latency if MIN_PLAUSIBLE_LATENCY_MS <= latency <= MAX_PLAUSIBLE_LATENCY_MS else None
+
+
+def timestamp_ms(value: Any) -> int | None:
+    """外部时间戳 → epoch 毫秒;不可解析返回 None。"""
+    try:
+        parsed = parse_external_timestamp(value)
+    except ValueError:
+        return None
+    return None if parsed is None else int(parsed.timestamp() * 1000)

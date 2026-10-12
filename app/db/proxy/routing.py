@@ -109,7 +109,8 @@ class ProxyRoutingMixin:
     def _insert_agent_usage_row(conn, software_id: int, model: str,
                                 prompt_tokens: int, completion_tokens: int,
                                 cache_read_tokens: int, total_tokens: int,
-                                requested_at: str, event_id: str) -> bool:
+                                requested_at: str, event_id: str,
+                                duration_ms: int = 0, output_tps: float = 0.0) -> bool:
         """Insert one imported software usage row on the caller's connection.
 
         A pending V1 event lets SQLite select the current write-time price and FX.  A
@@ -124,22 +125,30 @@ class ProxyRoutingMixin:
             (event_id, software_id),
         )
         if receipt.rowcount == 0:
+            # 收据已存在:上次扫描时回复还没写完(无 stop_reason,没估耗时)或
+            # 历史文件重新解析。只补写仍为空计时的行,不覆盖已有值。
+            if duration_ms > 0:
+                conn.execute("UPDATE request_log SET duration_ms=?,output_tps=? "
+                             "WHERE event_id=? AND duration_ms=0",
+                             (int(duration_ms), float(output_tps), event_id))
             return False
         cur = conn.execute(
             "INSERT OR IGNORE INTO request_log"
             "(event_id,source_kind,account_id,agent_software_id,model,prompt_tokens,completion_tokens,"
             "cache_read_tokens,total_tokens,equivalent_cost,billed_usage_cost,"
-            "is_streaming,status_code,duration_ms,requested_at,pricing_status) "
-            "VALUES(?,'import',?,?,?, ?,?,?,?,0,0,0,200,0,?,'pending')",
+            "is_streaming,status_code,duration_ms,output_tps,requested_at,pricing_status) "
+            "VALUES(?,'import',?,?,?, ?,?,?,?,0,0,0,200,?,?,?,'pending')",
             (event_id, software_id, software_id, model, int(prompt_tokens), int(completion_tokens),
-             int(cache_read_tokens), int(total_tokens), requested_at),
+             int(cache_read_tokens), int(total_tokens), int(duration_ms), float(output_tps),
+             requested_at),
         )
         return cur.rowcount > 0
 
     def insert_agent_usage(self, software_id: int, model: str,
                            prompt_tokens: int, completion_tokens: int,
                            cache_read_tokens: int, total_tokens: int,
-                           requested_at: str, event_id: str) -> bool:
+                           requested_at: str, event_id: str,
+                           duration_ms: int = 0, output_tps: float = 0.0) -> bool:
         """Insert one imported software usage row into request_log.
 
         Convenience wrapper opening its own connection (for manual/API use);
@@ -151,6 +160,7 @@ class ProxyRoutingMixin:
             ok = self._insert_agent_usage_row(
                 conn, software_id, model, prompt_tokens, completion_tokens,
                 cache_read_tokens, total_tokens, requested_at, event_id,
+                duration_ms=duration_ms, output_tps=output_tps,
             )
             conn.commit()
             return ok

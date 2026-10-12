@@ -5,18 +5,21 @@ from __future__ import annotations
 import os
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..common import (
     batch,
     config_value,
     configured_extra_roots,
+    estimated_latency_ms,
     iter_jsonl,
     make_event,
     project_name,
     safe_int,
     source,
     timestamp,
+    timestamp_ms,
     walk_files,
 )
 from ..ir import ParseBatch, UsageSource
@@ -25,6 +28,9 @@ KIND = "claude-code"
 LABEL = "Claude Code"
 DEFAULT_PATH = Path.home() / ".claude"
 log = logging.getLogger(__name__)
+
+# 沿父链往上最多走这么多跳(与 ref/cc-switch 一致)。
+MAX_CHAIN_HOPS = 32
 
 
 def _roots(software: dict) -> list[Path]:
@@ -129,6 +135,115 @@ def _apply_speed_marker(model: str, fast: bool) -> str:
     return model if model.endswith("-fast") else f"{model}-fast"
 
 
+@dataclass
+class _MessageTiming:
+    """一条回复(同一 message.id 的全部内容块)的计时线索。"""
+
+    # 文件里最先出现的那一块的父行,请求起点沿它往上找。
+    first_parent: str | None
+    # 最先出现的那一块是不是这条回复的第一块。不是的话起点会取晚,宁可不估。
+    starts_at_first_block: bool
+    # 各块时间戳(块写完的时刻)里最晚的一个,即回复结束。
+    end_ms: int | None = None
+    # 这个 message.id 的行里是否出现过非空 stop_reason(回复写完整了)。
+    has_stop_reason: bool = False
+
+
+def _line_uuid(obj: dict) -> str | None:
+    value = obj.get("uuid")
+    return value if isinstance(value, str) and value else None
+
+
+def _parent_uuid(obj: dict) -> str | None:
+    value = obj.get("parentUuid")
+    return value if isinstance(value, str) and value else None
+
+
+def _record_chain_node(chain: dict, obj: dict) -> None:
+    """把一行日志记入对话链:uuid → (parentUuid, timestamp_ms, is_attachment)。
+
+    attachment 行的时间戳不可靠(有的是回复开始后才补记的),找请求起点时
+    要跳过,所以单独标记。
+    """
+    uuid = _line_uuid(obj)
+    if uuid is None:
+        return
+    chain[uuid] = (_parent_uuid(obj), timestamp_ms(obj.get("timestamp")),
+                   obj.get("type") == "attachment")
+
+
+def _assistant_message_id(obj: dict) -> str | None:
+    """assistant 行的 message.id;别的行返回 None。"""
+    if obj.get("type") != "assistant":
+        return None
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        return None
+    value = message.get("id")
+    return value if isinstance(value, str) else None
+
+
+def _record_block_timing(timings: dict, obj: dict, msg_id: str) -> None:
+    """把一个内容块记入它所属回复的计时:最先出现的块定起点,最晚的块定结束。"""
+    end_ms = timestamp_ms(obj.get("timestamp"))
+    timing = timings.get(msg_id)
+    if timing is None:
+        index = obj.get("apiBlockIndex")
+        timing = _MessageTiming(
+            first_parent=_parent_uuid(obj),
+            # apiBlockIndex 缺省(旧版日志)按第一块处理。
+            starts_at_first_block=index is None or (
+                isinstance(index, int) and not isinstance(index, bool)
+                and index == 0),
+        )
+        timings[msg_id] = timing
+    if end_ms is not None and (timing.end_ms is None or end_ms > timing.end_ms):
+        timing.end_ms = end_ms
+    message = obj.get("message")
+    stop_reason = message.get("stop_reason") if isinstance(message, dict) else None
+    if isinstance(stop_reason, str) and stop_reason:
+        timing.has_stop_reason = True
+
+
+def _resolve_request_start_ms(chain: dict, first_parent: str | None) -> int | None:
+    """请求起点:从回复第一块的父行沿链上溯,跳过 attachment,取第一个别的行的时间戳。"""
+    cursor = first_parent
+    if cursor is None:
+        return None
+    for _ in range(MAX_CHAIN_HOPS):
+        node = chain.get(cursor)
+        if node is None:
+            return None
+        parent, node_ms, is_attachment = node
+        if not is_attachment:
+            return node_ms
+        cursor = parent
+        if cursor is None:
+            return None
+    return None
+
+
+def _message_durations(chain: dict, timings: dict) -> dict:
+    """按 message.id 给出可入库的估算耗时;估不出的不出现(入库按 0 处理)。
+
+    只给写完整了的回复算(出现过 stop_reason),而且要看得到它的第一块,
+    否则起点会对不上(与 ref/cc-switch 同口径)。
+    """
+    durations = {}
+    for msg_id, timing in timings.items():
+        if not timing.has_stop_reason or not timing.starts_at_first_block:
+            continue
+        if timing.end_ms is None:
+            continue
+        start_ms = _resolve_request_start_ms(chain, timing.first_parent)
+        if start_ms is None:
+            continue
+        latency = estimated_latency_ms(start_ms, timing.end_ms)
+        if latency is not None:
+            durations[msg_id] = latency
+    return durations
+
+
 def discover(software: dict, stop_event=None) -> list[UsageSource]:
     candidates = {}
     roots = _roots(software)
@@ -175,6 +290,16 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
     discovery_warnings = tuple(item.context.get("discovery_warnings") or ())
     if discovery_warnings:
         return batch([], 0, skipped=True, warnings=discovery_warnings)
+    # 估算耗时用的对话链与回复计时:整个文件先扫一遍(含没有 usage 的行)。
+    chain = {}
+    timings = {}
+    for _line_no, obj in iter_jsonl(item.path):
+        _record_chain_node(chain, obj)
+        msg_id = _assistant_message_id(obj)
+        if msg_id is not None:
+            _record_block_timing(timings, obj, msg_id)
+    durations = _message_durations(chain, timings)
+
     events = []
     count = 0
     first_project = item.context.get("fallback_project") or "unknown"
@@ -192,6 +317,7 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         if not isinstance(usage, dict):
             continue
         ts = timestamp(obj.get("timestamp"))
+        msg_id = _assistant_message_id(obj)
         call_id = f"{obj.get('message', {}).get('id', '')}\0{obj.get('requestId', '')}".strip("\0") or str(obj.get("uuid") or line_no)
         raw_model = obj["message"].get("model")
         if isinstance(raw_model, str) and raw_model.strip() and raw_model != "<synthetic>":
@@ -206,6 +332,8 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             input_tokens=safe_int(usage.get("input_tokens")) + cache_creation,
             output_tokens=usage.get("output_tokens", 0), cached_input_tokens=usage.get("cache_read_input_tokens", 0),
             project=first_project or "unknown", session_id=item.path.stem,
+            # 同一 message.id 的各块共用一份估算耗时,去重后落在保留的那一条上。
+            duration_ms=durations.get(msg_id, 0),
         )
         if event:
             current = seen.get(call_id)
