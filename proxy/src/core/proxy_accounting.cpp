@@ -59,12 +59,40 @@ void ProxyServer::enqueue_zero_usage(
 
 // ── cooldown probe ──────────────────────────────────────────────────────
 // While a plan key is inside its 5h cooldown (in-memory, per key slot), the
-// background probe thread asks the upstream every `cooldown_probe_interval_secs_`
-// whether quota has recovered.  A 2xx GET /models clears the cooldown early so
-// the key rejoins the candidate pool before the 5h window ends.  Discipline:
-// the probe writes NO request_log, does NOT acquire a gate slot (never counted
-// in max_concurrency) and touches no gate failure counters — it only observes
-// cooldown state and clears it.
+// background probe thread watches for quota recovery and clears the cooldown
+// early so the key rejoins the candidate pool before the 5h window ends.
+// Two recovery channels share the thread:
+//   - usage-watched sub-types (opencode-go) read the usage snapshot the
+//     dashboard poller refreshes every ~5 minutes — pure local reads, no
+//     HTTP at all.  Their gateway's catalog endpoint answers 200 for any
+//     (or no) key, so an HTTP probe could not witness recovery; the usage
+//     windows can.
+//   - every other plan key gets one minimal chat completion ("你好") per
+//     cooldown_probe_interval_secs_; 2xx means the key can serve again.  A
+//     completed call is the ground truth; a catalog 2xx would only prove
+//     the list is readable.  Accounts without a known model ("更新模型"
+//     never ran) fall back to the free GET catalog probe.
+// Discipline: neither channel writes request_log, acquires a gate slot
+// (never counted in max_concurrency) nor touches gate failure counters — they
+// only observe cooldown state and clear it.
+
+namespace {
+
+// Minimal chat body per upstream wire format: one "你好" user turn, one
+// output token.  Plan calls are free, so the probe costs nothing.
+std::string cooldown_probe_body(ir::ApiFormat format,
+                                const std::string &model) {
+    using nlohmann::json;
+    if (format == ir::ApiFormat::OpenAIResponses) {
+        return json{{"model", model}, {"input", "你好"},
+                    {"max_output_tokens", 1}}.dump();
+    }
+    return json{{"model", model}, {"max_tokens", 1},
+                {"messages", json::array({{{"role", "user"},
+                                           {"content", "你好"}}})}}.dump();
+}
+
+}  // namespace
 
 void ProxyServer::start_cooldown_probe() {
     std::call_once(cooldown_probe_once_, [this] {
@@ -74,15 +102,49 @@ void ProxyServer::start_cooldown_probe() {
 }
 
 void ProxyServer::cooldown_probe_loop() {
-    // Sleep in 200ms slices so shutdown is prompt; one cycle runs per interval
-    // (interval * 5 slices).  No work is done while nothing is cooling.
+    // Sleep in 200ms slices so shutdown is prompt; two independent cadences
+    // share the thread — the faster one is pure local reads.
+    auto next_usage_watch = std::chrono::steady_clock::now();
+    auto next_probe = next_usage_watch;
     while (!cooldown_probe_stop_.load()) {
-        for (int waited = 0; waited < cooldown_probe_interval_secs_ * 5;
-             ++waited) {
-            if (cooldown_probe_stop_.load()) return;
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_usage_watch) {
+            run_usage_watch_cycle();
+            next_usage_watch = now +
+                std::chrono::seconds(usage_watch_interval_secs_);
         }
-        run_cooldown_probe_cycle();
+        if (now >= next_probe) {
+            run_cooldown_probe_cycle();
+            next_probe = now +
+                std::chrono::seconds(cooldown_probe_interval_secs_);
+        }
+    }
+}
+
+void ProxyServer::run_usage_watch_cycle() {
+    const auto now = std::chrono::steady_clock::now();
+    const auto cooling = gate_.cooling_keys(now);
+    if (cooling.empty()) return;
+    for (const int key_slot_id : cooling) {
+        const auto target = db_.lookup_probe_target(key_slot_id);
+        if (!target) continue;  // key/account deleted meanwhile — cooldown is
+                                // in-memory and will expire on its own.
+        if (!target->usage_watch) continue;  // HTTP probe cycle handles it
+        const auto usage =
+            parse_credential_usage(key_slot_id, target->usage_json);
+        if (usage != nullptr && !usage->exhausted) {
+            // The provider's own quota report no longer marks this key as
+            // spent — the same signal scheduling trusts, so the cooldown can
+            // be cleared without any upstream contact.
+            gate_.clear_cooldown(key_slot_id);
+            TB_LOG_DEBUG(
+                    "[Proxy] cooldown: key %d quota recovered per the usage "
+                    "snapshot, cooldown cleared\n",
+                    key_slot_id);
+        }
+        // No usable usage data keeps the key cooling; the poller's next pass
+        // produces fresh data and the 5h window remains the backstop.
     }
 }
 
@@ -94,12 +156,13 @@ void ProxyServer::run_cooldown_probe_cycle() {
         const auto target = db_.lookup_probe_target(key_slot_id);
         if (!target) continue;  // key/account deleted meanwhile — cooldown is
                                 // in-memory and will expire on its own.
+        if (target->usage_watch) continue;  // usage-watch cycle handles it
         ForwardOptions opts;
         opts.non_streaming_timeout = 10;
         opts.non_streaming_total_timeout = 10;
         opts.auth_scheme = resolve_auth_scheme(target->api_format,
                                                target->auth_header);
-        // An "opencode-go" gateway rejects a session-less probe (400), which
+        // An opencode-go gateway rejects a session-less probe (400), which
         // would read as "still cooling" forever.  The probe carries no
         // conversation, so it identifies itself with a one-off session (the
         // handler-path helper takes a candidate, which a probe has none of).
@@ -107,19 +170,34 @@ void ProxyServer::run_cooldown_probe_cycle() {
             opts.opencode_upstream = true;
             opts.opencode_session = opencode_random_session_value();
         }
+        std::string method = "GET";
+        std::string probe_path = "/models";
+        std::string probe_body;
+        if (!target->probe_model.empty()) {
+            // Minimal chat probe on the account's own wire format, resolved
+            // through the same endpoint policy as real forwarding.
+            const auto format = ir::parse_api_format(target->api_format);
+            const auto &policy = chat_endpoint_policy(format);
+            bool path_is_full = false;
+            resolve_upstream_path(policy, target->api_format,
+                                  target->base_url, "", probe_path,
+                                  path_is_full);
+            probe_body = cooldown_probe_body(format, target->probe_model);
+            method = "POST";
+        }
         UpstreamClient::ForwardResult fwd;
         try {
-            fwd = upstream_.forward("GET", target->base_url, target->key_value,
-                                    "/models", "", "application/json", nullptr,
-                                    opts);
+            fwd = upstream_.forward(method, target->base_url,
+                                    target->key_value, probe_path, probe_body,
+                                    "application/json", nullptr, opts);
         } catch (const std::exception &e) {
             TB_LOG_WARN("[Proxy] cooldown probe error (key=%d): %s\n",
                     key_slot_id, e.what());
             continue;  // keep cooling; retry next cycle
         }
         if (fwd.status_code >= 200 && fwd.status_code < 300) {
-            // A successful health probe is explicit evidence that the
-            // provider's quota cooldown can be cleared.
+            // A successful probe is explicit evidence that the provider's
+            // quota cooldown can be cleared.
             gate_.clear_cooldown(key_slot_id);
             TB_LOG_DEBUG(
                     "[Proxy] cooldown probe: key %d healthy, cooldown cleared "

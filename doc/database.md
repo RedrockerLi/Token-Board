@@ -152,7 +152,7 @@ key/value 表。`last_exported_log_id` 是最近一次**完整成功**事务导�
 
 ### account_models — 账户模型目录
 
-`(account_id, model_id)` 唯一。看板"更新模型"从上游模型目录端点拉取后整体替换(路径默认 `{base}/models`;opencode-go 子类型声明为 `{base}/v1/models`),供 /v1/models 与模型映射界面使用。
+`(account_id, model_id)` 唯一。看板"更新模型"从上游模型目录端点拉取后整体替换(路径默认 `{base}/models`;opencode-go 子类型声明为 `{base}/v1/models`)。代理对普通账户的 `GET /v1/models` 直接返回这份目录(纯本地读,不请求上游;从未刷新则为空列表),模型映射界面同样读它。
 
 ### aggregate_entries — 聚合账户映射
 

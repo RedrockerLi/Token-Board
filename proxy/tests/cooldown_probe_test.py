@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Cooldown-probe experiment: a cooled plan key is re-probed every interval
-and cleared early when the upstream reports healthy.
+"""Cooldown-recovery experiment: a cooled plan key is re-checked every
+interval and cleared early when the upstream reports healthy.
 
 Drives the real proxy (with TB_COOLDOWN_PROBE_SECS=2) + mock_upstream.
-The mock's per-key GET status is toggled out-of-band via POST /__ctrl because
-the probe is a bare GET /models that carries no request-body mock_* flags.
+Two probe shapes coexist:
+  - a plan account WITHOUT a catalog model falls back to the free GET /models
+    probe;
+  - a plan account WITH a catalog model gets the minimal "你好" chat probe.
+Both carry no request-body mock_* flags, so their per-key status is pinned
+out-of-band via POST /__ctrl (which also drives bodyless POSTs).
 
-Flow:
+Flow (run twice, once per probe shape):
   cool key1 (GoUsageLimitError)        → key1 skipped, key2 serves
   flip mock key1 → 200, wait for probe → key1 serves again (probe cleared it)
   re-cool key1, keep mock 429, wait    → key1 still skipped (probe saw 429)
@@ -120,6 +124,35 @@ def wait_probe(upstream_port, key, after_count):
     raise AssertionError(f"cooldown probe for {key} never fired")
 
 
+def chat_probe_count(log_path, key):
+    """Minimal "你好" probe POSTs for *key* recorded in the mock log."""
+    if not Path(log_path).exists():
+        return 0
+    count = 0
+    for line in Path(log_path).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if (record.get("method") == "POST"
+                and record.get("auth") == f"Bearer {key}"
+                and (record.get("body") or {}).get("messages")
+                == [{"role": "user", "content": "你好"}]):
+            count += 1
+    return count
+
+
+def wait_chat_probe(log_path, key, after_count):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if chat_probe_count(log_path, key) > after_count:
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"chat probe for {key} never fired")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("token_proxy", type=str)
@@ -131,6 +164,7 @@ def main() -> None:
     schema_dir = Path(args.schema_dir).resolve()
     project_root = Path(args.project_root).resolve()
     sys.path.insert(0, str(project_root))
+    import scripts.mock_upstream as mock_upstream
     from scripts.mock_upstream import Handler, ThreadingHTTPServer
     from v1_fixture import ensure_v2_database
 
@@ -139,12 +173,25 @@ def main() -> None:
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
 
     with tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "mock_upstream.log"
+        mock_upstream.LOG_FILE = str(log_path)
         db_path = Path(tmp) / "token-board.db"
         ensure_v2_database(db_path, schema_dir)
         conn = sqlite3.connect(db_path)
         base_url = f"http://127.0.0.1:{upstream_port}"
         try:
             build_scenario(conn, "tb-p", "p-model", ["sk-p1", "sk-p2"], "sk-p-d")
+            # tb-q carries a catalog model, so its probe is the minimal
+            # "你好" chat instead of the GET /models fallback.
+            _, q_key_ids, _ = build_scenario(
+                conn, "tb-q", "q-model", ["sk-q1", "sk-q2"], "sk-q-d")
+            q_upstream = conn.execute(
+                "SELECT c.upstream_id FROM upstream_credentials c "
+                "JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+                "WHERE s.secret_value='sk-q1'").fetchone()[0]
+            conn.execute(
+                "INSERT INTO upstream_model_catalog(upstream_id, model_id) "
+                "VALUES(?,?)", (q_upstream, "q-probe-model"))
             conn.execute("UPDATE upstreams SET base_url=?", (base_url,))
             conn.commit()
             key_ids = {kv: k for k, kv in conn.execute(
@@ -154,6 +201,7 @@ def main() -> None:
         finally:
             conn.close()
         p1_id, p2_id = key_ids["sk-p1"], key_ids["sk-p2"]
+        q1_id, q2_id = q_key_ids[0], q_key_ids[1]
 
         proxy_port = free_port()
         env = {**os.environ, "TB_COOLDOWN_PROBE_SECS": "2"}
@@ -215,6 +263,33 @@ def main() -> None:
             assert st5 == [200] and keys5[0] == p2_id, \
                 f"req5 must still be served by p2 (probe saw 429): st={st5} keys={keys5}"
             print(f"OK: probe kept key1 cooled (req5 served by key2 {p2_id})")
+
+            # ── chat-probe flow: tb-q's account carries a catalog model, so
+            #    its recovery probe is a minimal "你好" chat per interval ──
+            ctrl(upstream_port, "POST", "/__ctrl", {"set": {"sk-q1": 429}})
+            send(proxy_port, "tb-q", {**common, "model": "q-model",
+                "mock_status_by_key": {"sk-q1": 429, "sk-q2": 200},
+                "mock_error_type_by_key": {"sk-q1": "GoUsageLimitError"}})
+            qrid, _, qst, qkeys = latest_attempts(db_path, "q-model")
+            assert qst == [429, 200] and qkeys[0] == q1_id \
+                and qkeys[1] == q2_id, f"chat probe req1 chain {qst} {qkeys}"
+            wait_chat_probe(log_path, "sk-q1", 0)  # pinned 429 keeps cooling
+            send(proxy_port, "tb-q", {**common, "model": "q-model"})
+            qrid, _, qst, qkeys = latest_attempts(db_path, "q-model", qrid)
+            assert qst == [200] and qkeys[0] == q2_id, \
+                f"q1 stays cooling while the chat probe is pinned " \
+                f"(q2 serves): {qst} {qkeys}"
+            print(f"OK: chat probe saw 429, q1 stayed cooling (q2 {q2_id})")
+
+            before = chat_probe_count(log_path, "sk-q1")
+            ctrl(upstream_port, "POST", "/__ctrl", {"set": {"sk-q1": 200}})
+            wait_chat_probe(log_path, "sk-q1", before)  # probe ran after flip
+            time.sleep(0.5)  # let the cleared cooldown land before asking again
+            send(proxy_port, "tb-q", {**common, "model": "q-model"})
+            qrid, _, qst, qkeys = latest_attempts(db_path, "q-model", qrid)
+            assert qst == [200] and qkeys[0] == q1_id, \
+                f"chat probe must clear q1: {qst} {qkeys}"
+            print(f"OK: chat probe cleared q1 ({qst} {qkeys})")
 
             print("cooldown probe test passed")
         finally:

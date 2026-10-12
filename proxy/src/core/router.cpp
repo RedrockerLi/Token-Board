@@ -37,6 +37,11 @@ std::int64_t parse_utc_timestamp(const std::string &value) {
     return epoch > 0 ? static_cast<std::int64_t>(epoch) : 0;
 }
 
+}  // namespace
+
+// Shared with the cooldown-recovery path (declared in router.h): an
+// opencode-go cooldown clears as soon as this parse reports quota again.
+
 // Parse one credential's usage_json into the frozen snapshot shape:
 //   {"checked_at": …, "error": null|"…", "windows": {"5h": {...}, "week": …,
 //    "month": …}, "monthly_period": {...}}
@@ -80,6 +85,8 @@ std::shared_ptr<const routing::CredentialUsage> parse_credential_usage(
     if (usage.windows.empty()) return nullptr;
     return std::make_shared<const routing::CredentialUsage>(std::move(usage));
 }
+
+namespace {
 
 bool glob_match(const std::string &pattern, const std::string &value) {
     size_t p = 0, v = 0, star = std::string::npos, retry = 0;
@@ -256,6 +263,17 @@ bool Router::reload() {
         next->client_to_route.emplace(route.key.key_value, entry);
     }
     next->timeouts = std::move(config.timeouts);
+
+    // Dashboard-maintained model catalogs, attached per upstream: /v1/models
+    // serves these verbatim for plain accounts, so no catalog request ever
+    // reaches an upstream.  Absent entry = never refreshed ("更新模型").
+    for (auto &up : next->upstreams) {
+        auto catalog_it = config.catalogs.find(up.upstream_id);
+        if (catalog_it == config.catalogs.end() || catalog_it->second.empty())
+            continue;
+        up.catalog_ref = std::make_shared<const std::vector<std::string>>(
+            std::move(catalog_it->second));
+    }
 
     // Only retire origins whose endpoint was removed or changed.  Unchanged
     // keep-alive connections remain hot across ordinary route/key edits.

@@ -77,6 +77,13 @@ public:
         const int secs = env ? std::atoi(env) : 3600;
         cooldown_probe_interval_secs_ =
             std::min(86400, std::max(1, secs));
+        // Usage-watch recovery cadence: 5min default, matching the dashboard
+        // poller that refreshes usage_json; TB_USAGE_WATCH_SECS override
+        // (tests shrink it to seconds).  Clamped to [1, 86400] seconds.
+        const char *usage_env = std::getenv("TB_USAGE_WATCH_SECS");
+        const int usage_secs = usage_env ? std::atoi(usage_env) : 300;
+        usage_watch_interval_secs_ =
+            std::min(86400, std::max(1, usage_secs));
     }
 
     /// Stops and joins the accounting + cooldown-probe threads.  Idempotent;
@@ -91,13 +98,17 @@ public:
     ~ProxyServer() { shutdown(); }
 
     /// Start the cooldown-probe background thread.  Idempotent (call from
-    /// setup_routes).  Every `cooldown_probe_interval_secs_` it probes plan
-    /// keys inside the 5h cooldown and clears the cooldown early when the
-    /// upstream reports healthy (2xx GET /models).  The probe never writes
-    /// request_log, never counts toward max_concurrency, and touches no gate
-    /// counters — it only observes + clears cooldown.
+    /// setup_routes).  Two recovery channels share the thread:
+    ///   - every `usage_watch_interval_secs_` (5min), keys whose subtype
+    ///     declares a usage query (opencode-go) are checked against the usage
+    ///     snapshot alone — pure local reads, no HTTP;
+    ///   - every `cooldown_probe_interval_secs_` (1h), the remaining cooling
+    ///     keys get one minimal chat probe ("你好"); 2xx clears the cooldown.
+    /// Neither channel writes request_log, counts toward max_concurrency, or
+    /// touches gate failure counters — they only observe + clear cooldown.
     void start_cooldown_probe();
     void cooldown_probe_loop();
+    void run_usage_watch_cycle();
     void run_cooldown_probe_cycle();
 
     void setup_routes(httplib::Server &server);
@@ -245,10 +256,12 @@ private:
     std::atomic<std::uint64_t> accounting_dropped_{0};
     std::atomic<std::uint64_t> accounting_rejected_{0};
 
-    // Cooldown-probe thread: while a plan key is inside its 5h cooldown, probe
-    // the upstream every cooldown_probe_interval_secs_ and clear early on 2xx.
+    // Cooldown-probe thread: while a plan key is inside its 5h cooldown, its
+    // recovery is observed on two cadences — the usage snapshot for
+    // usage-watched keys, a minimal chat probe for the rest.
     std::thread cooldown_probe_thread_;
     std::atomic<bool> cooldown_probe_stop_{false};
     std::once_flag cooldown_probe_once_;
     int cooldown_probe_interval_secs_ = 3600;
+    int usage_watch_interval_secs_ = 300;
 };

@@ -259,8 +259,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        # Test-only control endpoint: toggle the persistent per-key GET status
-        # map.  Requires no Authorization, so the proxy never sees it.
+        # Test-only control endpoint: toggle the persistent per-key status map
+        # (drives GET probes and, as a body-flag fallback, bodyless POSTs such
+        # as the cooldown chat probe).  Requires no Authorization, so the
+        # proxy never sees it.
         if self.path == "/__ctrl":
             raw = self._read_body()
             try:
@@ -310,6 +312,15 @@ class Handler(BaseHTTPRequestHandler):
         auth_key = authorization.removeprefix("Bearer ")
         if isinstance(status_by_key, dict) and auth_key in status_by_key:
             status = status_by_key[auth_key]
+        else:
+            # Out-of-band per-key pin (POST /__ctrl "set") also drives POST
+            # responses, as a fallback under the explicit body flags: the
+            # cooldown chat probe ("你好") carries no flags of its own, while
+            # every test request can still override its own status in-body.
+            with CONTROL_LOCK:
+                ctrl_status = CONTROL["status_by_key"].get(auth_key)
+            if ctrl_status is not None:
+                status = int(ctrl_status)
         if req.get("model") == "trigger-error":
             status = 400  # model-based trigger survives format conversion
         if req.get("model") == "trigger-429":

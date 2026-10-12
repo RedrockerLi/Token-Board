@@ -55,7 +55,11 @@ bool Database::prepare_statements() {
             stmt_insert_attempt_);
         PREPARE_ON(read_db_,
             "SELECT u.base_url,s.secret_value,u.api_format,u.auth_scheme,"
-            "CASE WHEN u.subtype='opencode-go' THEN 1 ELSE 0 END "
+            "CASE WHEN u.subtype='opencode-go' THEN 1 ELSE 0 END,"
+            "CASE WHEN u.subtype='opencode-go' THEN 1 ELSE 0 END,"
+            "COALESCE(c.usage_json,''),"
+            "COALESCE((SELECT mc.model_id FROM upstream_model_catalog mc "
+            "WHERE mc.upstream_id=u.id ORDER BY mc.model_id LIMIT 1),'') "
             "FROM upstream_credentials c JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
             "JOIN upstreams u ON u.id=c.upstream_id JOIN accounts a ON a.id=u.account_id "
             "WHERE c.runtime_id=?1 AND a.account_kind='proxy' "

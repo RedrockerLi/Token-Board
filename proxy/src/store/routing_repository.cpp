@@ -173,6 +173,29 @@ bool Database::load_routing_config(RoutingConfig &config) {
     }
     sqlite3_finalize(stmt);
     stmt = nullptr;
+    // Dashboard-maintained model catalogs: the Router attaches these to the
+    // runtime snapshot, and /v1/models serves them verbatim for plain
+    // accounts.  The catalog table's own generation triggers re-run this
+    // reload, so a "更新模型" refresh reaches the proxy within one tick.
+    const char *catalog_sql =
+        "SELECT u.id,m.model_id FROM upstream_model_catalog m "
+        "JOIN upstreams u ON u.id=m.upstream_id "
+        "ORDER BY m.upstream_id,m.model_id";
+    if (sqlite3_prepare_v2(read_db_, catalog_sql, -1, &stmt,
+                           nullptr) != SQLITE_OK) {
+        TB_LOG_ERROR( "[DB] routing snapshot model catalog failed: %s\n",
+                sqlite3_errmsg(read_db_));
+        return false;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const int upstream_id = sqlite3_column_int(stmt, 0);
+        const char *model = reinterpret_cast<const char *>(
+            sqlite3_column_text(stmt, 1));
+        if (model != nullptr && model[0] != '\0')
+            next.catalogs[upstream_id].push_back(model);
+    }
+    sqlite3_finalize(stmt);
+    stmt = nullptr;
     const char *timeouts_sql =
         "SELECT endpoint_kind,streaming_first_byte_timeout,streaming_idle_timeout,"
         "non_streaming_timeout FROM proxy_timeout_config";
@@ -222,6 +245,15 @@ std::optional<Database::ProbeTarget> Database::lookup_probe_target(
         t.auth_header = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_lookup_probe_target_, 3));
         t.opencode_session = sqlite3_column_int(stmt_lookup_probe_target_, 4) != 0;
+        t.usage_watch = sqlite3_column_int(stmt_lookup_probe_target_, 5) != 0;
+        const unsigned char *usage_json_text =
+            sqlite3_column_text(stmt_lookup_probe_target_, 6);
+        t.usage_json = usage_json_text
+            ? reinterpret_cast<const char *>(usage_json_text) : "";
+        const unsigned char *probe_model_text =
+            sqlite3_column_text(stmt_lookup_probe_target_, 7);
+        t.probe_model = probe_model_text
+            ? reinterpret_cast<const char *>(probe_model_text) : "";
         t.valid = !t.base_url.empty() && !t.key_value.empty();
     }
     sqlite3_reset(stmt_lookup_probe_target_);

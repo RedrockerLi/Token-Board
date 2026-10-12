@@ -45,7 +45,7 @@
 
 - 计费与调用量解耦：**每把上游密钥**按 `valid_from`(订阅起始日) 锚定的**行政月周期**收一次月费；同一账户多把密钥 = 多个独立订阅。
 - 调用照常被代理转发、照常记 `request_log`，但 `api_cost` 记的是**虚拟消费**（不买套餐按量算要花多少钱），用于衡量套餐划不划算。
-- 429 冷却也是**按密钥**：一把 plan 密钥被限流只冷却它自己，同账户其他密钥立即接管（[proxy/src/core/account_gate.h:18-21](proxy/src/core/account_gate.h#L18-L21)）。冷却期内代理每 1 小时向 `{base_url}/models` 探测一次（auth scheme 按 `api_format` 推导：anthropic 用 x-api-key、其余 Bearer），2xx 提前解除冷却，见 [proxy-internals.md](proxy-internals.md)「冷却探测」。
+- 429 冷却也是**按密钥**：一把 plan 密钥被限流只冷却它自己，同账户其他密钥立即接管（[proxy/src/core/account_gate.h:18-21](proxy/src/core/account_gate.h#L18-L21)）。冷却期的恢复观察分两条通道：带用量查询的子类型（opencode-go）每 5 分钟读一次用量快照，任一窗口未满即恢复（纯本地判断，不发请求）；其余 plan 密钥每 1 小时发一条最小的「你好」调用，2xx 提前解除冷却（没有目录模型名时退回 `GET {base}/models` 探测；auth scheme 按 `api_format` 推导：anthropic 用 x-api-key、其余 Bearer），见 [proxy-internals.md](proxy-internals.md)「冷却探测」。
 - 订阅周期、价格历史、删除默认操作见 [billing-pricing.md](billing-pricing.md)「plan 账户与虚拟消费」。
 
 ### 订阅计费与周期滚动（plan）
@@ -108,7 +108,7 @@
 - **模型改写**：转发前把请求体里的模型名替换成 `upstream_model`（`apply_body_model` / 转换路径 `cReq.model`）。
 - **回退时机**：候选在**尚未向客户端发出任何数据**时失败（429/5xx/超时/401/403）才回退；流式请求的响应头延迟到首次写出才提交，因此流式也能在首字节前换下一个候选。
 - **全部不可用**：返回 429（忙/冷却/全失败）；若最后是超时则 504（[proxy/src/core/proxy_server.cpp:1162-1211](proxy/src/core/proxy_server.cpp#L1162-L1211)）。
-- **模型目录**：`GET /v1/models` 对聚合账户返回所有 `pattern` 作为模型列表（[proxy/src/core/proxy_server.cpp:1872-1886](proxy/src/core/proxy_server.cpp#L1872-L1886)）。
+- **模型目录**：`GET /v1/models` 是纯本地读——聚合账户返回所有 `pattern`；普通账户返回数据库里保存的目录（看板「更新模型」维护，从未刷新则为空列表）；带 `anthropic-version` 头的 Anthropic 客户端返回空目录（[proxy/src/core/proxy_models.cpp](proxy/src/core/proxy_models.cpp)）。任何情况都不请求上游。
 
 ### 关键区别：聚合不是「账户」
 
@@ -231,7 +231,7 @@
 ### 添加步骤（三步 + 两个按需）
 
 1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label`（形如 `<type> — <说明>`，破折号后的说明进左栏卡片正文）是账户弹窗左栏类型选择卡文案、`short_label` 是类型徽章文案（账户列表与左栏卡片共用）。
-2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、代理的上游会话头注入、看板"更新模型"和用量轮询都从它派生。C++ 不需要同步——类型在代理里没有镜像列表，唯一进入请求路径的类型派生量是合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
+2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、代理的上游会话头注入、看板"更新模型"和用量轮询都从它派生。C++ 侧没有类型镜像表，但子分类的代理行为以 `CASE WHEN u.subtype='opencode-go'` 写在两处 SQL（路由快照的会话头标志、冷却探测目标的用量观察标志，[proxy/src/store/](proxy/src/store/)）；新增需要代理行为的子分类要在这两处同步。类型层的派生量另只有合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
 3. **智能体扩展另走智能体管理**：在 `agent_software` 增加 `agent_kind`，为该类型注册一个返回统一 UsageEvent 的解析器；订阅继续保存在独立的 `agent_subscriptions`，通过绑定表连接到软件，不把订阅误当成代理上游。
 
 两个按需的 if：

@@ -18,6 +18,11 @@ namespace routing {
 struct UpstreamRuntime {
     int upstream_id = 0;                      // Database upstreams.id
     std::shared_ptr<const Database::AccountInfo> account_ref;  // single copy
+    // The dashboard-maintained model catalog (upstream_model_catalog): what
+    // the proxy serves on /v1/models for plain accounts.  Null or empty means
+    // the account was never refreshed ("更新模型" never ran) — the endpoint
+    // then answers with an empty list, never with an upstream request.
+    std::shared_ptr<const std::vector<std::string>> catalog_ref;
 };
 
 // One quota window of an "opencode-go" credential, parsed from the usage

@@ -12,7 +12,7 @@
 | `/v1/messages` | POST | Anthropic 兼容转发(harness 格式 Anthropic) |
 | `/v1/responses` | POST | OpenAI Responses 转发(harness 格式 Responses) |
 | `/v1/embeddings` | POST | 嵌入转发(无格式转换) |
-| `/v1/models` | GET | 模型列表:聚合账户返回其模型目录;带 `anthropic-version` 头的 Anthropic 客户端返回空目录 `{"models":[]}`;其余透传上游 |
+| `/v1/models` | GET | 模型列表(纯本地,不请求上游):聚合账户返回其 `pattern` 目录;普通账户返回数据库保存的目录(看板"更新模型"维护,从未刷新则为空列表);带 `anthropic-version` 头的 Anthropic 客户端返回空目录 `{"models":[]}` |
 | `/v1/v1/chat/completions` 等 | 同上 | 双 `/v1` 前缀别名 |
 | `/v1/*` | OPTIONS | CORS 预检,返回 204 |
 | `/health` | GET | 健康检查,返回 `{"status":"ok","service":"token-board-proxy","concurrency":N}`(concurrency 为进程内实时并发数) |

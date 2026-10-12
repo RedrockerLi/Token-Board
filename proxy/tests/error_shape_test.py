@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Lock the unified terminal-error rendering across chat/embeddings/models.
+"""Lock the unified terminal-error rendering across chat and embeddings.
 
-Regression gate for the C audit finding: the three non-streaming handlers and
+/v1/models no longer forwards upstream: it serves the dashboard-maintained
+catalog purely locally (Anthropic clients get an empty {"models":[]}), and
+cases 8-9 pin that contract.
+
+Regression gate for the C audit finding: the non-streaming handlers and
 the streaming tail used to render failure bodies three different ways (chat via
-harness_codec.serialize_error_body + parse_error_body, embeddings/models via
+harness_codec.serialize_error_body + parse_error_body, embeddings via
 json_error with a raw "Upstream error: ..." text).  After the refactor every
-endpoint routes through the shared render_terminal_error(), so the error JSON
-shape is uniform:
+forwarding endpoint routes through the shared render_terminal_error(), so the
+error JSON shape is uniform:
 
   * all provider-quota-cooled 429 -> {"error": {"message", "type":"rate_limit_error", "code":429}}
   * local concurrency capacity -> 503 + Retry-After: 1
@@ -67,13 +71,16 @@ def wait_for_health(port: int) -> None:
 
 
 def send(proxy_port: int, method: str, path: str, local_key: str,
-         body: dict | None, timeout: float = 20) -> tuple[int, dict, object]:
+         body: dict | None, timeout: float = 20,
+         extra_headers: dict | None = None) -> tuple[int, dict, object]:
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": f"Bearer {local_key}",
+               "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(
         f"http://127.0.0.1:{proxy_port}{path}",
-        data=data, method=method,
-        headers={"Authorization": f"Bearer {local_key}",
-                 "Content-Type": "application/json"})
+        data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -101,7 +108,7 @@ def send_stream(proxy_port: int, path: str, local_key: str,
 
 
 def ctrl(upstream_port: int, payload: dict) -> None:
-    """Toggle the mock's out-of-band per-key GET status map (/__ctrl)."""
+    """Toggle the mock's out-of-band per-key status map (/__ctrl)."""
     req = urllib.request.Request(
         f"http://127.0.0.1:{upstream_port}/__ctrl",
         data=json.dumps(payload).encode(), method="POST",
@@ -110,21 +117,12 @@ def ctrl(upstream_port: int, payload: dict) -> None:
         r.read()
 
 
-def count_rows(db_path: str, model: str) -> int:
-    conn = sqlite3.connect(db_path)
-    try:
-        # Writer is async; poll briefly.
-        for _ in range(100):
-            n = conn.execute(
-                "SELECT COUNT(*) FROM request_log WHERE model=?",
-                (model,),
-            ).fetchone()[0]
-            if n:
-                return n
-            time.sleep(0.05)
-        return 0
-    finally:
-        conn.close()
+def ctrl_status(upstream_port: int) -> dict:
+    """The mock's probe counters and status map (/__ctrl/status)."""
+    with urllib.request.urlopen(
+            f"http://127.0.0.1:{upstream_port}/__ctrl/status",
+            timeout=5) as r:
+        return json.loads(r.read().decode())
 
 
 def main() -> None:
@@ -161,6 +159,7 @@ def main() -> None:
                     api_format=api_format, max_concurrency=max_concurrency)
                 add_plain_route(conn, f"tb-{name}", name, up, account_id,
                                 model_pattern="*")
+                return account_id, up
 
             # Separate accounts so the cooldown state of one scenario can never
             # leak into another.
@@ -172,8 +171,15 @@ def main() -> None:
             plain("sk-anth-busy", "anthbusy", recurring=True, api_format="anthropic")
             plain("sk-emb-500", "emb500")
             plain("sk-emb-busy", "embbusy", recurring=True)
-            plain("sk-mod-500", "mod500")
-            plain("sk-mod-busy", "modbusy")
+            _, mod500_up = plain("sk-mod-500", "mod500")
+            _, modbusy_up = plain("sk-mod-busy", "modbusy")
+            # /v1/models serves the stored catalog; §8-9 pin exactly that.
+            conn.executemany(
+                "INSERT INTO upstream_model_catalog(upstream_id, model_id) "
+                "VALUES(?,?)",
+                [(modbusy_up, "modbusy-catalog-a"),
+                 (modbusy_up, "modbusy-catalog-b"),
+                 (mod500_up, "mod500-catalog-a")])
 
             # Fast timeout round-trip for the chat timeout case.
             conn.execute(
@@ -343,28 +349,33 @@ def main() -> None:
                 "type": "rate_limit_error", "code": 429}}, body
             print(f"7 OK: embeddings busy-429 -> {body}")
 
-            # ── 8. Models busy-429 (GET, out-of-band status) + no accounting ──
+            # ── 8. Models is a local catalog read: the stored catalog is
+            #       served, the upstream is never contacted (the pinned 429
+            #       would surface if it were) and cooling never matters ──
             ctrl(upstream_port, {"set": {"sk-mod-busy": 429}})
-            status1, _, _ = send(proxy_port, "GET", "/v1/models", "tb-modbusy", None)
-            status2, body, _ = send(proxy_port, "GET", "/v1/models", "tb-modbusy", None)
-            ctrl(upstream_port, {"clear": ["sk-mod-busy"]})
-            assert status1 == 429 and status2 == 429, (status1, status2)
-            assert body["error"]["message"] == "mock GoUsageLimitError", body
-            assert count_rows(db_path, "modbusy-model") == 0, \
-                "models must not write request_log rows"
-            print(f"8 OK: models busy-429 (no accounting) -> {body}")
-
-            # ── 9. Models used-failure 500 → structured upstream error ──
-            ctrl(upstream_port, {"set": {"sk-mod-500": 500}})
+            probes_before = ctrl_status(upstream_port)["probes"].get(
+                "sk-mod-busy", 0)
             status, body, _ = send(proxy_port, "GET", "/v1/models",
-                "tb-mod500", None)
-            ctrl(upstream_port, {"clear": ["sk-mod-500"]})
-            assert status == 500, f"models 500 status {status}"
-            err = body["error"]
-            assert err["message"] == "mock GoUsageLimitError", body
-            assert err["type"] == "GoUsageLimitError", body
-            assert "Upstream error" not in json.dumps(body)
-            print(f"9 OK: models used-failure 500 structured -> {body}")
+                "tb-modbusy", None)
+            probes_after = ctrl_status(upstream_port)["probes"].get(
+                "sk-mod-busy", 0)
+            ctrl(upstream_port, {"clear": ["sk-mod-busy"]})
+            assert status == 200, status
+            assert [m["id"] for m in body["data"]] == \
+                ["modbusy-catalog-a", "modbusy-catalog-b"], body
+            assert probes_after == probes_before, \
+                "models must not contact the upstream"
+            print("8 OK: models served from the stored catalog")
+
+            # ── 9. Anthropic clients (cc) get the empty catalog: any model
+            #       name validates client-side, still a pure local read ──
+            status, body, _ = send(proxy_port, "GET", "/v1/models",
+                "tb-mod500", None,
+                extra_headers={"anthropic-version": "2023-06-01"})
+            assert status == 200 and body == {"models": []}, (status, body)
+            probes = ctrl_status(upstream_port)["probes"].get("sk-mod-500", 0)
+            assert probes == 0, "the anthropic catalog must be local"
+            print("9 OK: anthropic clients get the empty local catalog")
 
             print("error_shape tests passed")
         finally:

@@ -82,8 +82,18 @@ public:
         std::string api_format;
         std::string auth_header;
         // The upstream belongs to the "opencode-go" sub-type: its gateway
-        // requires the session header, so the cooldown probe must send one.
+        // requires the session header, so a cooldown probe must send one.
         bool opencode_session = false;
+        // The sub-type declares a usage query (opencode-go): quota recovery
+        // is read from the usage snapshot the dashboard poller refreshes —
+        // the gateway's catalog endpoint answers 200 for any or no key and
+        // cannot witness recovery, so no HTTP probe is sent for these keys.
+        bool usage_watch = false;
+        // Raw upstream_credentials.usage_json for the usage-watch path.
+        std::string usage_json;
+        // First catalog model of the upstream ("" = 更新模型 never ran): the
+        // minimal chat probe needs a model name to call.
+        std::string probe_model;
         bool valid = false;
     };
     std::optional<ProbeTarget> lookup_probe_target(int key_slot_id);
@@ -115,6 +125,10 @@ public:
         std::vector<RouteInfo> routes;
         std::vector<RoutingRule> rules;
         std::unordered_map<std::string, TimeoutConfig> timeouts;
+        // upstreams.id → its dashboard-maintained model catalog
+        // (upstream_model_catalog).  The Router attaches these to the runtime
+        // snapshot; /v1/models serves them verbatim for plain accounts.
+        std::unordered_map<int, std::vector<std::string>> catalogs;
     };
     bool load_routing_config(RoutingConfig &config);
     std::uint64_t routing_config_generation();

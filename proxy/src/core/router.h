@@ -12,6 +12,12 @@
 #include <unordered_map>
 #include <vector>
 
+/// Parse one credential's usage_json snapshot into the frozen scheduling
+/// shape (nullptr = no usable data).  Shared by the snapshot loader and the
+/// cooldown-recovery path, which reads recovery straight from this data.
+std::shared_ptr<const routing::CredentialUsage> parse_credential_usage(
+    int key_slot_id, const std::string &text);
+
 /// Resolves client keys and model rules from an immutable in-memory snapshot.
 /// SQLite is read only by the background generation watcher; request threads
 /// retain the snapshot they started with so a concurrent refresh cannot

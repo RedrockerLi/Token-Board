@@ -129,10 +129,13 @@ bash start.sh --debug
 
 ## 冷却探测
 
-plan 密钥进入 5h 冷却后,后台线程**每隔 `cooldown_probe_interval_secs_`(默认 3600s,`TB_COOLDOWN_PROBE_SECS` 环境变量可覆盖,单位秒)探测一次**该密钥对应的上游:向 `{base_url}/models` 发免费 `GET /models`(OpenAI 与 Anthropic 格式都有此端点),2xx 即 `clear_cooldown` 提前解除,该密钥重新进入候选池;GoUsageLimitError 429 或其它错误保持冷却、下一轮再探。
+plan 密钥进入 5h 冷却后,后台线程按两条通道观察恢复,任一确认即 `clear_cooldown` 提前解除,该密钥重新进入候选池;5 小时自然到期仍是兜底:
+
+- **用量通道(opencode-go)**:每 `usage_watch_interval_secs_`(默认 300s,`TB_USAGE_WATCH_SECS` 环境变量可覆盖)读一次该密钥的 `usage_json` 快照(用量轮询器每 ~5 分钟刷新,与调度同源),任一窗口未达 100% 即视为恢复——纯本地读,不发任何 HTTP。该网关的模型目录端点对任何(甚至无效)密钥都返回 200,不能用作健康探测。
+- **聊天探针(其余 plan 密钥)**:每 `cooldown_probe_interval_secs_`(默认 3600s,`TB_COOLDOWN_PROBE_SECS` 环境变量可覆盖)向账户发一条最小的"你好"(按账户线格式取 messages/chat/responses 路径,`max_tokens=1`),2xx 即恢复——一次完成的调用才是可用性的真信号;账户没有目录模型名("更新模型"从未运行)时退回免费 `GET {base}/models` 探测。GoUsageLimitError 429 或其它错误保持冷却、下一轮再探。
 
 - 探测线程在 `setup_routes` 启动(`start_cooldown_probe`,幂等),`shutdown()` 内 join(仿 `accounting_thread_` 生命周期);循环按 200ms 切片睡眠,退出迅速。
-- 探测目标按 `upstream_keys.id` 查 `lookup_probe_target`(read_db_ 连接,JOIN 账户取 base_url/key/auth),已删密钥/账户直接跳过。
+- 探测目标按 `upstream_keys.id` 查 `lookup_probe_target`(read_db_ 连接,JOIN 账户取 base_url/key/auth,并带该密钥的 usage_json 与目录首模型),已删密钥/账户直接跳过。
 - **纪律**:探测不写 `request_log`、不 `acquire`/`release`(不占 `max_concurrency`)、不新增冷却态——只观察并在 2xx 时 `clear_cooldown`。冷却状态依旧纯内存,重启即清。
 
 ## 超时与客户端断连

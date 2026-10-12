@@ -126,14 +126,15 @@ def ctrl(upstream_port, method, path, payload=None):
         return json.loads(r.read().decode())
 
 
-def wait_probe(upstream_port, key, after_count):
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        if ctrl(upstream_port, "GET", "/__ctrl/status")["probes"].get(
-                key, 0) > after_count:
-            return
-        time.sleep(0.2)
-    raise AssertionError(f"cooldown probe for {key} never fired")
+def set_usage(db_path, runtime_id, snapshot):
+    """Replace one credential's usage_json (what the poller would write)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE upstream_credentials SET usage_json=? "
+                     "WHERE runtime_id=?", (snapshot, runtime_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def latest_attempts(db_path, model, min_id=0):
@@ -199,8 +200,8 @@ def main() -> None:
             build_aggregate_scenario(
                 conn, "tb-oc3", "oc3-model", ["sk-oc3-p1"], None,
                 subtype="opencode-go")
-            # Cooldown-probe scenario (cooled key) and a plain account whose
-            # catalog/embeddings calls hit the upstream directly.
+            # Cooldown-recovery scenario (cooled key) and a plain account
+            # whose catalog/embeddings calls hit the upstream directly.
             _, probe_keys, _ = build_aggregate_scenario(
                 conn, "tb-oc4", "oc4-model", ["sk-oc4-p1", "sk-oc4-p2"], None,
                 subtype="opencode-go")
@@ -215,13 +216,29 @@ def main() -> None:
                     "UPDATE upstream_credentials SET usage_json=? "
                     "WHERE runtime_id=?",
                     (usage_snapshot(percent, resets_in), runtime_id))
+            # S6: the usage snapshot drives cooldown recovery.  p1 leads the
+            # rotation (its quota resets soonest) and p2 has room too, so the
+            # cooling/recooling order below is deterministic.
+            for runtime_id, (percent, resets_in) in zip(
+                    probe_keys, [(30, 600), (20, 7200)]):
+                conn.execute(
+                    "UPDATE upstream_credentials SET usage_json=? "
+                    "WHERE runtime_id=?",
+                    (usage_snapshot(percent, resets_in), runtime_id))
+            # S7: tb-oc5's plain account carries a stored catalog.
+            conn.executemany(
+                "INSERT INTO upstream_model_catalog(upstream_id, model_id) "
+                "VALUES(?,?)",
+                [(plain_upstream, "oc5-catalog-a"),
+                 (plain_upstream, "oc5-catalog-b")])
             conn.commit()
         finally:
             conn.close()
 
         proxy_port = free_port()
-        # Short probe interval so S6 reaches the cooldown probe within the run.
-        env = {**os.environ, "TB_COOLDOWN_PROBE_SECS": "2"}
+        # Short cadences so S6 reaches the recovery cycles within the run.
+        env = {**os.environ, "TB_COOLDOWN_PROBE_SECS": "2",
+               "TB_USAGE_WATCH_SECS": "2"}
         proxy = subprocess.Popen(
             [str(proxy_binary), "--db", str(db_path), "--host", "127.0.0.1",
              "--port", str(proxy_port)],
@@ -331,10 +348,11 @@ def main() -> None:
                 stream_record.get("x_opencode_session")
             print("S1 OK: the streaming forward carries the session header too")
 
-            # ── S6: cooldown probe carries the session header ────────────
-            # Every GET now demands the header, so a probe without one is a
-            # 400 and the cooled key never comes back early.
-            ctrl(upstream_port, "POST", "/__ctrl", {"require_session": True})
+            # ── S6: an opencode-go cooldown recovers from the usage snapshot ──
+            # The gateway's catalog answers 200 for any or no key, so an HTTP
+            # probe cannot witness recovery; the usage snapshot the poller
+            # refreshes is the signal.  The recovery is observed on the
+            # usage-watch cadence and must never send a request upstream.
             cooled, sibling = probe_keys
             send(proxy_port, "tb-oc4", {
                 "stream": False, "model": "oc4-model",
@@ -343,26 +361,62 @@ def main() -> None:
                 "mock_error_type_by_key": {"sk-oc4-p1": "GoUsageLimitError"}})
             rid, _, statuses, keys = latest_attempts(db_path, "oc4-model")
             assert statuses == [429, 200] and keys[1] == sibling, (statuses, keys)
-            wait_probe(upstream_port, "sk-oc4-p1", 0)
-            time.sleep(0.5)  # let the cleared cooldown land before asking again
+            time.sleep(3.0)  # >= one usage-watch cycle; usage says 30% -> clear
             send(proxy_port, "tb-oc4", {
                 "stream": False, "model": "oc4-model",
                 "messages": [{"role": "user", "content": "cool p1 again"}]})
+            rid, _, statuses, keys = latest_attempts(db_path, "oc4-model", rid)
+            assert keys == [cooled], \
+                f"S6: the recovered key must serve again (attempts={statuses}, {keys})"
+            probes = ctrl(upstream_port, "GET", "/__ctrl/status")["probes"]
+            assert probes.get("sk-oc4-p1", 0) == 0, \
+                f"S6: a usage-watched key must never be probed (probes={probes})"
+            print("S6 OK: the usage snapshot cleared the cooldown with no probe")
+
+            # ── S6b: exhausted usage holds the cooldown; recovery releases it ──
+            set_usage(db_path, cooled, usage_snapshot(100, 300))
+            time.sleep(0.5)  # let the exhausted snapshot hot-reload first
+            send(proxy_port, "tb-oc4", {
+                "stream": False, "model": "oc4-model",
+                "messages": [{"role": "user", "content": "recool exhausted"}],
+                "mock_status_by_key": {"sk-oc4-p2": 429, "sk-oc4-p1": 429},
+                "mock_error_type_by_key": {"sk-oc4-p1": "GoUsageLimitError"}})
+            # Usage-exhausted p1 is scheduled last, so p2 answers 429 first
+            # and p1 consumes the retry, re-entering the cooldown.
+            rid, _, statuses, keys = latest_attempts(db_path, "oc4-model", rid)
+            assert statuses == [429, 429] and keys[1] == cooled, (statuses, keys)
+            time.sleep(3.0)  # usage-watch cycles see 100% -> stays cooling
+            send(proxy_port, "tb-oc4", {
+                "stream": False, "model": "oc4-model",
+                "messages": [{"role": "user", "content": "still cooling"}]})
+            rid, _, statuses, keys = latest_attempts(db_path, "oc4-model", rid)
+            assert keys == [sibling], \
+                f"S6b: an exhausted key stays cooling (attempts={statuses}, {keys})"
+            set_usage(db_path, cooled, usage_snapshot(18, 600))
+            time.sleep(3.0)  # recovered usage -> the cooldown clears again
+            send(proxy_port, "tb-oc4", {
+                "stream": False, "model": "oc4-model",
+                "messages": [{"role": "user", "content": "recovered again"}]})
             _, _, statuses, keys = latest_attempts(db_path, "oc4-model", rid)
             assert keys == [cooled], \
-                f"S6: the probed key must serve again (attempts={statuses}, {keys})"
-            print(f"S6 OK: session-carrying probe cleared the cooldown "
-                  f"(attempts={statuses}, keys={keys})")
+                f"S6b: recovery must clear the cooldown again (attempts={statuses}, {keys})"
+            print("S6b OK: exhausted usage held the cooldown; recovery released it")
 
-            # ── S7: /v1/models passthrough reaches a session-policed upstream ──
+            # ── S7: /v1/models answers from the stored catalog, no upstream ──
             req = urllib.request.Request(
                 f"http://127.0.0.1:{proxy_port}/v1/models",
                 headers={"Authorization": "Bearer tb-oc5"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 models_status, models_body = r.status, r.read().decode()
-            assert models_status == 200 and models_body == "{}", \
-                f"S7: models passthrough {models_status} {models_body[:120]}"
-            print("S7 OK: /v1/models passthrough satisfied the session gate")
+            assert models_status == 200, \
+                f"S7: models catalog {models_status} {models_body[:120]}"
+            data = json.loads(models_body)
+            assert [m["id"] for m in data["data"]] == \
+                ["oc5-catalog-a", "oc5-catalog-b"], models_body
+            probes = ctrl(upstream_port, "GET", "/__ctrl/status")["probes"]
+            assert probes.get("sk-oc5-p1", 0) == 0, \
+                f"S7: the catalog is a local read (probes={probes})"
+            print("S7 OK: /v1/models served the stored catalog")
 
             # ── S8: embeddings carries the session header ────────────────
             status, _ = send(proxy_port, "tb-oc5", {
