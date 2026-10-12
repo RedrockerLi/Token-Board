@@ -504,59 +504,131 @@ function selectAccountsTab(type) {
     else loadAccountsTable();
 }
 
-/** One usage window cell ("37%" / "100% 限流" / "—").  The title carries the
- *  window reset time, or the error / 暂无数据 note when there is no data. */
-function usageWindowCell(win, usage) {
-    const note = usage ? (usage.error ? String(usage.error) : '') : '（暂无数据）';
-    let title = note;
-    if (!note && win && win.resets_at) title = `重置：${fmtLocal(win.resets_at)}`;
-    const titleAttr = title ? ` title="${esc(title)}"` : '';
-    const percent = win && win.percent != null ? Math.round(Number(win.percent)) : NaN;
-    if (!note && Number.isFinite(percent)) {
-        return percent >= 100
-            ? `<td${titleAttr}><span class="badge badge--warn">${percent}% 限流</span></td>`
-            : `<td${titleAttr}>${percent}%</td>`;
+// ── 「密钥用量」悬浮卡（账户名触发）──────────────────────────────────────
+//
+// 子类型声明了用量查询路径（usage_path）的账户，在账户表里以「名称」为锚点：
+// 悬浮时在单元格旁弹出一张卡片，逐把密钥列出 5小时/本周/本月 用量与重置倒计时。
+// 倒计时按上游返回的重置时刻（resets_at）算出，统一成 d/h/m、最多两段。
+// 卡片挂在 document.body 上（.page-container 的入场动画带
+// transform，会把 position:fixed 的参照系挪走），且 pointer-events:none —
+// 卡片自己不得抢走单元格的悬浮。
+
+const USAGE_WINDOWS = [['5h', '5小时'], ['week', '本周'], ['month', '本月']];
+
+/** 距上游重置时刻的剩余时间："1d1h" / "3h2m" / "45m" / "<1m"；没有可解析
+ *  的重置时刻返回空串。倒计时归零（重置时刻已过、快照尚未刷新）时给 "0m"：
+ *  该窗口已重置、配额已恢复，下一周期由下一次观测给出。 */
+function fmtResetIn(resetsAt) {
+    const target = Date.parse(String(resetsAt));
+    if (!Number.isFinite(target)) return '';
+    const remain = target - Date.now();
+    if (remain <= 0) return '0m';
+    const minutes = Math.floor(remain / 60000);
+    const days = Math.floor(minutes / 1440);
+    if (days) {
+        const hours = Math.floor(minutes / 60) % 24;
+        return hours ? `${days}d${hours}h` : `${days}d`;
     }
-    return `<td${titleAttr}>—</td>`;
+    const hours = Math.floor(minutes / 60);
+    if (hours) {
+        const rest = minutes % 60;
+        return rest ? `${hours}h${rest}m` : `${hours}h`;
+    }
+    return minutes ? `${minutes}m` : '<1m';
 }
 
-/** 「密钥用量」区：当前标签页的类型若存在带 usage_path 的子类型，则在账户表
- *  下方按密钥逐行渲染 5h/周/月 用量；无任何符合条件的行时整块隐藏。 */
-function renderAccountUsageSection() {
-    const section = document.getElementById('accountUsageSection');
-    const tbody = document.querySelector('#accountUsageTable tbody');
-    if (!section || !tbody) return;
-    const tracksUsage = Object.values(typeSpec(_accountsTabType).subtypes || {})
-        .some((s) => s && s.usage_path);
-    const rows = [];
-    if (tracksUsage) {
-        (_accountsCache || []).forEach((a) => {
-            if (a.is_aggregate || (a.account_type || 'api') !== _accountsTabType) return;
-            const sub = subtypeSpec(a.account_type, a.subtype);
-            if (!sub || !sub.usage_path) return;
-            (a.keys || []).forEach((k) => {
-                const usage = k.usage || null;   // 无 usage 数据 → 三个窗口显示 —
-                const windows = (usage && usage.windows) || {};
-                rows.push(`
-                    <tr>
-                        <td>${esc(a.name)}</td>
-                        <td>${k.label ? esc(k.label) : `<code>${esc(k.masked || '')}</code>`}</td>
-                        ${usageWindowCell(windows['5h'], usage)}
-                        ${usageWindowCell(windows.week, usage)}
-                        ${usageWindowCell(windows.month, usage)}
-                    </tr>
-                `);
-            });
-        });
+/** 一个窗口的展示值："36%(1h22m)"；上游没给重置时刻时只给百分比。 */
+function usageWindowText(win) {
+    const percent = win && win.percent != null ? Math.round(Number(win.percent)) : NaN;
+    if (!Number.isFinite(percent)) return '—';
+    const reset = win && win.resets_at ? fmtResetIn(win.resets_at) : '';
+    return reset ? `${percent}%(${reset})` : `${percent}%`;
+}
+
+/** 观测时刻：当天只给 HH:MM，跨天带上月-日。 */
+function fmtObservedAt(isoStr) {
+    const full = fmtLocal(isoStr);
+    if (!full) return '';
+    const day = full.slice(0, 10);
+    return day === _formatLocalDate(new Date())
+        ? full.slice(11, 16) : `${day.slice(5)} ${full.slice(11, 16)}`;
+}
+
+/** 该账户是否有用量可展示：子类型带 usage_path 且持有本机密钥。 */
+function tracksKeyUsage(account) {
+    const sub = subtypeSpec(account.account_type, account.subtype);
+    return !!(sub && sub.usage_path) && (account.keys || []).length > 0;
+}
+
+let _usageCardEl = null;
+
+function _usageCardNode() {
+    if (!_usageCardEl) {
+        _usageCardEl = document.createElement('div');
+        _usageCardEl.className = 'usage-card';
+        _usageCardEl.setAttribute('role', 'tooltip');
+        document.body.appendChild(_usageCardEl);
     }
-    tbody.innerHTML = rows.join('');
-    section.style.display = rows.length ? '' : 'none';
+    return _usageCardEl;
+}
+
+function hideUsageCard() {
+    if (_usageCardEl) _usageCardEl.classList.remove('is-open');
+}
+
+/** 悬浮卡内容：账户名 + 类型徽章，逐把密钥列三个窗口的用量与倒计时。 */
+function usageCardHtml(account) {
+    let observed = '';
+    const keys = (account.keys || []).map((key) => {
+        const usage = key.usage || null;
+        const windows = (usage && usage.windows) || {};
+        // 卡片脚注给「最旧」的观测时刻：密钥同轮轮询时彼此相同，一旦不同，
+        // 报最旧的那次才不会让陈旧数据藏在新鲜观测后面。
+        if (usage && usage.checked_at
+            && (!observed || usage.checked_at < observed)) {
+            observed = usage.checked_at;
+        }
+        const name = key.label ? esc(key.label) : `<code>${esc(key.masked || '')}</code>`;
+        const error = usage && usage.error
+            ? `<div class="usage-card__error">查询失败：${esc(String(usage.error))}</div>`
+            : '';
+        const rows = USAGE_WINDOWS.map(([windowName, label]) => {
+            const win = windows[windowName] || null;
+            const percent = win && win.percent != null ? Math.round(Number(win.percent)) : NaN;
+            const limit = Number.isFinite(percent) && percent >= 100;
+            return `<div class="usage-card__window"><span>${label}</span>`
+                + `<span${limit ? ' class="is-limit"' : ''}>${esc(usageWindowText(win))}</span></div>`;
+        }).join('');
+        return `<div class="usage-card__key">
+            <div class="usage-card__key-name">${name}</div>
+            ${error}${rows}
+        </div>`;
+    }).join('');
+    const foot = observed
+        ? `<div class="usage-card__foot">观测于 ${esc(fmtObservedAt(observed))}</div>` : '';
+    return `<div class="usage-card__head">`
+        + `<span class="usage-card__name">${esc(account.name)}</span>`
+        + `${accountTypeBadge(account.account_type)}</div>${keys}${foot}`;
+}
+
+/** 在锚点旁弹出用量卡；贴近视口边缘时向内收 / 翻到锚点上方。 */
+function showUsageCard(anchor, account) {
+    const card = _usageCardNode();
+    card.innerHTML = usageCardHtml(account);
+    card.classList.add('is-open');
+    const rect = anchor.getBoundingClientRect();
+    const box = card.getBoundingClientRect();
+    card.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - box.width - 8))}px`;
+    const below = rect.bottom + 8;
+    card.style.top = `${below + box.height <= window.innerHeight - 8
+        ? below : Math.max(8, rect.top - box.height - 8)}px`;
 }
 
 /** Render the current tab's account rows from the cached payload. */
 function renderAccountsTable() {
     const tbody = document.querySelector('#accountsTable tbody');
     if (!tbody || !_accountsCache) return;
+    hideUsageCard();   // 重渲染会换掉锚点，卡片不能留在旧位置
     const rows = _accountsCache.filter((a) =>
         !a.is_aggregate && (a.account_type || 'api') === _accountsTabType);
     if (!rows.length) {
@@ -573,9 +645,12 @@ function renderAccountsTable() {
                 ? ` title="${esc(`${keyCount} 把密钥：${keyNames.join('、')}`)}"`
                 : '';
             const pendingDeletion = isPendingAccountDeletion(a);
+            const usageAnchor = tracksKeyUsage(a)
+                ? `<span class="usage-anchor" data-account-id="${a.id}">${esc(a.name)}</span>`
+                : esc(a.name);
             return `
             <tr>
-                <td>${esc(a.name)}${a.ends_at ? ` <span class="badge badge--warn" title="到期删除：${esc(fmtLocal(a.ends_at))}">到期 ${esc(fmtLocal(a.ends_at).slice(0, 10))}</span>` : ''}</td>
+                <td>${usageAnchor}${a.ends_at ? ` <span class="badge badge--warn" title="到期删除：${esc(fmtLocal(a.ends_at))}">到期 ${esc(fmtLocal(a.ends_at).slice(0, 10))}</span>` : ''}</td>
                 <td${keyTitle}><code>${esc(firstMask)}</code>${keyCount > 1 ? ` <span class="badge" title="${keyCount} 把密钥（同一配置的多个并发槽位）">×${keyCount}</span>` : ''}${!firstMask && !keyCount ? ' <span class="badge badge--warn" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
@@ -597,13 +672,20 @@ function renderAccountsTable() {
             </tr>
         `;
         }).join('');
+        // 悬浮锚点在此重挂：tbody 刚被整体替换，旧监听随旧单元格一起消失。
+        tbody.querySelectorAll('.usage-anchor[data-account-id]').forEach((anchor) => {
+            const account = rows.find((a) => String(a.id) === anchor.dataset.accountId);
+            if (!account) return;
+            anchor.addEventListener('mouseenter', () => showUsageCard(anchor, account));
+            anchor.addEventListener('mouseleave', hideUsageCard);
+        });
     }
-    renderAccountUsageSection();
 }
 
 async function loadAccountsTable() {
     const tbody = document.querySelector('#accountsTable tbody');
     if (!tbody) return;
+    hideUsageCard();
     tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
     try {
         await ensureTypeSpecs();
@@ -614,8 +696,6 @@ async function loadAccountsTable() {
     } catch (err) {
         _accountsCache = null;   // 刷新失败时不留旧数据，避免切标签后误显示
         tbody.innerHTML = `<tr><td colspan="8" class="td-error">加载失败: ${esc(err.message)}</td></tr>`;
-        const section = document.getElementById('accountUsageSection');
-        if (section) section.style.display = 'none';
     }
 }
 
@@ -918,16 +998,6 @@ function initAccountsPage() {
                 <tbody></tbody>
             </table>
         </div>
-        <!-- 子类型带用量查询时渲染（见 renderAccountUsageSection） -->
-        <div class="usage-section" id="accountUsageSection" style="display:none">
-            <h2 class="usage-section__title">密钥用量</h2>
-            <div class="table-scroll">
-                <table class="mgmt-table usage-table" id="accountUsageTable">
-                    <thead><tr><th>账户</th><th>名称</th><th>5小时</th><th>本周</th><th>本月</th></tr></thead>
-                    <tbody></tbody>
-                </table>
-            </div>
-        </div>
         <div class="modal-overlay" id="accountModal" style="display:none">
             <div class="modal modal--account">
                 <div class="modal__header">
@@ -1012,6 +1082,11 @@ function initAccountsPage() {
             </div>
         </div>
     `;
+    // 表格滚动 / 视口变化会让固定定位的卡片错位，离开页面则整块失效：
+    // 这些时候直接收起（scroll 用捕获，才能收到 .table-scroll 内部滚动）。
+    window.addEventListener('scroll', hideUsageCard, true);
+    window.addEventListener('resize', hideUsageCard);
+    window.addEventListener('hashchange', hideUsageCard);
     loadAccountsTable();
 }
 

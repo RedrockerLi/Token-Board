@@ -50,8 +50,11 @@ inline bool candidate_usage_exhausted(const UpstreamCandidate &candidate) {
 /// Earliest reset (epoch seconds) among the windows that still have quota; 0
 /// when the candidate has no usable window or no usage data at all.  The
 /// soonest-resetting window is the one whose unused quota expires first.
-/// Exhausted candidates report no deadline: they are scheduled last, so they
-/// can never act as the lead.
+/// A reported percentage never decides whether a window competes: percent=0
+/// means "under 1% used", so such a window keeps its deadline like any
+/// other.  Only a window above kUsablePercent or without a parseable reset
+/// supplies nothing.  Exhausted candidates report no deadline: they are
+/// scheduled last, so they can never act as the lead.
 inline std::int64_t candidate_usage_deadline(
     const UpstreamCandidate &candidate) {
     const auto *usage = candidate.usage();

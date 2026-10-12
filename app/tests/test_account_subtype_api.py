@@ -263,6 +263,9 @@ class AccountSubtypeApiTest(AppDatabaseTestCase):
             "error": None,
             "windows": {
                 "5h": {"percent": 42, "resets_at": "2026-10-12T06:00:00Z"},
+                # A 0% window carries its reset too: percent counts usage, it
+                # does not report whether the window is live.
+                "week": {"percent": 0, "resets_at": "2026-10-19T00:00:00Z"},
                 "month": {"percent": 7, "resets_at": None},
             },
             "monthly_period": {"start": "2026-10-01", "end": None},

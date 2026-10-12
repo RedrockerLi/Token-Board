@@ -22,7 +22,9 @@ V2.5 给上游增加一类子分类标识与密钥级展示/观测字段。`upst
 路径探测上游后写入本机，不进入配置同步，云端不含这些观测。快照形状为
 `{checked_at,error,windows{5h,week,month:{percent,resets_at}},monthly_period{start,end}}`：
 `checked_at` 是观测时刻，`error` 是查询失败原因，`windows` 是各窗口的用量百分比与重置
-时刻，`monthly_period` 是观测到的月度周期边界。
+时刻（`resets_at` 原样保留上游返回的重置时刻，任何 percent 都记：0% 只说明用量不足 1%，
+窗口可能仍在计时；代理候选微调与看板都按它判断/展示），`monthly_period` 是观测到的月度
+周期边界。
 
 ## V2.4 历史增量
 

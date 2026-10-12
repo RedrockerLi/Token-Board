@@ -101,7 +101,8 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
                 # A numeric string is accepted and clamped into 0..100.
                 "rolling": {"percent": "142", "resetsAt": format_utc(
                     T0 + timedelta(hours=5))},
-                # A zero percentage carries a now+duration placeholder reset.
+                # A zero percentage still reports its window reset; percent
+                # only counts usage, it never decides whether a window is live.
                 "weekly": {"percent": 0, "resetsAt": format_utc(
                     T0 + timedelta(days=7))},
                 "monthly": {"percent": 0, "resetsAt": format_utc(reset)},
@@ -124,8 +125,9 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
                 self.assertEqual(payload["windows"], {
                     "5h": {"percent": 100,
                            "resets_at": format_utc(T0 + timedelta(hours=5))},
-                    "week": {"percent": 0, "resets_at": None},
-                    "month": {"percent": 0, "resets_at": None},
+                    "week": {"percent": 0, "resets_at": format_utc(
+                        T0 + timedelta(days=7))},
+                    "month": {"percent": 0, "resets_at": format_utc(reset)},
                 })
                 # The raw monthly reset drives the period chain even at 0%.
                 self.assertEqual(payload["monthly_period"],

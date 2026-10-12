@@ -90,6 +90,15 @@ int main() {
     unusable[1].usage_ref = usage_of({{20, 7200}});
     assert(usage_lead_start(unusable, 0) == 0);
 
+    // A 0% window supplies a deadline like any other usable window: the
+    // percentage measures usage, it never tells whether the window is live
+    // (under 1% rounds to 0 and the window is still counting down).
+    std::vector<UpstreamCandidate> idle(2);
+    idle[0].usage_ref = usage_of({{0, 7200}});
+    idle[1].usage_ref = usage_of({{0, 600}});
+    assert(candidate_usage_deadline(idle[1]) == 600);
+    assert(usage_lead_start(idle, 0) == 1);
+
     // Gap gate: exactly 30 min leads, one second less does not.
     std::vector<UpstreamCandidate> gap(2);
     gap[0].usage_ref = usage_of({{20, 2400}});

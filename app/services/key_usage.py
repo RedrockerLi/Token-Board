@@ -79,10 +79,14 @@ def _preview(value: object, limit: int = 80) -> str:
 def parse_usage_body(body: object, *, context: str = "") -> tuple[dict, datetime | None]:
     """Extract stored windows and the raw monthly reset from a response body.
 
-    The raw monthly ``resetsAt`` is returned separately because the observed
-    billing period chain needs it even when the reported percentage is zero
-    (the upstream then returns a now+duration placeholder that must not be
-    stored as a window reset).
+    Every window keeps the reset instant the upstream reported, whatever its
+    percentage: percent=0 means "under 1% used", not "no window", so the
+    dashboard counts down from it and the proxy's usage-aware tuning compares
+    it like any other deadline.  Only an unparseable ``resetsAt`` leaves the
+    field empty — that window then competes on percentage alone.
+
+    The raw monthly ``resetsAt`` is additionally returned on its own: the
+    observed billing period chain consumes it directly.
 
     Structural deviations never abort the poll, but each one is logged so a
     shape change at the undocumented upstream surface is noticeable; without
@@ -108,11 +112,14 @@ def parse_usage_body(body: object, *, context: str = "") -> tuple[dict, datetime
         if resets is None and percent > 0:
             log.warning("%swindow '%s' has an unparseable resetsAt: %s",
                         prefix, source, _preview(raw.get("resetsAt")))
-        # A zero percentage reports a now+duration placeholder, not a reset.
         windows[name] = {
             "percent": percent,
+            # 上游本次返回的重置时刻，任何 percent 都存：percent=0 只说明本窗口
+            # 用量不足 1%，窗口可能仍在计时（滚动窗口 = 末次使用 + 5h），也可能
+            # 空闲（上游给查询时刻+时长的占位值）。代理的候选微调按它比较截止
+            # （proxy/src/core/candidate_selection.h），看板按它显示重置倒计时。
             "resets_at": (format_utc(resets)
-                          if resets is not None and percent > 0 else None),
+                          if resets is not None else None),
         }
     monthly = usage.get("monthly")
     monthly_resets = (_resets_at(monthly.get("resetsAt"))
