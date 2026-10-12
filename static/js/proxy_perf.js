@@ -15,6 +15,9 @@ let chartUpstreamSuccess = null;
 let chartModelLatency = null;
 let chartModelSpeed = null;
 
+// 四幅概览图（请求数/成功率/模型 TTFT/模型速度）统一使用图表主色。
+const PERF_CHART_COLOR = '#B45F45';
+
 function perfEsc(value) {
     return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch) {
         return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
@@ -79,7 +82,7 @@ function buildPerfPageHTML() {
                 </div>
                 <div class="chart-card">
                     <div class="chart-card__title">各上游账户成功率 (最近 1h)</div>
-                    <div class="chart-container chart-container--sm" id="chartUpstreamSuccess"></div>
+                    <div class="chart-container chart-container--lg" id="chartUpstreamSuccess"></div>
                 </div>
             </div>
         </div>
@@ -260,9 +263,9 @@ function renderRPMChart(domId, data, minutes) {
         series: [{
             name: '请求数', type: 'line', data: vals,
             smooth: true, symbol: 'circle', symbolSize: 4,
-            lineStyle: { color: '#927CA6', width: 2 },
-            itemStyle: { color: '#927CA6' },
-            areaStyle: { color: 'rgba(146,124,166,0.10)' },
+            lineStyle: { color: PERF_CHART_COLOR, width: 2 },
+            itemStyle: { color: PERF_CHART_COLOR },
+            areaStyle: { color: 'rgba(180,95,69,0.10)' },
         }],
     });
 }
@@ -279,11 +282,6 @@ function renderUpstreamSuccessRateChart(domId, data) {
     // Success rate per real upstream over the last hour — highest volume first.
     var names = data.map(function(d) { return d.account_name; });
     var rates = data.map(function(d) { return d.success_rate; });
-    var colors = data.map(function(d) {
-        var r = d.success_rate;
-        if (r == null) return '#746B64';
-        return r >= 95 ? '#6F8A5D' : (r >= 80 ? '#C08B42' : '#A75558');
-    });
 
     chartUpstreamSuccess.setOption({
         tooltip: {
@@ -299,9 +297,8 @@ function renderUpstreamSuccessRateChart(domId, data) {
         yAxis: { type: 'value', axisLabel: { fontSize: 10 }, min: 0, max: 100 },
         series: [{
             name: '成功率', type: 'bar',
-            data: rates.map(function(v, i) {
-                return { value: v, itemStyle: { color: colors[i] } };
-            }),
+            data: rates,
+            itemStyle: { color: PERF_CHART_COLOR },
             barMaxWidth: 28,
             label: {
                 show: true, position: 'top', fontSize: 10,
@@ -331,7 +328,6 @@ function renderModelLatencyChart(domId, models) {
     models.sort(function(a, b) { return b.avg_ttft_ms - a.avg_ttft_ms; });
     var names = models.map(function(m) { return m.model; });
     var latencies = models.map(function(m) { return m.avg_ttft_ms; });
-    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#B45F45','#6E8B77','#6F8A5D','#C08B42','#927CA6','#A75558','#8F735B','#A57B93'])[i % 8]; });
 
     chartModelLatency.setOption({
         tooltip: {
@@ -348,9 +344,8 @@ function renderModelLatencyChart(domId, models) {
         yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
         series: [{
             name: 'TTFT', type: 'bar',
-            data: latencies.map(function(v, i) {
-                return { value: v, itemStyle: { color: colors[i] } };
-            }),
+            data: latencies,
+            itemStyle: { color: PERF_CHART_COLOR },
             barMaxWidth: 28,
         }],
     });
@@ -367,7 +362,6 @@ function renderModelSpeedChart(domId, models) {
         return;
     }
     models.sort(function(a, b) { return b.avg_output_tps - a.avg_output_tps; });
-    var colors = models.map(function(_, i) { return (typeof chartColors !== 'undefined' ? chartColors : ['#B45F45','#6E8B77','#6F8A5D','#C08B42','#927CA6','#A75558','#8F735B','#A57B93'])[i % 8]; });
     chartModelSpeed.setOption({
         tooltip: {
             trigger: 'axis', axisPointer: { type: 'shadow' },
@@ -382,7 +376,8 @@ function renderModelSpeedChart(domId, models) {
         yAxis: { type: 'value', name: 'tokens/s', axisLabel: { fontSize: 10 } },
         series: [{
             name: '输出速度', type: 'bar', barMaxWidth: 28,
-            data: models.map(function(m, i) { return { value: m.avg_output_tps, itemStyle: { color: colors[i] } }; }),
+            data: models.map(function(m) { return m.avg_output_tps; }),
+            itemStyle: { color: PERF_CHART_COLOR },
         }],
     });
 }
