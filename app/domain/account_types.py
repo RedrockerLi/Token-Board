@@ -22,6 +22,7 @@ class AccountSubtypeSpec:
     presets: dict  # 新建表单预填：base_url / monthly_price / currency / api_format
     session_header: bool  # 转发时注入 x-opencode-session 会话头（每对话稳定）
     usage_path: str | None  # 用量查询相对路径（GET + Bearer）；None = 无用量查询
+    models_path: str | None = None  # 模型目录相对路径（GET）；None = 默认 "{base}/models"
 
     def to_dict(self) -> dict:
         return {
@@ -29,6 +30,7 @@ class AccountSubtypeSpec:
             "presets": dict(self.presets),
             "session_header": self.session_header,
             "usage_path": self.usage_path,
+            "models_path": self.models_path,
         }
 
 
@@ -97,10 +99,22 @@ ACCOUNT_TYPES: dict[str, AccountTypeSpec] = {
                 },
                 session_header=True,
                 usage_path="/v1/usage",
+                models_path="/v1/models",
             ),
         },
     ),
 }
+
+
+def subtype_spec(subtype: str | None) -> AccountSubtypeSpec | None:
+    """Spec for a subtype slug across all types (None when not declared)."""
+    if not subtype:
+        return None
+    for type_spec in ACCOUNT_TYPES.values():
+        sub = type_spec.subtypes.get(subtype)
+        if sub is not None:
+            return sub
+    return None
 
 
 def spec(account_type: str | None) -> AccountTypeSpec:

@@ -222,15 +222,16 @@
 | `presets` | `base_url` / `monthly_price` / `currency` / `api_format` | 选中该子分类时新建表单的预填值 |
 | `session_header` | true / false | 转发时是否注入 `x-opencode-session`（每对话稳定） |
 | `usage_path` | 相对路径 / null | 用量查询路径（`GET` + Bearer 认证）；null = 无用量查询 |
+| `models_path` | 相对路径 / null | 模型目录路径（看板"更新模型"用）；null = 默认 `{base}/models` |
 
-当前只有 `plan` 带子分类，仅一项 `opencode-go`：`label` 为 `OpenCode Go — $10/月 · 含用量查询`，预设 `base_url=https://opencode.ai/zen/go`、月费 $10（USD）、`anthropic` 线格式，用量查询 `/v1/usage`。子分类写在账户上游行的 `upstreams.subtype`（NULL = 普通账户），只影响预设、上游会话头与用量轮询：计费、路由、删除语义继续跟随 `plan` 类型，类型徽章也仍是类型的 `short_label`（opencode-go 账户显示 `Plan`）。
+当前只有 `plan` 带子分类，仅一项 `opencode-go`：`label` 为 `OpenCode Go — $10/月 · 含用量查询`，预设 `base_url=https://opencode.ai/zen/go`、月费 $10（USD）、`anthropic` 线格式，用量查询 `/v1/usage`、模型目录 `/v1/models`。子分类写在账户上游行的 `upstreams.subtype`（NULL = 普通账户），只影响预设、上游会话头、看板"更新模型"与用量轮询：计费、路由、删除语义继续跟随 `plan` 类型，类型徽章也仍是类型的 `short_label`（opencode-go 账户显示 `Plan`）。
 
 前端据此渲染账户弹窗左栏：类型卡片来自 `ACCOUNT_TYPES` 的 `label` / `short_label`，选中带子分类的类型后再在其下渲染子分类卡片，子分类名不硬编码在前端；轮询写入的用量快照由密钥用量表展示。
 
 ### 添加步骤（三步 + 两个按需）
 
 1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label`（形如 `<type> — <说明>`，破折号后的说明进左栏卡片正文）是账户弹窗左栏类型选择卡文案、`short_label` 是类型徽章文案（账户列表与左栏卡片共用）。
-2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path` 填进 `AccountSubtypeSpec`；左栏子卡片、代理的上游会话头注入和用量轮询都从它派生。C++ 不需要同步——类型在代理里没有镜像列表，唯一进入请求路径的类型派生量是合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
+2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、代理的上游会话头注入、看板"更新模型"和用量轮询都从它派生。C++ 不需要同步——类型在代理里没有镜像列表，唯一进入请求路径的类型派生量是合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
 3. **智能体扩展另走智能体管理**：在 `agent_software` 增加 `agent_kind`，为该类型注册一个返回统一 UsageEvent 的解析器；订阅继续保存在独立的 `agent_subscriptions`，通过绑定表连接到软件，不把订阅误当成代理上游。
 
 两个按需的 if：

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit, urlunsplit
 
+from app.domain.account_types import subtype_spec
+
 
 def _origin(base_url: str) -> str:
     parts = urlsplit((base_url or "").strip())
@@ -36,6 +38,14 @@ def endpoint_url(account: dict, endpoint: str) -> str:
     fmt = str(account.get("api_format") or "openai").strip().lower()
     base_path = _base_path(base)
     if endpoint == "models":
+        # A subtype may declare its own catalog path (opencode-go's gateway
+        # serves the model list at /v1/models); everything else keeps the
+        # plain "{base}/models" shape, whatever wire format was chosen.
+        subtype = account.get("subtype")
+        declared = subtype_spec(
+            str(subtype).strip() if subtype else None)
+        if declared is not None and declared.models_path:
+            return base + declared.models_path
         path = "/models"
     elif endpoint == "messages" or fmt == "anthropic":
         path = "/messages" if base_path.endswith("/v1") else "/v1/messages"
