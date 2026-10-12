@@ -1701,6 +1701,82 @@ code {
     max-width: 880px;
 }
 
+/* ── Account modal: type rail on the left, form on the right ───────────── */
+.modal--account {
+    width: min(100%, 780px);
+    max-width: 780px;
+}
+
+.account-form-grid {
+    display: grid;
+    grid-template-columns: 196px minmax(0, 1fr);
+    gap: 22px;
+    align-items: start;
+}
+
+.account-form-main {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    min-width: 0;
+}
+
+.type-rail {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    align-self: stretch;
+    padding-right: 20px;
+    border-right: 1px solid var(--color-border);
+}
+
+.type-rail__title {
+    color: var(--color-text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.type-rail__list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.type-rail__item {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 7px;
+    width: 100%;
+    padding: 11px 12px;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+    color: var(--color-text);
+    background: rgba(255, 255, 255, 0.72);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color var(--transition), background var(--transition), box-shadow var(--transition);
+}
+
+.type-rail__item:hover {
+    border-color: rgba(59, 50, 44, 0.30);
+    background: #ffffff;
+}
+
+.type-rail__item.is-active {
+    border-color: var(--color-primary);
+    background: var(--color-primary-light);
+    box-shadow: 0 0 0 3px rgba(180, 95, 69, 0.13);
+}
+
+.type-rail__desc {
+    color: var(--color-text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.45;
+}
+
 .modal__header {
     flex: 0 0 auto;
     display: flex;
@@ -2086,9 +2162,31 @@ code {
     }
 
     .modal--wide,
-    .modal--lg {
+    .modal--lg,
+    .modal--account {
         width: 100%;
         max-width: 100%;
+    }
+
+    .account-form-grid {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 16px;
+    }
+
+    .type-rail {
+        padding-right: 0;
+        padding-bottom: 14px;
+        border-right: 0;
+        border-bottom: 1px solid var(--color-border);
+    }
+
+    .type-rail__list {
+        flex-direction: row;
+    }
+
+    .type-rail__item {
+        flex: 1 1 0;
+        min-width: 0;
     }
 
     .slot-row,

@@ -185,7 +185,7 @@
 |---------|------|---------|
 | `app/domain/account_types.py` 的 `ACCOUNT_TYPES`（[app/domain/account_types.py:47](app/domain/account_types.py#L47)） | **唯一权威**：`billing` / `routable` / `holds_keys` / `deletion` / `cooldown` / `subscription_unit` / `label` | 加一行 |
 | `proxy/src/core/account_types.h`（[proxy/src/core/account_types.h:22-50](proxy/src/core/account_types.h#L22-L50)） | C++ 请求时行为镜像：`non_routable_types()`（路由排除）+ `cooldown_class()`（429 冷却类别） | 同步两个列表 |
-| `GET /api/proxy/account-types` | 前端拉取整个规格表；类型下拉、徽章、价格字段显隐、删除流全部由它驱动，**前端不再硬编码类型** | 自动，无需改前端 |
+| `GET /api/proxy/account-types` | 前端拉取整个规格表；账户弹窗左栏的类型选择卡、徽章、价格字段显隐、删除流全部由它驱动，**前端不再硬编码类型** | 自动，无需改前端 |
 
 ### 一个上游类型的 7 个属性
 
@@ -202,7 +202,7 @@
 
 ### 添加步骤（三步 + 两个按需）
 
-1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label` 是设置页类型下拉文案、`short_label` 是账户列表徽章。
+1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label`（形如 `<type> — <说明>`，破折号后的说明进左栏卡片正文）是账户弹窗左栏类型选择卡文案、`short_label` 是类型徽章文案（账户列表与左栏卡片共用）。
 2. **`account_types.h` 同步两个列表**：若新类型不可路由，加进 `non_routable_types()`；若 429 应冷却 5 小时，在 `cooldown_class()` 加分支。
 3. **智能体扩展另走智能体管理**：在 `agent_software` 增加 `agent_kind`，为该类型注册一个返回统一 UsageEvent 的解析器；订阅继续保存在独立的 `agent_subscriptions`，通过绑定表连接到软件，不把订阅误当成代理上游。
 
@@ -210,4 +210,4 @@
 - **schema**：`account_type` 列无 CHECK 约束，新取值天然兼容，**一般不需要迁移**；仅当上游需要新列时才添加迁移。智能体新增字段应在智能体管理迁移中维护。
 - **前端徽章配色**：`badge--type-<type>` 的 CSS 类缺省落到默认样式，想要专属配色就在 `static/css/dashboard.css` 加一个类。
 
-前端类型下拉、价格字段显隐、删除提示、并发测试守卫都经 `/api/proxy/account-types` 读规格自动适配。校验也以规格表为准：`create_account` / `update_account` 拒绝未知类型；智能体软件类型则经 `/api/proxy/agent-types` 校验。
+前端账户弹窗左栏的类型选择卡、价格字段显隐、删除提示、并发测试守卫都经 `/api/proxy/account-types` 读规格自动适配。校验也以规格表为准：`create_account` / `update_account` 拒绝未知类型；智能体软件类型则经 `/api/proxy/agent-types` 校验。

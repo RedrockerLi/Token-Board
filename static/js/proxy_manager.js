@@ -28,15 +28,51 @@ function typeSpec(type) {
              subscription_unit: null, label: '', short_label: '' };
 }
 
-/** Render the account-type <select> options from the spec (labels). */
-function _populateTypeOptions(select) {
-    if (!select || !TYPE_SPECS) return;
-    const current = select.value;
-    select.innerHTML = Object.entries(TYPE_SPECS)
-        .map(([t, s]) => `<option value="${esc(t)}">${esc(s.label)}</option>`)
-        .join('');
-    // Preserve the previously-selected type if it exists in the spec.
-    if (TYPE_SPECS[current]) select.value = current;
+/** Spec labels read "<type> — <说明>"; the clause after the dash becomes the
+ *  rail card's description.  A label without a dash is shown as-is. */
+function _typeRailDesc(spec) {
+    const label = String((spec && spec.label) || '');
+    const dash = label.indexOf('—');
+    return dash === -1 ? label : label.slice(dash + 1).trim();
+}
+
+/** Render the account-type rail (left column of the account modal) from the
+ *  spec table — labels and badges only, never hard-coded type strings. */
+function _populateTypeOptions() {
+    const rail = document.getElementById('accountTypeRail');
+    if (!rail || !TYPE_SPECS) return;
+    rail.innerHTML = Object.entries(TYPE_SPECS).map(([t, s]) => `
+        <button type="button" class="type-rail__item" data-type="${esc(t)}"
+                aria-pressed="false">
+            <span class="badge badge--type-${esc(t)}">${esc(s.short_label || t)}</span>
+            <span class="type-rail__desc">${esc(_typeRailDesc(s))}</span>
+        </button>
+    `).join('');
+    rail.querySelectorAll('.type-rail__item').forEach((btn) => {
+        btn.addEventListener('click', () => selectAccountType(btn.dataset.type));
+    });
+}
+
+/** Highlight the rail item matching the form's current account_type. */
+function syncAccountTypeRail() {
+    const input = document.querySelector('#accountForm [name="account_type"]');
+    const current = input ? input.value : '';
+    document.querySelectorAll('#accountTypeRail .type-rail__item').forEach((btn) => {
+        const active = btn.dataset.type === current;
+        btn.classList.toggle('is-active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+}
+
+/** Pick an account type from the rail: store it on the form (the hidden
+ *  account_type input feeds saveAccount / collectKeyRows), repaint the rail
+ *  selection, and re-apply the type-dependent field visibility. */
+function selectAccountType(type) {
+    const input = document.querySelector('#accountForm [name="account_type"]');
+    if (!input || !TYPE_SPECS || !TYPE_SPECS[type]) return;
+    input.value = type;
+    syncAccountTypeRail();
+    toggleTypeFields(input);
 }
 
 function showToast(msg, type = 'success') {
@@ -471,7 +507,7 @@ async function editAccount(id) {
         const acc = accounts.find((a) => a.id === id);
         if (!acc) return;
         const form = document.querySelector('#accountForm');
-        _populateTypeOptions(form['account_type']);
+        _populateTypeOptions();
         form['name'].value = acc.name;
         form['base_url'].value = acc.base_url;
         form['api_format'].value = acc.api_format || 'openai';
@@ -481,7 +517,7 @@ async function editAccount(id) {
         form['monthly_price'].value = typeSpec(acc.account_type).billing === 'subscription' ? (acc.monthly_price || 0) : '';
         if (form['currency']) form['currency'].value = acc.currency || 'CNY';
         form['max_concurrency'].value = acc.max_concurrency || '';
-        toggleTypeFields(form['account_type']);
+        selectAccountType(form['account_type'].value);
         // Existing keys → masked keep-rows; user adds new rows as needed.
         resetKeyList();
         // Existing keys → masked keep-rows; user adds new rows as needed.
@@ -632,12 +668,12 @@ async function openAddAccountModal() {
     }
     const form = document.querySelector('#accountForm');
     if (form) {
-        _populateTypeOptions(form['account_type']);
+        _populateTypeOptions();
         form.reset();
         form.dataset.editId = '';
-        // Field visibility follows the selected type (default api); the key
-        // section is toggled by toggleTypeFields via holds_keys.
-        toggleTypeFields(form['account_type']);
+        // Field visibility follows the selected type (reset → default api);
+        // the key section is toggled by toggleTypeFields via holds_keys.
+        selectAccountType(form['account_type'].value);
     }
     resetKeyList();
     const delBtn = document.getElementById('accountDeleteBtn');
@@ -670,62 +706,70 @@ function initAccountsPage() {
             </table>
         </div>
         <div class="modal-overlay" id="accountModal" style="display:none">
-            <div class="modal">
+            <div class="modal modal--account">
                 <div class="modal__header">
                     <h3>账户信息</h3>
                     <button class="modal__close" onclick="closeModal('accountModal')">&times;</button>
                 </div>
                 <form id="accountForm" onsubmit="saveAccount(event)" data-edit-id="">
-                    <label>名称 <input name="name" required></label>
-                    <div id="accountKeySection" style="margin-bottom:10px;">
-                        <label>上游 API Key（多把密钥 = 同一配置的多个槽位；仅本机保存，不上传云端）</label>
-                        <div id="keyList" style="margin:4px 0;"></div>
-                        <div id="cloudKeyList" style="margin:4px 0;"></div>
-                        <button type="button" class="btn btn--sm" onclick="addKeyRow()">+ 添加密钥</button>
-                    </div>
-                    <div id="routingFields">
-                        <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1"></label>
-                        <label>API 格式
-                            <select name="api_format">
-                                <option value="openai">OpenAI 兼容</option>
-                                <option value="openai_responses">OpenAI Responses</option>
-                                <option value="anthropic">Anthropic 兼容</option>
-                            </select>
-                        </label>
-                        <label>上游路径（可选）
-                            <input name="endpoint_path" placeholder="留空自动推导，如 /v1/messages 或 /responses">
-                        </label>
-                        <label>认证方式
-                            <select name="auth_header">
-                                <option value="auto">自动（按 API 格式推导）</option>
-                                <option value="bearer">Authorization: Bearer</option>
-                                <option value="x-api-key">x-api-key + anthropic-version</option>
-                            </select>
-                        </label>
-                        <label>并发限额（可选，留空 = 无限制）
-                            <input name="max_concurrency" type="number" step="1" min="1" placeholder="如 3">
-                        </label>
-                    </div>
-                    <label>账户类型
-                        <!-- options rendered from /api/proxy/account-types by
-                             _populateTypeOptions() on modal open -->
-                        <select name="account_type" onchange="toggleTypeFields(this)"></select>
-                    </label>
-                    <label id="planPriceField" style="display:none;"><span>订阅月费 (<span id="planPriceSymbol">¥</span>/周期)</span>
-                        <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 99">
-                    </label>
-                    <label id="currencyField" style="display:none;">订阅币种
-                        <select name="currency" onchange="updatePlanPriceSymbol()">
-                            <option value="CNY">CNY</option>
-                            <option value="USD">USD</option>
-                        </select>
-                    </label>
-                    <div style="display:flex; gap:8px;">
-                        <button type="submit" class="btn btn--primary">添加账户</button>
-                        <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
-                        <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
-                        <button type="button" class="btn btn--sm" id="accountCancelDeleteBtn" style="display:none">取消删除</button>
-                        <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:var(--color-danger);">删除账户</button>
+                    <!-- 账户类型由左栏选择卡驱动；隐藏值保持表单字段语义 -->
+                    <input type="hidden" name="account_type" value="api">
+                    <div class="account-form-grid">
+                        <aside class="type-rail">
+                            <div class="type-rail__title" id="accountTypeRailTitle">账户类型</div>
+                            <!-- cards rendered from /api/proxy/account-types by
+                                 _populateTypeOptions() on modal open -->
+                            <div class="type-rail__list" id="accountTypeRail"
+                                 role="group" aria-labelledby="accountTypeRailTitle"></div>
+                        </aside>
+                        <div class="account-form-main">
+                            <label>名称 <input name="name" required></label>
+                            <div id="accountKeySection" style="margin-bottom:10px;">
+                                <label>上游 API Key（多把密钥 = 同一配置的多个槽位；仅本机保存，不上传云端）</label>
+                                <div id="keyList" style="margin:4px 0;"></div>
+                                <div id="cloudKeyList" style="margin:4px 0;"></div>
+                                <button type="button" class="btn btn--sm" onclick="addKeyRow()">+ 添加密钥</button>
+                            </div>
+                            <div id="routingFields">
+                                <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1"></label>
+                                <label>API 格式
+                                    <select name="api_format">
+                                        <option value="openai">OpenAI 兼容</option>
+                                        <option value="openai_responses">OpenAI Responses</option>
+                                        <option value="anthropic">Anthropic 兼容</option>
+                                    </select>
+                                </label>
+                                <label>上游路径（可选）
+                                    <input name="endpoint_path" placeholder="留空自动推导，如 /v1/messages 或 /responses">
+                                </label>
+                                <label>认证方式
+                                    <select name="auth_header">
+                                        <option value="auto">自动（按 API 格式推导）</option>
+                                        <option value="bearer">Authorization: Bearer</option>
+                                        <option value="x-api-key">x-api-key + anthropic-version</option>
+                                    </select>
+                                </label>
+                                <label>并发限额（可选，留空 = 无限制）
+                                    <input name="max_concurrency" type="number" step="1" min="1" placeholder="如 3">
+                                </label>
+                            </div>
+                            <label id="planPriceField" style="display:none;"><span>订阅月费 (<span id="planPriceSymbol">¥</span>/周期)</span>
+                                <input name="monthly_price" type="number" step="0.01" min="0" placeholder="如 99">
+                            </label>
+                            <label id="currencyField" style="display:none;">订阅币种
+                                <select name="currency" onchange="updatePlanPriceSymbol()">
+                                    <option value="CNY">CNY</option>
+                                    <option value="USD">USD</option>
+                                </select>
+                            </label>
+                            <div style="display:flex; gap:8px;">
+                                <button type="submit" class="btn btn--primary">添加账户</button>
+                                <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
+                                <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
+                                <button type="button" class="btn btn--sm" id="accountCancelDeleteBtn" style="display:none">取消删除</button>
+                                <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:var(--color-danger);">删除账户</button>
+                            </div>
+                        </div>
                     </div>
                 </form>
             </div>
