@@ -43,6 +43,25 @@ NormalizedError from_body(int status, const json &body,
     return result;
 }
 
+// One ladder for "no candidate was attempted": the terminal and the streaming
+// renderers must tell the client the same story for the same reason.
+const char *no_candidate_message(NoCandidateReason reason,
+                                 const char *busy_message) {
+    switch (reason) {
+        case NoCandidateReason::kProviderQuotaCooldown:
+            return "All upstream keys are in provider quota cooldown";
+        case NoCandidateReason::kKeyRateLimited:
+            return "All upstream keys are rate limited";
+        case NoCandidateReason::kKeyUnavailable:
+            return "All upstream keys are temporarily unavailable";
+        case NoCandidateReason::kLocalCapacity:
+        case NoCandidateReason::kNone:
+            break;
+    }
+    return busy_message ? busy_message
+                        : "All upstream key concurrency slots are occupied";
+}
+
 }  // namespace
 
 int no_upstream_status(const UpstreamClient::ForwardResult &result,
@@ -112,16 +131,8 @@ TerminalError render_terminal_error(
         out.retry_after_seconds = provider_cooldown
             ? 0
             : rate_limited ? std::max(1, opts.no_candidate_retry_after) : 1;
-        const char *message = provider_cooldown
-            ? "All upstream keys are in provider quota cooldown"
-            : rate_limited
-                ? "All upstream keys are rate limited"
-                : (opts.busy_message
-                       ? opts.busy_message
-                       : opts.no_candidate_reason ==
-                                 NoCandidateReason::kKeyUnavailable
-                             ? "All upstream keys are temporarily unavailable"
-                             : "All upstream key concurrency slots are occupied");
+        const char *message =
+            no_candidate_message(opts.no_candidate_reason, opts.busy_message);
         normalized = from_body(out.status, json{
             {"message", message},
             {"type", throttled ? "rate_limit_error" : "service_unavailable"},
@@ -189,10 +200,8 @@ NormalizedError render_stream_error(
         const bool rate_limited =
             no_candidate_reason == NoCandidateReason::kKeyRateLimited;
         const bool throttled = provider_cooldown || rate_limited;
-        const char *message = provider_cooldown
-            ? "All upstream keys are in provider quota cooldown"
-            : rate_limited ? "All upstream keys are rate limited"
-                           : busy_message;
+        const char *message =
+            no_candidate_message(no_candidate_reason, busy_message);
         out = from_body(throttled ? 429 : 503,
                         json{{"message", message},
                              {"type", throttled

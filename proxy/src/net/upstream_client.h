@@ -61,11 +61,11 @@ struct ForwardOptions {
     // Callers which cannot provide it retain a conservative SSE fallback.
     std::shared_ptr<std::atomic<uint64_t>> semantic_progress;
 
-    // Set by the protocol parser only after a complete terminal event has been
-    // processed and written downstream.  Returning false from on_chunk with
-    // this flag set turns httplib::Error::Canceled into a successful 2xx end;
-    // ordinary parser/sink cancellation remains an error.  When supplied, a
-    // clean EOF before this flag is set is classified as a truncated stream.
+    // Published by the protocol parser when it observes the stream's terminal
+    // event (Anthropic message_delta.stop_reason / message_stop, OpenAI
+    // finish_reason / [DONE], Responses response.completed).  When supplied,
+    // a clean EOF with this flag still unset is classified as a truncated
+    // stream (UpstreamFailureKind::StreamTruncated).
     std::shared_ptr<std::atomic<bool>> terminal_seen;
 
     // Client socket owned by cpp-httplib's server.  The central watchdog polls

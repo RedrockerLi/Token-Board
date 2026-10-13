@@ -53,6 +53,14 @@ Response selection:
   - "mock_simple_stream": true returns the plain content-only stream (no
     reasoning_content / cost frames).
   - Streaming: request body "stream": true returns an SSE stream.
+  - Terminal-shape flags, for stream-completeness tests:
+    "mock_omit_stop_reason" nulls the Anthropic message_delta.stop_reason;
+    "mock_omit_finish_reason" nulls every OpenAI chunk finish_reason;
+    "mock_omit_terminal" drops the protocol's terminal frame (message_stop /
+    [DONE] / response.completed); "mock_strip_final_blank" removes the blank
+    line after the last SSE frame; "mock_empty_stream" sends no frames at all
+    (a clean, terminal-less 200 body); "mock_omit_chunk_terminator" sends the
+    frames but closes without the final 0-chunk (a sloppy upstream close).
 
 GET endpoints:
   - /__ctrl/status and POST /__ctrl drive the test control surface (per-key GET
@@ -68,6 +76,7 @@ Usage:
 """
 import argparse
 import json
+import re
 import socket
 import sys
 import threading
@@ -458,6 +467,7 @@ class Handler(BaseHTTPRequestHandler):
                                "slowly trickles then stops" shape.
         """
         chunks = self._stream_chunks(fmt, model, req)
+        chunks = self._apply_terminal_shape(chunks, req)
         stall_after = req.get("mock_stall_after")
         stall_secs = float(req.get("mock_stall_secs", 5))
         stall_forever = bool(req.get("mock_stall_forever"))
@@ -477,11 +487,50 @@ class Handler(BaseHTTPRequestHandler):
         # Terminating chunk is exactly "0\r\n\r\n" — NOT a framed chunk (a
         # 5-byte "0\r\n\r\n" written via _write_chunk would be framed as
         # "5\r\n0\r\n\r\n\r\n", an invalid terminator that hangs the reader).
+        # mock_omit_chunk_terminator imitates a sloppy close: every frame is
+        # sent, then the connection closes without the terminating chunk.
+        if req.get("mock_omit_chunk_terminator"):
+            try:
+                self.wfile.flush()
+            except OSError:
+                pass
+            self.close_connection = True
+            return
         try:
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except OSError:
             pass
+
+    def _apply_terminal_shape(self, chunks, req):
+        """Rewrite the SSE frames per the mock_omit_* / mock_strip_* flags.
+
+        These shape the stream's *terminator* without touching the content
+        frames, so tests can distinguish a complete stream (protocol terminal
+        present, in any of its wire-accepted spellings) from a genuinely
+        truncated stream (content then a clean, terminal-less end).
+        """
+        if req.get("mock_empty_stream"):
+            return []
+        if req.get("mock_omit_stop_reason"):
+            chunks = [re.sub(r'"stop_reason":\s*"[^"]*"',
+                             '"stop_reason":null', c) for c in chunks]
+        if req.get("mock_omit_finish_reason"):
+            chunks = [re.sub(r'"finish_reason":\s*"[^"]*"',
+                             '"finish_reason":null', c) for c in chunks]
+        if req.get("mock_omit_terminal"):
+            chunks = [c for c in chunks
+                      if "message_stop" not in c
+                      and not c.startswith("data: [DONE]")
+                      and '"response.completed"' not in c]
+        if req.get("mock_strip_final_blank") and chunks:
+            last = chunks[-1]
+            if last.endswith("\n\n"):
+                last = last[:-2]
+            elif last.endswith("\r\n\r\n"):
+                last = last[:-4]
+            chunks = chunks[:-1] + [last]
+        return chunks
 
     def _write_chunk(self, c):
         """Write one HTTP/1.1 chunked-encoding frame; False if client closed."""

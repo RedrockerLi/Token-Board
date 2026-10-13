@@ -122,7 +122,6 @@ UpstreamClient::forward(const std::string &method,
     auto watch = std::make_shared<ForwardWatch>();
     watch->semantic_seen = opts.semantic_seen;
     watch->semantic_progress = opts.semantic_progress;
-    watch->terminal_seen = opts.terminal_seen;
     watch->downstream_socket = opts.downstream_socket;
 
     std::vector<std::string> dns_addresses;
@@ -329,10 +328,13 @@ UpstreamClient::forward(const std::string &method,
             result.error = "Client disconnected";
         } else if (ok && !watch->expired.load(std::memory_order_acquire)) {
             result.status_code = upstream_res.status;
-            const bool truncated = opts.terminal_seen &&
+            const bool successful_status = upstream_res.status >= 200 &&
+                                           upstream_res.status < 300;
+            // Only a 2xx body can be a truncated stream; an error response
+            // carries no SSE terminal event by design.
+            const bool truncated = successful_status && opts.terminal_seen &&
                 !opts.terminal_seen->load(std::memory_order_acquire);
-            result.success = (upstream_res.status >= 200 &&
-                              upstream_res.status < 300) && !truncated;
+            result.success = successful_status && !truncated;
             if (truncated)
                 result.failure_kind = UpstreamFailureKind::StreamTruncated;
             else if (!result.success)
@@ -348,6 +350,24 @@ UpstreamClient::forward(const std::string &method,
                     upstream_res.get_header_value("Retry-After"));
             }
         } else {
+            const bool terminal_rescue = streaming &&
+                err == httplib::Error::Read &&
+                !watch->expired.load(std::memory_order_acquire) &&
+                opts.terminal_seen &&
+                opts.terminal_seen->load(std::memory_order_acquire);
+            if (terminal_rescue) {
+                // The terminal event was parsed and forwarded; the body then
+                // ended without the chunked terminator (a sloppy close).
+                // Every protocol-level byte arrived, so this is a completed
+                // transport payload rather than a read failure.
+                result.status_code = upstream_res.status;
+                result.success = upstream_res.status >= 200 &&
+                                 upstream_res.status < 300;
+                if (!result.success)
+                    result.failure_kind = UpstreamFailureKind::HttpStatus;
+                result.error.clear();
+                return false;
+            }
             result.is_timeout = watch->expired.load(std::memory_order_acquire) ||
                                 err == httplib::Error::ConnectionTimeout;
             result.failure_kind = classify_transport_failure(err,

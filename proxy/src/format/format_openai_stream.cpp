@@ -20,7 +20,10 @@ public:
             if (!ok) return;
             std::string event_name, payload;
             if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
-            if (payload == "[DONE]") return;
+            if (is_done_payload(payload)) {
+                handle_done(guard);
+                return;
+            }
             json j;
             try {
                 j = json::parse(payload);
@@ -44,7 +47,10 @@ public:
             if (!ok) return;
             std::string event_name, payload;
             if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
-            if (payload == "[DONE]") return;
+            if (is_done_payload(payload)) {
+                handle_done(guard);
+                return;
+            }
             json j;
             try {
                 j = json::parse(payload);
@@ -69,6 +75,9 @@ private:
     std::string id_, model_;
     bool started_ = false;
     bool failed_ = false;
+    // A finish_reason has already been published; a later [DONE] must not
+    // publish a second, defaulted terminal event.
+    bool terminal_emitted_ = false;
 
     const ToolMapping *mapping_for(const std::string &name) const {
         if (!context_) return nullptr;
@@ -97,6 +106,35 @@ private:
             if (!emit(ev)) return;
         }
         tool_calls_.clear();
+    }
+
+    // Gateways pad the sentinel ("data: [DONE] " / "data:  [DONE]"); compare
+    // after trimming whitespace on both sides.
+    static bool is_done_payload(const std::string &payload) {
+        size_t begin = 0, end = payload.size();
+        while (begin < end &&
+               (payload[begin] == ' ' || payload[begin] == '\t'))
+            ++begin;
+        while (end > begin &&
+               (payload[end - 1] == ' ' || payload[end - 1] == '\t' ||
+                payload[end - 1] == '\r' || payload[end - 1] == '\n'))
+            --end;
+        return end - begin == 6 && payload.compare(begin, 6, "[DONE]") == 0;
+    }
+
+    // `data: [DONE]` is the protocol's stream terminator.  Providers that
+    // never send a finish_reason chunk still end here; publish the terminal
+    // event so a clean EOF is not classified as a truncated stream.  A
+    // finish_reason seen earlier always wins, and a provider that stated no
+    // reason yields a reason-less terminal.
+    void handle_done(const EmitFn &emit) {
+        flush_tool_done(emit);
+        if (terminal_emitted_) return;
+        terminal_emitted_ = true;
+        StreamEvent ev;
+        ev.type = StreamEventType::MessageFinish;
+        ev.stop_reason = StopReason::Absent;
+        emit(ev);
     }
 
     // Extract text from a delta content field that may be a plain string or an
@@ -158,13 +196,15 @@ private:
             if (!ch.is_object()) continue;
             int index = ch.value("index", 0);
 
-            if (ch.contains("finish_reason") && !ch["finish_reason"].is_null()) {
+            if (ch.contains("finish_reason") &&
+                ch["finish_reason"].is_string()) {
                 flush_tool_done(emit);
                 StreamEvent ev;
                 ev.type = StreamEventType::MessageFinish;
                 ev.index = index;
                 ev.stop_reason = fmt::openai_finish_reason_to_stop(
                     ch["finish_reason"].get<std::string>());
+                terminal_emitted_ = true;
                 if (!emit(ev)) return;
             }
 
@@ -343,7 +383,10 @@ public:
             case StreamEventType::ToolCallDone:
                 return true;  // no explicit done in OpenAI stream
             case StreamEventType::MessageFinish:
-                deferred_finish_ = fmt::stop_reason_to_openai(ev.stop_reason);
+                // A reason-less terminal leaves no finish_reason chunk to
+                // emit; the stream still ends with [DONE].
+                if (ev.stop_reason != StopReason::Absent)
+                    deferred_finish_ = fmt::stop_reason_to_openai(ev.stop_reason);
                 return true;  // emitted after usage (or at finish)
             case StreamEventType::UsageEvent:
                 last_usage_ = ev.usage;

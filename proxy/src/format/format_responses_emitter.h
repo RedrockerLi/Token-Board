@@ -15,7 +15,10 @@ private:
     const ir::ConversionContext *context_ = nullptr;
     std::string id_, model_ = "unknown";
     bool started_ = false, finished_ = false, completed_emitted_ = false;
-    std::string deferred_status_ = "completed";
+    // Set when the terminal event arrives; an empty value means "not yet
+    // finished", so a usage event that precedes the terminal must not emit
+    // response.completed early (or with a guessed status).
+    std::string deferred_status_;
     ir::Usage last_usage_;
     json terminal_extras_ = json::object();
     std::map<int, std::string> text_, reasoning_text_, item_ids_;

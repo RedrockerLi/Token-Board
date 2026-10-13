@@ -162,6 +162,8 @@ plan 密钥进入配额冷却后,后台线程按两条通道观察恢复,任一�
 
 超时(`is_timeout=true`)对客户端统一给 `{"error":{"type":"timeout_error","code":504}}`,错误消息带实际触发的秒数。流式路径按客户端格式发终止错误帧:Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`,让客户端知道上游没回,而不是静默断连。
 
+流式请求另有**终端事件校验**:上游 2xx 流干净结束(chunked 正常收尾或读到 EOF)时,若解析器从未发布终止事件,按截断失败处理——对外状态 502、消息 `Upstream stream truncated before terminal event`,已向客户端提交过的流向其补发终止错误帧,截断的密钥按 5xx 规则获得 30 秒上游故障避让;未提交的截断(空体 200)可换候选重试。终止事件按上游线格式认定:Anthropic `message_delta.stop_reason` 或 `message_stop`,OpenAI chat `choices[].finish_reason` 或 `data: [DONE]`,Responses `response.completed`/`response.incomplete`;结束前仍驻留在 SSE 帧缓冲里的终止帧先冲净再判定。非 2xx 响应不参与该校验(按 HTTP 状态分类)。环境变量 `PROXY_STRICT_TERMINAL=0` 关闭校验(干净结束即按成功计费),默认开启。已知限制:上游忽略 `stream:true`、以整包 JSON 200(无 `data:` 帧)应答时没有终止事件,按截断处理。
+
 客户端断连的检测用 `spawn_client_monitor`:一个线程每 250ms poll 客户端 socket,发现 `POLLHUP / POLLERR / POLLRDHUP` 就 `shutdown()` 上游 socket,把阻塞中的上游读立刻打断,释放线程池线程,而不是干等满超时。注意 TCP 对端 FIN 只表现为 `POLLIN + POLLRDHUP`,所以 poll 必须显式请求 `POLLRDHUP`。非流式路径也有等价的 `client_disconnected` 检查,确认客户端已走就把这次请求记为 499(零 token)结束。
 
 ## 请求记账与性能事件

@@ -22,7 +22,7 @@ ApiFormat parse_api_format(const std::string &s);
 std::string to_string(ApiFormat f);
 
 enum class ContentKind { Text, Image, File, Audio, ToolUse, ToolResult, Thinking };
-enum class StopReason { Stop, Length, ToolUse, ContentFilter, Unknown };
+enum class StopReason { Stop, Length, ToolUse, ContentFilter, Unknown, Absent };
 
 // Responses is an ordered Item protocol.  Keep this metadata alongside the
 // legacy Message/ContentBlock view so codecs can migrate incrementally without

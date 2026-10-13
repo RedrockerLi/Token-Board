@@ -60,13 +60,16 @@ private:
             if (!fmt::parse_sse_frame(frame, &event, &payload) || payload.empty()) return;
             json j; try { j = json::parse(payload); } catch (...) { return; }
             EmitFn downstream = [&](const StreamEvent &ev) { ok = ok && emit(ev); return ok; };
-            handle_frame(j, downstream);
+            handle_frame(j, event, downstream);
         };
         if (final) sse_.finish(handle); else sse_.feed(data, len, handle);
         return ok;
     }
-    void handle_frame(const json &j, const EmitFn &emit) {
-        const std::string type = j.value("type", "");
+    void handle_frame(const json &j, const std::string &event_name,
+                      const EmitFn &emit) {
+        // The SSE `event:` name is authoritative for the Responses wire;
+        // payloads that carry no `type` (trimmed gateways) still dispatch.
+        const std::string type = j.value("type", event_name);
         if (type == "response.created") {
             StreamEvent ev; ev.type = StreamEventType::MessageStart;
             if (j.contains("response") && j["response"].is_object()) {
@@ -262,7 +265,16 @@ private:
             emit(ev); return;
         }
         if (type == "response.completed" || type == "response.incomplete") {
-            if (!j.contains("response") || !j["response"].is_object()) return;
+            if (!j.contains("response") || !j["response"].is_object()) {
+                // A gateway that trims the response envelope still ends the
+                // stream here; publish the terminal event by type alone so a
+                // clean EOF is not classified as a truncated stream.
+                StreamEvent fin; fin.type = StreamEventType::MessageFinish;
+                fin.stop_reason = fmt::responses_status_to_stop(
+                    type == "response.incomplete" ? "incomplete" : "completed");
+                emit(fin);
+                return;
+            }
             const auto &r = j["response"]; StreamEvent fin; fin.type = StreamEventType::MessageFinish;
             fin.stop_reason = fmt::responses_status_to_stop(r.value("status", type));
             if (r.contains("object")) fin.extra["object"] = r["object"];

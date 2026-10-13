@@ -16,7 +16,6 @@ struct ForwardWatch {
     std::atomic<bool> client_disconnected{false};
     std::shared_ptr<std::atomic<bool>> semantic_seen;
     std::shared_ptr<std::atomic<uint64_t>> semantic_progress;
-    std::shared_ptr<std::atomic<bool>> terminal_seen;
     int downstream_socket = -1;
     WatchSocket cancel_socket = INVALID_SOCKET;
     httplib::Client *cancel_client = nullptr;

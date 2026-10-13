@@ -67,6 +67,11 @@ private:
     std::map<int, std::string> thinking_signatures_, redacted_data_;
     Usage usage_;
     bool failed_ = false;
+    // A terminal event has already been published; a later message_stop must
+    // not publish a second one with a defaulted stop_reason (emitters keep
+    // the first finish they see).
+    bool finish_emitted_ = false;
+    json pending_context_management_;
 
     const ToolMapping *mapping_for(const std::string &name) const {
         if (!context_) return nullptr;
@@ -241,14 +246,35 @@ private:
                         d["stop_reason"].get<std::string>());
                     if (!context_management.is_null())
                         ev.extra["context_management"] = context_management;
+                    finish_emitted_ = true;
                     if (!emit(ev)) return;
                 }
             }
+            // A message_delta without stop_reason may still carry the
+            // context_management envelope; keep it for the trailing
+            // message_stop so the terminal event can carry it.
+            if (!context_management.is_null())
+                pending_context_management_ = context_management;
             if (j.contains("usage") && j["usage"].is_object()) {
                 merge_usage(j["usage"]);
                 StreamEvent ev;
                 ev.type = StreamEventType::UsageEvent;
                 ev.usage = usage_;
+                if (!emit(ev)) return;
+            }
+        } else if (type == "message_stop") {
+            // Anthropic's canonical stream terminator.  Providers that omit
+            // the stop_reason-bearing message_delta still end here; publish
+            // the terminal event so a clean EOF is not classified as a
+            // truncated stream.  An earlier stop_reason always wins, and a
+            // provider that stated no reason yields a reason-less terminal.
+            if (!finish_emitted_) {
+                StreamEvent ev;
+                ev.type = StreamEventType::MessageFinish;
+                ev.stop_reason = StopReason::Absent;
+                if (!pending_context_management_.is_null())
+                    ev.extra["context_management"] = pending_context_management_;
+                finish_emitted_ = true;
                 if (!emit(ev)) return;
             }
         } else if (type == "error") {
@@ -327,7 +353,13 @@ public:
                 return stop_block(sink, ev.index);
             case StreamEventType::MessageFinish:
                 seen_finish_ = true;
-                deferred_stop_ = fmt::stop_reason_to_anthropic(ev.stop_reason);
+                // The provider stated no reason (e.g. a bare message_stop):
+                // the outgoing message_delta carries stop_reason: null rather
+                // than an invented value.
+                if (ev.stop_reason == StopReason::Absent)
+                    reason_absent_ = true;
+                else
+                    deferred_stop_ = fmt::stop_reason_to_anthropic(ev.stop_reason);
                 if (ev.extra.contains("context_management"))
                     context_management_ = ev.extra["context_management"];
                 if (!started_ && !emit_message_start(sink)) return false;
@@ -337,7 +369,9 @@ public:
                 if (!started_ && !emit_message_start(sink)) return false;
                 // Usage can arrive before finish_reason in the same final chunk;
                 // only emit message_delta once the real stop_reason is known.
-                if (seen_finish_ && !delta_emitted_) {
+                // A reason-less terminal never produces a message_delta (the
+                // stream ends with message_stop alone, as upstream ended it).
+                if (seen_finish_ && !delta_emitted_ && !reason_absent_) {
                     if (!close_open_blocks(sink)) return false;
                     if (!emit_message_delta(sink)) return false;
                 }
@@ -357,7 +391,7 @@ public:
         if (!started_) return true;
         if (!finished_) {
             if (!close_open_blocks(sink)) return false;
-            if (!delta_emitted_) {
+            if (!delta_emitted_ && !reason_absent_) {
                 if (!emit_message_delta(sink)) return false;
             }
             return sink(frame("message_stop", json{{"type", "message_stop"}}));
@@ -379,6 +413,7 @@ private:
     std::map<int, OpenBlock> open_blocks_;  // source index → open Anthropic block
     int next_index_ = 0;                    // monotonically increasing Anthropic block index
     bool seen_finish_ = false;              // a MessageFinish has been seen
+    bool reason_absent_ = false;            // terminal carried no stop_reason
     bool failed_ = false;
     json failure_;
     json context_management_;

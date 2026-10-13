@@ -47,6 +47,7 @@ void ProxyServer::handle_streaming(
                 [this, &inflight_id] { request_finished(inflight_id); });
             const UpstreamCandidate *used = nullptr; UpstreamClient::ForwardResult final_result;
             bool committed = false, last_timeout = false; int last_status = 429;
+            bool last_attempt_passthrough = false;
             int last_account_id = 0, last_slot_id = 0, last_duration_ms = 0, attempts_made = 0;
             std::vector<Database::AttemptInfo> attempts; json last_stream_error;
             bool first_semantic = true;
@@ -120,6 +121,7 @@ void ProxyServer::handle_streaming(
                     parsed_request && responses_request_needs_tool_adapter(*parsed_request);
                 const bool passthrough = harness == upstream &&
                     !responses_item_adapter;
+                last_attempt_passthrough = passthrough;
                 const bool filter_thinking = passthrough && upstream == ir::ApiFormat::OpenAI;
                 auto attempt_timeouts = base_timeouts;
                 if (!clamp_to_remaining_budget(attempt_timeouts, deadline, true)) {
@@ -333,7 +335,8 @@ void ProxyServer::handle_streaming(
                         if (strict_terminal_enabled())
                             opts.terminal_seen = attempt_terminal_seen;
                     });
-                    if (metrics_enabled || !passthrough) {
+                    if (metrics_enabled || !passthrough ||
+                        result.failure_kind == UpstreamFailureKind::StreamTruncated) {
                     try {
                         const ir::StreamParser::EmitFn finish_events =
                             passthrough ? ir::StreamParser::EmitFn(on_metrics_event)
@@ -342,6 +345,31 @@ void ProxyServer::handle_streaming(
                     } catch (...) {
                         log_proxy_stream_protocol_error(log_context, candidate, result.duration_ms);
                         mark_proxy_stream_protocol_failure(result, 502, "upstream stream parser failure");
+                    }
+                }
+                // upstream_forward classified the attempt before the parser
+                // flushed its SSE frame buffer.  A terminal event still
+                // buffered at EOF (last frame without a trailing blank line)
+                // is only published by parser->finish(); re-evaluate the
+                // truncation verdict before any other failure override.
+                if (result.failure_kind == UpstreamFailureKind::StreamTruncated) {
+                    if (attempt_terminal_seen->load(std::memory_order_acquire)) {
+                        TB_LOG_DEBUG(
+                            "[Proxy] truncation verdict cleared after EOF flush "
+                            "request_id=%llu\n",
+                            static_cast<unsigned long long>(log_context.request_id));
+                        // A passthrough tail may have been cut before its frame
+                        // terminator; close the dangling frame so the client's
+                        // SSE parser can dispatch the flushed terminal event.
+                        if (passthrough) write_to_sink("\n\n");
+                        result.success = true;
+                        result.failure_kind = UpstreamFailureKind::None;
+                        result.error.clear();
+                    } else {
+                        // A genuinely truncated 2xx stream: report a failure
+                        // status instead of the upstream's 200.  The error
+                        // message itself is rendered from result.error.
+                        result.status_code = 502;
                     }
                 }
                 if (attempt_has_stream_error && !result.client_disconnected) {
@@ -529,6 +557,11 @@ void ProxyServer::handle_streaming(
                                    0, attempts);
             }
             if (!committed || !terminal_error_forwarded) {
+                // A committed passthrough stream may have been cut mid-frame;
+                // close any dangling SSE frame so the terminal error frame is
+                // parsed as its own event instead of being swallowed.
+                if (committed && last_attempt_passthrough)
+                    write_to_sink("\n\n");
                 const json body = err.passthrough
                     ? (last_stream_error.is_null()
                         ? normalized_error_body(err) : last_stream_error)

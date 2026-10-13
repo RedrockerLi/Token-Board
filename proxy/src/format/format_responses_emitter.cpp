@@ -211,6 +211,7 @@ bool ResponsesStreamEmitter::emit(const StreamEvent &ev, const Sink &sink) {
                 catch (...) { item["arguments"] = payload; }
                 item["execution"] = "client";
             } else item["arguments"] = payload;
+            text_finished_.insert(oi);  // do not re-close this item at the terminal
             return sink(frame("response.output_item.done",
                               json{{"type", "response.output_item.done"},
                                    {"output_index", oi}, {"item", item}}));
@@ -486,7 +487,9 @@ json ResponsesStreamEmitter::build_output() {
 
 bool ResponsesStreamEmitter::emit_completed(const Sink &sink) {
     completed_emitted_ = true;
-    json response{{"id", id_}, {"object", "response"}, {"status", deferred_status_},
+    const std::string status = deferred_status_.empty() ? "completed"
+                                                        : deferred_status_;
+    json response{{"id", id_}, {"object", "response"}, {"status", status},
                   {"model", model_}, {"output", build_output()},
                   {"usage", json{{"input_tokens", last_usage_.prompt_tokens},
                                   {"output_tokens", last_usage_.completion_tokens},
@@ -496,6 +499,7 @@ bool ResponsesStreamEmitter::emit_completed(const Sink &sink) {
         response["object"] = terminal_extras_["object"];
     if (terminal_extras_.contains("context_management"))
         response["context_management"] = terminal_extras_["context_management"];
-    const std::string event = deferred_status_ == "incomplete" ? "response.incomplete" : "response.completed";
+    const std::string event = status == "incomplete" ? "response.incomplete"
+                                                     : "response.completed";
     return sink(frame(event, json{{"type", event}, {"response", response}}));
 }

@@ -217,6 +217,25 @@ static std::string convert_stream(const CodecRegistry &reg, ApiFormat from,
     return out;
 }
 
+// Terminal recognition is a parser property (the error-path classifiers read
+// the parser's MessageFinish events), not an emitter-shape property: every
+// emitter synthesizes its terminator at finish() regardless.  Count the
+// parser's own MessageFinish publications.
+static int count_message_finish(const CodecRegistry &reg, ApiFormat from,
+                                const std::string &sse) {
+    const FormatCodec &fc = reg.get(from);
+    auto parser = fc.make_stream_parser();
+    if (!parser) return -1;
+    int finishes = 0;
+    auto emit = [&finishes](const StreamEvent &ev) -> bool {
+        if (ev.type == StreamEventType::MessageFinish) finishes++;
+        return true;
+    };
+    parser->feed(sse.data(), sse.size(), emit);
+    parser->finish(emit);
+    return finishes;
+}
+
 static std::vector<std::pair<std::string, json>>
 split_anthropic_frames(const std::string &sse) {
     std::vector<std::pair<std::string, json>> frames;
@@ -243,6 +262,255 @@ static int count_frames(const std::vector<std::pair<std::string, json>> &frames,
     for (const auto &f : frames)
         if (f.first == event) n++;
     return n;
+}
+
+static int count_substr(const std::string &s, const std::string &needle) {
+    int n = 0;
+    for (size_t pos = 0; (pos = s.find(needle, pos)) != std::string::npos;
+         pos += needle.size())
+        n++;
+    return n;
+}
+
+// ── Stream terminal-event recognition ────────────────────────────────────
+// Providers may end an Anthropic stream with only message_stop (no
+// stop_reason-bearing message_delta) and an OpenAI stream with only [DONE]
+// (no finish_reason chunk).  Those are complete streams; the conversions
+// must still produce a terminal frame WITHOUT inventing a stop reason the
+// upstream never stated (the reason is passed through as absent/null), and a
+// real stop_reason seen earlier must not be overwritten by the terminator.
+
+static void test_anthropic_message_stop_only(const CodecRegistry &reg) {
+    printf("--- Anthropic message_stop-only terminal ---\n");
+    std::string sse =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"mm\"}}\n\n"
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const std::string openai =
+        convert_stream(reg, ApiFormat::Anthropic, ApiFormat::OpenAI, sse);
+    check(count_substr(openai, "\"finish_reason\":\"stop\"") == 0,
+          "message_stop-only: no invented finish_reason");
+    check(count_substr(openai, "\"finish_reason\":\"") == 0,
+          "message_stop-only: no finish_reason chunk at all");
+    check(openai.find("data: [DONE]") != std::string::npos,
+          "message_stop-only: stream ends with [DONE]");
+    const std::string responses =
+        convert_stream(reg, ApiFormat::Anthropic, ApiFormat::OpenAIResponses, sse);
+    check(responses.find("response.completed") != std::string::npos,
+          "message_stop-only: Responses target completes");
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::Anthropic, ApiFormat::Anthropic, sse));
+    check(!frames.empty() && frames.back().first == "message_stop",
+          "message_stop-only: Anthropic target ends with message_stop");
+    check(count_frames(frames, "message_delta") == 0,
+          "message_stop-only: no reason-less message_delta is emitted");
+    check(count_message_finish(reg, ApiFormat::Anthropic, sse) == 1,
+          "message_stop-only: parser publishes exactly one terminal");
+}
+
+static void test_anthropic_stop_reason_survives_message_stop(
+    const CodecRegistry &reg) {
+    printf("--- Anthropic stop_reason survives trailing message_stop ---\n");
+    std::string sse =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"mm\"}}\n\n"
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n"
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_sequence\":null}}\n\n"
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const std::string openai =
+        convert_stream(reg, ApiFormat::Anthropic, ApiFormat::OpenAI, sse);
+    check(count_substr(openai, "\"finish_reason\":\"length\"") == 1,
+          "max_tokens: finish_reason=length preserved");
+    check(count_substr(openai, "\"finish_reason\":\"stop\"") == 0,
+          "max_tokens: no downgraded stop frame");
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::Anthropic, ApiFormat::Anthropic, sse));
+    check(count_frames(frames, "message_delta") == 1,
+          "max_tokens: exactly one message_delta");
+    bool preserved = false;
+    for (const auto &f : frames)
+        if (f.first == "message_delta" &&
+            f.second.value("delta", json()).value("stop_reason", "") == "max_tokens")
+            preserved = true;
+    check(preserved, "max_tokens: stop_reason preserved in message_delta");
+    check(count_message_finish(reg, ApiFormat::Anthropic, sse) == 1,
+          "max_tokens: trailing message_stop does not re-publish the terminal");
+}
+
+static void test_anthropic_tool_use_survives_message_stop(
+    const CodecRegistry &reg) {
+    printf("--- Anthropic tool_use survives trailing message_stop ---\n");
+    std::string sse =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"mm\"}}\n\n"
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"f\",\"input\":{}}}\n\n"
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null}}\n\n"
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const std::string openai =
+        convert_stream(reg, ApiFormat::Anthropic, ApiFormat::OpenAI, sse);
+    check(count_substr(openai, "\"finish_reason\":\"tool_calls\"") == 1,
+          "tool_use: finish_reason=tool_calls preserved");
+    check(count_substr(openai, "\"finish_reason\":\"stop\"") == 0,
+          "tool_use: no downgraded stop frame");
+    check(count_message_finish(reg, ApiFormat::Anthropic, sse) == 1,
+          "tool_use: parser publishes exactly one terminal");
+}
+
+static void test_openai_done_only_terminal(const CodecRegistry &reg) {
+    printf("--- OpenAI [DONE]-only terminal ---\n");
+    std::string sse =
+        "data: {\"id\":\"1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+        "data: [DONE]\n\n";
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::OpenAI, ApiFormat::Anthropic, sse));
+    check(!frames.empty() && frames.back().first == "message_stop",
+          "[DONE]-only: last frame is message_stop");
+    check(count_frames(frames, "message_delta") == 0,
+          "[DONE]-only: no reason-less message_delta is emitted");
+    check(count_message_finish(reg, ApiFormat::OpenAI, sse) == 1,
+          "[DONE]-only: parser publishes exactly one terminal");
+}
+
+static void test_openai_finish_then_done_dedupe(const CodecRegistry &reg) {
+    printf("--- OpenAI finish_reason + [DONE] dedupe ---\n");
+    std::string sse =
+        "data: {\"id\":\"1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::OpenAI, ApiFormat::Anthropic, sse));
+    check(count_frames(frames, "message_delta") == 1,
+          "finish+[DONE]: exactly one message_delta");
+    bool tool_use = false;
+    for (const auto &f : frames)
+        if (f.first == "message_delta" &&
+            f.second.value("delta", json()).value("stop_reason", "") == "tool_use")
+            tool_use = true;
+    check(tool_use, "finish+[DONE]: tool_calls not downgraded by the sentinel");
+    size_t stop_idx = frames.size(), delta_idx = frames.size();
+    for (size_t i = 0; i < frames.size(); i++) {
+        if (frames[i].first == "content_block_stop" && stop_idx == frames.size())
+            stop_idx = i;
+        if (frames[i].first == "message_delta" && delta_idx == frames.size())
+            delta_idx = i;
+    }
+    check(stop_idx < delta_idx,
+          "finish+[DONE]: message_delta follows content_block_stop");
+    check(count_message_finish(reg, ApiFormat::OpenAI, sse) == 1,
+          "finish+[DONE]: trailing sentinel does not re-publish the terminal");
+}
+
+static void test_terminal_frame_without_blank_line(const CodecRegistry &reg) {
+    printf("--- terminal frame without trailing blank line ---\n");
+    // The buffered tail is only dispatched by parser->finish(); the terminal
+    // event must still be produced.
+    std::string sse =
+        "data: {\"id\":\"1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+        "data: [DONE]";
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::OpenAI, ApiFormat::Anthropic, sse));
+    check(!frames.empty() && frames.back().first == "message_stop",
+          "no-blank-line: terminal still produced");
+    check(count_message_finish(reg, ApiFormat::OpenAI, sse) == 1,
+          "no-blank-line: EOF flush publishes the terminal");
+}
+
+static void test_responses_terminal_without_envelope(const CodecRegistry &reg) {
+    printf("--- Responses terminal without response envelope ---\n");
+    std::string sse =
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"
+        "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::OpenAIResponses, ApiFormat::Anthropic, sse));
+    check(!frames.empty() && frames.back().first == "message_stop",
+          "responses no-envelope: terminal still produced");
+    check(count_message_finish(reg, ApiFormat::OpenAIResponses, sse) == 1,
+          "responses no-envelope: parser publishes exactly one terminal");
+    // The SSE event name alone must also terminate (payload without a type).
+    std::string named_only =
+        "event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n"
+        "event: response.completed\ndata: {}\n\n";
+    check(count_message_finish(reg, ApiFormat::OpenAIResponses, named_only) == 1,
+          "responses no-envelope: event name alone publishes the terminal");
+}
+
+// A tool-call stream terminated by the sentinel alone (no finish_reason):
+// the reason stays absent end-to-end — never an invented tool_calls, and
+// never a downgraded stop.
+static void test_openai_done_only_tool_terminal(const CodecRegistry &reg) {
+    printf("--- OpenAI [DONE]-only tool terminal ---\n");
+    std::string sse =
+        "data: {\"id\":\"1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n"
+        "data: [DONE]\n\n";
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::OpenAI, ApiFormat::Anthropic, sse));
+    check(count_frames(frames, "message_delta") == 0,
+          "[DONE]-only tool: reason stays absent (no message_delta)");
+    check(!frames.empty() && frames.back().first == "message_stop",
+          "[DONE]-only tool: stream still terminates with message_stop");
+    const std::string openai =
+        convert_stream(reg, ApiFormat::OpenAI, ApiFormat::OpenAI, sse);
+    check(count_substr(openai, "\"finish_reason\":\"tool_calls\"") == 0,
+          "[DONE]-only tool: no invented finish_reason=tool_calls");
+    check(count_substr(openai, "\"finish_reason\":\"") == 0,
+          "[DONE]-only tool: no finish_reason chunk at all");
+    check(openai.find("data: [DONE]") != std::string::npos,
+          "[DONE]-only tool: stream ends with [DONE]");
+}
+
+// The reverse shape: an Anthropic tool stream whose only terminal is
+// message_stop (message_delta carries usage, stop_reason null).  The absent
+// reason stays absent — no invented tool_calls, no downgraded stop.
+static void test_anthropic_tool_message_stop_only(const CodecRegistry &reg) {
+    printf("--- Anthropic tool stream, message_stop-only terminal ---\n");
+    std::string sse =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"mm\"}}\n\n"
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"f\",\"input\":{}}}\n\n"
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null,\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n\n"
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const std::string openai =
+        convert_stream(reg, ApiFormat::Anthropic, ApiFormat::OpenAI, sse);
+    check(count_substr(openai, "\"finish_reason\":\"tool_calls\"") == 0,
+          "message_stop-only tool: no invented finish_reason=tool_calls");
+    check(count_substr(openai, "\"finish_reason\":\"stop\"") == 0,
+          "message_stop-only tool: no downgraded stop frame");
+    check(openai.find("data: [DONE]") != std::string::npos,
+          "message_stop-only tool: stream still ends with [DONE]");
+}
+
+// Usage arriving before the terminal must not emit response.completed early;
+// the completion frame closes the stream after the item frames.
+static void test_responses_completed_after_items(const CodecRegistry &reg) {
+    printf("--- Responses completion is emitted last ---\n");
+    std::string sse =
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"mm\"}}\n\n"
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null,\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n\n"
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::Anthropic, ApiFormat::OpenAIResponses, sse));
+    check(count_frames(frames, "response.completed") == 1,
+          "completed-last: exactly one response.completed");
+    check(!frames.empty() && frames.back().first == "response.completed",
+          "completed-last: response.completed is the final frame");
+}
+
+// A tool stream must close its item exactly once.
+static void test_responses_tool_done_once(const CodecRegistry &reg) {
+    printf("--- Responses tool item is closed once ---\n");
+    std::string sse =
+        "data: {\"id\":\"1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    auto frames = split_anthropic_frames(
+        convert_stream(reg, ApiFormat::OpenAI, ApiFormat::OpenAIResponses, sse));
+    check(count_frames(frames, "response.output_item.done") == 1,
+          "tool done once: exactly one output_item.done");
 }
 
 // Bug A + E: OpenAI tool-call stream must emit valid Anthropic SSE —
@@ -873,6 +1141,17 @@ static int self_test() {
     test_responses_custom_tool_items(reg);
     test_responses_stream_lifecycle(reg);
     test_native_media_bridges(reg);
+    test_anthropic_message_stop_only(reg);
+    test_anthropic_stop_reason_survives_message_stop(reg);
+    test_anthropic_tool_use_survives_message_stop(reg);
+    test_openai_done_only_terminal(reg);
+    test_openai_finish_then_done_dedupe(reg);
+    test_terminal_frame_without_blank_line(reg);
+    test_responses_terminal_without_envelope(reg);
+    test_openai_done_only_tool_terminal(reg);
+    test_anthropic_tool_message_stop_only(reg);
+    test_responses_completed_after_items(reg);
+    test_responses_tool_done_once(reg);
 
     printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILED",
            g_failures, g_failures == 1 ? "" : "s");
