@@ -52,6 +52,18 @@ python3 scripts/mock_upstream.py --port 9100
 
 它复刻了真实上游的严格校验:chat completions 拒绝 `role: developer` 消息、拒绝非 `function` 类型的工具、拒绝 `parameters` 不是 `{"type":"object"}` 的工具。请求体里可以塞测试钩子:`mock_format`(指定响应格式)、`mock_status`(指定返回状态码)、`mock_delay`、`mock_tool`、`mock_simple_stream`(无 reasoning 的纯流)。
 
+## 测试隔离
+
+测试代码与业务代码按层次使用固定的主隔离策略；新测试沿用所在层次的策略，只有技术上确不可行时才引入例外，并把适用范围、理由与边界登记在本节。
+
+- **目录与命名**：C++ 测试可执行文件与 Python 端到端脚本都在 `proxy/tests/`(`*_test.cpp` / `*_test.py`)；应用层测试在 `app/tests/`(pytest `testpaths` 只收集这里，`test_*.py`、`*.js`)。测试代码不放进 `proxy/src/` 或 `app/` 的业务目录。
+- **构建**：测试目标只定义在 `proxy/tests/CMakeLists.txt`、只随 `BUILD_TESTING` 存在且不链接进 `token_proxy`。测试目标自行编译它要覆盖的生产源文件；测试专用编译宏只定义在测试目标上，生产目标与生产库从不定义这类宏。
+- **运行时外部依赖**：C++ 测试在进程内起 `httplib::Server` 或裸 socket mock；Python 端到端测试用 `scripts/mock_upstream.py` 配 `proxy/tests/v1_fixture.py` 搭建上游与数据库；不引入第三方 mock 框架。
+- **配置与环境变量**：生产参数(`TB_MAX_WORKERS`、`TB_TASK_QUEUE_MAX`、`TB_COOLDOWN_PROBE_SECS`、`TB_USAGE_WATCH_SECS`、`TB_LEDGER_REFRESH_SECS`、`PROXY_STRICT_TERMINAL`)的默认值即生产行为，测试用它们压缩时间或灰度；只服务测试脚本的标志(`TB_TEST_DEBUG`)由脚本自己读取，不进入任何二进制。
+- **端到端**：Python 集成测试启动真实 `token_proxy` 二进制(CTest 传 `$<TARGET_FILE:token_proxy>`)，断言对外行为与落库结果。
+
+当前唯一的例外是崩溃注入点：`accounting_recovery` 需要在「spool 已 fdatasync、SQLite 尚未提交」的精确时刻终止进程，mock 与配置层表达不了，因此在构建层例外——`durable_spool.cpp` 中 `#ifdef TB_ENABLE_TEST_CRASH` 的注入点只随测试目标 `token_proxy_test` 存在(该目标在 `tests/` 下自行编译 store 源文件并定义宏)，生产库永不定义该宏。边界由 `crash_hook_isolation` 用例强制:生产二进制必须不含 `TB_TEST_CRASH_AFTER_SPOOL_SYNC` 标记，测试二进制必须含。
+
 ## 脚本
 
 | 脚本 | 用途 |
