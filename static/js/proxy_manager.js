@@ -296,6 +296,29 @@ function updatePlanPriceSymbol() {
     if (sym && curSel) sym.textContent = currencySymbol(curSel.value);
 }
 
+// ── 单上游多密钥：展示顺序 ───────────────────────────────────────────────
+// 同一上游挂多把密钥时，展示一律按密钥名称的字典序排列；密钥没有名称时以
+// 打码值为名——卡片与列表展示的名字本就是「名称，否则打码」。排序只发生在
+// 渲染层：存储里的 position（入库顺序、调度同分基序）不因展示而改变。
+
+/** 密钥的展示名：名称优先，缺省退回打码值；同时充当排序键。 */
+function keyDisplayName(key) {
+    const label = key && key.label ? String(key.label) : '';
+    return label || String((key && key.masked) || '');
+}
+
+/** 展示名的字典序比较器（UTF-16 码元序，与浏览器区域设置无关）。 */
+function compareKeyNames(a, b) {
+    const nameA = keyDisplayName(a);
+    const nameB = keyDisplayName(b);
+    return nameA < nameB ? -1 : (nameA > nameB ? 1 : 0);
+}
+
+/** 按展示名排序后的新数组；同名保持原有相对顺序（sort 稳定）。 */
+function sortKeysByName(keys) {
+    return [...(keys || [])].sort(compareKeyNames);
+}
+
 // ── Multi-key form helpers ─────────────────────────────────────────────
 // Editing shows existing keys as masked keep-rows (id + masked value, never
 // the secret) plus editable rows for NEW keys. `_keyRowsEdited` tracks whether
@@ -342,13 +365,17 @@ function addKeyRow(value, validFrom) {
     list.appendChild(div);
 }
 
-function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion, label) {
+/// 已配置密钥的保留行。`storedIndex` 是它在存储顺序（position）里的下标：
+/// 行按名称字典序展示，但提交 keep_key_ids 时按该下标还原原顺序，展示排序
+/// 不得把 position 改成名称顺序（数据库不因展示而移动）。
+function addExistingKeyRow(keepId, masked, validFrom, pendingDeletion, label, storedIndex) {
     const list = document.getElementById('keyList');
     if (!list) return;
     const div = document.createElement('div');
     div.style.cssText = 'display:flex; gap:6px; margin:6px 0; align-items:center; flex-wrap:wrap;';
     div.className = 'existing-key';
     div.dataset.keepId = keepId;
+    div.dataset.storedIndex = storedIndex;
     const labelInput = document.createElement('input');
     labelInput.type = 'text';
     labelInput.className = 'existing-key-label key-label-input';
@@ -459,6 +486,9 @@ function collectKeyRows(form) {
             : null);
     });
     const keepRows = [...form.querySelectorAll('#keyList .existing-key')];
+    // 行按名称展示；提交顺序回到存储下标，让「重命名/增删密钥后保存」只写
+    // 用户的改动，不把 position 顺序改写成名称顺序。
+    keepRows.sort((a, b) => Number(a.dataset.storedIndex) - Number(b.dataset.storedIndex));
     const keep_key_ids = keepRows.map(r => r.dataset.keepId);
     const keep_labels = Object.fromEntries(keepRows.map(r => {
         const labelInput = r.querySelector('.existing-key-label');
@@ -579,7 +609,7 @@ function hideUsageCard() {
 /** 悬浮卡内容：账户名 + 类型徽章，逐把密钥列三个窗口的用量与倒计时。 */
 function usageCardHtml(account) {
     let observed = '';
-    const keys = (account.keys || []).map((key) => {
+    const keys = sortKeysByName(account.keys).map((key) => {
         const usage = key.usage || null;
         const windows = (usage && usage.windows) || {};
         // 卡片脚注给「最旧」的观测时刻：密钥同轮轮询时彼此相同，一旦不同，
@@ -645,7 +675,7 @@ function renderAccountsTable() {
         tbody.innerHTML = `<tr><td colspan="8" class="td-empty">暂无${esc(label)}类型账户，请点击"添加账户"（聚合账户请到"上游账户聚合"管理）</td></tr>`;
     } else {
         tbody.innerHTML = rows.map((a) => {
-            const keyEntries = [...(a.keys || []), ...(a.cloud_keys || [])];
+            const keyEntries = sortKeysByName([...(a.keys || []), ...(a.cloud_keys || [])]);
             const uniqueMasks = [...new Set(keyEntries.map((key) => key.masked).filter(Boolean))];
             const keyCount = Number(a.key_count || uniqueMasks.length || 0);
             const firstMask = uniqueMasks[0] || '';
@@ -824,12 +854,15 @@ async function editAccount(id) {
         // 已安排本期期末删除的 key（ends_at 在未来）移除键灰置。
         resetKeyList();
         const nowUtc = new Date().toISOString();
-        (acc.keys || []).forEach((k) => {
-            addExistingKeyRow(k.id, k.masked, k.valid_from,
-                              !!(k.ends_at && k.ends_at > nowUtc), k.label);
-        });
+        (acc.keys || []).map((key, storedIndex) => ({ key, storedIndex }))
+            .sort((a, b) => compareKeyNames(a.key, b.key))
+            .forEach(({ key, storedIndex }) => {
+                addExistingKeyRow(key.id, key.masked, key.valid_from,
+                                  !!(key.ends_at && key.ends_at > nowUtc),
+                                  key.label, storedIndex);
+            });
         // cloud-only 密钥（云端有、本机无明文）→ 补填明文的输入框。
-        (acc.cloud_keys || []).forEach((ck) => addCloudKeyRow(id, ck));
+        sortKeysByName(acc.cloud_keys).forEach((ck) => addCloudKeyRow(id, ck));
         form.dataset.editId = id;
         form.querySelector('[type=submit]').textContent = '保存';
         document.getElementById('accountDeleteBtn').style.display = '';

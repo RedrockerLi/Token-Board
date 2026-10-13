@@ -16,6 +16,12 @@ set_tests_properties(app_testbench PROPERTIES
     LABELS "app;integration"
 )
 
+add_test(
+    NAME frontend_proxy_manager_key_order
+    COMMAND ${NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_key_order.js
+)
+
 foreach(FRONTEND_TZ Asia/Shanghai America/New_York UTC Pacific/Kiritimati)
     string(REPLACE "/" "_" FRONTEND_TZ_NAME "${FRONTEND_TZ}")
     add_test(
