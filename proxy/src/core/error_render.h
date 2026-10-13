@@ -9,8 +9,9 @@
 #include <vector>
 
 // Terminal status when no candidate could be used by a non-streaming request:
-// 504 on timeout, 429 only for explicit provider quota cooldown, 503 for
-// local capacity, otherwise the last upstream status when it is >= 400.
+// 504 on timeout, 429 for an explicit provider quota cooldown or an all-keys
+// rate limit, 503 for local capacity or unavailable keys, otherwise the last
+// upstream status when it is >= 400.
 int no_upstream_status(const UpstreamClient::ForwardResult &result,
                        const std::vector<Database::AttemptInfo> &attempts,
                        NoCandidateReason reason);
@@ -33,6 +34,9 @@ struct TerminalErrorOptions {
     int used_failure_status = 0;   // chat-converted floor: a sub-400 failure lifts to this
     const char *busy_message = nullptr;  // local-capacity message (models override)
     NoCandidateReason no_candidate_reason = NoCandidateReason::kNone;
+    // Smallest remaining rate-limit avoid among the skipped candidates; the
+    // all-rate-limited response reports it as Retry-After.
+    int no_candidate_retry_after = 0;
 };
 
 struct TerminalError {
@@ -77,4 +81,5 @@ NormalizedError render_stream_error(
     const std::vector<Database::AttemptInfo> &attempts, bool last_timeout,
     const json &in_stream_error, int last_status,
     NoCandidateReason no_candidate_reason,
-    const char *busy_message = "All upstream key concurrency slots are occupied");
+    const char *busy_message = "All upstream key concurrency slots are occupied",
+    int no_candidate_retry_after = 0);

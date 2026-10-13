@@ -74,8 +74,12 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         ? embedding_timeouts.non_streaming_timeout : 600;
     const auto embedding_deadline = t0 + std::chrono::seconds(embedding_budget_seconds);
 
-    std::vector<std::size_t> order(cands.size());
-    std::iota(order.begin(), order.end(), 0);
+    // Embeddings carry no conversation, so no session binding applies; the
+    // same ordering still vetoes exhausted keys and balances by pressure and
+    // cumulative cost.
+    const auto order = candidate_order(
+        cands, std::nullopt, routing_rr_.fetch_add(1, std::memory_order_relaxed),
+        wall_now_epoch(), &cost_ledger_, &gate_);
     AttemptExecutor executor(gate_);
     auto outcome = executor.execute(
         {&cands, order, embedding_deadline, embedding_budget_seconds,

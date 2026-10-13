@@ -1,3 +1,6 @@
+#include <cctype>
+#include <string>
+
 class ForwardWatchdog {
 public:
     static ForwardWatchdog &instance() {
@@ -90,4 +93,31 @@ inline bool is_usage_limit_error(const std::string &body) {
     if (body.empty()) return false;
     return body.find("GoUsageLimitError") != std::string::npos ||
            body.find("\"limitName\"") != std::string::npos;
+}
+
+/// The quota window an explicit usage-limit envelope names, mapped to the
+/// stored window names ("5h" / "week" / "month"); empty when the envelope
+/// carries no usable limitName.  The scan is deliberately positional (find
+/// the key, then its string value) so the net layer stays free of a JSON
+/// dependency, and an unknown name falls back to the caller's own ordering
+/// rather than guessing a window.
+inline std::string usage_limit_window(const std::string &body) {
+    const auto key = body.find("\"limitName\"");
+    if (key == std::string::npos) return {};
+    const auto colon = body.find(':', key);
+    if (colon == std::string::npos) return {};
+    const auto quote = body.find('"', colon + 1);
+    if (quote == std::string::npos) return {};
+    const auto end = body.find('"', quote + 1);
+    if (end == std::string::npos) return {};
+    std::string name = body.substr(quote + 1, end - quote - 1);
+    for (auto &c : name) c = static_cast<char>(std::tolower(
+        static_cast<unsigned char>(c)));
+    if (name.find("roll") != std::string::npos ||
+        name.find("hour") != std::string::npos ||
+        name.find("5h") != std::string::npos)
+        return "5h";
+    if (name.find("week") != std::string::npos) return "week";
+    if (name.find("month") != std::string::npos) return "month";
+    return {};
 }

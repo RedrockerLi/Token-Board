@@ -106,11 +106,6 @@ bool Database::log_recovery_complete() {
     return !log_recovering_ && log_accepting_;
 }
 
-void Database::set_cost_observer(CostObserver observer) {
-    std::lock_guard<std::mutex> lock(cost_observer_mutex_);
-    cost_observer_ = std::move(observer);
-}
-
 bool Database::persist_log_records(const LogRecord *records,
                                    std::size_t count) {
     if (count == 0) return true;
@@ -133,8 +128,6 @@ bool Database::persist_log_records(const LogRecord *records,
                 sqlite3_errmsg(write_db_));
         return false;
     }
-    std::vector<const LogRecord *> inserted_records;
-    inserted_records.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
         bool inserted = false;
         if (!write_log_record_in_transaction(records[i], &inserted)) {
@@ -145,7 +138,6 @@ bool Database::persist_log_records(const LogRecord *records,
                         sqlite3_errmsg(write_db_));
             return false;
         }
-        if (inserted) inserted_records.push_back(&records[i]);
     }
     rc = sqlite3_exec(write_db_, "COMMIT", nullptr, nullptr, nullptr);
     if (rc == SQLITE_OK) {
@@ -162,10 +154,10 @@ bool Database::persist_log_records(const LogRecord *records,
                     return all;
                 }()))
             return false;
-        // V1 pricing is authoritative in SQLite. Notify the process-local
-        // routing ledger only after the transaction is durable, so a failed
-        // batch cannot bias routing with a cost that was never recorded.
-        notify_rated_costs(inserted_records);
+        // V1 pricing is authoritative in SQLite; the process-local routing
+        // ledger reads its totals back through load_key_cost_totals on its
+        // own cadence, so a failed batch can never bias routing with a cost
+        // that was never recorded.
         return true;
     }
     TB_LOG_ERROR( "[DB] request-log COMMIT error (%d): %s\n", rc,
@@ -178,33 +170,6 @@ bool Database::persist_log_records(const LogRecord *records,
     // The transaction may already have committed. Replaying is safe because
     // event_id is unique and checked before inserting attempts.
     return false;
-}
-
-void Database::notify_rated_costs(
-    const std::vector<const LogRecord *> &records) {
-    CostObserver observer;
-    {
-        std::lock_guard<std::mutex> lock(cost_observer_mutex_);
-        observer = cost_observer_;
-    }
-    if (!observer || !write_db_) return;
-
-    sqlite3_stmt *statement = nullptr;
-    const char *sql = "SELECT equivalent_cost FROM request_log "
-                      "WHERE event_id=?1";
-    if (sqlite3_prepare_v2(write_db_, sql, -1, &statement, nullptr) != SQLITE_OK)
-        return;
-    for (const LogRecord *record : records) {
-        if (!record || record->upstream_key_id == 0) continue;
-        sqlite3_reset(statement);
-        sqlite3_bind_text(statement, 1, record->event_id.c_str(), -1,
-                          SQLITE_STATIC);
-        if (sqlite3_step(statement) == SQLITE_ROW) {
-            const double cost = sqlite3_column_double(statement, 0);
-            if (cost > 0.0) observer(record->upstream_key_id, cost);
-        }
-    }
-    sqlite3_finalize(statement);
 }
 
 bool Database::write_log_record_in_transaction(const LogRecord &record,

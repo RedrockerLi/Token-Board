@@ -96,6 +96,12 @@ inline const char *proxy_gate_reason(
             return "local_capacity";
         case AccountGate::KeyAcquireResult::kSubscriptionCooldown:
             return "provider_quota_cooldown";
+        case AccountGate::KeyAcquireResult::kRateLimited:
+            return "rate_limited";
+        case AccountGate::KeyAcquireResult::kAuthError:
+            return "auth_error";
+        case AccountGate::KeyAcquireResult::kProviderFault:
+            return "provider_fault";
         case AccountGate::KeyAcquireResult::kAcquired:
             break;
     }

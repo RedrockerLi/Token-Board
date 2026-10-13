@@ -7,12 +7,27 @@ declared by the account-type spec and stores one snapshot per credential in
 ``upstream_credentials.usage_json``; ``app/services/billing_units.py`` turns
 the monthly part into the reset-driven billing period.
 
-Every query is defensive: a malformed window is dropped, and an unreachable
-or rejecting endpoint keeps the previous snapshot while recording an error
-string, so a failed poll never advances the observed monthly chain.  Billing
-treats a snapshot older than 48 hours, one carrying an error, or one without
-a complete observed monthly period as absent and falls back to the account's
-anchor day.
+A snapshot is ``{checked_at, error, windows, monthly_period}``:
+``checked_at`` is the moment of the last SUCCESSFUL observation.  A failed
+query only writes ``error`` and keeps the previous windows, monthly period
+and ``checked_at``; a credential whose first poll fails carries no
+``checked_at`` at all, so a failure can never pass as an observation.  A
+response from which any of the three windows is missing or unusable counts
+as a failure too: an incomplete observation must not silently retract what
+an earlier complete one confirmed (the proxy treats a reported-exhausted
+window as spent until trusted evidence shows the window reset).  Billing
+keeps its own contract: a snapshot older than 48 hours, one carrying an
+error, or one without a complete observed monthly period is treated as
+absent and falls back to the account's anchor day.
+
+Each window stores ``{percent, resets_at, state}``.  ``state`` is the rolling
+lifecycle the proxy scheduler consumes: ``started`` (the window counts down
+toward a real deadline; also inferred whenever ``percent >= 1``), ``idle``
+(unused window — the upstream's reset stamp is the observation moment plus
+the rolling duration, so nothing is expiring yet) and ``unknown`` (a stamp
+beyond that placeholder, or no usable reset at all — never guessed).  Weekly
+and monthly windows are calendar periods and count as ``started`` whenever
+their reset parses.
 
 The usage route is first-party but undocumented, so every deviation from the
 expected shape — a missing window, an unparseable percent or resetsAt, a
@@ -26,7 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 
@@ -42,6 +57,17 @@ USAGE_REQUEST_TIMEOUT_SECONDS = 15.0
 
 # Upstream response key -> stored window name.
 WINDOW_SOURCES = (("rolling", "5h"), ("weekly", "week"), ("monthly", "month"))
+
+# The rolling window's fixed duration.  An unused window's placeholder
+# resetsAt equals the observation moment plus this span — that is how "idle"
+# is told apart from a real deadline (last use + the same span).
+ROLLING_WINDOW_SECONDS = 5 * 3600
+
+# Only a reset stamp this close to observation+duration counts as the idle
+# placeholder; anything clearly earlier is a real deadline.  A window started
+# seconds ago sits inside the band and reads idle until the next poll, which
+# is harmless — the alternative is guessing.
+STATE_TOLERANCE_SECONDS = 30
 
 
 def _percent(value: object) -> int | None:
@@ -76,14 +102,43 @@ def _preview(value: object, limit: int = 80) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
-def parse_usage_body(body: object, *, context: str = "") -> tuple[dict, datetime | None]:
+def _window_state(name: str, percent: int, resets: datetime | None,
+                  observed: datetime | None) -> str:
+    """Classify one window's lifecycle: ``started`` / ``idle`` / ``unknown``.
+
+    Only the rolling window can be idle — weekly and monthly quota belongs to
+    calendar periods that are always running.  The idle tell is the upstream's
+    placeholder reset stamp (observation moment plus the rolling duration),
+    compared against *observed*, this credential's own response instant;
+    everything that cannot be told apart stays ``unknown`` rather than
+    guessed.
+    """
+    if name != "5h":
+        return "started" if resets is not None else "unknown"
+    if resets is None or observed is None:
+        return "unknown"
+    if percent >= 1:
+        return "started"
+    delta = (observed + timedelta(seconds=ROLLING_WINDOW_SECONDS)
+             - resets).total_seconds()
+    if delta > STATE_TOLERANCE_SECONDS:
+        return "started"
+    if delta >= -STATE_TOLERANCE_SECONDS:
+        return "idle"
+    return "unknown"
+
+
+def parse_usage_body(body: object, *, observed: datetime | None = None,
+                     context: str = "") -> tuple[dict, datetime | None]:
     """Extract stored windows and the raw monthly reset from a response body.
 
     Every window keeps the reset instant the upstream reported, whatever its
     percentage: percent=0 means "under 1% used", not "no window", so the
-    dashboard counts down from it and the proxy's usage-aware tuning compares
-    it like any other deadline.  Only an unparseable ``resetsAt`` leaves the
-    field empty — that window then competes on percentage alone.
+    dashboard counts down from it and the proxy compares it like any other
+    deadline.  Each window also carries the lifecycle ``state`` the scheduler
+    consumes (see the module docstring); classifying it needs *observed* —
+    the moment this credential's response arrived — so the idle placeholder
+    is compared against the right instant instead of a batch-wide one.
 
     The raw monthly ``resetsAt`` is additionally returned on its own: the
     observed billing period chain consumes it directly.
@@ -112,14 +167,21 @@ def parse_usage_body(body: object, *, context: str = "") -> tuple[dict, datetime
         if resets is None and percent > 0:
             log.warning("%swindow '%s' has an unparseable resetsAt: %s",
                         prefix, source, _preview(raw.get("resetsAt")))
+        state = _window_state(name, percent, resets, observed)
+        if name == "5h" and state == "unknown" and resets is not None:
+            log.warning("%swindow '%s' reports a reset beyond the observed "
+                        "rolling window: %s", prefix, source,
+                        _preview(raw.get("resetsAt")))
         windows[name] = {
             "percent": percent,
             # 上游本次返回的重置时刻，任何 percent 都存：percent=0 只说明本窗口
             # 用量不足 1%，窗口可能仍在计时（滚动窗口 = 末次使用 + 5h），也可能
-            # 空闲（上游给查询时刻+时长的占位值）。代理的候选微调按它比较截止
-            # （proxy/src/core/candidate_selection.h），看板按它显示重置倒计时。
+            # 空闲（上游给观测时刻+时长的占位值）。state 区分两种情况；代理的
+            # 候选排序按它判断（proxy/src/core/candidate_selection.h），看板按
+            # 它显示重置倒计时。
             "resets_at": (format_utc(resets)
                           if resets is not None else None),
+            "state": state,
         }
     monthly = usage.get("monthly")
     monthly_resets = (_resets_at(monthly.get("resetsAt"))
@@ -173,49 +235,70 @@ def _prior_payload(raw: object) -> object:
         return None
 
 
-def _failure(prior: object, moment: datetime, message: str) -> dict:
-    """A failed poll keeps the previous windows and monthly period."""
+def _failure(prior: object, message: str) -> dict:
+    """A failed poll keeps the previous observation untouched.
+
+    Only ``error`` changes; ``checked_at`` still names the last SUCCESSFUL
+    observation, and a credential that never had one carries no
+    ``checked_at`` at all.  Keep this split: the proxy scheduler derives both
+    snapshot freshness (how old the data is) and cooldown-recovery evidence
+    (whether a reset has been observed) from it.
+    """
     previous = prior if isinstance(prior, dict) else {}
-    return {
-        "checked_at": format_utc(moment),
-        "error": message,
-        "windows": previous.get("windows") or {},
-        "monthly_period": previous.get("monthly_period"),
-    }
+    payload: dict = {}
+    if previous.get("checked_at"):
+        payload["checked_at"] = previous["checked_at"]
+    payload["error"] = message
+    payload["windows"] = previous.get("windows") or {}
+    payload["monthly_period"] = previous.get("monthly_period")
+    return payload
 
 
-def _query_usage(url: str, key: str, *, moment: datetime, prior: object,
+def _query_usage(url: str, key: str, *, clock, prior: object,
                  context: str = "") -> dict:
-    """Query one credential and build the payload stored for it."""
+    """Query one credential and build the payload stored for it.
+
+    *clock* supplies the observation moment and is read after the response,
+    so windows are classified against this credential's own arrival instant
+    (credentials are queried sequentially; a batch-wide moment would drift
+    apart for later keys).  A structurally incomplete response is a failure,
+    never a partial success: keeping only the usable windows would silently
+    retract what an earlier complete observation confirmed.
+    """
     try:
         response = requests.get(
             url, headers={"Authorization": "Bearer " + key,
                           "Accept": "application/json"},
             timeout=USAGE_REQUEST_TIMEOUT_SECONDS)
     except requests.RequestException as exc:
-        return _failure(prior, moment, f"网络错误：{type(exc).__name__}")
+        return _failure(prior, f"网络错误：{type(exc).__name__}")
+    observed = as_utc(clock())
     if response.status_code != 200:
-        return _failure(prior, moment, f"HTTP {response.status_code}")
+        return _failure(prior, f"HTTP {response.status_code}")
     try:
         body = response.json()
     except ValueError:
-        return _failure(prior, moment, "响应不是有效 JSON")
+        return _failure(prior, "响应不是有效 JSON")
     try:
-        windows, resets = parse_usage_body(body, context=context)
+        windows, resets = parse_usage_body(body, observed=observed,
+                                           context=context)
     except ValueError as exc:
-        return _failure(prior, moment, str(exc))
-    if not windows:
-        log.warning("usage poll: %s response carried no usable windows: %s",
-                    context, _preview(body, 300))
+        return _failure(prior, str(exc))
+    missing = [name for _, name in WINDOW_SOURCES if name not in windows]
+    if missing:
+        log.warning("usage poll: %s response is incomplete "
+                    "(missing windows: %s): %s", context, ",".join(missing),
+                    _preview(body, 300))
+        return _failure(prior, "响应不完整：缺少 " + ",".join(missing) + " 窗口")
     if resets is None:
         log.warning("usage poll: %s response carried no usable monthly reset: %s",
                     context, _preview(body, 300))
     prior_month = prior.get("monthly_period") if isinstance(prior, dict) else None
     return {
-        "checked_at": format_utc(moment),
+        "checked_at": format_utc(observed),
         "error": None,
         "windows": windows,
-        "monthly_period": advance_monthly_period(prior_month, moment, resets),
+        "monthly_period": advance_monthly_period(prior_month, observed, resets),
     }
 
 
@@ -223,9 +306,13 @@ def poll_usage_once(proxy_db, *, now: datetime | None = None) -> dict:
     """Refresh the usage snapshot of every usage-capable upstream key once.
 
     The database is read first and written once at the end, so the HTTP
-    queries never run while a SQLite write lock is held.
+    queries never run while a SQLite write lock is held.  *now* pins the
+    cycle moment for tests; observation instants then come from that same
+    pinned value instead of the wall clock, keeping stored ``checked_at``
+    values deterministic.
     """
     moment = as_utc(now or utc_now()).replace(microsecond=0)
+    clock = (lambda: moment) if now is not None else utc_now
     conn = proxy_db._connect()
     try:
         targets = usage_targets(conn, moment=moment)
@@ -237,7 +324,7 @@ def poll_usage_once(proxy_db, *, now: datetime | None = None) -> dict:
         for credential in target["credentials"]:
             context = f"credential {credential['uuid']} ({target['url']})"
             payload = _query_usage(
-                target["url"], credential["secret_value"], moment=moment,
+                target["url"], credential["secret_value"], clock=clock,
                 prior=_prior_payload(credential["usage_json"]), context=context)
             snapshots[credential["uuid"]] = payload
             if payload["error"] is not None:
@@ -254,6 +341,7 @@ def poll_usage_once(proxy_db, *, now: datetime | None = None) -> dict:
 
 
 __all__ = [
+    "ROLLING_WINDOW_SECONDS", "STATE_TOLERANCE_SECONDS",
     "USAGE_REQUEST_TIMEOUT_SECONDS", "WINDOW_SOURCES", "advance_monthly_period",
     "parse_usage_body", "poll_usage_once",
 ]

@@ -43,11 +43,15 @@ std::int64_t parse_utc_timestamp(const std::string &value) {
 // opencode-go cooldown clears as soon as this parse reports quota again.
 
 // Parse one credential's usage_json into the frozen snapshot shape:
-//   {"checked_at": …, "error": null|"…", "windows": {"5h": {...}, "week": …,
-//    "month": …}, "monthly_period": {...}}
+//   {"checked_at": …(last successful observation), "error": null|"…",
+//    "windows": {"5h": {percent, resets_at, state}, "week": …, "month": …},
+//    "monthly_period": {...}}
 // Unusable input means "no usage data" (a null result), so the credential then
-// has no deadline and is never treated as exhausted.  Fields are read one at a
-// time: a single window with a bad payload must not discard the others.
+// has no window signals and is never treated as exhausted.  Fields are read
+// one at a time: a single window with a bad payload must not discard the
+// others.  The exhausted verdict is deliberately NOT computed here — it
+// depends on the wall clock (a window whose reset passes reopens the key) and
+// is derived per request in candidate_selection.h.
 std::shared_ptr<const routing::CredentialUsage> parse_credential_usage(
     int key_slot_id, const std::string &text) {
     if (text.empty()) return nullptr;
@@ -55,6 +59,10 @@ std::shared_ptr<const routing::CredentialUsage> parse_credential_usage(
     try {
         const auto root = nlohmann::json::parse(text);
         if (!root.is_object()) return nullptr;
+        const auto checked = root.find("checked_at");
+        if (checked != root.end() && checked->is_string())
+            usage.observed_at =
+                parse_utc_timestamp(checked->get<std::string>());
         const auto windows = root.find("windows");
         if (windows == root.end() || !windows->is_object()) return nullptr;
         for (const char *name : {"5h", "week", "month"}) {
@@ -69,7 +77,23 @@ std::shared_ptr<const routing::CredentialUsage> parse_credential_usage(
             const auto reset = window->find("resets_at");
             if (reset != window->end() && reset->is_string())
                 entry.resets_at = parse_utc_timestamp(reset->get<std::string>());
-            if (entry.percent >= kExhaustedPercent) usage.exhausted = true;
+            const auto state = window->find("state");
+            if (state != window->end() && state->is_string()) {
+                const std::string value = state->get<std::string>();
+                if (value == "started")
+                    entry.state = routing::WindowState::kStarted;
+                else if (value == "idle")
+                    entry.state = routing::WindowState::kIdle;
+                else
+                    entry.state = routing::WindowState::kUnknown;
+            } else {
+                // Snapshots written before the state field: calendar windows
+                // are always running; the rolling window stays unknown
+                // (never guessed) until the next poll.
+                entry.state = std::string(name) != "5h" && entry.resets_at > 0
+                    ? routing::WindowState::kStarted
+                    : routing::WindowState::kUnknown;
+            }
             usage.windows.push_back(std::move(entry));
         }
     } catch (const std::exception &e) {

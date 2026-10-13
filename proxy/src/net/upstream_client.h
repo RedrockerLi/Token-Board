@@ -141,8 +141,16 @@ public:
         // "error":{"type":"GoUsageLimitError",...},"metadata":{"limitName":…}}).
         // The caller uses it to distinguish an explicit subscription quota
         // exhaustion from ordinary upstream failures; only the former may
-        // enter the retained 5h provider-quota cooldown.
+        // enter the retained provider-quota cooldown.
         bool usage_limit = false;
+        // The window the usage-limit envelope named ("5h" / "week" / "month";
+        // empty when absent): the cooldown prefers that window's trusted reset
+        // over the PLAN_COOLDOWN fallback.
+        std::string limit_window;
+        // Upstream Retry-After (seconds, already clamped to [1, 86400]); 0
+        // when the response carried none.  An ordinary 429 holds the key for
+        // this long instead of a fixed avoid window.
+        int retry_after_seconds = 0;
         UpstreamFailureKind failure_kind = UpstreamFailureKind::None;
     };
 

@@ -37,26 +37,20 @@ bool strict_terminal_enabled() {
     return std::string(v) != "0";
 }
 
-size_t affinity_start(SessionAffinity &affinity,
-                             const std::string &scope,
-                             const std::string &session_id,
-                             const std::vector<UpstreamCandidate> &cands) {
-    // Affinity spans EVERY candidate's key slot, not just the first priority
-    // group: any account (cheap or expensive) with multiple keys deserves the
-    // same in-group affinity + wear-leveling.  The returned index is a global
-    // index into `cands` (slots below mirror the candidate order), and
-    // candidate_order later maps it to a per-group rotation start while still
-    // trying cheaper groups first.
+std::optional<size_t> affinity_bound_index(
+    SessionAffinity &affinity, const std::string &scope,
+    const std::string &session_id,
+    const std::vector<UpstreamCandidate> &cands) {
+    // The binding spans EVERY candidate's key slot, not just the first
+    // priority group: any account with multiple keys deserves the same
+    // in-group affinity.  The returned index is a global index into `cands`;
+    // candidate_order maps it to its own group's start while still trying
+    // higher-priority groups first.
+    if (cands.empty()) return std::nullopt;
     std::vector<int> slots;
-    if (cands.empty()) return 0;
     slots.reserve(cands.size());
     for (const auto &cand : cands) slots.push_back(cand.key_slot_id);
-    // Usage-aware preference: a credential whose usable quota expires clearly
-    // sooner than the next one starts the rotation, so that quota is spent
-    // before it resets.  Candidates without usage data keep the session
-    // affinity / cheapest-key order unchanged.
-    return usage_lead_start(
-        cands, affinity.preferred_index(scope, session_id, slots));
+    return affinity.bound_index(scope, session_id, slots);
 }
 
 /// Build a JSON error response.

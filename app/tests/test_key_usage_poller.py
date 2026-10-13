@@ -124,10 +124,12 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
                 self.assertIsNone(payload["error"])
                 self.assertEqual(payload["windows"], {
                     "5h": {"percent": 100,
-                           "resets_at": format_utc(T0 + timedelta(hours=5))},
+                           "resets_at": format_utc(T0 + timedelta(hours=5)),
+                           "state": "started"},
                     "week": {"percent": 0, "resets_at": format_utc(
-                        T0 + timedelta(days=7))},
-                    "month": {"percent": 0, "resets_at": format_utc(reset)},
+                        T0 + timedelta(days=7)), "state": "started"},
+                    "month": {"percent": 0, "resets_at": format_utc(reset),
+                              "state": "started"},
                 })
                 # The raw monthly reset drives the period chain even at 0%.
                 self.assertEqual(payload["monthly_period"],
@@ -137,7 +139,14 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
                 "SELECT count(*) FROM upstreams WHERE account_id=? AND subtype=?",
                 (account_id, "opencode-go")).fetchone()[0], 1)
 
-    def test_poll_skips_malformed_windows_and_unparseable_resets(self) -> None:
+    def test_incomplete_responses_count_as_failures(self) -> None:
+        """Missing or unusable windows are a failure, never a partial success.
+
+        Keeping only the usable windows would silently retract what an
+        earlier complete observation confirmed — the proxy treats a
+        reported-exhausted window as spent until trusted evidence shows the
+        window reset.
+        """
         db = self.proxy_database()
         with usage_server() as server:
             self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
@@ -147,14 +156,62 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
                 "monthly": {"percent": 7, "resetsAt": "yesterday-ish"},
             }})
 
-            poll_usage_once(db, now=T0)
+            stats = poll_usage_once(db, now=T0)
 
+            self.assertEqual(stats["errors"], 1)
             payload = next(iter(self._snapshots().values()))
-            self.assertEqual(payload["windows"], {
-                "month": {"percent": 7, "resets_at": None},
-            })
-            # An unparseable raw reset establishes no chain at all.
+            self.assertEqual(payload["error"], "响应不完整：缺少 5h,week 窗口")
+            # A first-ever failure carries no observation stamp at all.
+            self.assertNotIn("checked_at", payload)
+            self.assertEqual(payload["windows"], {})
             self.assertIsNone(payload["monthly_period"])
+
+    def test_window_state_classification(self) -> None:
+        """started / idle / unknown for the rolling window's lifecycle."""
+        from app.services.key_usage import parse_usage_body
+
+        five_hours = timedelta(hours=5)
+
+        def classify(percent: int, resets: datetime | None, *,
+                     observed: datetime = T0) -> str:
+            body = {"usage": {
+                "rolling": {"percent": percent,
+                            "resetsAt": (format_utc(resets)
+                                         if resets is not None else None)},
+                "weekly": {"percent": 1, "resetsAt": format_utc(
+                    T0 + timedelta(days=7))},
+                "monthly": {"percent": 1, "resetsAt": format_utc(
+                    T0 + timedelta(days=30))},
+            }}
+            windows, _ = parse_usage_body(body, observed=observed)
+            return windows["5h"]["state"]
+
+        # Any recorded usage means the window is running.
+        self.assertEqual(classify(3, T0 + five_hours), "started")
+        # An unused window's stamp is observation + duration; a couple of
+        # seconds of request/truncation noise stays inside the tolerance.
+        self.assertEqual(classify(0, T0 + five_hours), "idle")
+        self.assertEqual(classify(0, T0 + five_hours + timedelta(seconds=20)),
+                         "idle")
+        self.assertEqual(classify(0, T0 + five_hours - timedelta(seconds=20)),
+                         "idle")
+        # A real deadline (last use + duration) clears the tolerance band.
+        self.assertEqual(classify(0, T0 + five_hours - timedelta(minutes=5)),
+                         "started")
+        # Anywhere past the placeholder is an anomaly — never guessed.
+        self.assertEqual(classify(0, T0 + five_hours + timedelta(seconds=40)),
+                         "unknown")
+        self.assertEqual(classify(0, None), "unknown")
+
+        # Calendar windows are started whenever their reset parses.
+        windows, _ = parse_usage_body({"usage": {
+            "rolling": {"percent": 0, "resetsAt": format_utc(T0 + five_hours)},
+            "weekly": {"percent": 0, "resetsAt": format_utc(
+                T0 + timedelta(days=7))},
+            "monthly": {"percent": 0, "resetsAt": None},
+        }}, observed=T0)
+        self.assertEqual(windows["week"]["state"], "started")
+        self.assertEqual(windows["month"]["state"], "unknown")
 
     def test_parse_usage_body_rejects_unusable_windows(self) -> None:
         from app.services.key_usage import parse_usage_body
@@ -199,16 +256,27 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
             self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
             reset = T0 + timedelta(days=31)
             server.state["response"] = (200, {"usage": {
-                "rolling": {"percent": 12, "resetsAt": format_utc(T0)},
+                "rolling": {"percent": 12, "resetsAt": format_utc(
+                    T0 + timedelta(hours=2))},
+                "weekly": {"percent": 0, "resetsAt": format_utc(
+                    T0 + timedelta(days=7))},
                 "monthly": {"percent": 3, "resetsAt": format_utc(reset)},
             }})
             poll_usage_once(db, now=T0)
             previous = next(iter(self._snapshots().values()))
+            self.assertEqual(previous["checked_at"], format_utc(T0))
 
             for offset, response, message in (
                     (1, (403, {"error": "no subscription"}), "HTTP 403"),
                     (2, (200, b"<html>not json</html>"), "响应不是有效 JSON"),
-                    (3, (200, {"nope": 1}), "响应缺少 usage 字段")):
+                    (3, (200, {"nope": 1}), "响应缺少 usage 字段"),
+                    # A structurally incomplete 200 is a failure too: a
+                    # failed query must never advance checked_at nor drop
+                    # the previously confirmed windows.
+                    (4, (200, {"usage": {
+                        "monthly": {"percent": 3,
+                                    "resetsAt": format_utc(reset)},
+                    }}), "响应不完整：缺少 5h,week 窗口")):
                 moment = T0 + timedelta(hours=offset)
                 server.state["response"] = response
 
@@ -217,7 +285,8 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
                 self.assertEqual(stats["errors"], 1)
                 payload = next(iter(self._snapshots().values()))
                 self.assertEqual(payload["error"], message)
-                self.assertEqual(payload["checked_at"], format_utc(moment))
+                # checked_at keeps naming the last SUCCESSFUL observation.
+                self.assertEqual(payload["checked_at"], format_utc(T0))
                 self.assertEqual(payload["windows"], previous["windows"])
                 self.assertEqual(payload["monthly_period"],
                                  previous["monthly_period"])
@@ -231,6 +300,9 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
         self.assertEqual(stats["errors"], 1)
         payload = next(iter(self._snapshots().values()))
         self.assertEqual(payload["error"], "网络错误：ConnectionError")
+        # A credential whose first poll fails carries no observation stamp —
+        # a failure must never pass as an observation.
+        self.assertNotIn("checked_at", payload)
         self.assertEqual(payload["windows"], {})
         self.assertIsNone(payload["monthly_period"])
 
@@ -243,6 +315,10 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
 
             def poll(moment: datetime, resets: datetime) -> dict:
                 server.state["response"] = (200, {"usage": {
+                    "rolling": {"percent": 1, "resetsAt": format_utc(
+                        moment + timedelta(hours=2))},
+                    "weekly": {"percent": 1, "resetsAt": format_utc(
+                        moment + timedelta(days=6))},
                     "monthly": {"percent": 10, "resetsAt": format_utc(resets)},
                 }})
                 poll_usage_once(db, now=moment)
@@ -313,6 +389,10 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
             moment = first_end + timedelta(hours=1)
             observed_end = first_end + timedelta(days=25)
             server.state["response"] = (200, {"usage": {
+                "rolling": {"percent": 5, "resetsAt": format_utc(
+                    moment + timedelta(hours=2))},
+                "weekly": {"percent": 5, "resetsAt": format_utc(
+                    moment + timedelta(days=5))},
                 "monthly": {"percent": 20, "resetsAt": format_utc(observed_end)},
             }})
 
@@ -371,12 +451,35 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
         self.assertIn("window 'rolling' has an unparseable resetsAt", joined)
         self.assertIn("window 'weekly' has an unusable percent", joined)
         self.assertIn("window 'monthly' missing or not an object", joined)
-        self.assertIn("no usable monthly reset", joined)
-        # The degraded response still stores a snapshot (defensive parsing
-        # is unchanged); the logs are the change-detection surface.
+        self.assertIn("response is incomplete", joined)
+        # Nothing usable came back, so the whole response is a failure — no
+        # degraded snapshot may stand in for an observation.
         snapshot = next(iter(self._snapshots().values()))
+        self.assertNotIn("checked_at", snapshot)
+        self.assertEqual(snapshot["windows"], {})
         self.assertIsNone(snapshot["monthly_period"])
-        self.assertIsNone(snapshot["windows"]["5h"]["resets_at"])
+
+    def test_a_reset_beyond_the_rolling_window_is_logged(self) -> None:
+        """A stamp past observation+duration is an anomaly — never guessed."""
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            server.state["response"] = (200, {"usage": {
+                "rolling": {"percent": 0, "resetsAt": format_utc(
+                    T0 + timedelta(hours=6))},
+                "weekly": {"percent": 1, "resetsAt": format_utc(
+                    T0 + timedelta(days=7))},
+                "monthly": {"percent": 1, "resetsAt": format_utc(
+                    T0 + timedelta(days=30))},
+            }})
+            with self.assertLogs("app.services.key_usage",
+                                 level="WARNING") as captured:
+                poll_usage_once(db, now=T0)
+
+        self.assertIn("reports a reset beyond the observed rolling window",
+                      "\n".join(captured.output))
+        snapshot = next(iter(self._snapshots().values()))
+        self.assertEqual(snapshot["windows"]["5h"]["state"], "unknown")
 
     def test_poll_failures_log_the_credential_and_reason(self) -> None:
         db = self.proxy_database()

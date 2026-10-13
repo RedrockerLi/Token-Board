@@ -207,13 +207,27 @@ inline AttemptExecutor::CandidateSkipped proxy_candidate_skip_logger(
     return [context = std::move(context)](
                const UpstreamCandidate &candidate,
                AccountGate::KeyAcquireResult acquire_result) {
-        const int status = acquire_result ==
-                AccountGate::KeyAcquireResult::kSubscriptionCooldown
-            ? 429 : 503;
+        const bool throttled =
+            acquire_result == AccountGate::KeyAcquireResult::kSubscriptionCooldown ||
+            acquire_result == AccountGate::KeyAcquireResult::kRateLimited;
         log_proxy_failure(context, "candidate_selection",
-                          proxy_gate_reason(acquire_result), status, -1, 0, 0,
-                          false, 0, &candidate);
+                          proxy_gate_reason(acquire_result),
+                          throttled ? 429 : 503, -1, 0, 0, false, 0,
+                          &candidate);
     };
+}
+
+inline const char *proxy_no_candidate_reason_name(
+    NoCandidateReason reason) noexcept {
+    switch (reason) {
+        case NoCandidateReason::kLocalCapacity: return "local_capacity";
+        case NoCandidateReason::kProviderQuotaCooldown:
+            return "provider_quota_cooldown";
+        case NoCandidateReason::kKeyRateLimited: return "key_rate_limited";
+        case NoCandidateReason::kKeyUnavailable: return "key_unavailable";
+        case NoCandidateReason::kNone: break;
+    }
+    return "no_upstream_candidate";
 }
 
 inline const char *proxy_terminal_failure_reason(
@@ -221,11 +235,7 @@ inline const char *proxy_terminal_failure_reason(
     const UpstreamClient::ForwardResult &result) noexcept {
     if (!outcome.attempts.empty() || outcome.budget_exhausted)
         return proxy_failure_reason(result);
-    return outcome.no_candidate_reason ==
-               NoCandidateReason::kProviderQuotaCooldown
-        ? "provider_quota_cooldown"
-        : outcome.no_candidate_reason == NoCandidateReason::kLocalCapacity
-            ? "local_capacity" : "no_upstream_candidate";
+    return proxy_no_candidate_reason_name(outcome.no_candidate_reason);
 }
 
 inline bool proxy_response_json_valid(
@@ -272,11 +282,7 @@ inline const char *proxy_stream_terminal_failure_reason(
     const UpstreamClient::ForwardResult &result,
     const nlohmann::json &stream_error) noexcept {
     if (outcome.attempts.empty())
-        return outcome.no_candidate_reason ==
-                   NoCandidateReason::kProviderQuotaCooldown
-            ? "provider_quota_cooldown"
-            : outcome.no_candidate_reason == NoCandidateReason::kLocalCapacity
-                ? "local_capacity" : "no_upstream_candidate";
+        return proxy_no_candidate_reason_name(outcome.no_candidate_reason);
     return stream_error.is_null() ? proxy_failure_reason(result)
                                   : "stream_protocol_error";
 }

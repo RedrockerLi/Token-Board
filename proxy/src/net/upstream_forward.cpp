@@ -2,6 +2,42 @@
 #include "http_debug_log.h"
 #include "upstream_failure_kind.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+
+namespace {
+
+// Upstream Retry-After: delta-seconds or an HTTP-date.  Absent or
+// unparseable hints read as 0 (the caller applies its own avoid window);
+// usable ones clamp into [1, 86400] so a far-future date cannot hold a key
+// out longer than a day.
+int parse_retry_after_seconds(const std::string &value) {
+    if (value.empty()) return 0;
+    bool digits_only = true;
+    for (unsigned char c : value)
+        if (!std::isdigit(c)) digits_only = false;
+    if (digits_only) {
+        const long seconds = std::strtol(value.c_str(), nullptr, 10);
+        return static_cast<int>(std::clamp<long>(seconds, 1, 86400));
+    }
+    std::tm tm{};
+    std::istringstream stream(value);
+    stream >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S GMT");
+    if (stream.fail()) return 0;
+    tm.tm_isdst = 0;
+    const std::time_t when = timegm(&tm);
+    if (when <= 0) return 0;
+    const long seconds = static_cast<long>(when - std::time(nullptr));
+    if (seconds <= 0) return 1;
+    return static_cast<int>(std::min<long>(seconds, 86400));
+}
+
+}  // namespace
+
 namespace upstream_metrics_detail {
 
 // ClientPool is intentionally private to the forwarding implementation.  A
@@ -305,8 +341,12 @@ UpstreamClient::forward(const std::string &method,
                 result.error = truncated
                     ? "Upstream stream truncated before terminal event"
                     : "Upstream returned " + std::to_string(upstream_res.status);
-            if (upstream_res.status >= 400)
+            if (upstream_res.status >= 400) {
                 result.usage_limit = is_usage_limit_error(result.body);
+                result.limit_window = usage_limit_window(result.body);
+                result.retry_after_seconds = parse_retry_after_seconds(
+                    upstream_res.get_header_value("Retry-After"));
+            }
         } else {
             result.is_timeout = watch->expired.load(std::memory_order_acquire) ||
                                 err == httplib::Error::ConnectionTimeout;
@@ -413,8 +453,12 @@ UpstreamClient::forward(const std::string &method,
             result.success = (result.status_code >= 200 && result.status_code < 300);
             if (!result.success)
                 result.failure_kind = UpstreamFailureKind::HttpStatus;
-            if (result.status_code >= 400)
+            if (result.status_code >= 400) {
                 result.usage_limit = is_usage_limit_error(result.body);
+                result.limit_window = usage_limit_window(result.body);
+                result.retry_after_seconds = parse_retry_after_seconds(
+                    upstream_res.get_header_value("Retry-After"));
+            }
             if (response_too_large) {
                 result.body_too_large = true;
                 result.success = false;

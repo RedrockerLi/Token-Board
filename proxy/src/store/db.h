@@ -169,8 +169,20 @@ public:
     void release_log_slot();
     bool log_writer_healthy();
     bool log_recovery_complete();
-    using CostObserver = std::function<void(int key_slot_id, double cost)>;
-    void set_cost_observer(CostObserver observer);
+
+    /// Per-key-slot cost aggregate over the retained request_log, feeding the
+    /// routing cost ledger.  Priced rows contribute their equivalent_cost;
+    /// rows that consumed tokens but carry no priced cost contribute their
+    /// tokens, so usage is never read as zero just because the bill is.
+    struct KeyCostTotals {
+        int key_slot_id = 0;
+        double priced_cost = 0.0;
+        long long priced_tokens = 0;
+        long long unpriced_tokens = 0;
+        long long requests = 0;
+    };
+    bool load_key_cost_totals(std::vector<KeyCostTotals> &totals);
+
     std::size_t log_last_batch_size() const noexcept {
         return log_last_batch_size_.load(std::memory_order_acquire);
     }
@@ -227,8 +239,6 @@ private:
                                          bool *inserted = nullptr);
     bool update_accounting_metrics(
         const std::vector<const LogRecord *> &records);
-    void notify_rated_costs(
-        const std::vector<const LogRecord *> &records);
     bool append_log_spool_locked(const std::string &payload);
     bool read_log_spool_batch_locked(std::vector<SpoolRecord> &batch);
     bool compact_log_spool_locked(bool force);
@@ -257,8 +267,6 @@ private:
     std::mutex write_mutex_;
     std::mutex read_mutex_;
     std::mutex pricing_mutex_;
-    std::mutex cost_observer_mutex_;
-    CostObserver cost_observer_;
     mutable std::mutex log_queue_mutex_;
     std::condition_variable log_queue_cv_;
     std::thread log_writer_thread_;

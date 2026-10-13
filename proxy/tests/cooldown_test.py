@@ -5,10 +5,11 @@ Drives the real proxy against mock_upstream with an aggregate topology
 (plan account with two keys + Deepseek-API fallback, behind one aggregate
 root), and asserts the request_attempts chain for each scenario:
 
-  A1  GoUsageLimitError 429 on plan key1 → key1 cools down (5h); same-request
+  A1  GoUsageLimitError 429 on plan key1 → key1 cools down; same-request
       falls to key2, and a subsequent request skips key1 entirely.
-  A1b plain 429 (no GoUsageLimitError) on a single key → the next request
-      immediately retries that key (proves there is no cross-request backoff).
+  A1b plain 429 (no GoUsageLimitError) on a single key → the key holds a
+      short rate-limit avoid (honoring Retry-After): the immediate retry is
+      a fast local 429, and the key is tried again once the avoid expires.
   A2  both plan keys GoUsageLimitError → both cool down; requests fall to the
       Deepseek-API fallback and later skip both plan keys.
 
@@ -139,11 +140,15 @@ def main() -> None:
             conn.close()
 
         proxy_port = free_port()
+        command = [str(proxy_binary), "--db", str(db_path), "--host",
+                   "127.0.0.1", "--port", str(proxy_port)]
+        if os.environ.get("TB_TEST_DEBUG"):
+            command.extend(["--log-level", "debug"])
         proxy = subprocess.Popen(
-            [str(proxy_binary), "--db", str(db_path), "--host", "127.0.0.1",
-             "--port", str(proxy_port)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-            env=os.environ.copy())
+            command,
+            stdout=None if os.environ.get("TB_TEST_DEBUG") else subprocess.DEVNULL,
+            stderr=None if os.environ.get("TB_TEST_DEBUG") else subprocess.PIPE,
+            text=True, env=os.environ.copy())
         try:
             wait_for_health(proxy_port)
             common = {"stream": False,
@@ -163,17 +168,29 @@ def main() -> None:
             print("A1 OK: GoUsageLimitError key1 -> cooldown, fallback key2, "
                   f"skip on next request (chain1={st1}, chain2={st2})")
 
-            # ── A1b: plain 429 is not remembered across requests ──
+            # ── A1b: a plain 429 holds the key for a short rate-limit avoid ──
+            # Distinct from the retained quota cooldown above: the hold
+            # honors the upstream's Retry-After and clears on the next
+            # successful call.
             send(proxy_port, "tb-a1b", {**common, "model": "a1b-model",
-                "mock_status_by_key": {"sk-a1b-p1": 429}})
+                "mock_status_by_key": {"sk-a1b-p1": 429},
+                "mock_retry_after": 1})
             rid, n1, st1, _ = latest_attempts(db_path, "a1b-model")
             assert n1 == 1 and st1 == [429], f"A1b req1 {n1=} {st1}"
 
+            status = send(proxy_port, "tb-a1b", {**common, "model": "a1b-model"})
+            rid2, n2, st2, _ = latest_attempts(db_path, "a1b-model", rid)
+            assert n2 == 0 and st2 == [], \
+                f"A1b req2 must be a fast local 429: {n2=} {st2}"
+            assert status == 429, f"A1b req2 status {status}"
+
+            time.sleep(1.2)  # past the Retry-After the 429 carried
             send(proxy_port, "tb-a1b", {**common, "model": "a1b-model"})
-            _, n2, st2, _ = latest_attempts(db_path, "a1b-model", rid)
-            assert n2 == 1 and st2 == [200], f"A1b req2 must retry key1: {n2=} {st2}"
-            print("A1b OK: plain 429 does not create cross-request key state "
-                  f"(chain1={st1}, chain2={st2})")
+            _, n3, st3, _ = latest_attempts(db_path, "a1b-model", rid2)
+            assert n3 == 1 and st3 == [200], \
+                f"A1b req3 must retry key1 after the avoid expires: {n3=} {st3}"
+            print("A1b OK: plain 429 holds a short Retry-After avoid, then "
+                  f"expires (chain1={st1}, chain2=[] fast 429, chain3={st3})")
 
             # ── A2: both plan keys GoUsageLimit → fall to Deepseek-API ──
             send(proxy_port, "tb-a2", {**common, "model": "a2-model",

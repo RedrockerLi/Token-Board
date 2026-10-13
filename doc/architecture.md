@@ -85,7 +85,7 @@ Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查�
 
 看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。代理和智能体用量都按日×统一身份×模型批量导出到 Dashboard V2.1 的 `daily_usage`；智能体订阅周期费用在物化时按当日有效绑定直接归属 Agent，写入 `monthly_recurring_costs`，再以云端权威模型同步到 WebDAV。
 
-智能体用量由 `token-maintenance` 内的 importer worker 采集。服务启动立即执行一次，之后每 1800 秒执行一次；前端页面加载时通过 Unix datagram socket 异步唤醒同一个 worker。worker 串行扫描已登记的软件日志并写入 `token-board.db/request_log`，因此不会因定时任务和浏览器刷新并发扫描而重复计量。`project` 与 `session_id` 可在 adapter 解析期间短暂存在，但不再作为数据库字段保存。同一服务还运行用量轮询 worker：每 300 秒按上游子分类声明的用量查询路径探测密钥用量，把快照写入本机 `upstream_credentials.usage_json`，供账户页的账户名悬浮用量卡与代理的用量感知调度读取；观测只存本机，不参与配置同步。
+智能体用量由 `token-maintenance` 内的 importer worker 采集。服务启动立即执行一次，之后每 1800 秒执行一次；前端页面加载时通过 Unix datagram socket 异步唤醒同一个 worker。worker 串行扫描已登记的软件日志并写入 `token-board.db/request_log`，因此不会因定时任务和浏览器刷新并发扫描而重复计量。`project` 与 `session_id` 可在 adapter 解析期间短暂存在，但不再作为数据库字段保存。同一服务还运行用量轮询 worker：每 300 秒按上游子分类声明的用量查询路径探测密钥用量，把快照写入本机 `upstream_credentials.usage_json`，供账户页的账户名悬浮用量卡与代理的用量感知调度读取。快照的 `checked_at` 是最近一次成功观测时刻，失败只记 `error` 并保留旧值；每个窗口带 `state`（已启动/空闲/未知），代理只在快照新鲜（10 分钟内）时采信窗口压力，已确认耗尽的窗口跨过期持续生效；观测只存本机，不参与配置同步。
 
 `dashboard.db` 是纯存档，V2.1 使用统一的 `accounts`、`daily_usage` 和 `monthly_recurring_costs`；`accounts.account_kind` 区分代理上游与智能体软件。它不保存价格表，也不承担重算配置价格的职责。V2.2 Agent 周期费用的导出事件按不可变的周期费用主键补发；V2.1 历史分摊仍按旧源键兼容读取，不按物化时间筛选。
 

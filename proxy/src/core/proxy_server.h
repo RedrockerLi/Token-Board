@@ -21,6 +21,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -67,10 +68,7 @@ public:
     ProxyServer(Database &db, Router &router, UpstreamClient &upstream,
                 UsageRecorder &recorder, CodecRegistry &codecs)
         : db_(db), router_(router), upstream_(upstream), recorder_(recorder),
-          codecs_(codecs), affinity_(&cost_ledger_) {
-        db_.set_cost_observer([this](int key_slot_id, double cost) {
-            cost_ledger_.add(key_slot_id, cost);
-        });
+          codecs_(codecs) {
         // Cooldown probe cadence: 1h default; TB_COOLDOWN_PROBE_SECS override
         // (tests shrink it to seconds).  Clamped to [1, 86400] seconds.
         const char *env = std::getenv("TB_COOLDOWN_PROBE_SECS");
@@ -84,6 +82,14 @@ public:
         const int usage_secs = usage_env ? std::atoi(usage_env) : 300;
         usage_watch_interval_secs_ =
             std::min(86400, std::max(1, usage_secs));
+        // Cost-ledger refresh cadence: 5min default; the ledger's totals come
+        // from the retained request_log, so restarts do not reset them.
+        // TB_LEDGER_REFRESH_SECS override (tests shrink it to seconds).
+        // Clamped to [1, 86400] seconds.
+        const char *ledger_env = std::getenv("TB_LEDGER_REFRESH_SECS");
+        const int ledger_secs = ledger_env ? std::atoi(ledger_env) : 300;
+        ledger_refresh_interval_secs_ =
+            std::min(86400, std::max(1, ledger_secs));
     }
 
     /// Stops and joins the accounting + cooldown-probe threads.  Idempotent;
@@ -92,24 +98,26 @@ public:
     void shutdown() {
         cooldown_probe_stop_.store(true);
         if (cooldown_probe_thread_.joinable()) cooldown_probe_thread_.join();
-        db_.set_cost_observer({});
     }
 
     ~ProxyServer() { shutdown(); }
 
     /// Start the cooldown-probe background thread.  Idempotent (call from
-    /// setup_routes).  Two recovery channels share the thread:
+    /// setup_routes).  Three cadences share the thread:
     ///   - every `usage_watch_interval_secs_` (5min), keys whose subtype
     ///     declares a usage query (opencode-go) are checked against the usage
     ///     snapshot alone — pure local reads, no HTTP;
     ///   - every `cooldown_probe_interval_secs_` (1h), the remaining cooling
-    ///     keys get one minimal chat probe ("你好"); 2xx clears the cooldown.
-    /// Neither channel writes request_log, counts toward max_concurrency, or
-    /// touches gate failure counters — they only observe + clear cooldown.
+    ///     keys get one minimal chat probe ("你好"); 2xx clears the cooldown;
+    ///   - every `ledger_refresh_interval_secs_` (5min), the cost ledger
+    ///     re-reads its per-key-slot totals from the retained request_log.
+    /// No channel writes request_log, counts toward max_concurrency, or
+    /// touches gate failure counters — they only observe and update state.
     void start_cooldown_probe();
     void cooldown_probe_loop();
     void run_usage_watch_cycle();
     void run_cooldown_probe_cycle();
+    void run_ledger_refresh_cycle();
 
     void setup_routes(httplib::Server &server);
     std::uint64_t allocate_request_id() noexcept {
@@ -198,7 +206,8 @@ private:
     /// fails is an error status (429/504) committed to the client.
     void handle_streaming(const std::vector<UpstreamCandidate> &cands,
                           const std::vector<CandidateRequestBody> &candidate_bodies,
-                          std::uint64_t request_id, size_t start,
+                          std::uint64_t request_id,
+                          std::optional<size_t> bound_index,
                           const std::string &session_id,
                           int route_account_id, int local_key_id,
                           EndpointKind endpoint_kind,
@@ -231,9 +240,9 @@ private:
     UpstreamClient &upstream_;
     UsageRecorder &recorder_;
     CodecRegistry &codecs_;
-    AccountGate gate_;           // per-key-slot concurrency + plan cooldown
-    KeyCostLedger cost_ledger_;  // accrued cost per key slot (cold-start bias)
-    SessionAffinity affinity_;   // session → preferred key (in-memory)
+    AccountGate gate_;           // per-key-slot concurrency + failure states
+    KeyCostLedger cost_ledger_;  // accrued cost per key slot (wear leveling)
+    SessionAffinity affinity_;   // session → bound key (in-memory)
     ResponsesStateStore responses_state_; // complete bounded Responses chains
 
     struct LiveRequest {
@@ -256,12 +265,14 @@ private:
     std::atomic<std::uint64_t> accounting_dropped_{0};
     std::atomic<std::uint64_t> accounting_rejected_{0};
 
-    // Cooldown-probe thread: while a plan key is inside its 5h cooldown, its
-    // recovery is observed on two cadences — the usage snapshot for
-    // usage-watched keys, a minimal chat probe for the rest.
+    // Cooldown-probe thread: while a plan key is inside its quota cooldown,
+    // its recovery is observed on two cadences — the usage snapshot for
+    // usage-watched keys, a minimal chat probe for the rest — and the same
+    // thread refreshes the cost ledger's request_log aggregates.
     std::thread cooldown_probe_thread_;
     std::atomic<bool> cooldown_probe_stop_{false};
     std::once_flag cooldown_probe_once_;
     int cooldown_probe_interval_secs_ = 3600;
     int usage_watch_interval_secs_ = 300;
+    int ledger_refresh_interval_secs_ = 300;
 };

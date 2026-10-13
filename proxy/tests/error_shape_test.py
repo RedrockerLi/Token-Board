@@ -262,21 +262,31 @@ def main() -> None:
             assert b"timeout_error" in raw, raw
             print("3 OK: streaming timeout -> 504 + Connection: close")
 
-            # A proxy-generated 504 must not cool the only key.  The next
-            # request must reach the mock and succeed immediately.
-            status, body, _ = send(
+            # A proxy-generated 504 is a provider fault: the key takes a
+            # short avoid so the immediate retry cannot hammer the upstream
+            # that just failed to answer, and the client gets a fast,
+            # explicit 503 instead.
+            status, body, headers = send(
                 proxy_port, "POST", "/v1/chat/completions", "tb-chatstream",
                 {**chat, "model": "chatstream-model", "stream": False})
-            assert status == 200, f"post-timeout request must be forwarded: {status} {body}"
-            print("3b OK: proxy timeout does not create cross-request key state")
+            assert status == 503, f"post-timeout request: {status} {body}"
+            assert headers.get("Retry-After") == "1", headers
+            assert body["error"]["type"] == "service_unavailable", body
+            assert body["error"]["message"] == \
+                "All upstream keys are temporarily unavailable", body
+            print("3b OK: proxy timeout -> short provider-fault avoid "
+                  "(immediate retry is a fast 503, not a re-hammer)")
 
             # Local per-key capacity is a proxy resource condition, not an
             # upstream rate limit: it returns 503 while the slot is occupied.
             first_done = threading.Event()
             def hold_capacity():
                 try:
+                    # Within the 1s non-streaming timeout: the holder must
+                    # succeed (a timeout would fault the key and turn the
+                    # follow-up below into a fast 503 instead).
                     send(proxy_port, "POST", "/v1/chat/completions", "tb-chatcap",
-                         {**chat, "model": "chatcap-model", "mock_delay": 2},
+                         {**chat, "model": "chatcap-model", "mock_delay": 0.6},
                          timeout=10)
                 finally:
                     first_done.set()

@@ -248,8 +248,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             request_conversion);
         const std::string &session_id = context.session_id;
         const auto scope = affinity_scope(ar.route.local_key_id, harness);
-        size_t start = affinity_start(affinity_, scope, session_id, cands);
-        handle_streaming(cands, candidate_bodies, request_id, start, session_id,
+        const auto bound = affinity_bound_index(affinity_, scope, session_id,
+                                                cands);
+        handle_streaming(cands, candidate_bodies, request_id, bound, session_id,
                          ar.route.account_id, ar.route.local_key_id,
                          context.endpoint_kind, harness, model,
                          std::move(parsed_json), std::move(parsed_request),
@@ -292,13 +293,15 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         harness == ir::ApiFormat::OpenAIResponses &&
         responses_request_needs_tool_adapter(context.parsed_ir);
 
-    // Session-affinity spillover: start at the session's preferred candidate
-    // and wrap around in fixed order (P, P+1, …, n-1, 0, …, P-1).
+    // The session's bound key (when one is live) pins its own group's start;
+    // everything else is ordered by candidate_order.
     const std::string &session_id = context.session_id;
     const auto scope = affinity_scope(ar.route.local_key_id, harness);
-    size_t start = affinity_start(affinity_, scope, session_id, cands);
+    const auto bound = affinity_bound_index(affinity_, scope, session_id,
+                                            cands);
     const auto order = candidate_order(
-        cands, start, routing_rr_.fetch_add(1, std::memory_order_relaxed));
+        cands, bound, routing_rr_.fetch_add(1, std::memory_order_relaxed),
+        wall_now_epoch(), &cost_ledger_, &gate_);
     const auto base_timeouts = timeout_config_cached(request_policy.kind);
     const int budget_seconds = base_timeouts.non_streaming_timeout > 0
         ? base_timeouts.non_streaming_timeout : 600;

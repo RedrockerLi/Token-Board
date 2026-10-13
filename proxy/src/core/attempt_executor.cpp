@@ -33,11 +33,46 @@ AccountGate::KeyAcquireResult AttemptExecutor::acquire(
 void AttemptExecutor::complete(
     const UpstreamCandidate &candidate,
     const UpstreamClient::ForwardResult &result) const {
-    if (result.status_code == 429 && result.usage_limit &&
-        candidate.account().extended_usage_limit_cooldown) {
-        gate_.mark_subscription_cooldown(candidate.key_slot_id);
+    const int slot = candidate.key_slot_id;
+    const std::int64_t now = wall_now_epoch();
+    if (result.success) {
+        // A completed call is ground truth that clears the short-lived
+        // failure states; the quota cooldown is only lifted by reset
+        // evidence (a slot inside the cooldown is skipped and cannot
+        // succeed here).
+        gate_.note_success(slot);
+    } else if (result.status_code == 429 && result.usage_limit &&
+               candidate.account().extended_usage_limit_cooldown) {
+        // Explicit subscription quota exhaustion: prefer the trusted window
+        // reset over the fixed fallback and record the evidence.
+        const auto plan = quota_cooldown_plan(candidate, result.limit_window,
+                                              now);
+        gate_.mark_subscription_cooldown(
+            slot,
+            std::chrono::seconds(std::max<std::int64_t>(
+                1, plan.until_wall - now)),
+            AccountGate::CooldownEvidence{plan.window, plan.evidence_resets_at,
+                                          now});
+    } else if (result.status_code == 429) {
+        // An ordinary 429 is rate limiting, not a subscription quota: a short
+        // avoid honoring the upstream's Retry-After, never the retained
+        // cooldown.
+        const int seconds = result.retry_after_seconds > 0
+            ? std::min(result.retry_after_seconds, 86400)
+            : static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+                                   AccountGate::RATE_LIMIT_AVOID)
+                                   .count());
+        gate_.mark_rate_limited(slot, std::chrono::seconds(seconds));
+    } else if (result.status_code == 401 || result.status_code == 403) {
+        gate_.mark_auth_error(slot);
+    } else if ((result.status_code >= 500 || result.is_timeout) &&
+               result.failure_kind != UpstreamFailureKind::RequestConversion) {
+        // Provider faults (5xx, transport timeouts) get a short avoid that a
+        // later success clears; local conversion failures never blame the
+        // key.
+        gate_.mark_provider_fault(slot);
     }
-    gate_.release(candidate.key_slot_id);
+    gate_.release(slot);
 }
 
 bool AttemptExecutor::should_retry(
@@ -82,6 +117,8 @@ AttemptOutcome AttemptExecutor::run(
     AttemptOutcome outcome;
     bool saw_concurrency_full = false;
     bool saw_subscription_cooldown = false;
+    bool saw_rate_limited = false;
+    bool saw_key_unavailable = false;
     for (std::size_t position = 0; position < order.size(); ++position) {
         const std::size_t index = order[position];
         if (index >= candidates.size()) continue;
@@ -94,13 +131,31 @@ AttemptOutcome AttemptExecutor::run(
                 acquire_result == AccountGate::KeyAcquireResult::kConcurrencyFull;
             saw_subscription_cooldown = saw_subscription_cooldown ||
                 acquire_result == AccountGate::KeyAcquireResult::kSubscriptionCooldown;
+            if (acquire_result == AccountGate::KeyAcquireResult::kRateLimited) {
+                saw_rate_limited = true;
+                const int wait =
+                    gate_.rate_limit_avoid_seconds(candidate.key_slot_id);
+                if (wait > 0 &&
+                    (outcome.no_candidate_retry_after == 0 ||
+                     wait < outcome.no_candidate_retry_after))
+                    outcome.no_candidate_retry_after = wait;
+            } else if (acquire_result == AccountGate::KeyAcquireResult::kAuthError ||
+                       acquire_result ==
+                           AccountGate::KeyAcquireResult::kProviderFault) {
+                saw_key_unavailable = true;
+            }
             continue;
         }
+        // The lease releases the slot if this iteration unwinds (an exception
+        // inside a forward callback); complete() releases it on the normal
+        // paths and the lease is disarmed afterwards.
+        GateLease lease(gate_, candidate.key_slot_id);
 
         const auto now = std::chrono::steady_clock::now();
         const auto remaining = std::chrono::duration_cast<
             std::chrono::milliseconds>(deadline - now).count();
         if (remaining <= 0) {
+            lease.disarm();
             gate_.release(candidate.key_slot_id);
             outcome.result.status_code = 504;
             outcome.result.is_timeout = true;
@@ -123,6 +178,7 @@ AttemptOutcome AttemptExecutor::run(
             outcome.result.status_code >= 200 &&
             outcome.result.status_code < 300;
         complete(candidate, outcome.result);
+        lease.disarm();
 
         const bool retry = should_retry(outcome.result, downstream_gone,
                                         position + 1 < order.size());
@@ -138,7 +194,10 @@ AttemptOutcome AttemptExecutor::run(
             ? NoCandidateReason::kLocalCapacity
             : saw_subscription_cooldown
                 ? NoCandidateReason::kProviderQuotaCooldown
-                : NoCandidateReason::kNone;
+                : saw_rate_limited
+                    ? NoCandidateReason::kKeyRateLimited
+                    : saw_key_unavailable ? NoCandidateReason::kKeyUnavailable
+                                          : NoCandidateReason::kNone;
     }
     return outcome;
 }

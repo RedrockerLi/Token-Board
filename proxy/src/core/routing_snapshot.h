@@ -25,19 +25,34 @@ struct UpstreamRuntime {
     std::shared_ptr<const std::vector<std::string>> catalog_ref;
 };
 
+// Rolling-window lifecycle reported by the usage poller.  Only the 5h window
+// can be idle: an unused rolling window's reset stamp is a placeholder
+// (observation moment + window duration), so nothing is expiring yet.  State
+// is never guessed: an ambiguous or missing stamp reads as kUnknown.
+enum class WindowState {
+    kStarted,
+    kIdle,
+    kUnknown,
+};
+
 // One quota window of an "opencode-go" credential, parsed from the usage
 // snapshot the Python poller writes into upstream_credentials.usage_json.
 struct UsageWindow {
     std::string name;                         // "5h" / "week" / "month"
     int percent = 0;                          // 0..100 used
     std::int64_t resets_at = 0;               // epoch seconds; 0 == unknown
+    WindowState state = WindowState::kUnknown;
 };
 
 // Parsed usage of one credential.  The snapshot owns at most one instance per
 // credential and shares it with every candidate referencing that credential.
 struct CredentialUsage {
     std::vector<UsageWindow> windows;
-    bool exhausted = false;                   // any window >= 100%
+    // Wall-clock epoch of the last SUCCESSFUL usage observation (0 = never).
+    // Snapshot freshness and cooldown-recovery evidence derive from it; the
+    // routed exhausted/veto decision is computed per request in
+    // candidate_selection.h, never frozen here.
+    std::int64_t observed_at = 0;
 };
 
 struct CredentialRuntime {

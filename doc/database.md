@@ -20,11 +20,16 @@ V2.5 给上游增加一类子分类标识与密钥级展示/观测字段。`upst
 的子分类（NULL = 普通账户，当前取值 `opencode-go`）；`upstream_credentials.label` 是密钥
 名称；`upstream_credentials.usage_json` 是该密钥的用量快照，由用量轮询按子分类的用量查询
 路径探测上游后写入本机，不进入配置同步，云端不含这些观测。快照形状为
-`{checked_at,error,windows{5h,week,month:{percent,resets_at}},monthly_period{start,end}}`：
-`checked_at` 是观测时刻，`error` 是查询失败原因，`windows` 是各窗口的用量百分比与重置
-时刻（`resets_at` 原样保留上游返回的重置时刻，任何 percent 都记：0% 只说明用量不足 1%，
-窗口可能仍在计时；代理候选微调与看板都按它判断/展示），`monthly_period` 是观测到的月度
-周期边界。
+`{checked_at,error,windows{5h,week,month:{percent,resets_at,state}},monthly_period{start,end}}`：
+`checked_at` 是最近一次**成功**观测时刻（查询失败只写 `error` 并完整保留旧快照与旧
+`checked_at`，从未成功过的密钥没有该字段），`windows` 是各窗口的用量百分比、重置时刻与
+生命周期 `state`（`started`/`idle`/`unknown`；`resets_at` 原样保留上游返回的重置时刻，
+任何 percent 都记——0% 只说明用量不足 1%），`monthly_period` 是观测到的月度周期边界。
+结构不完整的响应（任一窗口缺失或 percent 不可用）按查询失败处理，防止不完整的新观测
+解除已确认的耗尽。代理按 `checked_at` 判定快照新鲜度（10 分钟）并据 `state` 区分滚动
+窗口是否已启动，看板按 `resets_at` 显示重置倒计时——完整调度语义见
+[proxy-internals.md](proxy-internals.md)。计费仍按它自己的契约判定：快照超过 48 小时、
+带 `error` 或缺少完整月度周期即视为缺失，回落到锚点日。
 
 ## V2.4 历史增量
 

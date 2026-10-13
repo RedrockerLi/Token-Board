@@ -124,6 +124,23 @@ def wait_probe(upstream_port, key, after_count):
     raise AssertionError(f"cooldown probe for {key} never fired")
 
 
+def send_until_start(db_path, proxy_port, local_key, body, model, key_id,
+                     min_id):
+    """Send requests until one starts at *key_id*.
+
+    Tied candidates rotate their start per request, so a scenario that must
+    exercise a specific first key is reached by exercising both parities.
+    Returns (rid, statuses, keys) of the matching request.
+    """
+    rid = min_id
+    for _ in range(2):
+        send(proxy_port, local_key, body)
+        rid, _, statuses, keys = latest_attempts(db_path, model, rid)
+        if keys and keys[0] == key_id:
+            return rid, statuses, keys
+    raise AssertionError(f"{model}: no request started at key {key_id}")
+
+
 def chat_probe_count(log_path, key):
     """Minimal "你好" probe POSTs for *key* recorded in the mock log."""
     if not Path(log_path).exists():
@@ -250,45 +267,59 @@ def main() -> None:
             print(f"OK: probe cleared key1 early (req3 served by key1 {p1_id})")
 
             # ── negative: re-cool key1, keep mock 429; probe retains cooldown ──
-            send(proxy_port, "tb-p", {**common, "model": "p-model",
-                "mock_status_by_key": {"sk-p1": 429, "sk-p2": 200},
-                "mock_error_type_by_key": {"sk-p1": "GoUsageLimitError"}})
-            rid4, _, st4, _ = latest_attempts(db_path, "p-model", rid3)
-            assert st4 == [429, 200], f"req4 recool chain {st4}"
+            # Only the request that starts at key1 re-cools it, so send until
+            # the rotation actually does.
+            recool_body = {**common, "model": "p-model",
+                           "mock_status_by_key": {"sk-p1": 429, "sk-p2": 200},
+                           "mock_error_type_by_key":
+                               {"sk-p1": "GoUsageLimitError"}}
+            rid4, st4, keys4 = send_until_start(
+                db_path, proxy_port, "tb-p", recool_body, "p-model", p1_id,
+                rid3)
+            assert st4 == [429, 200], f"req4 recool chain {st4} {keys4}"
             ctrl(upstream_port, "POST", "/__ctrl", {"set": {"sk-p1": 429}})
             before = ctrl(upstream_port, "GET", "/__ctrl/status")["probes"].get("sk-p1", 0)
             wait_probe(upstream_port, "sk-p1", before)   # probe saw 429 again
-            send(proxy_port, "tb-p", {**common, "model": "p-model"})
-            _, _, st5, keys5 = latest_attempts(db_path, "p-model", rid4)
-            assert st5 == [200] and keys5[0] == p2_id, \
-                f"req5 must still be served by p2 (probe saw 429): st={st5} keys={keys5}"
-            print(f"OK: probe kept key1 cooled (req5 served by key2 {p2_id})")
+            # Both start parities: key1 must be skipped (never attempted) and
+            # key2 must keep serving.
+            for _ in range(2):
+                send(proxy_port, "tb-p", {**common, "model": "p-model"})
+                rid4, _, st5, keys5 = latest_attempts(db_path, "p-model", rid4)
+                assert st5 == [200] and keys5[0] == p2_id, \
+                    f"req5 must be served by p2 (probe saw 429): st={st5} keys={keys5}"
+                assert p1_id not in keys5, \
+                    f"re-cooled key1 must never be attempted: {keys5}"
+            print(f"OK: probe kept key1 cooled (requests served by key2 {p2_id})")
 
             # ── chat-probe flow: tb-q's account carries a catalog model, so
             #    its recovery probe is a minimal "你好" chat per interval ──
             ctrl(upstream_port, "POST", "/__ctrl", {"set": {"sk-q1": 429}})
-            send(proxy_port, "tb-q", {**common, "model": "q-model",
-                "mock_status_by_key": {"sk-q1": 429, "sk-q2": 200},
-                "mock_error_type_by_key": {"sk-q1": "GoUsageLimitError"}})
-            qrid, _, qst, qkeys = latest_attempts(db_path, "q-model")
-            assert qst == [429, 200] and qkeys[0] == q1_id \
-                and qkeys[1] == q2_id, f"chat probe req1 chain {qst} {qkeys}"
+            q_body = {**common, "model": "q-model",
+                      "mock_status_by_key": {"sk-q1": 429, "sk-q2": 200},
+                      "mock_error_type_by_key": {"sk-q1": "GoUsageLimitError"}}
+            qrid, qst, qkeys = send_until_start(
+                db_path, proxy_port, "tb-q", q_body, "q-model", q1_id, 0)
+            assert qst == [429, 200] and qkeys[1] == q2_id, \
+                f"chat probe req1 chain {qst} {qkeys}"
             wait_chat_probe(log_path, "sk-q1", 0)  # pinned 429 keeps cooling
-            send(proxy_port, "tb-q", {**common, "model": "q-model"})
-            qrid, _, qst, qkeys = latest_attempts(db_path, "q-model", qrid)
-            assert qst == [200] and qkeys[0] == q2_id, \
-                f"q1 stays cooling while the chat probe is pinned " \
-                f"(q2 serves): {qst} {qkeys}"
+            for _ in range(2):
+                send(proxy_port, "tb-q", {**common, "model": "q-model"})
+                qrid, _, qst, qkeys = latest_attempts(db_path, "q-model", qrid)
+                assert qst == [200] and qkeys[0] == q2_id, \
+                    f"q1 stays cooling while the chat probe is pinned " \
+                    f"(q2 serves): {qst} {qkeys}"
+                assert q1_id not in qkeys, \
+                    f"cooling q1 must never be attempted: {qkeys}"
             print(f"OK: chat probe saw 429, q1 stayed cooling (q2 {q2_id})")
 
             before = chat_probe_count(log_path, "sk-q1")
             ctrl(upstream_port, "POST", "/__ctrl", {"set": {"sk-q1": 200}})
             wait_chat_probe(log_path, "sk-q1", before)  # probe ran after flip
             time.sleep(0.5)  # let the cleared cooldown land before asking again
-            send(proxy_port, "tb-q", {**common, "model": "q-model"})
-            qrid, _, qst, qkeys = latest_attempts(db_path, "q-model", qrid)
-            assert qst == [200] and qkeys[0] == q1_id, \
-                f"chat probe must clear q1: {qst} {qkeys}"
+            qrid, qst, qkeys = send_until_start(
+                db_path, proxy_port, "tb-q", {**common, "model": "q-model"},
+                "q-model", q1_id, qrid)
+            assert qst == [200], f"chat probe must clear q1: {qst} {qkeys}"
             print(f"OK: chat probe cleared q1 ({qst} {qkeys})")
 
             print("cooldown probe test passed")

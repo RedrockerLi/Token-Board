@@ -17,12 +17,11 @@ void ProxyServer::enqueue_log(
     int ttft_ms, int generation_ms, double output_tps, int upstream_ttft_ms,
     int upstream_duration_ms, int attempt_count,
     const std::vector<Database::AttemptInfo> &attempts) {
-    double cost = 0.0;
     const bool accepted = recorder_.log_request(
             account_id, local_key_id, usage, is_streaming, status_code,
             duration_ms, upstream_key_id, ttft_ms, generation_ms, output_tps,
             upstream_ttft_ms, upstream_duration_ms, attempt_count, attempts,
-            current_request_queue_delay_ms(), &cost,
+            current_request_queue_delay_ms(), nullptr,
             accounting_reservation_.get());
     if (!accepted) {
         // The token remains live when record construction or queue admission
@@ -41,8 +40,6 @@ void ProxyServer::enqueue_log(
     // the writer queue.  Resetting the empty shared_ptr is intentionally
     // harmless and makes the ownership transition explicit.
     accounting_reservation_.reset();
-    if (upstream_key_id != 0 && cost > 0.0)
-        cost_ledger_.add(upstream_key_id, cost);
 }
 
 void ProxyServer::enqueue_zero_usage(
@@ -102,10 +99,11 @@ void ProxyServer::start_cooldown_probe() {
 }
 
 void ProxyServer::cooldown_probe_loop() {
-    // Sleep in 200ms slices so shutdown is prompt; two independent cadences
-    // share the thread — the faster one is pure local reads.
+    // Sleep in 200ms slices so shutdown is prompt; three independent cadences
+    // share the thread — the frequent ones are pure local reads.
     auto next_usage_watch = std::chrono::steady_clock::now();
     auto next_probe = next_usage_watch;
+    auto next_ledger = next_usage_watch;
     while (!cooldown_probe_stop_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         const auto now = std::chrono::steady_clock::now();
@@ -119,6 +117,11 @@ void ProxyServer::cooldown_probe_loop() {
             next_probe = now +
                 std::chrono::seconds(cooldown_probe_interval_secs_);
         }
+        if (now >= next_ledger) {
+            run_ledger_refresh_cycle();
+            next_ledger = now +
+                std::chrono::seconds(ledger_refresh_interval_secs_);
+        }
     }
 }
 
@@ -126,26 +129,74 @@ void ProxyServer::run_usage_watch_cycle() {
     const auto now = std::chrono::steady_clock::now();
     const auto cooling = gate_.cooling_keys(now);
     if (cooling.empty()) return;
+    const std::int64_t wall_now = wall_now_epoch();
     for (const int key_slot_id : cooling) {
         const auto target = db_.lookup_probe_target(key_slot_id);
         if (!target) continue;  // key/account deleted meanwhile — cooldown is
                                 // in-memory and will expire on its own.
         if (!target->usage_watch) continue;  // HTTP probe cycle handles it
+        AccountGate::CooldownEvidence evidence;
+        if (!gate_.cooldown_evidence(key_slot_id, &evidence)) continue;
         const auto usage =
             parse_credential_usage(key_slot_id, target->usage_json);
-        if (usage != nullptr && !usage->exhausted) {
-            // The provider's own quota report no longer marks this key as
-            // spent — the same signal scheduling trusts, so the cooldown can
-            // be cleared without any upstream contact.
+        // Recovery evidence must be fresh: a stale snapshot (or none) proves
+        // nothing and keeps the key cooling until its deadline.
+        if (!usage_snapshot_fresh(usage.get(), wall_now)) continue;
+        // A reported-spent window whose trusted reset is still ahead keeps
+        // the veto in force — nothing may lift a confirmed exhaustion while
+        // the window it named has not reset.
+        bool exhausted = false;
+        for (const auto &window : usage->windows) {
+            if (window.percent >= kExhaustedPercent &&
+                window.resets_at > wall_now) {
+                exhausted = true;
+                break;
+            }
+        }
+        if (exhausted) continue;
+        bool clear = false;
+        if (!evidence.window.empty() && evidence.resets_at > 0) {
+            // Clear only on reset evidence: the evidence window must have
+            // begun a new cycle (its reset stamp moved).  A percentage that
+            // merely reads below 100 again — integer rounding — is not a
+            // reset, and clearing on it would only produce a 429 loop.
+            const auto *window =
+                find_usage_window(usage.get(), evidence.window.c_str());
+            clear = window != nullptr &&
+                    window->resets_at != evidence.resets_at;
+        } else if (usage->observed_at > evidence.marked_wall) {
+            // No window evidence was recorded at marking time; an observation
+            // completed after the mark that shows no exhausted window is the
+            // best available evidence.
+            clear = true;
+        }
+        TB_LOG_DEBUG(
+            "[Proxy] cooldown watch: key %d evidence=(%s,%lld) observed=%lld "
+            "clear=%d\n",
+            key_slot_id, evidence.window.empty() ? "-" : evidence.window.c_str(),
+            static_cast<long long>(evidence.resets_at),
+            static_cast<long long>(usage->observed_at), clear ? 1 : 0);
+        if (clear) {
             gate_.clear_cooldown(key_slot_id);
             TB_LOG_DEBUG(
-                    "[Proxy] cooldown: key %d quota recovered per the usage "
+                    "[Proxy] cooldown: key %d reset observed in the usage "
                     "snapshot, cooldown cleared\n",
                     key_slot_id);
         }
-        // No usable usage data keeps the key cooling; the poller's next pass
-        // produces fresh data and the 5h window remains the backstop.
     }
+}
+
+void ProxyServer::run_ledger_refresh_cycle() {
+    std::vector<Database::KeyCostTotals> totals;
+    if (!db_.load_key_cost_totals(totals)) return;
+    std::vector<KeyCostLedger::SlotTotals> slots;
+    slots.reserve(totals.size());
+    for (const auto &row : totals) {
+        slots.push_back(KeyCostLedger::SlotTotals{
+            row.key_slot_id, row.priced_cost, row.priced_tokens,
+            row.unpriced_tokens, row.requests});
+    }
+    cost_ledger_.refresh(slots);
 }
 
 void ProxyServer::run_cooldown_probe_cycle() {

@@ -5,8 +5,8 @@ Drives the real proxy with an aggregate topology (plan account with two keys
 + Deepseek-API fallback) and asserts the request_attempts chains:
 
   A3  no fallback account: all plan keys cooled → fast 429 with 0 attempts.
-  A4  fallback 502 does not create cross-request key backoff; the next request
-      retries that fallback immediately.
+  A4  a fallback 502 gives that key a short provider-fault avoid; the
+      immediate retry is a fast 429 with 0 attempts.
   B1  non-streaming 5xx fast-fail → [plan/500, plan/500, api/200].
   B2  streaming 429 pre-commit → buffered, not written to the client →
       [plan/429, plan/429, api/200].
@@ -167,18 +167,23 @@ def main() -> None:
             assert n2 == 0 and st2 == [], f"A3 req2 must be 0-attempt fast 429: {st2}"
             print(f"A3 OK: all plan cooled, no fallback -> 0-attempt 429 (chain1={st})")
 
-            # ── A4: plan cooled + fallback 502 is not remembered ──
+            # ── A4: a fallback 502 faults that key for a short avoid ──
             send(proxy_port, "tb-a4", {**common, "model": "a4-model", "stream": False,
                 "mock_status_by_key": {"sk-a4-p1": 429, "sk-a4-p2": 429, "sk-a4-d": 502},
                 "mock_error_type_by_key": {"sk-a4-p1": "GoUsageLimitError",
                                            "sk-a4-p2": "GoUsageLimitError"}})
             rid, _, st = latest_attempts(db_path, "a4-model")
             assert st == [429, 429, 502], f"A4 req1 chain {st}"
-            send(proxy_port, "tb-a4", {**common, "model": "a4-model", "stream": False})
+            # req2 (immediate): both plan keys are in their retained quota
+            # cooldown and the fallback carries the provider-fault avoid the
+            # 502 created — nothing is tried, and the client gets the
+            # provider-cooldown 429 without touching the upstream.
+            status = send(proxy_port, "tb-a4", {**common, "model": "a4-model", "stream": False})
             _, n2, st2 = latest_attempts(db_path, "a4-model", rid)
-            assert n2 == 1 and st2 == [200], f"A4 req2 must retry fallback: {n2=} {st2}"
-            print(f"A4 OK: fallback 502 does not create key backoff "
-                  f"(chain1={st}, chain2={st2})")
+            assert n2 == 0 and st2 == [], f"A4 req2 must be a fast 429: {n2=} {st2}"
+            assert status == 429, f"A4 req2 status {status}"
+            print(f"A4 OK: fallback 502 -> short provider-fault avoid, "
+                  f"immediate retry is a fast 429 (chain1={st})")
 
             # ── B1: non-streaming 5xx fast-fail → next candidates ──
             send(proxy_port, "tb-b1", {**common, "model": "b1-model", "stream": False,

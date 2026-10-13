@@ -2,7 +2,7 @@
 void ProxyServer::handle_streaming(
     const std::vector<UpstreamCandidate> &cands,
     const std::vector<CandidateRequestBody> &candidate_bodies,
-    std::uint64_t request_id, size_t start,
+    std::uint64_t request_id, std::optional<size_t> bound_index,
     const std::string &session_id, int route_account_id, int local_key_id,
     EndpointKind endpoint_kind,
     ir::ApiFormat harness,
@@ -18,7 +18,9 @@ void ProxyServer::handle_streaming(
     set_proxy_log_stream_fields(log_context, resolved_model, route_account_id, local_key_id);
     const std::string content_type = req.has_header("Content-Type") ? req.get_header_value("Content-Type") : "application/json";
     const std::string scope = affinity_scope(local_key_id, harness);
-    const auto order = candidate_order(cands, start, routing_rr_.fetch_add(1, std::memory_order_relaxed));
+    const auto order = candidate_order(
+        cands, bound_index, routing_rr_.fetch_add(1, std::memory_order_relaxed),
+        wall_now_epoch(), &cost_ledger_, &gate_);
     const auto base_timeouts = timeout_config_cached(request_policy.kind);
     const int budget_seconds = base_timeouts.streaming_first_byte_timeout > 0 ? base_timeouts.streaming_first_byte_timeout : 60; const auto deadline = t0 + std::chrono::seconds(budget_seconds);
     res.set_chunked_content_provider(
@@ -499,7 +501,8 @@ void ProxyServer::handle_streaming(
             const auto err = render_stream_error(
                 &codecs_.get(harness), final_result, attempts, last_timeout,
                 last_stream_error.is_null() ? json() : last_stream_error,
-                last_status, outcome.no_candidate_reason);
+                last_status, outcome.no_candidate_reason, nullptr,
+                outcome.no_candidate_retry_after);
             const char *final_reason = proxy_stream_terminal_failure_reason(
                 outcome, final_result, last_stream_error);
             log_proxy_request_final(log_context, final_reason, err.status, final_result.duration_ms, attempts.size(), final_result.timeout_secs, outcome.last_attempted);

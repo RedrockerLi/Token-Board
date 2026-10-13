@@ -19,6 +19,8 @@ enum class NoCandidateReason {
     kNone,
     kLocalCapacity,
     kProviderQuotaCooldown,
+    kKeyRateLimited,
+    kKeyUnavailable,
 };
 
 struct AttemptOutcome {
@@ -32,6 +34,9 @@ struct AttemptOutcome {
     bool successful = false;
     bool budget_exhausted = false;
     NoCandidateReason no_candidate_reason = NoCandidateReason::kNone;
+    // Smallest remaining rate-limit avoid among skipped candidates (seconds);
+    // the terminal renderer reports it as the downstream Retry-After.
+    int no_candidate_retry_after = 0;
 };
 
 class AttemptExecutor {

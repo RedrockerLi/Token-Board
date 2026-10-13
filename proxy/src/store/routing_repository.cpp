@@ -261,4 +261,44 @@ std::optional<Database::ProbeTarget> Database::lookup_probe_target(
     return t;
 }
 
+// ── load_key_cost_totals ─────────────────────────────────────────────────
+
+bool Database::load_key_cost_totals(std::vector<KeyCostTotals> &totals) {
+    totals.clear();
+    std::shared_lock<std::shared_mutex> lifecycle(lifecycle_mutex_);
+    std::lock_guard<std::mutex> lock(read_mutex_);
+    if (!read_db_) return false;
+    // Priced rows contribute their frozen equivalent_cost (the plan's virtual
+    // cost included); unpriced rows contribute only their tokens, which the
+    // ledger prices at the global priced cost per token.  Request counts are
+    // carried solely to derive an expected per-request cost for in-flight
+    // reservations — never as a consumption measure of their own.
+    const char *sql =
+        "SELECT upstream_key_id,"
+        " SUM(CASE WHEN equivalent_cost > 0 THEN equivalent_cost ELSE 0 END),"
+        " SUM(CASE WHEN equivalent_cost > 0 THEN total_tokens ELSE 0 END),"
+        " SUM(CASE WHEN (equivalent_cost IS NULL OR equivalent_cost <= 0)"
+        "          AND total_tokens > 0 THEN total_tokens ELSE 0 END),"
+        " SUM(CASE WHEN total_tokens > 0 THEN 1 ELSE 0 END)"
+        " FROM request_log WHERE upstream_key_id IS NOT NULL"
+        " GROUP BY upstream_key_id";
+    sqlite3_stmt *statement = nullptr;
+    if (sqlite3_prepare_v2(read_db_, sql, -1, &statement, nullptr) != SQLITE_OK) {
+        TB_LOG_ERROR("[DB] key-cost aggregate prepare error: %s\n",
+                     sqlite3_errmsg(read_db_));
+        return false;
+    }
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        KeyCostTotals row;
+        row.key_slot_id = sqlite3_column_int(statement, 0);
+        row.priced_cost = sqlite3_column_double(statement, 1);
+        row.priced_tokens = sqlite3_column_int64(statement, 2);
+        row.unpriced_tokens = sqlite3_column_int64(statement, 3);
+        row.requests = sqlite3_column_int64(statement, 4);
+        totals.push_back(row);
+    }
+    sqlite3_finalize(statement);
+    return true;
+}
+
 // ── log_request ──────────────────────────────────────────────────────────

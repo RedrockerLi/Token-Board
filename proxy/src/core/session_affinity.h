@@ -1,52 +1,46 @@
 #pragma once
 
-#include "key_cost_ledger.h"
-
 #include <chrono>
 #include <cstdint>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-/// Bounded, process-local session to upstream-credential affinity.
+/// Bounded, process-local session to upstream-credential binding.
+///
+/// A binding exists only after a key successfully served the session; the
+/// request order then starts that group at the bound key so its cache stays
+/// warm.  Everything else about ordering (pressure, cost, exhaustion) lives
+/// in candidate_order — this class is a binding store, nothing more.
 class SessionAffinity {
 public:
     SessionAffinity() = default;
-    explicit SessionAffinity(KeyCostLedger *ledger) : ledger_(ledger) {}
 
-    size_t preferred_index(const std::string &scope,
-                           const std::string &session_id,
-                           const std::vector<int> &key_slot_ids) {
-        if (session_id.empty() || key_slot_ids.empty()) return 0;
+    /// Index (into `key_slot_ids`) of the session's live binding; nullopt for
+    /// an empty/expired session, an unknown session or a bound key that is
+    /// not part of this candidate set.
+    std::optional<size_t> bound_index(const std::string &scope,
+                                      const std::string &session_id,
+                                      const std::vector<int> &key_slot_ids) {
+        if (session_id.empty() || key_slot_ids.empty()) return std::nullopt;
         const std::string key = digest(scope, session_id);
         std::lock_guard<std::mutex> lock(mutex_);
         auto now = std::chrono::steady_clock::now();
         auto it = bindings_.find(key);
-        if (it != bindings_.end()) {
-            if (now - it->second.last_seen > ttl_) {
-                lru_.erase(it->second.lru_it);
-                bindings_.erase(it);
-            } else {
-                it->second.last_seen = now;
-                lru_.splice(lru_.begin(), lru_, it->second.lru_it);
-                for (size_t i = 0; i < key_slot_ids.size(); ++i)
-                    if (key_slot_ids[i] == it->second.key_slot_id) return i;
-            }
+        if (it == bindings_.end()) return std::nullopt;
+        if (now - it->second.last_seen > ttl_) {
+            lru_.erase(it->second.lru_it);
+            bindings_.erase(it);
+            return std::nullopt;
         }
-        if (ledger_) return ledger_->lowest_cost_index(key_slot_ids);
-        size_t best = 0;
-        uint64_t best_score = 0;
-        for (size_t i = 0; i < key_slot_ids.size(); ++i) {
-            const uint64_t score = hash64(
-                key + "#" + std::to_string(key_slot_ids[i]));
-            if (i == 0 || score > best_score) {
-                best = i;
-                best_score = score;
-            }
-        }
-        return best;
+        it->second.last_seen = now;
+        lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+        for (size_t i = 0; i < key_slot_ids.size(); ++i)
+            if (key_slot_ids[i] == it->second.key_slot_id) return i;
+        return std::nullopt;
     }
 
     void bind(const std::string &scope, const std::string &session_id,
@@ -94,5 +88,4 @@ private:
     std::mutex mutex_;
     std::list<std::string> lru_;
     std::unordered_map<std::string, Entry> bindings_;
-    KeyCostLedger *ledger_ = nullptr;
 };

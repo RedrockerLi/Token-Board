@@ -68,15 +68,31 @@ def iso_after(seconds: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
 
 
+# Every key of one subscription reports the same absolute week/month period
+# ends (the upstream's calendar boundaries do not depend on when a key was
+# queried).  Pin them once so sibling ordering is decided by the rolling
+# window — never by per-write timestamp offsets.
+_BOUNDARY_EPOCH = time.time()
+
+
+def _iso_epoch(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
 def usage_snapshot(percent: int, resets_in: float) -> str:
     """The frozen usage_json shape the Python poller writes."""
     return json.dumps({
         "checked_at": iso_after(0),
         "error": None,
         "windows": {
-            "5h": {"percent": percent, "resets_at": iso_after(resets_in)},
-            "week": {"percent": 3, "resets_at": iso_after(3 * 86400)},
-            "month": {"percent": 2, "resets_at": iso_after(20 * 86400)},
+            "5h": {"percent": percent, "resets_at": iso_after(resets_in),
+                   "state": "started"},
+            "week": {"percent": 3,
+                     "resets_at": _iso_epoch(_BOUNDARY_EPOCH + 3 * 86400),
+                     "state": "started"},
+            "month": {"percent": 2,
+                      "resets_at": _iso_epoch(_BOUNDARY_EPOCH + 20 * 86400),
+                      "state": "started"},
         },
         "monthly_period": {"start": iso_after(-86400),
                            "end": iso_after(29 * 86400)},
@@ -135,6 +151,26 @@ def set_usage(db_path, runtime_id, snapshot):
         conn.commit()
     finally:
         conn.close()
+
+
+def send_until_served(db_path, proxy_port, local_key, body, model, key_id,
+                      min_id, deadline=8.0):
+    """Send until a request is served by *key_id*.
+
+    The usage watch lifts a cooldown on its own cadence, so recovery is
+    polled (one request per idle cycle) instead of timed.
+    """
+    end = time.monotonic() + deadline
+    rid = min_id
+    statuses, keys = [], []
+    while time.monotonic() < end:
+        send(proxy_port, local_key, body)
+        rid, _, statuses, keys = latest_attempts(db_path, model, rid)
+        if keys and keys[0] == key_id:
+            return rid, statuses, keys
+        time.sleep(0.4)
+    raise AssertionError(
+        f"{model}: key {key_id} was never served: {statuses} {keys}")
 
 
 def latest_attempts(db_path, model, min_id=0):
@@ -239,11 +275,15 @@ def main() -> None:
         # Short cadences so S6 reaches the recovery cycles within the run.
         env = {**os.environ, "TB_COOLDOWN_PROBE_SECS": "2",
                "TB_USAGE_WATCH_SECS": "2"}
+        command = [str(proxy_binary), "--db", str(db_path), "--host",
+                   "127.0.0.1", "--port", str(proxy_port)]
+        if os.environ.get("TB_TEST_DEBUG"):
+            command.extend(["--log-level", "debug"])
         proxy = subprocess.Popen(
-            [str(proxy_binary), "--db", str(db_path), "--host", "127.0.0.1",
-             "--port", str(proxy_port)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-            env=env)
+            command,
+            stdout=None if os.environ.get("TB_TEST_DEBUG") else subprocess.DEVNULL,
+            stderr=None if os.environ.get("TB_TEST_DEBUG") else subprocess.PIPE,
+            text=True, env=env)
         try:
             wait_for_health(proxy_port)
 
@@ -317,14 +357,18 @@ def main() -> None:
             print(f"S3 OK: usage order lead->late->exhausted "
                   f"(attempts={statuses}, keys={keys})")
 
+            # S3's plain 429s put lead and late into their short rate-limit
+            # avoid, so the immediate streaming request goes straight to the
+            # one remaining key — a spent window is the last resort only when
+            # nothing else is available.
             status, text = send(proxy_port, "tb-oc1",
                                 {**common, "stream": True, **flags})
             rid, _, statuses, keys = latest_attempts(db_path, "oc1-model", rid)
             assert status == 200 and "[DONE]" in text, f"S4 streaming status {status}"
-            assert statuses == [429, 429, 200], f"S4 streaming attempts {statuses}"
-            assert keys == [lead, late, exhausted], f"S4 streaming keys {keys}"
-            print(f"S4 OK: streaming 429 pre-commit falls back to the healthy "
-                  f"sibling (attempts={statuses})")
+            assert statuses == [200] and keys == [exhausted], \
+                f"S4 must go straight to the remaining key: {statuses} {keys}"
+            print("S4 OK: sibling 429s hold their avoid; streaming reaches "
+                  f"the remaining key directly (attempts={statuses})")
 
             # ── S5: every key 429 → the client receives the error ───────
             status, text = send(proxy_port, "tb-oc2", {
@@ -361,12 +405,17 @@ def main() -> None:
                 "mock_error_type_by_key": {"sk-oc4-p1": "GoUsageLimitError"}})
             rid, _, statuses, keys = latest_attempts(db_path, "oc4-model")
             assert statuses == [429, 200] and keys[1] == sibling, (statuses, keys)
-            time.sleep(3.0)  # >= one usage-watch cycle; usage says 30% -> clear
-            send(proxy_port, "tb-oc4", {
-                "stream": False, "model": "oc4-model",
-                "messages": [{"role": "user", "content": "cool p1 again"}]})
-            rid, _, statuses, keys = latest_attempts(db_path, "oc4-model", rid)
-            assert keys == [cooled], \
+            # Simulate the poller's next observation after the window reset:
+            # the rolling window began a new cycle, so its reset stamp has
+            # moved — the evidence the usage watch requires before lifting
+            # the cooldown (a merely similar percentage is not enough).
+            set_usage(db_path, cooled, usage_snapshot(5, 300))
+            rid, statuses, keys = send_until_served(
+                db_path, proxy_port, "tb-oc4",
+                {"stream": False, "model": "oc4-model",
+                 "messages": [{"role": "user", "content": "cool p1 again"}]},
+                "oc4-model", cooled, rid)
+            assert statuses == [200], \
                 f"S6: the recovered key must serve again (attempts={statuses}, {keys})"
             probes = ctrl(upstream_port, "GET", "/__ctrl/status")["probes"]
             assert probes.get("sk-oc4-p1", 0) == 0, \
@@ -380,7 +429,10 @@ def main() -> None:
                 "stream": False, "model": "oc4-model",
                 "messages": [{"role": "user", "content": "recool exhausted"}],
                 "mock_status_by_key": {"sk-oc4-p2": 429, "sk-oc4-p1": 429},
-                "mock_error_type_by_key": {"sk-oc4-p1": "GoUsageLimitError"}})
+                "mock_error_type_by_key": {"sk-oc4-p1": "GoUsageLimitError"},
+                # The sibling's plain 429 must not hold it for a minute: the
+                # re-cool request is followed by requests seconds later.
+                "mock_retry_after": 1})
             # Usage-exhausted p1 is scheduled last, so p2 answers 429 first
             # and p1 consumes the retry, re-entering the cooldown.
             rid, _, statuses, keys = latest_attempts(db_path, "oc4-model", rid)
@@ -393,12 +445,12 @@ def main() -> None:
             assert keys == [sibling], \
                 f"S6b: an exhausted key stays cooling (attempts={statuses}, {keys})"
             set_usage(db_path, cooled, usage_snapshot(18, 600))
-            time.sleep(3.0)  # recovered usage -> the cooldown clears again
-            send(proxy_port, "tb-oc4", {
-                "stream": False, "model": "oc4-model",
-                "messages": [{"role": "user", "content": "recovered again"}]})
-            _, _, statuses, keys = latest_attempts(db_path, "oc4-model", rid)
-            assert keys == [cooled], \
+            _, statuses, keys = send_until_served(
+                db_path, proxy_port, "tb-oc4",
+                {"stream": False, "model": "oc4-model",
+                 "messages": [{"role": "user", "content": "recovered again"}]},
+                "oc4-model", cooled, rid)
+            assert statuses == [200], \
                 f"S6b: recovery must clear the cooldown again (attempts={statuses}, {keys})"
             print("S6b OK: exhausted usage held the cooldown; recovery released it")
 

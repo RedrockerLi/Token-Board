@@ -70,10 +70,10 @@
 ### 多密钥带来的行为
 
 - **每把 Key 一个并发槽位**：`max_concurrency` 按 Key 计数，一把 Key 打满后请求溢流到下一把（[proxy/src/core/account_gate.h:13-16](proxy/src/core/account_gate.h#L13-L16)）。
-- **每把 Key 一个冷却单元**：plan 的配额 429 冷却按 `key_slot_id` 隔离，兄弟 Key 不受连坐。
-- **候选顺序**：同一账户的密钥按 `(position, runtime_id)` 排列，起点依次取**会话亲和**（该会话上次成功服务的 Key）→ **成本台账**（累计花费最小的 Key，见下）→ **轮转**，再沿固定顺序环绕尝试（[proxy/src/core/candidate_selection.h:27-46](proxy/src/core/candidate_selection.h#L27-L46)）。带用量快照的账户另做用量感知微调：**可用窗口（percent ≤ 70）的重置时刻比其它候选都早至少 30 分钟**的 Key 排到最前，**任一窗口 ≥100%** 的 Key 排到最后尝试，没有用量快照的候选不受影响。
-- **会话亲和(session affinity)**：同一会话（请求头 `x-session-id` / `x-claude-code-session-id` / `x-conversation-id`，否则取 body 的 OpenAI `user` 或 Anthropic `metadata.user_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/session_affinity.h:19-50](proxy/src/core/session_affinity.h#L19-L50)）。
-- **冷启动成本平衡**：新会话没有绑定记录时，优先选**累计消费最少**的 Key（进程内 `KeyCostLedger`，由记账线程异步喂数据），让多把 Key 按花费磨损得更均匀（[proxy/src/core/key_cost_ledger.h](proxy/src/core/key_cost_ledger.h)）。
+- **每把 Key 一个故障单元**：plan 的配额冷却与各类失败避让都按 `key_slot_id` 隔离（配额耗尽按可信重置冷却；普通 429 / 401 / 403 / 5xx / 超时各有短避让），兄弟 Key 不受连坐。
+- **候选顺序**：同一账户的密钥按 `(position, runtime_id)` 排列，组内排序（[proxy/src/core/candidate_selection.h](proxy/src/core/candidate_selection.h)）：耗尽窗口（≥100% 且重置未到）的 Key 排最后并按最早可信重置排序 → 会话绑定的 Key 最前 → 月/周/5h 窗口压力（剩余额度 ÷ 距重置时间，无容差）逐级 → 累计消耗最少 → 请求轮转兜底。带用量快照的 Key 只在快照新鲜（10 分钟）且窗口已启动时提供压力信号；没有用量数据的 Key 按累计消耗竞争，不因缺数据受损（完整语义见 [proxy-internals.md](proxy-internals.md)）。
+- **会话亲和(session affinity)**：同一会话（请求头 `x-session-id` / `x-claude-code-session-id` / `x-conversation-id`，否则取 body 的 OpenAI `user` 或 Anthropic `metadata.user_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/session_affinity.h](proxy/src/core/session_affinity.h)）。
+- **成本平衡**：没有会话绑定（或没有用量信号可比）时，优先选**累计消耗最少**的 Key——`KeyCostLedger` 每 5 分钟从 `request_log` 聚合等价成本（已计价为 0 但消耗了 token 的行按全局单价折算，账单为零不等于消耗为零），排序成本含在途请求的预期花费，重启后由首次聚合恢复（[proxy/src/core/key_cost_ledger.h](proxy/src/core/key_cost_ledger.h)）。
 - **上游会话头与 User-Agent**：带 OpenCode-Go 子分类的账户注入 `x-opencode-session`，取值依次为下游透传的该头 → 请求解析出的会话标识 → 稳定会话指纹（`tb-` + SHA-256(system 指令 + 首条 user 消息，去掉 cache_control) 的前 32 位）→ 随机值；这些上游请求另带固定 `User-Agent: token-board/1.0`（代理不转发下游的 User-Agent，普通账户不加这两个头）。
 - **每把 Key 一个订阅生命周期**：plan 账户的每把 Key 独立拥有 `valid_from` / `ends_at`，其中 `valid_from` 只保存 UTC 日期并固定从 `00:00Z` 生效，月费按「锚点日」各自切周期。删除密钥/账户按设置页「删除默认操作」执行：`immediate`（本期立即删除，本期计费）或 `end_of_period`（到期立即删除，本期计费、下期不计费——每把 Key 的 `ends_at` 设为自己的本期期末，到期前仍保持可路由；账户合同的 `ends_at` 取所有仍有效 Key 到期时间的最大值）。api 始终立即删除。
 - **观测**：会话→密钥的绑定只存在于进程内的 `SessionAffinity`（上限 10 万条、24 小时过期、不落库）；持久记录是 `request_log.upstream_key_id` 与 `request_attempts`。
@@ -124,7 +124,7 @@
 2. **模型解析**：从请求体取模型名，剥掉 Claude Code 的 `[1m]`/`[1M]` 后缀 → `resolve_candidates_cached` 按账户形态展开候选链（普通账户=每把 Key 一个候选；聚合=匹配 entry × 每把 Key）。无候选返回 400「模型不可用」。
 3. **候选循环**：每个候选先过 `try_acquire_eligible`（冷却检查 + 并发槽），成功才占用槽位转发。
 4. **转发**：客户端线格式与账户 `api_format` 相同走直通(passthrough)，不同走 IR 转换；超时按客户端线格式分三档。
-5. **失败处理**：429/5xx/401/403 且未向客户端发数据 → 记一次 attempt，标记失败（合同声明 `subscription_5h` 的账户收到明确的配额耗尽 429 → 该密钥 5h 冷却；其余失败不记忆）→ 试下一个候选。
+5. **失败处理**：429/5xx/401/403/超时且未向客户端发数据 → 记一次 attempt，并按类落 Key 级状态（配额耗尽 → 冷却到可信重置/5 小时兜底；普通 429 → `Retry-After`/60 秒避让；401/403 → 15 分钟；5xx/超时 → 30 秒）→ 试下一个候选；请求内容错误不换 Key 重试。
 6. **成功绑定**：成功后会话亲和绑定到该 Key；记账线程把结果入队写 `request_log`。
 
 ## 六、保存入库链路行为
@@ -224,9 +224,9 @@
 | `usage_path` | 相对路径 / null | 用量查询路径（`GET` + Bearer 认证）；null = 无用量查询 |
 | `models_path` | 相对路径 / null | 模型目录路径（看板"更新模型"用）；null = 默认 `{base}/models` |
 
-当前只有 `plan` 带子分类，仅一项 `opencode-go`：`label` 为 `OpenCode Go — $10/月 · 含用量查询`，预设 `base_url=https://opencode.ai/zen/go`、月费 $10（USD）、`anthropic` 线格式，用量查询 `/v1/usage`、模型目录 `/v1/models`。子分类写在账户上游行的 `upstreams.subtype`（NULL = 普通账户），只影响预设、上游会话头、看板"更新模型"与用量轮询：计费、路由、删除语义继续跟随 `plan` 类型，类型徽章也仍是类型的 `short_label`（opencode-go 账户显示 `Plan`）。
+当前只有 `plan` 带子分类，仅一项 `opencode-go`：`label` 为 `OpenCode Go — $10/月 · 含用量查询`，预设 `base_url=https://opencode.ai/zen/go`、月费 $10（USD）、`anthropic` 线格式，用量查询 `/v1/usage`、模型目录 `/v1/models`。子分类写在账户上游行的 `upstreams.subtype`（NULL = 普通账户），只影响预设、上游会话头、看板"更新模型"、用量轮询及其派生的用量感知调度与冷却恢复：计费、路由分组、删除语义继续跟随 `plan` 类型，类型徽章也仍是类型的 `short_label`（opencode-go 账户显示 `Plan`）。
 
-前端据此渲染账户弹窗左栏：类型卡片来自 `ACCOUNT_TYPES` 的 `label` / `short_label`，选中带子分类的类型后再在其下渲染子分类卡片，子分类名不硬编码在前端；轮询写入的用量快照在账户页以账户名悬浮卡展示（逐把密钥列出 5小时/本周/本月 用量与重置倒计时）。
+前端据此渲染账户弹窗左栏：类型卡片来自 `ACCOUNT_TYPES` 的 `label` / `short_label`，选中带子分类的类型后再在其下渲染子分类卡片，子分类名不硬编码在前端；轮询写入的用量快照在账户页以账户名悬浮卡展示（逐把密钥列出 5小时/本周/本月 用量与重置倒计时）。代理的用量感知调度按同一份快照工作：`state=started` 的窗口提供"重置前把额度用掉"的压力信号，`state=idle` 的滚动窗口（重置为占位值）不提供信号，过期快照不参与——任一窗口 100% 且重置未到的密钥排到最后（完整语义见 [proxy-internals.md](proxy-internals.md)）。
 
 ### 添加步骤（三步 + 两个按需）
 

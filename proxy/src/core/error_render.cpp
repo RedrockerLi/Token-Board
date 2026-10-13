@@ -50,7 +50,10 @@ int no_upstream_status(const UpstreamClient::ForwardResult &result,
                        NoCandidateReason reason) {
     if (result.is_timeout) return 504;
     if (attempts.empty())
-        return reason == NoCandidateReason::kProviderQuotaCooldown ? 429 : 503;
+        return reason == NoCandidateReason::kProviderQuotaCooldown ||
+                       reason == NoCandidateReason::kKeyRateLimited
+                   ? 429
+                   : 503;
     return result.status_code >= 400 ? result.status_code : 429;
 }
 
@@ -102,17 +105,26 @@ TerminalError render_terminal_error(
     } else if (!opts.used && attempts.empty()) {
         const bool provider_cooldown =
             opts.no_candidate_reason == NoCandidateReason::kProviderQuotaCooldown;
-        out.status = provider_cooldown ? 429 : 503;
-        out.retry_after_seconds = provider_cooldown ? 0 : 1;
+        const bool rate_limited =
+            opts.no_candidate_reason == NoCandidateReason::kKeyRateLimited;
+        const bool throttled = provider_cooldown || rate_limited;
+        out.status = throttled ? 429 : 503;
+        out.retry_after_seconds = provider_cooldown
+            ? 0
+            : rate_limited ? std::max(1, opts.no_candidate_retry_after) : 1;
         const char *message = provider_cooldown
             ? "All upstream keys are in provider quota cooldown"
-            : (opts.busy_message
-                   ? opts.busy_message
-                   : "All upstream key concurrency slots are occupied");
+            : rate_limited
+                ? "All upstream keys are rate limited"
+                : (opts.busy_message
+                       ? opts.busy_message
+                       : opts.no_candidate_reason ==
+                                 NoCandidateReason::kKeyUnavailable
+                             ? "All upstream keys are temporarily unavailable"
+                             : "All upstream key concurrency slots are occupied");
         normalized = from_body(out.status, json{
             {"message", message},
-            {"type", provider_cooldown ? "rate_limit_error"
-                                        : "service_unavailable"},
+            {"type", throttled ? "rate_limit_error" : "service_unavailable"},
             {"code", out.status}});
     } else if (opts.used && opts.passthrough && !fwd.body.empty()) {
         // Same-format upstream error: preserve its structured body verbatim.
@@ -152,7 +164,8 @@ NormalizedError render_stream_error(
     const FormatCodec *upstream_codec, const UpstreamClient::ForwardResult &fwd,
     const std::vector<Database::AttemptInfo> &attempts, bool last_timeout,
     const json &in_stream_error, int last_status,
-    NoCandidateReason no_candidate_reason, const char *busy_message) {
+    NoCandidateReason no_candidate_reason, const char *busy_message,
+    int no_candidate_retry_after) {
     NormalizedError out;
     out.status = last_timeout ? 504 : last_status;
     if (!in_stream_error.is_null()) {
@@ -173,16 +186,22 @@ NormalizedError render_stream_error(
     } else if (attempts.empty()) {
         const bool provider_cooldown =
             no_candidate_reason == NoCandidateReason::kProviderQuotaCooldown;
+        const bool rate_limited =
+            no_candidate_reason == NoCandidateReason::kKeyRateLimited;
+        const bool throttled = provider_cooldown || rate_limited;
         const char *message = provider_cooldown
             ? "All upstream keys are in provider quota cooldown"
-            : busy_message;
-        out = from_body(provider_cooldown ? 429 : 503,
+            : rate_limited ? "All upstream keys are rate limited"
+                           : busy_message;
+        out = from_body(throttled ? 429 : 503,
                         json{{"message", message},
-                             {"type", provider_cooldown
+                             {"type", throttled
                                           ? "rate_limit_error"
                                           : "service_unavailable"},
-                             {"code", provider_cooldown ? 429 : 503}});
-        out.retry_after_seconds = provider_cooldown ? 0 : 1;
+                             {"code", throttled ? 429 : 503}});
+        out.retry_after_seconds = provider_cooldown
+            ? 0
+            : rate_limited ? std::max(1, no_candidate_retry_after) : 1;
     } else {
         out = from_body(out.status,
                         normalize_upstream_error(upstream_codec, fwd,

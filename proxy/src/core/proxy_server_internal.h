@@ -35,23 +35,6 @@
 
 using json = nlohmann::json;
 
-class GateLease {
-public:
-    GateLease(AccountGate &gate, int key_slot_id) noexcept
-        : gate_(&gate), key_slot_id_(key_slot_id) {}
-    GateLease(const GateLease &) = delete;
-    GateLease &operator=(const GateLease &) = delete;
-    ~GateLease() { release(); }
-    void release() {
-        if (!gate_) return;
-        gate_->release(key_slot_id_);
-        gate_ = nullptr;
-    }
-private:
-    AccountGate *gate_;
-    int key_slot_id_;
-};
-
 template <typename F>
 class ScopeExit {
 public:
@@ -123,9 +106,13 @@ inline void configure_opencode_session(ForwardOptions &opts,
 
 std::string affinity_scope(int local_key_id, ir::ApiFormat harness);
 bool strict_terminal_enabled();
-size_t affinity_start(SessionAffinity &affinity, const std::string &scope,
-                      const std::string &session_id,
-                      const std::vector<UpstreamCandidate> &candidates);
+/// The session's live binding within this request's candidate list, or
+/// nothing.  The index only pins its own priority group's start inside
+/// candidate_order; it never reorders groups.
+std::optional<size_t> affinity_bound_index(
+    SessionAffinity &affinity, const std::string &scope,
+    const std::string &session_id,
+    const std::vector<UpstreamCandidate> &candidates);
 void record_responses_state(ProxyServer &server, const json &request_body,
                             const std::string &response_body,
                             const std::vector<json> *current_input = nullptr);
