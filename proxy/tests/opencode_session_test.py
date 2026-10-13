@@ -20,6 +20,9 @@ Drives the real proxy against mock_upstream with "opencode-go" upstreams
       key is cleared early while the mock demands the header on every GET.
   S7  the /v1/models passthrough reaches the same session-policed upstream.
   S8  embeddings requests carry the session header as well.
+  S9  a lapsed subscription (EntitlementError verdict in usage_json) is
+      demoted behind healthy and exhausted keys and rejoins normal
+      scheduling as soon as an observation says the subscription is back.
 
 Usage:
   python3 opencode_session_test.py <token_proxy> <schema_dir> <project_root>
@@ -84,6 +87,7 @@ def usage_snapshot(percent: int, resets_in: float) -> str:
     return json.dumps({
         "checked_at": iso_after(0),
         "error": None,
+        "subscription": "active",
         "windows": {
             "5h": {"percent": percent, "resets_at": iso_after(resets_in),
                    "state": "started"},
@@ -96,6 +100,17 @@ def usage_snapshot(percent: int, resets_in: float) -> str:
         },
         "monthly_period": {"start": iso_after(-86400),
                            "end": iso_after(29 * 86400)},
+    })
+
+
+def lapsed_snapshot() -> str:
+    """The usage_json shape the poller writes after an EntitlementError 403."""
+    return json.dumps({
+        "error": "HTTP 403",
+        "error_at": iso_after(0),
+        "subscription": "inactive",
+        "windows": {},
+        "monthly_period": None,
     })
 
 
@@ -236,6 +251,10 @@ def main() -> None:
             build_aggregate_scenario(
                 conn, "tb-oc3", "oc3-model", ["sk-oc3-p1"], None,
                 subtype="opencode-go")
+            # S9: one lapsed key (no subscription) beside one healthy key.
+            _, lapse_keys, _ = build_aggregate_scenario(
+                conn, "tb-oc6", "oc6-model", ["sk-oc6-p1", "sk-oc6-p2"], None,
+                subtype="opencode-go")
             # Cooldown-recovery scenario (cooled key) and a plain account
             # whose catalog/embeddings calls hit the upstream directly.
             _, probe_keys, _ = build_aggregate_scenario(
@@ -261,6 +280,17 @@ def main() -> None:
                     "UPDATE upstream_credentials SET usage_json=? "
                     "WHERE runtime_id=?",
                     (usage_snapshot(percent, resets_in), runtime_id))
+            # S9: p1's subscription is gone (the poller's EntitlementError
+            # verdict, no windows at all); p2 is healthy with a modest
+            # pressure signal so any normal ordering rule would prefer p2
+            # only via the demotion.
+            lapsed_key, lapse_sibling = lapse_keys
+            conn.execute(
+                "UPDATE upstream_credentials SET usage_json=? WHERE runtime_id=?",
+                (lapsed_snapshot(), lapsed_key))
+            conn.execute(
+                "UPDATE upstream_credentials SET usage_json=? WHERE runtime_id=?",
+                (usage_snapshot(20, 7200), lapse_sibling))
             # S7: tb-oc5's plain account carries a stored catalog.
             conn.executemany(
                 "INSERT INTO upstream_model_catalog(upstream_id, model_id) "
@@ -479,6 +509,31 @@ def main() -> None:
             assert (record.get("x_opencode_session") or "").startswith("tb-"), \
                 (status, record.get("x_opencode_session"))
             print("S8 OK: embeddings carries the session header")
+
+            # ── S9: a lapsed subscription is demoted behind everything ────
+            # p1 holds an EntitlementError verdict (no windows at all): every
+            # request must be served by the healthy sibling, request after
+            # request — the rotation must never surface the lapsed key while
+            # anything else exists.
+            for hop in range(3):
+                status, _ = send(proxy_port, "tb-oc6", {
+                    "stream": False, "model": "oc6-model",
+                    "messages": [{"role": "user", "content": f"lapsed {hop}"}]})
+                rid, _, statuses, keys = latest_attempts(db_path, "oc6-model")
+                assert status == 200 and statuses == [200] \
+                    and keys == [lapse_sibling], \
+                    f"S9: lapsed key must stay demoted (hop={hop}, {statuses}, {keys})"
+            # The subscription is observed again: the key rejoins normal
+            # scheduling immediately (its rolling pressure now leads).
+            set_usage(db_path, lapsed_key, usage_snapshot(90, 600))
+            time.sleep(0.5)  # let the new snapshot hot-reload
+            status, _ = send(proxy_port, "tb-oc6", {
+                "stream": False, "model": "oc6-model",
+                "messages": [{"role": "user", "content": "lapsed recovered"}]})
+            rid, _, statuses, keys = latest_attempts(db_path, "oc6-model", rid)
+            assert status == 200 and statuses == [200] and keys == [lapsed_key], \
+                f"S9: recovery must restore normal scheduling ({statuses}, {keys})"
+            print("S9 OK: the lapsed key stayed demoted and rejoined on recovery")
 
             print("opencode session tests passed")
         finally:

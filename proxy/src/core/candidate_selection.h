@@ -114,6 +114,28 @@ inline std::int64_t candidate_exhausted_reset(
     return earliest;
 }
 
+// The "not subscribed" verdict is respected while its evidence is this
+// recent.  The poller refreshes error_at on every failed poll (5-minute
+// cadence), so only a poller that stopped running entirely lets the verdict
+// expire — the key then re-enters normal scheduling and the provider
+// discovers the truth again.  Mirrors OBSERVED_PERIOD_MAX_AGE_SECONDS in
+// app/services/billing_units.py.
+inline constexpr std::int64_t kLapseEvidenceSeconds = 48 * 3600;
+
+/// True while the usage poller's "no active subscription" verdict holds.
+/// Lapsed keys are demoted behind every other candidate — exhausted ones
+/// included: a spent window reopens by itself at its trusted reset, a lapsed
+/// subscription only by an external action, so it is attempted when nothing
+/// else exists (the provider stays authoritative; local data never
+/// fabricates the refusal).
+inline bool candidate_subscription_lapsed(const UpstreamCandidate &candidate,
+                                          std::int64_t now) {
+    const auto *usage = candidate.usage();
+    if (usage == nullptr || !usage->subscription_inactive) return false;
+    if (usage->error_at <= 0) return false;
+    return now - usage->error_at <= kLapseEvidenceSeconds;
+}
+
 enum class UsageWindowKind { kMonthly, kWeekly, kRolling };
 
 inline const char *usage_window_name(UsageWindowKind kind) {
@@ -238,10 +260,12 @@ inline QuotaCooldownPlan quota_cooldown_plan(
 ///      competes on;
 ///   5. the base order: the group rotated by `rr_offset`, so exact ties
 ///      spread across requests instead of pinning the lowest index.
-/// The final stable partition lifts exhausted candidates of every group
-/// behind all usable ones, ordering them by their earliest trusted reset —
-/// when nothing else exists the soonest-recovering key is attempted first
-/// (the provider stays authoritative; local data never fabricates a 429).
+/// The final stable partitions lift exhausted candidates of every group
+/// behind all usable ones (ordered by their earliest trusted reset), and
+/// keys whose subscription the upstream refused behind even those: when
+/// nothing else exists the soonest-recovering key is attempted first, and a
+/// lapsed key only once nothing else can take the request (the provider
+/// stays authoritative; local data never fabricates a refusal).
 inline std::vector<size_t> candidate_order(
     const std::vector<UpstreamCandidate> &candidates,
     std::optional<size_t> bound_index, size_t rr_offset, std::int64_t now,
@@ -318,6 +342,11 @@ inline std::vector<size_t> candidate_order(
     }
     std::stable_partition(order.begin(), order.end(), [&](size_t index) {
         return !candidate_usage_exhausted(candidates[index], now);
+    });
+    // A lapsed subscription sinks behind even the exhausted: those recover
+    // at their trusted reset, a lapsed key only by an external action.
+    std::stable_partition(order.begin(), order.end(), [&](size_t index) {
+        return !candidate_subscription_lapsed(candidates[index], now);
     });
     return order;
 }

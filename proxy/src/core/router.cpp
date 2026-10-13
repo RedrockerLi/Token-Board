@@ -63,6 +63,16 @@ std::shared_ptr<const routing::CredentialUsage> parse_credential_usage(
         if (checked != root.end() && checked->is_string())
             usage.observed_at =
                 parse_utc_timestamp(checked->get<std::string>());
+        // The subscription verdict is independent of the windows: a lapsed
+        // snapshot carries none, yet the scheduler must still see the key.
+        const auto subscription = root.find("subscription");
+        if (subscription != root.end() && subscription->is_string())
+            usage.subscription_inactive =
+                subscription->get<std::string>() == "inactive";
+        const auto error_at = root.find("error_at");
+        if (error_at != root.end() && error_at->is_string())
+            usage.error_at =
+                parse_utc_timestamp(error_at->get<std::string>());
         const auto windows = root.find("windows");
         if (windows == root.end() || !windows->is_object()) return nullptr;
         for (const char *name : {"5h", "week", "month"}) {
@@ -106,7 +116,9 @@ std::shared_ptr<const routing::CredentialUsage> parse_credential_usage(
                     "scheduling it without usage data\n", key_slot_id);
         return nullptr;
     }
-    if (usage.windows.empty()) return nullptr;
+    // A lapsed snapshot has no windows by design; it still must reach the
+    // scheduler so the key can be demoted.  Anything else empty is noise.
+    if (usage.windows.empty() && !usage.subscription_inactive) return nullptr;
     return std::make_shared<const routing::CredentialUsage>(std::move(usage));
 }
 

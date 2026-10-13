@@ -200,6 +200,44 @@ int main() {
                                   {win("month", 100, 0)});
     assert(!candidate_usage_exhausted(no_reset, now));
 
+    // A lapsed subscription (the upstream refused it with its entitlement
+    // error; the snapshot then carries no windows) sinks behind every other
+    // candidate — behind even the exhausted, because a spent window reopens
+    // at its trusted reset while a lapsed key needs an external action.  It
+    // is still attempted when nothing else can take the request: the
+    // provider stays authoritative.
+    auto lapsed_usage = [&](std::int64_t error_at) {
+        auto usage = std::make_shared<routing::CredentialUsage>();
+        usage->subscription_inactive = true;
+        usage->error_at = error_at;
+        return std::shared_ptr<const routing::CredentialUsage>(usage);
+    };
+    std::vector<UpstreamCandidate> lapsed(3);
+    lapsed[0].key_slot_id = 10;
+    lapsed[0].usage_ref = lapsed_usage(now);
+    lapsed[1].key_slot_id = 11;
+    lapsed[1].usage_ref = fresh({win("month", 100, now + 2 * day)});
+    lapsed[2].key_slot_id = 12;
+    lapsed[2].usage_ref = fresh({win("month", 60, now + 30 * day)});
+    assert(candidate_subscription_lapsed(lapsed[0], now));
+    assert(!candidate_subscription_lapsed(lapsed[1], now));
+    assert((order_of(lapsed, now) == std::vector<size_t>{2, 1, 0}));
+    std::vector<UpstreamCandidate> only_lapsed(1);
+    only_lapsed[0].key_slot_id = 10;
+    only_lapsed[0].usage_ref = lapsed_usage(now);
+    assert((order_of(only_lapsed, now) == std::vector<size_t>{0}));
+
+    // The verdict holds while its evidence is refreshed by the poller's
+    // failures and expires once nothing polled for kLapseEvidenceSeconds:
+    // the key then re-enters normal scheduling.
+    std::vector<UpstreamCandidate> expired(2);
+    expired[0].key_slot_id = 10;
+    expired[0].usage_ref = lapsed_usage(now - kLapseEvidenceSeconds - 1);
+    expired[1].key_slot_id = 11;
+    expired[1].usage_ref = fresh({win("month", 60, now + 30 * day)});
+    assert(!candidate_subscription_lapsed(expired[0], now));
+    assert((order_of(expired, now) == std::vector<size_t>{1, 0}));
+
     // The session-bound key leads its own group even against higher pressure
     // — cache affinity wins inside the group — but exhaustion still outranks
     // a binding, and groups keep their configured order.

@@ -9,14 +9,17 @@ choose the transaction/profile that owns the read.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from app.core.time import as_utc, format_utc, parse_runtime_timestamp, utc_now
 from app.db.proxy.common import _parse_iso_date
+from app.db.proxy.key_usage import usage_path
 
 
 # A usage snapshot older than this cannot drive a reset-driven period: the
 # upstream may have rolled since, so billing falls back to the anchor day.
+# The same age bounds a "not subscribed" verdict: every failed poll refreshes
+# its evidence, so a verdict this old means no poll has run at all.
 OBSERVED_PERIOD_MAX_AGE_SECONDS = 48 * 3600
 
 
@@ -35,6 +38,22 @@ class ObservedPeriod:
         return abs(age) <= max_age
 
 
+@dataclass(frozen=True)
+class SubscriptionState:
+    """The usage poller's verdict on the paid subscription itself.
+
+    ``inactive`` is set on the upstream's structured 403 entitlement error
+    and cleared by any complete observation; ``error_at`` names when the last
+    failed poll ran (the verdict's freshness evidence), and ``resumed_at``
+    the first successful observation after a lapse — the moment the
+    subscription was seen again, which starts the post-lapse billing chain.
+    """
+
+    inactive: bool = False
+    error_at: datetime | None = None
+    resumed_at: datetime | None = None
+
+
 def _optional_timestamp(value: object) -> datetime | None:
     """Parse one optional runtime timestamp, ignoring malformed values."""
     if value in (None, ""):
@@ -45,6 +64,17 @@ def _optional_timestamp(value: object) -> datetime | None:
         return None
 
 
+def _payload(raw: object) -> dict | None:
+    """Decode a stored usage_json column into its payload object."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def parse_observed_period(raw: object) -> ObservedPeriod | None:
     """Parse ``upstream_credentials.usage_json`` into its observed period.
 
@@ -53,13 +83,8 @@ def parse_observed_period(raw: object) -> ObservedPeriod | None:
     monthly period are required: a snapshot that names only a start would
     otherwise pin the first billing period to the moment it was taken.
     """
-    if not raw:
-        return None
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict) or payload.get("error"):
+    payload = _payload(raw)
+    if payload is None or payload.get("error"):
         return None
     monthly = payload.get("monthly_period")
     checked_at = _optional_timestamp(payload.get("checked_at"))
@@ -70,6 +95,22 @@ def parse_observed_period(raw: object) -> ObservedPeriod | None:
     if start is None or end is None:
         return None
     return ObservedPeriod(start=start, end=end, checked_at=checked_at)
+
+
+def parse_subscription_state(raw: object) -> SubscriptionState:
+    """Parse the subscription verdict out of a stored usage_json payload.
+
+    Snapshots that predate the verdict (and keys that never completed a
+    poll) read as "no verdict": not inactive, no resume stamp.
+    """
+    payload = _payload(raw)
+    if payload is None:
+        return SubscriptionState()
+    return SubscriptionState(
+        inactive=payload.get("subscription") == "inactive",
+        error_at=_optional_timestamp(payload.get("error_at")),
+        resumed_at=_optional_timestamp(payload.get("resumed_at")),
+    )
 
 
 def observed_period_end(raw: object, moment: datetime, *,
@@ -102,6 +143,12 @@ class BillingUnit:
     contract_id: int | None = None
     subscription_id: int | None = None
     observed_period: ObservedPeriod | None = None
+    subscription: SubscriptionState = field(default_factory=SubscriptionState)
+    # A subtype that declares a usage query path: its fresh keys wait for the
+    # first observation before the anchor calendar may bill them.
+    usage_tracked: bool = False
+    usage_present: bool = False
+    created_at: datetime | None = None
 
     @property
     def anchor_day(self) -> int:
@@ -112,6 +159,21 @@ class BillingUnit:
         """Whether this unit carries a usable observed monthly period."""
         return (self.observed_period is not None
                 and self.observed_period.fresh(moment, max_age))
+
+    def lapse_verdict_fresh(self, moment: datetime,
+                            max_age: int = OBSERVED_PERIOD_MAX_AGE_SECONDS
+                            ) -> bool:
+        """Whether the poller's "not subscribed" verdict still has evidence.
+
+        Every failed poll refreshes ``error_at``, so a verdict within
+        *max_age* means the poller kept seeing the lapse; an older one means
+        no poll completed at all (the poller itself is down) and billing
+        falls back to the anchor calendar instead of trusting it forever.
+        """
+        evidence = self.subscription.error_at
+        if not self.subscription.inactive or evidence is None:
+            return False
+        return abs((as_utc(moment) - evidence).total_seconds()) <= max_age
 
 
 def _parsed_ends_at(value: object) -> datetime | None:
@@ -142,7 +204,7 @@ class BillingUnitResolver:
                 seen: set[tuple[int, str]] = set()
                 credentials = conn.execute(
                     "SELECT c.runtime_id,c.uuid,c.key_masked,c.valid_from,c.created_at,"
-                    "c.ends_at,c.usage_json "
+                    "c.ends_at,c.usage_json,u.subtype "
                     "FROM upstream_credentials c JOIN upstreams u ON u.id=c.upstream_id "
                     "WHERE u.account_id=? "
                     "AND (c.ends_at IS NULL OR c.ends_at>?) "
@@ -176,6 +238,11 @@ class BillingUnitResolver:
                         contract_id=int(contract["id"]),
                         observed_period=parse_observed_period(
                             credential["usage_json"]),
+                        subscription=parse_subscription_state(
+                            credential["usage_json"]),
+                        usage_tracked=bool(usage_path(credential["subtype"])),
+                        usage_present=bool(credential["usage_json"]),
+                        created_at=_optional_timestamp(credential["created_at"]),
                     ))
             else:
                 valid_from = (
@@ -247,5 +314,6 @@ class BillingUnitResolver:
 
 __all__ = [
     "OBSERVED_PERIOD_MAX_AGE_SECONDS", "BillingUnit", "BillingUnitResolver",
-    "ObservedPeriod", "observed_period_end", "parse_observed_period",
+    "ObservedPeriod", "SubscriptionState", "observed_period_end",
+    "parse_observed_period", "parse_subscription_state",
 ]

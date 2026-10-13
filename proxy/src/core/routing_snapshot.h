@@ -53,6 +53,15 @@ struct CredentialUsage {
     // routed exhausted/veto decision is computed per request in
     // candidate_selection.h, never frozen here.
     std::int64_t observed_at = 0;
+    // The Python poller's verdict on the paid subscription itself: set while
+    // the upstream refused it with its structured entitlement error
+    // (OpenCode Go answers 403 with an EntitlementError envelope) and no
+    // later complete observation cleared it.  A lapsed snapshot carries no
+    // windows by design; error_at names when the last failed usage query ran
+    // (0 = none) and is refreshed by every failed poll, so a verdict whose
+    // error_at is ancient means the poller stopped running entirely.
+    bool subscription_inactive = false;
+    std::int64_t error_at = 0;
 };
 
 struct CredentialRuntime {

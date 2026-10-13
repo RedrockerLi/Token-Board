@@ -14,7 +14,12 @@ Which period is "current" is decided by one resolver
 (:func:`resolve_unit_period`): the recorded ledger wins while it still covers
 the moment, otherwise the unit rolls from the previous period's end — driven
 by a fresh observed monthly reset (:mod:`app.services.key_usage`) when the
-upstream reports one, and by the anchor-day calendar otherwise.
+upstream reports one, and by the anchor-day calendar otherwise.  Two usage
+snapshot verdicts suspend that roll: a fresh "not subscribed" verdict holds
+new periods until an observation confirms a subscription again (the resumed
+chain starts at the observed resume moment, never backfilling the gap), and
+a freshly added usage-tracked key waits briefly for its first observation
+instead of billing the anchor immediately.
 """
 
 from __future__ import annotations
@@ -31,6 +36,15 @@ from app.core.time import (
 from app.db.proxy.billing_export import ensure_billing_export_events_conn
 from app.services import fx
 from app.services.billing_units import BillingUnit, BillingUnitResolver
+
+
+# A freshly added usage-tracked key waits this long for its first usage
+# observation before the anchor calendar may bill it: the account save
+# triggers a poll, so the normal wait is seconds, and a key whose
+# subscription is already gone must not produce a creation charge.  After
+# the grace the anchor takes over so an unreachable endpoint cannot stall
+# billing forever.
+NEW_KEY_OBSERVATION_GRACE_SECONDS = 15 * 60
 
 
 def _period(moment: datetime, anchor: int) -> tuple[datetime, datetime]:
@@ -75,8 +89,14 @@ def resolve_unit_period(conn: sqlite3.Connection, unit: BillingUnit,
     The ledger is authoritative: while a recorded charge covers *moment* its
     period is returned unchanged.  Otherwise the unit rolls forward from the
     previous period's end, driven by the observed monthly reset when the
-    upstream usage snapshot is fresh and by the anchor day otherwise.  A unit
-    whose billing start lies in the future has no period yet.
+    upstream usage snapshot is fresh and by the anchor day otherwise.  A
+    fresh "not subscribed" verdict suspends the roll instead — the upstream
+    says no subscription is being paid, so no new period may open until an
+    observation confirms one again (existing frozen rows are untouched);
+    the resumed subscription then starts its first period at ``resumed_at``,
+    never backfilling the unpaid gap.  A freshly added usage-tracked key
+    likewise waits for its first observation before the anchor may bill it.
+    A unit whose billing start lies in the future has no period yet.
     """
     moment = as_utc(moment).replace(microsecond=0)
     if moment < as_utc(unit.valid_from):
@@ -92,13 +112,36 @@ def resolve_unit_period(conn: sqlite3.Connection, unit: BillingUnit,
         previous_start = _timestamp(row["period_start"])
         if previous_start is not None:
             return previous_start, previous_end
+    if unit.lapse_verdict_fresh(moment):
+        # The usage poller saw the upstream refuse the subscription
+        # (EntitlementError).  Stop opening periods; the verdict itself
+        # expires once the poller stops refreshing it (see the unit type).
+        return None
+    if (unit.usage_tracked and not unit.usage_present
+            and unit.created_at is not None
+            and (moment - as_utc(unit.created_at)).total_seconds()
+            < NEW_KEY_OBSERVATION_GRACE_SECONDS):
+        # A new usage-tracked key bills from its first observation: seconds
+        # away in the normal case (the save triggers a poll), a lapse yields
+        # no row at all, and only a still-unobserved key falls back to the
+        # anchor after the grace so an unreachable endpoint cannot stall
+        # billing forever.
+        return None
+    resumed_at = unit.subscription.resumed_at
     anchor = billing_period(moment, unit.anchor_day)
     observed = unit.observed_period
     if observed is None or not unit.observed_fresh(moment):
         # The anchor calendar: a rolling start lands exactly on the previous
         # period's end, otherwise on the boundary containing the moment.
-        return previous_end or anchor.start, anchor.end
+        start = previous_end or anchor.start
+        if resumed_at is not None and start < resumed_at:
+            start = resumed_at
+        return start, anchor.end
     start = previous_end or observed.start
+    # A resumed subscription starts its chain at the first observation after
+    # the lapse — the pre-lapse chain end must not backfill the unpaid gap.
+    if resumed_at is not None and start < resumed_at:
+        start = resumed_at
     # An upstream window can begin before this machine knew the subscription;
     # the valid_from floor must hold for the first observed period too, or the
     # row would start before the paid term and find no price event.

@@ -53,6 +53,8 @@
 - 订阅账户在**添加时**就为当前周期计一次费：创建事务内物化当期 `billing_period_charges`；之后由维护服务的**账单物化 worker 每 60 秒**自动滚动，到期即生成下一期费用，不需要人工续订。
 - 每把密钥的周期锚点是自己的 `valid_from`（留空 = 创建日）——锚点日为起始日的日号，短月取月末；同一账户的多把密钥各自切周期。
 - 带**用量查询**的子分类（`opencode-go`）跟随**观测到的月度重置**：用量轮询写下的 `monthly_period.start/end` 在**新鲜（≤48 小时）**时就是周期边界，滚动出的新周期 `period_start` 接在上一期 `period_end` 上。观测只决定**尚未生成**的周期起点，既有周期费用与冻结账目绝不改写。
+- **停付/复付**同样由用量查询判定：上游以 403 + `EntitlementError` 拒绝即记 `subscription:"inactive"`，此后不再生成新周期（已冻结的当期保持，停付空档不补计）；任一完整观测恢复后记下复付时刻 `resumed_at`，新周期自该时刻起算、焊接回观测边界。停付证据超过 **48 小时**未刷新（轮询器停摆）判定失效，回到锚点契约。
+- **新增密钥**先等首轮观测再计费：保存会立即触发一次用量查询——已订阅的几秒后按观测周期出账，已停付的不出账；15 分钟内始终没有观测结果则回退锚点周期照常计费。
 - 观测缺失或已超过 **48 小时**时，周期回退到 `valid_from` 锚点的行政月；跨过整个周期都没拿到观测时该周期只计一笔，不补缴。
 - `end_of_period` 取消也跟随观测：观测新鲜时结束时刻取观测边界 **−1 秒**，否则取锚点周期的期末。
 
@@ -71,7 +73,7 @@
 
 - **每把 Key 一个并发槽位**：`max_concurrency` 按 Key 计数，一把 Key 打满后请求溢流到下一把（[proxy/src/core/account_gate.h:13-16](proxy/src/core/account_gate.h#L13-L16)）。
 - **每把 Key 一个故障单元**：plan 的配额冷却与各类失败避让都按 `key_slot_id` 隔离（配额耗尽按可信重置冷却；普通 429 / 401 / 403 / 5xx / 超时各有短避让），兄弟 Key 不受连坐。
-- **候选顺序**：同一账户的密钥按 `(position, runtime_id)` 排列，组内排序（[proxy/src/core/candidate_selection.h](proxy/src/core/candidate_selection.h)）：耗尽窗口（≥100% 且重置未到）的 Key 排最后并按最早可信重置排序 → 会话绑定的 Key 最前 → 月/周/5h 窗口压力（剩余额度 ÷ 距重置时间，无容差）逐级 → 累计消耗最少 → 请求轮转兜底。带用量快照的 Key 只在快照新鲜（10 分钟）且窗口已启动时提供压力信号；没有用量数据的 Key 按累计消耗竞争，不因缺数据受损（完整语义见 [proxy-internals.md](proxy-internals.md)）。
+- **候选顺序**：同一账户的密钥按 `(position, runtime_id)` 排列，组内排序（[proxy/src/core/candidate_selection.h](proxy/src/core/candidate_selection.h)）：耗尽窗口（≥100% 且重置未到）的 Key 排最后并按最早可信重置排序，订阅已停付（用量查询 403 EntitlementError 判定）的 Key 再沉到其后 → 会话绑定的 Key 最前 → 月/周/5h 窗口压力（剩余额度 ÷ 距重置时间，无容差）逐级 → 累计消耗最少 → 请求轮转兜底。带用量快照的 Key 只在快照新鲜（10 分钟）且窗口已启动时提供压力信号；没有用量数据的 Key 按累计消耗竞争，不因缺数据受损（完整语义见 [proxy-internals.md](proxy-internals.md)）。
 - **会话亲和(session affinity)**：同一会话（请求头 `x-session-id` / `x-claude-code-session-id` / `x-conversation-id`，否则取 body 的 OpenAI `user` 或 Anthropic `metadata.user_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/session_affinity.h](proxy/src/core/session_affinity.h)）。
 - **成本平衡**：没有会话绑定（或没有用量信号可比）时，优先选**累计消耗最少**的 Key——`KeyCostLedger` 每 5 分钟从 `request_log` 聚合等价成本（已计价为 0 但消耗了 token 的行按全局单价折算，账单为零不等于消耗为零），排序成本含在途请求的预期花费，重启后由首次聚合恢复（[proxy/src/core/key_cost_ledger.h](proxy/src/core/key_cost_ledger.h)）。
 - **上游会话头与 User-Agent**：带 OpenCode-Go 子分类的账户注入 `x-opencode-session`，取值依次为下游透传的该头 → 请求解析出的会话标识 → 稳定会话指纹（`tb-` + SHA-256(system 指令 + 首条 user 消息，去掉 cache_control) 的前 32 位）→ 随机值；这些上游请求另带固定 `User-Agent: token-board/1.0`（代理不转发下游的 User-Agent，普通账户不加这两个头）。

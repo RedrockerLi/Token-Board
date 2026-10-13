@@ -589,9 +589,18 @@ function usageCardHtml(account) {
             observed = usage.checked_at;
         }
         const name = key.label ? esc(key.label) : `<code>${esc(key.masked || '')}</code>`;
-        const error = usage && usage.error
-            ? `<div class="usage-card__error">查询失败：${esc(String(usage.error))}</div>`
-            : '';
+        // 「订阅已停付」是轮询器对订阅本身的判定（上游 EntitlementError），
+        // 与普通查询失败分开显示：停付期间不计费、调度降级，直到观测恢复；
+        // 附最近一次查询失败时刻，便于区分失效判定与实时判定。
+        const lapsed = usage && usage.subscription === 'inactive';
+        const error = lapsed
+            ? `<div class="usage-card__error">订阅已停付：上游未检测到有效订阅`
+              + (usage.error_at
+                  ? `（最近查询 ${esc(fmtObservedAt(usage.error_at))}）` : '')
+              + '</div>'
+            : (usage && usage.error
+                ? `<div class="usage-card__error">查询失败：${esc(String(usage.error))}</div>`
+                : '');
         const rows = USAGE_WINDOWS.map(([windowName, label]) => {
             const win = windows[windowName] || null;
             const percent = win && win.percent != null ? Math.round(Number(win.percent)) : NaN;

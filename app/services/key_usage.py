@@ -7,18 +7,36 @@ declared by the account-type spec and stores one snapshot per credential in
 ``upstream_credentials.usage_json``; ``app/services/billing_units.py`` turns
 the monthly part into the reset-driven billing period.
 
-A snapshot is ``{checked_at, error, windows, monthly_period}``:
-``checked_at`` is the moment of the last SUCCESSFUL observation.  A failed
-query only writes ``error`` and keeps the previous windows, monthly period
-and ``checked_at``; a credential whose first poll fails carries no
-``checked_at`` at all, so a failure can never pass as an observation.  A
-response from which any of the three windows is missing or unusable counts
-as a failure too: an incomplete observation must not silently retract what
-an earlier complete one confirmed (the proxy treats a reported-exhausted
-window as spent until trusted evidence shows the window reset).  Billing
-keeps its own contract: a snapshot older than 48 hours, one carrying an
-error, or one without a complete observed monthly period is treated as
-absent and falls back to the account's anchor day.
+A snapshot is ``{checked_at, error, error_at, subscription, resumed_at,
+windows, monthly_period}``: ``checked_at`` is the moment of the last
+SUCCESSFUL observation.  A failed query only writes ``error``/``error_at``
+and keeps the previous windows, monthly period, ``checked_at``,
+``subscription`` and ``resumed_at``; a credential whose first poll fails
+carries no ``checked_at`` at all, so a failure can never pass as an
+observation.  A response from which any of the three windows is missing or
+unusable counts as a failure too: an incomplete observation must not
+silently retract what an earlier complete one confirmed (the proxy treats a
+reported-exhausted window as spent until trusted evidence shows the window
+reset).
+
+``subscription`` is this poller's verdict on the paid subscription itself:
+``inactive`` once the endpoint answers 403 with the upstream's structured
+entitlement error ("OpenCode Go subscription required"), ``active`` on any
+complete observation, absent when no verdict exists yet (legacy snapshots
+and keys that never completed a poll).  The verdict only ever flips on
+positive evidence of one side: other failures (transport, other statuses,
+incomplete bodies — recorded in ``error`` with ``error_at`` naming when the
+attempt ran) leave it untouched, and any full success clears it.  On the
+inactive→active transition ``resumed_at`` records the first successful
+observation after the lapse; it then stays put so billing can start the new
+period from the moment the subscription was actually seen again.
+
+Billing keeps its own contract: a snapshot older than 48 hours, one carrying
+an error, or one without a complete observed monthly period is treated as
+absent and falls back to the account's anchor day — except that a fresh
+lapsed verdict suspends charging until a subscription is observed again,
+and a freshly added usage-tracked key waits for its first observation
+before the anchor may bill it.
 
 Each window stores ``{percent, resets_at, state}``.  ``state`` is the rolling
 lifecycle the proxy scheduler consumes: ``started`` (the window counts down
@@ -235,23 +253,74 @@ def _prior_payload(raw: object) -> object:
         return None
 
 
-def _failure(prior: object, message: str) -> dict:
+def _prior_subscription(prior: object) -> str | None:
+    """The subscription verdict a stored payload carries, legacy included.
+
+    A snapshot from before the verdict existed is upgraded in place: its
+    ``error`` naming an HTTP 403 is the pre-verdict spelling of "no active
+    subscription", so a key that lapsed (and possibly already resumed) under
+    the old poller still yields the inactive→active transition that stamps
+    ``resumed_at``.
+    """
+    if not isinstance(prior, dict):
+        return None
+    state = prior.get("subscription")
+    if state in ("active", "inactive"):
+        return state
+    if "subscription" not in prior:
+        error = prior.get("error")
+        if isinstance(error, str) and error.startswith("HTTP 403"):
+            return "inactive"
+    return None
+
+
+def _failure(prior: object, message: str, *, lapse: bool, moment: datetime) -> dict:
     """A failed poll keeps the previous observation untouched.
 
-    Only ``error`` changes; ``checked_at`` still names the last SUCCESSFUL
-    observation, and a credential that never had one carries no
+    ``error`` and ``error_at`` change; ``checked_at`` still names the last
+    SUCCESSFUL observation, and a credential that never had one carries no
     ``checked_at`` at all.  Keep this split: the proxy scheduler derives both
     snapshot freshness (how old the data is) and cooldown-recovery evidence
-    (whether a reset has been observed) from it.
+    (whether a reset has been observed) from it.  ``subscription`` only ever
+    becomes inactive here (on positive entitlement evidence); any other
+    failure leaves the previous verdict standing, while ``resumed_at`` and
+    the observed windows are preserved so a pending resume or a confirmed
+    exhaustion is never lost to a transient error.
     """
     previous = prior if isinstance(prior, dict) else {}
     payload: dict = {}
     if previous.get("checked_at"):
         payload["checked_at"] = previous["checked_at"]
     payload["error"] = message
+    payload["error_at"] = format_utc(moment)
+    subscription = "inactive" if lapse else _prior_subscription(previous)
+    if subscription is not None:
+        payload["subscription"] = subscription
+    if previous.get("resumed_at"):
+        payload["resumed_at"] = previous["resumed_at"]
     payload["windows"] = previous.get("windows") or {}
     payload["monthly_period"] = previous.get("monthly_period")
     return payload
+
+
+def _entitlement_lapse(response) -> bool:
+    """Whether a non-200 response carries the upstream's entitlement verdict.
+
+    OpenCode Go answers "no active subscription" with 403 and
+    ``{"type":"error","error":{"type":"EntitlementError",...}}`` — the same
+    envelope family as the GoUsageLimitError the proxy consumes.  Only that
+    structured body counts as positive evidence; a bare 403 stays a plain
+    failure so a proxy or WAF answering 403 is never billed as a lapse.
+    """
+    if response.status_code != 403:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    error = body.get("error") if isinstance(body, dict) else None
+    kind = error.get("type") if isinstance(error, dict) else None
+    return kind == "EntitlementError"
 
 
 def _query_usage(url: str, key: str, *, clock, prior: object,
@@ -271,35 +340,48 @@ def _query_usage(url: str, key: str, *, clock, prior: object,
                           "Accept": "application/json"},
             timeout=USAGE_REQUEST_TIMEOUT_SECONDS)
     except requests.RequestException as exc:
-        return _failure(prior, f"网络错误：{type(exc).__name__}")
+        return _failure(prior, f"网络错误：{type(exc).__name__}",
+                        lapse=False, moment=as_utc(clock()))
     observed = as_utc(clock())
     if response.status_code != 200:
-        return _failure(prior, f"HTTP {response.status_code}")
+        return _failure(prior, f"HTTP {response.status_code}",
+                        lapse=_entitlement_lapse(response), moment=observed)
     try:
         body = response.json()
     except ValueError:
-        return _failure(prior, "响应不是有效 JSON")
+        return _failure(prior, "响应不是有效 JSON", lapse=False, moment=observed)
     try:
         windows, resets = parse_usage_body(body, observed=observed,
                                            context=context)
     except ValueError as exc:
-        return _failure(prior, str(exc))
+        return _failure(prior, str(exc), lapse=False, moment=observed)
     missing = [name for _, name in WINDOW_SOURCES if name not in windows]
     if missing:
         log.warning("usage poll: %s response is incomplete "
                     "(missing windows: %s): %s", context, ",".join(missing),
                     _preview(body, 300))
-        return _failure(prior, "响应不完整：缺少 " + ",".join(missing) + " 窗口")
+        return _failure(prior, "响应不完整：缺少 " + ",".join(missing) + " 窗口",
+                        lapse=False, moment=observed)
     if resets is None:
         log.warning("usage poll: %s response carried no usable monthly reset: %s",
                     context, _preview(body, 300))
     prior_month = prior.get("monthly_period") if isinstance(prior, dict) else None
-    return {
+    payload = {
         "checked_at": format_utc(observed),
         "error": None,
+        "subscription": "active",
         "windows": windows,
         "monthly_period": advance_monthly_period(prior_month, observed, resets),
     }
+    # A success after a lapse (or after a legacy snapshot whose last poll was
+    # the pre-verdict HTTP 403) starts the post-lapse chain here; later
+    # successes keep carrying the stamp so billing always derives the new
+    # chain's origin from the moment the subscription was first seen again.
+    if _prior_subscription(prior) == "inactive":
+        payload["resumed_at"] = format_utc(observed)
+    elif isinstance(prior, dict) and prior.get("resumed_at"):
+        payload["resumed_at"] = prior["resumed_at"]
+    return payload
 
 
 def poll_usage_once(proxy_db, *, now: datetime | None = None) -> dict:

@@ -20,16 +20,21 @@ V2.5 给上游增加一类子分类标识与密钥级展示/观测字段。`upst
 的子分类（NULL = 普通账户，当前取值 `opencode-go`）；`upstream_credentials.label` 是密钥
 名称；`upstream_credentials.usage_json` 是该密钥的用量快照，由用量轮询按子分类的用量查询
 路径探测上游后写入本机，不进入配置同步，云端不含这些观测。快照形状为
-`{checked_at,error,windows{5h,week,month:{percent,resets_at,state}},monthly_period{start,end}}`：
-`checked_at` 是最近一次**成功**观测时刻（查询失败只写 `error` 并完整保留旧快照与旧
-`checked_at`，从未成功过的密钥没有该字段），`windows` 是各窗口的用量百分比、重置时刻与
-生命周期 `state`（`started`/`idle`/`unknown`；`resets_at` 原样保留上游返回的重置时刻，
-任何 percent 都记——0% 只说明用量不足 1%），`monthly_period` 是观测到的月度周期边界。
-结构不完整的响应（任一窗口缺失或 percent 不可用）按查询失败处理，防止不完整的新观测
-解除已确认的耗尽。代理按 `checked_at` 判定快照新鲜度（10 分钟）并据 `state` 区分滚动
-窗口是否已启动，看板按 `resets_at` 显示重置倒计时——完整调度语义见
-[proxy-internals.md](proxy-internals.md)。计费仍按它自己的契约判定：快照超过 48 小时、
-带 `error` 或缺少完整月度周期即视为缺失，回落到锚点日。
+`{checked_at,error,error_at,subscription,resumed_at,windows{5h,week,month:{percent,resets_at,state}},monthly_period{start,end}}`：
+`checked_at` 是最近一次**成功**观测时刻（查询失败只写 `error`/`error_at` 并完整保留旧快照、
+旧 `checked_at` 与旧判定，从未成功过的密钥没有 `checked_at` 字段），`windows` 是各窗口的
+用量百分比、重置时刻与生命周期 `state`（`started`/`idle`/`unknown`；`resets_at` 原样保留
+上游返回的重置时刻，任何 percent 都记——0% 只说明用量不足 1%），`monthly_period` 是观测到
+的月度周期边界。`subscription` 是轮询器对订阅本身的判定（`inactive` = 上游以 403 +
+EntitlementError 拒绝且尚无成功观测推翻，`active` = 任一完整观测，缺省 = 尚无判定）；
+`error_at` 是最近一次失败尝试时刻（判定证据，每次失败刷新），`resumed_at` 是停付后首次
+成功观测时刻（复付计费的起点）。结构不完整的响应（任一窗口缺失或 percent 不可用）按查询
+失败处理，防止不完整的新观测解除已确认的耗尽。代理按 `checked_at` 判定快照新鲜度
+（10 分钟）并据 `state` 区分滚动窗口是否已启动，看板按 `resets_at` 显示重置倒计时、
+按 `subscription` 显示「订阅已停付」，代理把停付密钥沉到候选末尾——完整调度语义见
+[proxy-internals.md](proxy-internals.md)。计费消费同一判定：停付证据（`error_at`）在
+48 小时内有效，期间不开新周期、复付自 `resumed_at` 起算；其余契约不变——快照超过
+48 小时、带 `error` 或缺少完整月度周期即视为缺失，回落到锚点日。
 
 ## V2.4 历史增量
 

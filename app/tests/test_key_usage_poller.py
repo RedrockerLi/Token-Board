@@ -511,6 +511,152 @@ class KeyUsagePollerTest(AppDatabaseTestCase):
             with self.assertNoLogs("app.services.key_usage", level="WARNING"):
                 poll_usage_once(db, now=T0)
 
+    # --- the subscription verdict (lapse / resume) ---------------------------
+
+    # The upstream's structured refusal: 403 naming the entitlement error.
+    ENTITLEMENT_403 = (403, {"type": "error", "error": {
+        "type": "EntitlementError",
+        "message": "OpenCode Go subscription required."}})
+
+    def _healthy_response(self, reset: datetime) -> tuple:
+        return (200, {"usage": {
+            "rolling": {"percent": 12, "resetsAt": format_utc(
+                T0 + timedelta(hours=2))},
+            "weekly": {"percent": 30, "resetsAt": format_utc(
+                T0 + timedelta(days=7))},
+            "monthly": {"percent": 3, "resetsAt": format_utc(reset)},
+        }})
+
+    def _seed_snapshot(self, payload: dict) -> None:
+        """Store one raw usage_json payload, as a pre-verdict poller would."""
+        with sqlite_connection(self.proxy_path) as conn:
+            conn.execute("UPDATE upstream_credentials SET usage_json=?",
+                         (json.dumps(payload, ensure_ascii=False),))
+            conn.commit()
+
+    def test_entitlement_403_marks_the_subscription_inactive(self) -> None:
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            server.state["response"] = self._healthy_response(
+                T0 + timedelta(days=31))
+            poll_usage_once(db, now=T0)
+            previous = next(iter(self._snapshots().values()))
+            self.assertEqual(previous["subscription"], "active")
+
+            server.state["response"] = self.ENTITLEMENT_403
+            stats = poll_usage_once(db, now=T0 + timedelta(hours=1))
+
+        self.assertEqual(stats["errors"], 1)
+        snapshot = next(iter(self._snapshots().values()))
+        # The verdict flips on the structured entitlement body alone ...
+        self.assertEqual(snapshot["error"], "HTTP 403")
+        self.assertEqual(snapshot["error_at"],
+                         format_utc(T0 + timedelta(hours=1)))
+        self.assertEqual(snapshot["subscription"], "inactive")
+        # ... while the observation side is preserved untouched, as with any
+        # other failure.
+        self.assertEqual(snapshot["checked_at"], previous["checked_at"])
+        self.assertEqual(snapshot["windows"], previous["windows"])
+        self.assertEqual(snapshot["monthly_period"], previous["monthly_period"])
+
+    def test_a_bare_403_keeps_the_active_verdict(self) -> None:
+        """Only the upstream's entitlement body is lapse evidence."""
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            server.state["response"] = self._healthy_response(
+                T0 + timedelta(days=31))
+            poll_usage_once(db, now=T0)
+
+            # A generic 403 (proxy, WAF, reshaped body) stays a plain failure.
+            server.state["response"] = (403, {"error": "no subscription"})
+            poll_usage_once(db, now=T0 + timedelta(hours=1))
+            snapshot = next(iter(self._snapshots().values()))
+            self.assertEqual(snapshot["error"], "HTTP 403")
+            self.assertEqual(snapshot["subscription"], "active")
+            self.assertEqual(snapshot["error_at"],
+                             format_utc(T0 + timedelta(hours=1)))
+
+            # A later entitlement refusal still flips it.
+            server.state["response"] = self.ENTITLEMENT_403
+            poll_usage_once(db, now=T0 + timedelta(hours=3))
+            snapshot = next(iter(self._snapshots().values()))
+            self.assertEqual(snapshot["subscription"], "inactive")
+
+    def test_inactive_verdict_survives_unrelated_failures(self) -> None:
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            server.state["response"] = self.ENTITLEMENT_403
+            poll_usage_once(db, now=T0)
+
+            server.state["response"] = (500, {"error": "boom"})
+            poll_usage_once(db, now=T0 + timedelta(hours=1))
+            snapshot = next(iter(self._snapshots().values()))
+
+        self.assertEqual(snapshot["error"], "HTTP 500")
+        # The evidence timestamp refreshes on every failed poll; the verdict
+        # itself is only ever cleared by a complete observation.
+        self.assertEqual(snapshot["error_at"],
+                         format_utc(T0 + timedelta(hours=1)))
+        self.assertEqual(snapshot["subscription"], "inactive")
+
+    def test_a_success_after_a_lapse_stamps_resumed_at(self) -> None:
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            server.state["response"] = self._healthy_response(
+                T0 + timedelta(days=31))
+            poll_usage_once(db, now=T0)
+            prior_month = next(iter(self._snapshots().values()))["monthly_period"]
+
+            server.state["response"] = self.ENTITLEMENT_403
+            poll_usage_once(db, now=T0 + timedelta(hours=1))
+
+            resumed = T0 + timedelta(hours=2)
+            server.state["response"] = self._healthy_response(
+                T0 + timedelta(days=62))
+            poll_usage_once(db, now=resumed)
+            snapshot = next(iter(self._snapshots().values()))
+
+            self.assertEqual(snapshot["subscription"], "active")
+            self.assertIsNone(snapshot["error"])
+            self.assertNotIn("error_at", snapshot)
+            self.assertEqual(snapshot["resumed_at"], format_utc(resumed))
+            self.assertEqual(snapshot["checked_at"], format_utc(resumed))
+            # The chain itself is untouched: it still welds to the previous
+            # monthly end (billing clamps to resumed_at on its own side).
+            self.assertEqual(snapshot["monthly_period"]["start"],
+                             prior_month["start"])
+
+            # Later successes keep carrying the stamp.
+            server.state["response"] = self._healthy_response(
+                T0 + timedelta(days=62))
+            poll_usage_once(db, now=T0 + timedelta(hours=5))
+            snapshot = next(iter(self._snapshots().values()))
+            self.assertEqual(snapshot["resumed_at"], format_utc(resumed))
+            self.assertEqual(snapshot["checked_at"],
+                             format_utc(T0 + timedelta(hours=5)))
+
+    def test_legacy_403_snapshot_yields_a_resume_stamp(self) -> None:
+        """A pre-verdict HTTP 403 failure upgrades to the inactive verdict."""
+        db = self.proxy_database()
+        with usage_server() as server:
+            self._plan(db, f"http://127.0.0.1:{server.server_address[1]}")
+            # The shape the old poller stored for a key that never succeeded.
+            self._seed_snapshot({"error": "HTTP 403", "windows": {},
+                                 "monthly_period": None})
+
+            server.state["response"] = self._healthy_response(
+                T0 + timedelta(days=31))
+            poll_usage_once(db, now=T0)
+            snapshot = next(iter(self._snapshots().values()))
+
+        self.assertEqual(snapshot["subscription"], "active")
+        self.assertEqual(snapshot["resumed_at"], format_utc(T0))
+        self.assertEqual(snapshot["checked_at"], format_utc(T0))
+
 
 if __name__ == "__main__":
     import unittest
