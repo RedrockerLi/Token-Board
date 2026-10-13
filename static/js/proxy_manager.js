@@ -653,7 +653,7 @@ function renderAccountsTable() {
                 <td>${usageAnchor}${a.ends_at ? ` <span class="badge badge--warn" title="到期删除：${esc(fmtLocal(a.ends_at))}">到期 ${esc(fmtLocal(a.ends_at).slice(0, 10))}</span>` : ''}</td>
                 <td${keyTitle}><code>${esc(firstMask)}</code>${keyCount > 1 ? ` <span class="badge" title="${keyCount} 把密钥（同一配置的多个并发槽位）">×${keyCount}</span>` : ''}${!firstMask && !keyCount ? ' <span class="badge badge--warn" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
-                <td>${esc(({openai: 'OpenAI', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic'})[a.api_format] || a.api_format)}</td>
+                <td>${esc(({openai: 'OpenAI Chat Completions', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic Messages'})[a.api_format] || a.api_format)}</td>
                 <td>${accountTypeBadge(a.account_type)}</td>
                 <td>${typeSpec(a.account_type).billing === 'subscription'
                     ? currencySymbol(a.currency) + (+(a.monthly_price || 0)).toFixed(2) + (typeSpec(a.account_type).subscription_unit === 'per_key' ? '/密钥·周期' : '/周期')
@@ -987,7 +987,7 @@ function initAccountsPage() {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">上游账户管理</h1>
-            <p class="page-subtitle">支持 OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 的上游服务</p>
+            <p class="page-subtitle">支持 OpenAI Chat Completions / OpenAI Responses / Anthropic Messages 的上游服务</p>
             <button class="btn btn--primary" onclick="openAddAccountModal()">+ 添加账户</button>
         </div>
         <!-- 账户类型标签页由 /api/proxy/account-types 的规格表渲染 -->
@@ -1028,9 +1028,9 @@ function initAccountsPage() {
                                 <label>Base URL <input name="base_url" placeholder="https://api.example.com/v1"></label>
                                 <label>API 格式
                                     <select name="api_format">
-                                        <option value="openai">OpenAI 兼容</option>
+                                        <option value="openai">OpenAI Chat Completions</option>
                                         <option value="openai_responses">OpenAI Responses</option>
-                                        <option value="anthropic">Anthropic 兼容</option>
+                                        <option value="anthropic">Anthropic Messages</option>
                                     </select>
                                 </label>
                                 <label>上游路径（可选）

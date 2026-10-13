@@ -9,9 +9,9 @@
 
 /** Client wire formats (proxy_timeout_config rows) and their display labels. */
 const TIMEOUT_GROUPS = [
-    { key: 'anthropic',        label: 'Anthropic 客户端', hint: 'Claude Code · /v1/messages' },
-    { key: 'openai_responses', label: 'OpenAI Responses', hint: 'codex · /v1/responses' },
-    { key: 'openai',           label: 'OpenAI 客户端',   hint: 'OpenAI SDK · /v1/chat/completions' },
+    { key: 'anthropic',        label: 'Anthropic Messages',      hint: 'Claude Code · /v1/messages' },
+    { key: 'openai_responses', label: 'OpenAI Responses',        hint: 'codex · /v1/responses' },
+    { key: 'openai',           label: 'OpenAI Chat Completions', hint: 'OpenAI SDK · /v1/chat/completions' },
 ];
 
 /** Fallback values for "恢复默认" (mirror cc-switch's per-app defaults). */

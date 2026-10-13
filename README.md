@@ -4,7 +4,7 @@
 
 核心特性:
 
-- 三种线格式互相转换:OpenAI 兼容(`/v1/chat/completions`)、OpenAI Responses(`/v1/responses`)、Anthropic 兼容(`/v1/messages`)。Claude Code、codex、OpenAI SDK 等工具可以同时接进来,客户端格式由请求 URL 自动识别
+- 三种线格式互相转换:OpenAI Chat Completions(`/v1/chat/completions`)、OpenAI Responses(`/v1/responses`)、Anthropic Messages(`/v1/messages`)。Claude Code、codex、OpenAI SDK 等工具可以同时接进来,客户端格式由请求 URL 自动识别
 - 多账户路由:一个本地密钥绑定一个上游账户;聚合账户把多个上游合并成一个模型列表,同一模型可配置多个账户自动回退
 - 峰谷定价:按时段给模型定价配倍率,成本在请求写入时按当时价格固化,改价不回溯
 - 用量看板:模型趋势、Token 类型分布、按用户分摊费用;存档只存用量与总价,改价不回溯
@@ -36,15 +36,15 @@ bash start.sh --no-browser
 先给工具配上代理的地址和本地密钥(密钥在仪表板生成,见下面的配置流程):
 
 ```bash
-# OpenAI 兼容工具(OpenAI SDK、各类兼容客户端)
+# OpenAI Chat Completions 工具(OpenAI SDK 等)
 export OPENAI_BASE_URL=http://localhost:8800/v1
 export OPENAI_API_KEY=<本地密钥>
 
-# Anthropic 兼容工具(Claude Code 等)
+# Anthropic Messages 工具(Claude Code 等)
 export ANTHROPIC_BASE_URL=http://localhost:8800/v1
 export ANTHROPIC_AUTH_TOKEN=<本地密钥>
 
-# OpenAI Responses(codex 等)
+# OpenAI Responses 工具(codex 等)
 export OPENAI_BASE_URL=http://localhost:8800/v1
 export OPENAI_API_KEY=<本地密钥>
 ```
@@ -57,7 +57,7 @@ export OPENAI_API_KEY=<本地密钥>
 
 ## 配置流程
 
-1. 打开仪表板 → **代理管理 → 上游账户** → 添加账户,填上游 API 的 Base URL、Key,选 API 格式(OpenAI / OpenAI Responses / Anthropic)
+1. 打开仪表板 → **代理管理 → 上游账户** → 添加账户,填上游 API 的 Base URL、Key,选 API 格式(OpenAI Chat Completions / OpenAI Responses / Anthropic Messages)
 2. **代理管理 → 本地密钥** → 生成密钥,选关联的账户(密钥只显示一次,注意保存)
 3. 把密钥填入 AI 工具的 `API_KEY`(或 `AUTH_TOKEN`),Base URL 指到代理
 4. 发一个请求验证:用量会出现在 **消费报告** 和 **请求日志**,实时并发与延迟看 **性能监控**
