@@ -3,49 +3,48 @@
 from app.core.time import format_utc, utc_now
 from app.db.proxy.common import sqlite3, timedelta
 from app.services.billing_units import BillingUnitResolver
-from app.services.billing_report import live_request_sql
+from app.services.billing_report import attributed_request_sql
 
 
 class ProxyBillingLedgerMixin:
     def get_recent_billing_days(self, days: int = 30) -> list[str]:
-        """Distinct current-state request dates in the last *days* days."""
+        """Distinct attributed request dates in the last *days* days."""
         conn = self._connect()
         try:
             now = utc_now()
             rows = conn.execute("""
                 SELECT DISTINCT date(r.requested_at) AS d
                 FROM request_log r
-            """ + live_request_sql("r") + """
+            """ + attributed_request_sql("r") + """
                 ORDER BY d
             """, {
                 "start": format_utc(now - timedelta(days=int(days))),
                 "end": format_utc(now),
-                "now": format_utc(now),
             }).fetchall()
             return [r["d"] for r in rows]
         finally:
             conn.close()
 
     def get_today_upstream_usage(self) -> list[dict]:
-        """Per live proxy account or Agent software used today."""
+        """Per attributed proxy account or Agent software used today."""
         conn = self._connect()
         try:
             now = utc_now()
             today = now.strftime("%Y-%m-%d")
             rows = conn.execute("""
-                SELECT live_account.name AS account_name,
-                       CASE WHEN live_account.account_kind='agent' THEN 'agent'
+                SELECT ai.name AS account_name,
+                       CASE WHEN ai.account_kind='agent' THEN 'agent'
                             ELSE r.source_kind END AS source_kind,
                        COALESCE(SUM(r.billed_usage_cost), 0) AS real_cost,
                        COALESCE(SUM(r.equivalent_cost), 0) AS theoretical_cost,
                        COALESCE(SUM(r.total_tokens), 0) AS tokens,
                        COUNT(*) AS requests
                 FROM request_log r
-            """ + live_request_sql("r") + """ AND date(r.requested_at)=:today
-                GROUP BY live_account.id
+            """ + attributed_request_sql("r") + """ AND date(r.requested_at)=:today
+                GROUP BY ai.id
                 ORDER BY theoretical_cost DESC
             """, {"start": f"{today}T00:00:00Z", "end": format_utc(now),
-                  "now": format_utc(now), "today": today}).fetchall()
+                  "today": today}).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()

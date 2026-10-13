@@ -16,7 +16,7 @@ from app.db.proxy.lifecycle import ProxyLifecycleMixin
 from app.db.proxy.performance import ProxyPerformanceMixin
 from app.db.proxy.pricing import ProxyPricingMixin
 from app.db.proxy.routing import ProxyRoutingMixin
-from app.services.billing_report import actual_cost, live_request_sql
+from app.services.billing_report import actual_cost, attributed_request_sql
 
 
 class ProxyDatabase(
@@ -71,21 +71,21 @@ class ProxyDatabase(
                 "SELECT COUNT(*) total_requests,COALESCE(SUM(total_tokens),0) total_tokens,"
                 "COALESCE(SUM(equivalent_cost),0) theoretical_cost,"
                 "COALESCE(SUM(billed_usage_cost),0) billed_usage_cost "
-                "FROM request_log r " + live_request_sql("r"),
-                {"start": start_text, "end": now_text, "now": now_text},
+                "FROM request_log r " + attributed_request_sql("r"),
+                {"start": start_text, "end": now_text},
             ).fetchone()
             daily = conn.execute(
                 "SELECT COUNT(*) requests,COALESCE(SUM(equivalent_cost),0) theoretical,"
                 "COALESCE(SUM(billed_usage_cost),0) metered FROM request_log r "
-                + live_request_sql("r") + " AND date(r.requested_at)=:today",
-                {"start": f"{today}T00:00:00Z", "end": now_text,
-                 "now": now_text, "today": today},
+                + attributed_request_sql("r") + " AND date(r.requested_at)=:today",
+                {"start": f"{today}T00:00:00Z", "end": now_text, "today": today},
             ).fetchone()
             costs = actual_cost(conn, now=now, days=30)
             active_upstreams = conn.execute(
-                "SELECT COUNT(DISTINCT r.account_id) FROM request_log r "
-                "JOIN accounts a ON a.id=r.account_id "
-                "WHERE a.account_kind='proxy' AND date(r.requested_at)=?", (today,),
+                "SELECT COUNT(DISTINCT ai.id) FROM request_log r "
+                "JOIN account_identities ai "
+                "ON ai.id=COALESCE(r.account_identity_id,r.account_id) "
+                "WHERE ai.account_kind='proxy' AND date(r.requested_at)=?", (today,),
             ).fetchone()[0]
             incomplete = conn.execute(
                 "SELECT COUNT(*) FROM billing_period_charges "

@@ -154,6 +154,13 @@ class ProxyAgentMixin(ProxySubscriptionMixin):
             conn.close()
 
     def delete_agent_software(self, software_id: int) -> bool:
+        """Remove one Agent software's live graph while retaining history.
+
+        Imported rows keep their ``account_identity_id`` and frozen Agent
+        charges keep their ``software_id``, so consumption reports keep
+        attributing past usage after the software is gone; the delete only
+        stops future imports.
+        """
         conn = self._connect()
         try:
             row = conn.execute(

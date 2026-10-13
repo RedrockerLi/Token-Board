@@ -59,7 +59,7 @@
 | `/api/proxy/accounts` | GET | 上游账户列表 |
 | `/api/proxy/accounts` | POST | 新建账户(name + upstream_key 必填) |
 | `/api/proxy/accounts/<id>` | PUT | 更新账户字段 |
-| `/api/proxy/accounts/<id>` | DELETE | 删除账户(有关联密钥或日志时拒绝) |
+| `/api/proxy/accounts/<id>` | DELETE | 删除账户:立即模式物理删除实时账户与密钥图,`end_of_period` 模式到期后由延迟清理任务删除;历史日志(解绑到身份)与冻结账目保留,消费报表不受影响 |
 | `/api/proxy/accounts/<id>/cancel-deletion` | POST | 取消尚未到期的订阅账户删除 |
 | `/api/proxy/accounts/<id>/models` | GET | 账户模型目录 |
 | `/api/proxy/accounts/<id>/models` | POST | 从上游模型目录端点拉取(默认 `{base}/models`,opencode-go 为 `{base}/v1/models`)并整体替换模型目录 |
@@ -105,7 +105,7 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/proxy/billing` | GET | 按 账户×模型×日 聚合的账单(默认近 30 天,参数 `account_id`、`from`、`to`、`days`) |
+| `/api/proxy/billing` | GET | 按 身份×模型×日 聚合的账单(默认近 30 天,参数 `account_id`(身份 id)、`from`、`to`、`days`);按 `account_identities` 归属,包含已删除账户/软件的历史 |
 | `/api/proxy/billing/daily` | GET | 近 `days` 天(默认 30)每日账单,滚动窗口 |
 | `/api/proxy/billing/daily-by-model` | GET | 近 `days` 天每日所有非聚合上游的输入/输出/缓存命中 Token 分解(堆叠柱状图用);`cost` 仅统计 `api` 类型实际费用 |
 | `/api/proxy/billing/recent-days` | GET | 近 `days` 天有数据的日期列表 |

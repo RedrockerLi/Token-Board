@@ -258,13 +258,29 @@ class ProxyAccountWriteMixin:
                     new_valid_froms=data.get("new_valid_froms"),
                     keep_labels=data.get("keep_labels"),
                     new_labels=new_labels, account_type=final_type)
-        if is_subscription(final_type) and ("monthly_price" in data or
-                                             original_type != final_type):
-            conn.execute(
-                "INSERT INTO billing_rate_events"
-                "(contract_id,recurring_price,effective_at,effective_rule) VALUES(?,?,?,?)",
-                (original["contract_id"], float(data.get("monthly_price") or 0),
-                 utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"), "next_period"),
+        if is_subscription(final_type):
+            price_supplied = "monthly_price" in data
+            new_price = (float(data.get("monthly_price") or 0)
+                         if price_supplied else None)
+            current_price = original["current_price"]
+            # A rename-only save must not write a billing fact: append a rate
+            # event only when the submitted price really changes, or when the
+            # account just became a subscription without any rate event yet.
+            needs_event = (
+                (price_supplied and float(current_price or 0) != new_price)
+                or (original_type != final_type and current_price is None)
             )
+            if needs_event:
+                conn.execute(
+                    "INSERT INTO billing_rate_events"
+                    "(contract_id,recurring_price,effective_at,effective_rule) "
+                    "VALUES(?,?,?,'next_period') "
+                    "ON CONFLICT(contract_id,effective_at,effective_rule) "
+                    "DO UPDATE SET recurring_price=excluded.recurring_price",
+                    (original["contract_id"],
+                     new_price if new_price is not None
+                     else float(current_price or 0),
+                     utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")),
+                )
         conn.commit()
         return conn.total_changes > 0

@@ -1,8 +1,14 @@
-"""One read interface for current-state actual costs.
+"""Historical-attribution reads for actual costs.
 
-Frozen ledgers remain immutable history, but they are not proof that the
-corresponding live billing unit still exists.  Every query in this module
-therefore uses the ledger for the amount and live V2 rows for eligibility.
+Every figure is attributed through ``account_identities``: request rows use
+``COALESCE(r.account_identity_id, r.account_id)`` and frozen period charges
+use their own identity snapshot (falling back to the contract's account for
+legacy rows).  Live routing rows are never consulted, so deleting an account
+or software — or renaming one — cannot change a historical report: deletion
+only stops future imports/routing, and ``name`` is a display attribute.
+
+Rows with no attributable identity are excluded.  Frozen rows stay frozen
+facts: only the ``finalized`` flag and the period window gate the totals.
 """
 
 from __future__ import annotations
@@ -17,150 +23,100 @@ def _window(now: datetime | None, days: int) -> tuple[str, str]:
     return start, end
 
 
-def live_request_sql(alias: str = "r", *, start_param: str = ":start",
-                     end_param: str = ":end", now_param: str = ":now") -> str:
-    """Return the current-configuration request filter.
+def attributed_request_sql(alias: str = "r", *, start_param: str = ":start",
+                           end_param: str = ":end") -> str:
+    """Return the historical-identity request fragment.
 
-    The request log intentionally keeps detached historical rows.  A current
-    consumption report must not fall back to ``account_identities`` for those
-    rows.  A nullable credential/client-key reference is accepted because
-    imported usage and some internal routes do not carry that reference; when
-    present, it must still resolve to a live row.
+    The fragment joins ``account_identities`` as ``ai`` and ends with the
+    window predicate, so callers may project ``ai.id``/``ai.name``/
+    ``ai.account_kind`` and append further ``AND`` predicates.  It carries no
+    live credential/client-key/agent-software existence test: a report must
+    attribute history even after the live configuration row is deleted.
     """
     return f"""
-        JOIN accounts live_account ON live_account.id={alias}.account_id
-        WHERE live_account.account_kind IN ('proxy','agent')
-          AND (
-                (live_account.account_kind='proxy'
-                 AND ({alias}.credential_uuid IS NULL OR EXISTS(
-                    SELECT 1 FROM upstream_credentials live_credential
-                    JOIN upstreams live_upstream
-                      ON live_upstream.id=live_credential.upstream_id
-                    WHERE live_credential.uuid={alias}.credential_uuid
-                      AND live_upstream.account_id=live_account.id
-                      AND (live_credential.ends_at IS NULL
-                           OR live_credential.ends_at>{now_param})
-                 )))
-                OR
-                (live_account.account_kind='agent'
-                 AND EXISTS(
-                    SELECT 1 FROM agent_software live_software
-                    WHERE live_software.id={alias}.agent_software_id
-                 ))
-              )
-          AND ({alias}.client_key_id IS NULL OR EXISTS(
-                SELECT 1 FROM client_keys live_client_key
-                WHERE live_client_key.id={alias}.client_key_id
-              ))
+        JOIN account_identities ai
+          ON ai.id=COALESCE({alias}.account_identity_id,{alias}.account_id)
+        WHERE ai.account_kind IN ('proxy','agent')
           AND {alias}.requested_at>={start_param}
           AND {alias}.requested_at<={end_param}
     """
 
 
-def _live_request_filter(alias: str = "r") -> str:
-    """Current request filter with stable named parameters."""
-    return live_request_sql(alias, start_param=":start", end_param=":end")
+def _attributed_request_filter(alias: str = "r") -> str:
+    """Attributed request fragment with stable named parameters."""
+    return attributed_request_sql(alias, start_param=":start", end_param=":end")
 
 
 def _proxy_charge_sql() -> str:
+    """Frozen per-key proxy charges attributed to the historical identity.
+
+    ``c.credential_uuid IS NOT NULL`` keeps the exact row set the previous
+    ``billing_scope='credential'`` gate selected (per-account charges carry a
+    NULL uuid) without reading the possibly-deleted contract.  No live join
+    remains, so a finalized charge stays reportable after its live graph is
+    removed.
+    """
     return """
         FROM billing_period_charges c
-        JOIN billing_contracts bc ON bc.id=c.contract_id
-        JOIN upstream_credentials live_credential
-          ON live_credential.uuid=c.credential_uuid
-        JOIN upstreams live_upstream
-          ON live_upstream.id=live_credential.upstream_id
-        JOIN accounts live_account
-          ON live_account.id=live_upstream.account_id
-         AND live_account.account_kind='proxy'
-        WHERE c.finalized_at IS NOT NULL
+        JOIN account_identities ai
+          ON ai.id=COALESCE(
+               c.account_identity_id,
+               (SELECT bc.account_id FROM billing_contracts bc
+                WHERE bc.id=c.contract_id))
+        WHERE ai.account_kind='proxy'
+          AND c.credential_uuid IS NOT NULL
+          AND c.finalized_at IS NOT NULL
           AND c.normalized_recurring_cost IS NOT NULL
-          AND bc.charge_type='recurring'
-          AND bc.billing_scope='credential'
-          AND bc.account_id=live_account.id
-          AND (live_credential.ends_at IS NULL
-               OR live_credential.ends_at>:now)
-          AND (bc.ends_at IS NULL OR bc.ends_at>:now)
           AND c.period_start>=:start AND c.period_start<=:end
     """
 
 
 def _agent_allocation_sql() -> str:
+    """Legacy V2.1 allocations attributed to the historical software id."""
     return """
         FROM agent_subscription_charge_allocations allocation
         JOIN agent_subscription_period_charges charge
           ON charge.id=allocation.period_charge_id
-        JOIN agent_subscriptions live_subscription
-          ON live_subscription.id=charge.subscription_id
-        JOIN agent_subscription_instances live_instance
-          ON live_instance.id=charge.instance_id
-         AND live_instance.subscription_id=live_subscription.id
-        JOIN agent_software live_software
-          ON live_software.id=allocation.software_id
-        JOIN accounts live_agent_account
-          ON live_agent_account.id=live_software.id
-         AND live_agent_account.account_kind='agent'
+        JOIN account_identities ai ON ai.id=allocation.software_id
         WHERE allocation.is_finalized=1
           AND allocation.normalized_recurring_cost IS NOT NULL
           AND charge.is_finalized=1
           AND charge.software_id IS NULL
-          AND (live_subscription.ends_on IS NULL
-               OR live_subscription.ends_on>date(:now))
-          AND (live_instance.ends_on IS NULL OR live_instance.ends_on>date(:now))
-          AND EXISTS(
-                SELECT 1 FROM agent_subscription_bindings live_binding
-                WHERE live_binding.subscription_id=live_subscription.id
-                  AND live_binding.software_id=allocation.software_id
-                  AND live_binding.valid_from<=date(:now)
-                  AND (live_binding.ends_on IS NULL
-                       OR live_binding.ends_on>date(:now))
-              )
+          AND ai.account_kind='agent'
           AND charge.period_start>=:start AND charge.period_start<=:end
     """
 
 
 def _agent_charge_sql() -> str:
-    """Return the live direct-owner Agent charge relation.
+    """Directly-owned Agent charges attributed by the frozen software id.
 
-    V2.2 stores the Agent effective when each period charge is materialized.
-    The owner is stored on the charge itself, so this query has no
-    date-sensitive binding join and can report a just-created charge
-    immediately.
+    ``software_id`` is written on the charge at materialization time and
+    shares the identity id space, so no live subscription/instance/software
+    join (and no date-sensitive binding join) is needed.
     """
     return """
         FROM agent_subscription_period_charges charge
-        JOIN agent_subscriptions live_subscription
-          ON live_subscription.id=charge.subscription_id
-        JOIN agent_subscription_instances live_instance
-          ON live_instance.id=charge.instance_id
-         AND live_instance.subscription_id=live_subscription.id
-        JOIN agent_software live_software
-          ON live_software.id=charge.software_id
-        JOIN accounts live_agent_account
-          ON live_agent_account.id=live_software.id
-         AND live_agent_account.account_kind='agent'
+        JOIN account_identities ai ON ai.id=charge.software_id
         WHERE charge.software_id IS NOT NULL
+          AND ai.account_kind='agent'
           AND charge.is_finalized=1
           AND charge.normalized_recurring_cost IS NOT NULL
-          AND (live_subscription.ends_on IS NULL
-               OR live_subscription.ends_on>date(:now))
-          AND (live_instance.ends_on IS NULL
-               OR live_instance.ends_on>date(:now))
           AND charge.period_start>=:start AND charge.period_start<=:end
     """
 
 
 def actual_cost(conn, *, now: datetime | None = None, days: int = 30) -> dict:
-    """Return current-state actual cost for a UTC rolling window.
+    """Return attributed actual cost for a UTC rolling window.
 
-    Historical rows can remain in the database after a hard delete, but only
-    rows whose live billing unit still exists are eligible here.
+    Metered cost comes from request rows via their identity; recurring cost
+    from frozen period charges via their identity snapshots.  Deleting or
+    renaming the live configuration never changes a past window.
     """
     start, end = _window(now, days)
-    params = {"start": start, "end": end, "now": end}
+    params = {"start": start, "end": end}
     metered = conn.execute(
         "SELECT COALESCE(SUM(r.billed_usage_cost),0) FROM request_log r "
-        + _live_request_filter("r"), params
+        + _attributed_request_filter("r"), params
     ).fetchone()[0]
     proxy = conn.execute(
         "SELECT COALESCE(SUM(c.normalized_recurring_cost),0) "
@@ -186,7 +142,7 @@ def actual_cost(conn, *, now: datetime | None = None, days: int = 30) -> dict:
 def recurring_by_period_start(conn, *, now: datetime | None = None,
                               days: int = 30) -> dict[str, float]:
     start, end = _window(now, days)
-    params = {"start": start, "end": end, "now": end}
+    params = {"start": start, "end": end}
     result: dict[str, float] = {}
     for row in conn.execute(
         "SELECT date(c.period_start) period_start,"
@@ -214,15 +170,15 @@ def recurring_by_period_start(conn, *, now: datetime | None = None,
 
 def actual_cost_by_day(conn, *, now: datetime | None = None,
                        days: int = 30) -> dict[str, dict[str, float]]:
-    """Return current-state metered/recurring/total cost by UTC day."""
+    """Return attributed metered/recurring/total cost by UTC day."""
     start, end = _window(now, days)
-    params = {"start": start, "end": end, "now": end}
+    params = {"start": start, "end": end}
     result: dict[str, dict[str, float]] = {}
 
     for row in conn.execute(
         "SELECT date(r.requested_at) day,"
         "COALESCE(SUM(r.billed_usage_cost),0) cost "
-        "FROM request_log r " + _live_request_filter("r") +
+        "FROM request_log r " + _attributed_request_filter("r") +
         " GROUP BY date(r.requested_at)", params):
         result[str(row[0])] = {
             "metered_cost": float(row[1] or 0),
@@ -261,5 +217,6 @@ def actual_cost_by_day(conn, *, now: datetime | None = None,
     return result
 
 
-__all__ = ["_agent_charge_sql", "_agent_allocation_sql", "actual_cost",
-           "actual_cost_by_day", "live_request_sql", "recurring_by_period_start"]
+__all__ = ["_agent_allocation_sql", "_agent_charge_sql", "_proxy_charge_sql",
+           "actual_cost", "actual_cost_by_day", "attributed_request_sql",
+           "recurring_by_period_start"]

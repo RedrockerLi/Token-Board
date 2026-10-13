@@ -6,7 +6,7 @@ from app.services.billing_report import (
     _agent_charge_sql,
     _agent_allocation_sql,
     _proxy_charge_sql,
-    live_request_sql,
+    attributed_request_sql,
 )
 
 
@@ -68,11 +68,10 @@ class ProxyBillingReadMixin:
         date_to: str | None = None,
         days: int = 30,
     ) -> list[dict]:
-        """Aggregated current-state billing by account + model + date.
+        """Aggregated billing by historical identity + model + date.
 
-        Frozen request rows remain available for audit, but detached rows do
-        not belong to the current consumption view.  The shared live request
-        predicate is therefore applied before grouping.
+        Attribution uses ``account_identities`` so rows detached by a
+        deletion stay in the report; ``account_id`` is the identity id.
         """
         conn = self._connect()
         try:
@@ -82,9 +81,11 @@ class ProxyBillingReadMixin:
             end = _filter_bound(date_to, end=True) or format_utc(now)
             sql = """
                 SELECT
-                    live_account.name AS account_name,
-                    live_account.id AS account_id,
-                    r.agent_software_id,
+                    ai.name AS account_name,
+                    ai.id AS account_id,
+                    COALESCE(r.agent_software_id,
+                             CASE WHEN ai.account_kind='agent'
+                                  THEN ai.id END) AS agent_software_id,
                     r.model,
                     date(r.requested_at) AS date,
                     COUNT(*) AS requests,
@@ -94,15 +95,15 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.billed_usage_cost), 0) AS cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost
                 FROM request_log r
-            """ + live_request_sql("r")
-            params = {"start": start, "end": end, "now": end}
+            """ + attributed_request_sql("r")
+            params = {"start": start, "end": end}
             if account_id:
-                sql += " AND live_account.id=:account_id"
+                sql += " AND ai.id=:account_id"
                 params["account_id"] = account_id
 
             sql += """
-                GROUP BY live_account.id, r.model, date(r.requested_at)
-                ORDER BY date(r.requested_at) DESC, live_account.id, r.model
+                GROUP BY ai.id, r.model, date(r.requested_at)
+                ORDER BY date(r.requested_at) DESC, ai.id, r.model
             """
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
@@ -165,23 +166,23 @@ class ProxyBillingReadMixin:
         conn = self._connect()
         try:
             start, end = self._utc_window(days)
-            request_params = {"start": start, "end": end, "now": end}
+            request_params = {"start": start, "end": end}
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
-                    live_account.id AS account_id,
-                    live_account.name AS account_name,
+                    ai.id AS account_id,
+                    ai.name AS account_name,
                     COALESCE(SUM(r.billed_usage_cost), 0) AS metered_cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost,
-                    CASE WHEN live_account.account_kind='agent' THEN 'agent'
+                    CASE WHEN ai.account_kind='agent' THEN 'agent'
                          WHEN r.billing_unit_id IS NOT NULL THEN 'plan'
                          ELSE 'api' END AS account_type,
                     COUNT(*) AS requests,
                     COALESCE(SUM(r.total_tokens), 0) AS total_tokens
                 FROM request_log r
-            """ + live_request_sql("r") + """
-                GROUP BY date(r.requested_at), live_account.id
-                ORDER BY date, live_account.id
+            """ + attributed_request_sql("r") + """
+                GROUP BY date(r.requested_at), ai.id
+                ORDER BY date, ai.id
             """, request_params).fetchall()
             result = {}
             for row in rows:
@@ -191,24 +192,24 @@ class ProxyBillingReadMixin:
                 result[(item["date"], item["account_id"])] = item
 
             recurring_queries = (
-                """SELECT date(c.period_start) date,live_account.id account_id,
-                          live_account.name account_name,
+                """SELECT date(c.period_start) date,ai.id account_id,
+                          ai.name account_name,
                           COALESCE(SUM(c.normalized_recurring_cost),0) recurring_cost,
                           'plan' account_type
                 """ + _proxy_charge_sql() + """
-                   GROUP BY date(c.period_start),live_account.id""",
-                """SELECT date(charge.period_start) date,live_software.id account_id,
-                          live_agent_account.name account_name,
+                   GROUP BY date(c.period_start),ai.id""",
+                """SELECT date(charge.period_start) date,ai.id account_id,
+                          ai.name account_name,
                           COALESCE(SUM(charge.normalized_recurring_cost),0) recurring_cost,
                           'agent' account_type
                 """ + _agent_charge_sql() + """
-                   GROUP BY date(charge.period_start),live_software.id""",
-                """SELECT date(charge.period_start) date,live_software.id account_id,
-                          live_agent_account.name account_name,
+                   GROUP BY date(charge.period_start),ai.id""",
+                """SELECT date(charge.period_start) date,ai.id account_id,
+                          ai.name account_name,
                           COALESCE(SUM(allocation.normalized_recurring_cost),0) recurring_cost,
                           'agent' account_type
                 """ + _agent_allocation_sql() + """
-                   GROUP BY date(charge.period_start),live_software.id""",
+                   GROUP BY date(charge.period_start),ai.id""",
             )
             for sql in recurring_queries:
                 for row in conn.execute(sql, request_params):
@@ -233,7 +234,7 @@ class ProxyBillingReadMixin:
         conn = self._connect()
         try:
             start, end = self._utc_window(days)
-            params = {"start": start, "end": end, "now": end}
+            params = {"start": start, "end": end}
             rows = conn.execute("""
                 SELECT
                     date(r.requested_at) AS date,
@@ -245,7 +246,7 @@ class ProxyBillingReadMixin:
                     COALESCE(SUM(r.billed_usage_cost), 0) AS metered_cost,
                     COALESCE(SUM(r.equivalent_cost), 0) AS equivalent_cost
                 FROM request_log r
-            """ + live_request_sql("r") + """
+            """ + attributed_request_sql("r") + """
                 GROUP BY date(r.requested_at)
                 ORDER BY date
             """, params).fetchall()

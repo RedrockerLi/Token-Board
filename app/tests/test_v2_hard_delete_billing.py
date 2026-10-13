@@ -312,7 +312,7 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
                 "SELECT count(*) FROM daily_model_usage WHERE user_id=0"
             ).fetchone()[0], 1)
 
-    def test_actual_cost_excludes_frozen_charges_after_live_account_delete(self) -> None:
+    def test_actual_cost_keeps_frozen_charges_after_live_account_delete(self) -> None:
         db = self.proxy_database()
         db.update_plan_billing_config({"cancellation_mode": "immediate"})
         live_id = db.create_account({
@@ -341,8 +341,9 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
             )
             conn.commit()
 
-        # This keeps the old finalized charge and identity for audit while
-        # removing the live configuration graph.
+        # The delete removes only the live configuration graph; the identity
+        # snapshot and the frozen charge keep the deleted account's history
+        # in every attributed report.
         self.assertTrue(db.delete_account(deleted_id, mode="immediate")["ok"])
         with sqlite_connection(self.proxy_path) as conn:
             costs = actual_cost(conn, now=now)
@@ -351,10 +352,16 @@ class V2HardDeleteBillingTest(AppDatabaseTestCase):
                 "WHERE account_identity_id=? AND finalized_at IS NOT NULL",
                 (deleted_id,),
             ).fetchone()[0], 1)
+            # The frozen charge reports through the identity snapshot even
+            # though the live contract row is gone.
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM billing_contracts WHERE account_id=?",
+                (deleted_id,),
+            ).fetchone())
 
-        self.assertAlmostEqual(costs["metered_cost"], 2.0)
-        self.assertAlmostEqual(costs["recurring_cost"], 10.0)
-        self.assertAlmostEqual(costs["total_cost"], 12.0)
+        self.assertAlmostEqual(costs["metered_cost"], 101.0)
+        self.assertAlmostEqual(costs["recurring_cost"], 109.0)
+        self.assertAlmostEqual(costs["total_cost"], 210.0)
 
 
 if __name__ == "__main__":

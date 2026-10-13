@@ -83,6 +83,8 @@ def purge_proxy_account(conn: sqlite3.Connection,
     Request history is retained through ``account_identity_id``; only the
     live account/contract/credential graph is removed.  Frozen charge rows
     carry source IDs/snapshots but no longer have parent FKs (V1.17).
+    Consumption reports read history through those identities, so a delete
+    only stops future routing/billing and never changes past windows.
     """
     # Remove the account-owned routing graph first.  Aggregate route rules can
     # also point at this account's upstreams, so those rules must be removed

@@ -106,7 +106,7 @@ Dashboard `monthly_recurring_costs` 使用 `is_frozen`/`frozen_on`，不再保�
 
 | 字段 | 说明 |
 |------|------|
-| `account_id` / `account_identity_id` / `local_key_id` | 实时请求可使用 `account_id`；删除后保留 `account_identity_id` 与 billing 快照，显示 JOIN `account_identities` 取名字 |
+| `account_id` / `account_identity_id` / `local_key_id` | 实时请求可使用 `account_id`；删除后保留 `account_identity_id` 与 billing 快照；显示与消费报表都按 `COALESCE(account_identity_id, account_id)` JOIN `account_identities` 归属，删除或改名不改变历史金额 |
 | `model` | 实际调用的模型名(聚合账户为上游模型名) |
 | `prompt_tokens` | 总输入,含缓存命中 |
 | `completion_tokens` | 输出 |

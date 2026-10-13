@@ -214,6 +214,8 @@ class DashboardReportsTest(AppDatabaseTestCase):
         before = self.client.get("/api/summary").get_json()
 
         database = self.proxy_database()
+        stats_before = database.get_stats()
+        daily_before = database.get_daily_billing()
         database.update_plan_billing_config({"cancellation_mode": "immediate"})
         self.assertTrue(database.delete_account(
             self.plan_account_id, mode="immediate")["ok"])
@@ -225,6 +227,14 @@ class DashboardReportsTest(AppDatabaseTestCase):
         self.assertAlmostEqual(
             after["theoretical_total_cost"], before["theoretical_total_cost"])
         self.assertAlmostEqual(after["actual_cost"], before["actual_cost"])
+
+        # The local consumption report is attributed by identity: the same
+        # delete changes every number by exactly nothing.
+        stats_after = database.get_stats()
+        for key in ("total_requests", "metered_cost", "recurring_cost",
+                    "total_cost", "theoretical_cost", "total_tokens"):
+            self.assertEqual(stats_after[key], stats_before[key], key)
+        self.assertEqual(database.get_daily_billing(), daily_before)
 
     def test_all_public_facades_import(self) -> None:
         from app.db.dashboard_db import DashboardDatabase
