@@ -384,8 +384,11 @@ def transform_dashboard(source: Path, shadow: Path, proxy_source: Path | None,
 
 def source_version_value(path: Path):
     from app.db.migrations import SchemaVersion
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(path)
+    try:
         value = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        conn.close()
     major, minor = divmod(value, 10_000)
     return SchemaVersion(major, minor)
 

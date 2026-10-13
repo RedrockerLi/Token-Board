@@ -66,6 +66,11 @@ class SemaphorePool final : public httplib::TaskQueue {
             }
             jobs_.push_back({std::move(fn), std::chrono::steady_clock::now()});
             queued_.fetch_add(1, std::memory_order_release);
+            // Post while holding mutex_: shutdown() sets its flag and posts
+            // the exit permits under the same mutex_, so this permit can
+            // never surface after sem_destroy(), and shutdown always counts
+            // every accepted job before it fixes the permit total.
+            sem_post(&sem_);
             const size_t current = num_threads_.load(std::memory_order_acquire);
             const size_t busy = active_.load(std::memory_order_acquire);
             if (current < max_threads_ && jobs_.size() > current - std::min(current, busy)) {
@@ -76,26 +81,34 @@ class SemaphorePool final : public httplib::TaskQueue {
         // Growth happens on the enqueue that observes the backlog.  This
         // removes the old 200 ms control-loop delay from burst latency.
         if (should_grow) resize(grow_to);
-        // Post outside the lock: the woken thread can enter the critical
-        // section immediately instead of blocking on `mutex_`.
-        sem_post(&sem_);
         return true;
     }
 
     void shutdown() override {
-        bool expected = false;
-        if (!shutdown_.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel))
-            return;
+        {
+            // Serialize with resize(): no worker may be spawned after the
+            // permit total below is fixed, and threads_/num_threads_ are
+            // mutated only under this lock.
+            std::lock_guard<std::mutex> resize_lock(resize_mutex_);
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool expected = false;
+            if (!shutdown_.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel))
+                return;
 
-        // Post exactly N times — one per worker. Existing queued jobs keep
-        // their own semaphore permits and are drained before a worker consumes
-        // one of these shutdown permits. This mirrors httplib::ThreadPool:
-        // accepted sockets are not silently abandoned during graceful stop.
-        for (size_t i = 0; i < num_threads_.load(); ++i) {
-            sem_post(&sem_);
+            // Post exactly N times — one per worker. Existing queued jobs
+            // already hold their own permits (posted in enqueue() under
+            // mutex_) and are drained before a worker consumes one of these
+            // shutdown permits. This mirrors httplib::ThreadPool: accepted
+            // sockets are not silently abandoned during graceful stop.
+            for (size_t i = 0; i < num_threads_.load(std::memory_order_acquire); ++i) {
+                sem_post(&sem_);
+            }
         }
 
+        // Join outside the locks: workers need mutex_ to drain the queue.
+        // The flag is set, so resize() can now only observe it and return;
+        // threads_ is stable from here on.
         for (auto &t : threads_) {
             if (t.joinable()) t.join();
         }

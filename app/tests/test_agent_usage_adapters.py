@@ -15,8 +15,8 @@ from app.services.agent_usage.adapters import (
     alma, amp, antigravity, claude_code, cline, codearts_agent, codebuddy,
     codex, cola, copilot_cli, craft_agent, cursor, devin, dimagent, droid,
     dsh, gemini_cli, grok, hermes, kiro, kimi_code, mcode, mimocode,
-    openclaw, opencode, pi_common, qoder, qoder_cn, roo_code, qwen_code,
-    trae_cli, workbuddy, zcode,
+    openclaw, opencode, pi_coding_agent, pi_common, qoder, qoder_cn,
+    roo_code, qwen_code, trae_cli, workbuddy, zcode,
 )
 from app.services.agent_usage import cindy_ledger
 from app.services.agent_usage.ir import UsageEvent, UsageSource
@@ -1683,6 +1683,39 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
                 self.assertEqual(craft_agent.discover({})[0].path, session)
                 self.assertEqual(len(hermes.discover({})), 1)
 
+    def test_craft_agent_parses_configured_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_dir = root / "workspaces" / "project" / ".pi-sessions"
+            session_dir.mkdir(parents=True)
+            session = session_dir / "session.jsonl"
+            session.write_text("\n".join([
+                json.dumps({
+                    "type": "session", "version": 1, "id": "craft-session",
+                    "timestamp": "2026-08-24T00:00:00Z",
+                    "cwd": "/work/craft-project",
+                }),
+                json.dumps({
+                    "type": "message", "id": "message-1",
+                    "timestamp": "2026-08-24T00:00:01Z",
+                    "message": {
+                        "role": "assistant", "model": "craft-model",
+                        "usage": {"input": 30, "output": 9},
+                    },
+                }),
+            ]) + "\n", encoding="utf-8")
+            # A stray .jsonl outside .pi-sessions must not be imported.
+            (root / "workspaces" / "project" / "notes.jsonl").write_text(
+                "{}\n", encoding="utf-8")
+
+            sources = craft_agent.discover(
+                {"config": {"data_root": str(root)}})
+            self.assertEqual([item.path for item in sources], [session])
+            self.assert_one_event(
+                craft_agent.parse(sources[0]), model="craft-model",
+                prompt=30, completion=9, cache=0, total=39,
+                project="craft-project", session_id="craft-session")
+
     def _write_hermes_store(self, home: Path, *, session_id: str, profile: str = "",
                             model: str = "hermes-model",
                             started_at: str = "2026-08-24T00:00:00Z",
@@ -2007,6 +2040,73 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual((event.prompt_tokens, event.completion_tokens,
                               event.cache_read_tokens, event.total_tokens),
                              (100, 20, 40, 120))
+
+    def test_pi_coding_agent_module_routes_pi_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            session = sessions / "session.jsonl"
+            session.write_text("\n".join([
+                json.dumps({
+                    "type": "session", "version": 1, "id": "pi-module-session",
+                    "timestamp": "2026-08-24T00:00:00Z", "cwd": "/work/project",
+                }),
+                json.dumps({
+                    "type": "message", "id": "message-1",
+                    "timestamp": "2026-08-24T00:00:01Z",
+                    "message": {
+                        "role": "assistant", "model": "pi-model",
+                        "usage": {"input": 60, "cacheRead": 40,
+                                  "output": 20, "reasoning": 5},
+                    },
+                }),
+            ]) + "\n", encoding="utf-8")
+
+            sources = pi_coding_agent.discover({"config": {
+                "data_root": str(sessions),
+                "cindy_dirs": str(root / "no-cindy"),
+            }})
+            self.assertEqual([item.path for item in sources], [session])
+            self.assert_one_event(
+                pi_coding_agent.parse(sources[0]), model="pi-model",
+                prompt=100, completion=20, cache=40, total=120,
+                project="project", session_id="pi-module-session")
+
+    def test_pi_coding_agent_module_parses_cindy_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cindy_dir = root / "cindy"
+            cindy_dir.mkdir()
+            path = cindy_dir / "cindy-owner.db"
+            with sqlite_connection(path) as connection:
+                connection.execute("""
+                    CREATE TABLE daily_model_usage (
+                        day TEXT, agent_kind TEXT, model TEXT,
+                        input_tokens INTEGER, output_tokens INTEGER,
+                        cache_read_tokens INTEGER, cache_create_tokens INTEGER
+                    )
+                """)
+                connection.execute(
+                    "INSERT INTO daily_model_usage VALUES(?,?,?,?,?,?,?)",
+                    ("2026-08-22", "pi", "pi-ledger-model", 20, 2, 10, 1),
+                )
+                connection.execute(
+                    "INSERT INTO daily_model_usage VALUES(?,?,?,?,?,?,?)",
+                    ("2026-08-22", "codex", "codex-decoy", 50, 5, 0, 0),
+                )
+
+            sources = pi_coding_agent.discover({"config": {
+                "data_root": str(root / "no-pi"),
+                "cindy_dirs": str(cindy_dir),
+            }})
+            self.assertEqual(len(sources), 1)
+            self.assertTrue(sources[0].context.get("cindy"))
+            parsed = pi_coding_agent.parse(sources[0])
+            self.assert_one_event(parsed, model="pi-ledger-model",
+                                  prompt=31, completion=2, cache=10, total=33)
+            self.assertTrue(parsed.events[0].event_id.startswith(
+                "pi-coding-agent:"))
 
     def test_opencode_accepts_custom_sqlite_filename(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

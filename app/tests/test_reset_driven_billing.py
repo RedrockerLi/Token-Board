@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import unittest
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 from app.core.time import billing_period, format_utc, parse_runtime_timestamp, utc_now
@@ -456,14 +457,18 @@ class ResetDrivenBillingTest(AppDatabaseTestCase):
 class ResolveUnitPeriodAnchorTest(unittest.TestCase):
     """Direct checks of the resolver's anchor-branch edges."""
 
-    def _conn(self) -> sqlite3.Connection:
+    @contextmanager
+    def _conn(self):
         conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.execute(
-            "CREATE TABLE billing_period_charges ("
-            "contract_id INTEGER, credential_uuid TEXT, "
-            "period_start TEXT, period_end TEXT)")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                "CREATE TABLE billing_period_charges ("
+                "contract_id INTEGER, credential_uuid TEXT, "
+                "period_start TEXT, period_end TEXT)")
+            yield conn
+        finally:
+            conn.close()
 
     def _unit(self, **overrides) -> BillingUnit:
         values = dict(
@@ -479,16 +484,18 @@ class ResolveUnitPeriodAnchorTest(unittest.TestCase):
         moment = datetime(2026, 9, 20, tzinfo=timezone.utc)
 
         # Without a resume stamp the anchor boundary stands.
-        period = resolve_unit_period(self._conn(), self._unit(), moment)
+        with self._conn() as conn:
+            period = resolve_unit_period(conn, self._unit(), moment)
         self.assertEqual(period, (datetime(2026, 9, 1, tzinfo=timezone.utc),
                                   datetime(2026, 10, 1, tzinfo=timezone.utc)))
 
         # A subscription seen again later inside the same boundary must not
         # be backdated to its start (billing follows the observation).
-        period = resolve_unit_period(
-            self._conn(),
-            self._unit(subscription=SubscriptionState(resumed_at=resumed)),
-            moment)
+        with self._conn() as conn:
+            period = resolve_unit_period(
+                conn,
+                self._unit(subscription=SubscriptionState(resumed_at=resumed)),
+                moment)
         self.assertEqual(period, (resumed,
                                   datetime(2026, 10, 1, tzinfo=timezone.utc)))
 

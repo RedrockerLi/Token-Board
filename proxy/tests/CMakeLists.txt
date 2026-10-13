@@ -96,6 +96,13 @@ add_executable(spool_codec_test spool_codec_test.cpp)
 target_include_directories(spool_codec_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(spool_codec_test PRIVATE cxx_std_17)
 
+# SemaphorePool lifecycle: concurrent enqueue/resize/shutdown must not lose
+# shutdown permits; a watchdog turns any deadlocked join into a failure.
+add_executable(semaphore_pool_test semaphore_pool_test.cpp)
+target_include_directories(semaphore_pool_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(semaphore_pool_test PRIVATE cxx_std_17)
+target_link_libraries(semaphore_pool_test PRIVATE Threads::Threads)
+
 # Upstream forwarding regression: fast responses must not wait for a watchdog
 # polling interval, and invalid targets must normalize to a retryable 502.
 add_executable(upstream_client_test
@@ -238,6 +245,46 @@ add_test(NAME accounting_abort COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/..
 )
 
+# Crash-injection build of the production proxy: the store sources are
+# compiled here with TB_ENABLE_TEST_CRASH so accounting_recovery can stop the
+# process at an exact durable-spool boundary.  Test targets compile the
+# sources they exercise; production libraries never define test-only macros.
+add_executable(token_proxy_test
+    ${CMAKE_SOURCE_DIR}/src/main.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/db.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/database_lifecycle.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/database_statements.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/routing_repository.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/pricing_repository.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/durable_spool.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/usage_writer.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/usage_recorder.cpp
+    ${CMAKE_SOURCE_DIR}/third_party/sqlite3.c
+)
+set_source_files_properties(${CMAKE_SOURCE_DIR}/third_party/sqlite3.c PROPERTIES
+    LANGUAGE C
+    COMPILE_FLAGS "-O2 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1"
+)
+target_include_directories(token_proxy_test PRIVATE
+    ${TEST_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
+)
+# NDEBUG cancels this directory's -UNDEBUG so the binary matches the Release
+# production build; the crash point is the only intended difference.
+target_compile_definitions(token_proxy_test PRIVATE
+    TB_ENABLE_TEST_CRASH=1
+    CPPHTTPLIB_LISTEN_BACKLOG=512
+    NDEBUG
+)
+target_compile_features(token_proxy_test PRIVATE cxx_std_17)
+target_link_libraries(token_proxy_test PRIVATE
+    token_proxy_runtime token_proxy_format token_proxy_net
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+)
+
 
 # ── Test registration ────────────────────────────────────────────────────
 add_test(NAME format_conversion COMMAND format_conv_test)
@@ -248,6 +295,16 @@ add_test(NAME endpoint_policy COMMAND endpoint_policy_test)
 add_test(NAME usage_accounting COMMAND usage_accounting_test)
 add_test(NAME usage_parser COMMAND usage_parser_test)
 add_test(NAME spool_codec COMMAND spool_codec_test)
+add_test(NAME semaphore_pool COMMAND semaphore_pool_test)
+# Build-time contract: the crash-injection marker must exist in the test
+# binary and must never appear in the shipped proxy.
+add_test(
+    NAME crash_hook_isolation
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/crash_hook_isolation_test.py
+            $<TARGET_FILE:token_proxy>
+            $<TARGET_FILE:token_proxy_test>
+)
 add_test(
     NAME schema_version
     COMMAND ${Python3_EXECUTABLE}
@@ -368,7 +425,7 @@ add_test(
     NAME accounting_recovery
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/accounting_recovery_test.py
-            $<TARGET_FILE:token_proxy>
+            $<TARGET_FILE:token_proxy_test>
             ${CMAKE_SOURCE_DIR}/../schema
             ${CMAKE_SOURCE_DIR}/..
 )
@@ -478,7 +535,8 @@ set_tests_properties(
 )
 set_tests_properties(format_conversion session_affinity endpoint_policy source_size
     refactor_boundaries
-    accounting_abort usage_accounting usage_parser
+    accounting_abort usage_accounting usage_parser semaphore_pool
+    crash_hook_isolation
     PROPERTIES LABELS "unit")
 set_tests_properties(upstream_client PROPERTIES LABELS "integration")
 set_tests_properties(

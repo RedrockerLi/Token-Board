@@ -10,6 +10,108 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+namespace {
+
+// Deterministic stale-keep-alive peer for the pooled-socket retry:
+//   1. accept connection 1, answer the first request, keep it open;
+//   2. the moment the next request arrives on that pooled socket, RST-close
+//      it — this lands after cpp-httplib's liveness pre-check, which silently
+//      repairs a socket that is already dead;
+//   3. accept the retry on connection 2 and answer it.
+// SO_RCVTIMEO keeps the helper from hanging the test when the client
+// misbehaves.
+void recv_until(int fd, std::string &buffer, const char *needle) {
+    char chunk[4096];
+    while (buffer.find(needle) == std::string::npos) {
+        const ssize_t n = ::recv(fd, chunk, sizeof(chunk), 0);
+        if (n <= 0) return;
+        buffer.append(chunk, static_cast<size_t>(n));
+    }
+}
+
+bool send_all(int fd, const std::string &data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, 0);
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+std::string http_ok_response(const std::string &body, const char *content_type) {
+    return "HTTP/1.1 200 OK\r\nContent-Type: " + std::string(content_type) +
+           "\r\nContent-Length: " + std::to_string(body.size()) +
+           "\r\nConnection: keep-alive\r\n\r\n" + body;
+}
+
+int make_listener() {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    const int one = 1;
+    ::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    timeval accept_timeout{5, 0};
+    ::setsockopt(listener, SOL_SOCKET, SO_RCVTIMEO, &accept_timeout,
+                 sizeof(accept_timeout));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    assert(::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+    assert(::listen(listener, 8) == 0);
+    return listener;
+}
+
+int listener_port(int listener) {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    assert(::getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &len) == 0);
+    return ntohs(addr.sin_port);
+}
+
+void stale_keepalive_peer(int listener, std::string first_response,
+                          std::string retry_response,
+                          std::atomic<int> *connections) {
+    const timeval recv_timeout{5, 0};
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    const int first = ::accept(listener, reinterpret_cast<sockaddr *>(&addr), &len);
+    if (first < 0) return;
+    ::setsockopt(first, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout,
+                 sizeof(recv_timeout));
+    connections->fetch_add(1, std::memory_order_relaxed);
+    std::string request;
+    recv_until(first, request, "\r\n\r\n");
+    send_all(first, first_response);
+    // Wait for the reused socket to carry the next request, then kill it with
+    // an RST so the client observes a Read/Write failure with no response.
+    char byte = 0;
+    if (::recv(first, &byte, 1, 0) > 0) {
+        linger reset{1, 0};
+        ::setsockopt(first, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    }
+    ::close(first);
+
+    const int retry = ::accept(listener, reinterpret_cast<sockaddr *>(&addr), &len);
+    if (retry < 0) return;
+    ::setsockopt(retry, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout,
+                 sizeof(recv_timeout));
+    connections->fetch_add(1, std::memory_order_relaxed);
+    request.clear();
+    recv_until(retry, request, "\r\n\r\n");
+    send_all(retry, retry_response);
+    ::close(retry);
+}
+
+} // namespace
 
 int main() {
     httplib::Server server;
@@ -167,6 +269,77 @@ int main() {
             }, comp_opts);
         assert(comp.success);
         assert(comp.status_code == 200);
+    }
+
+    // ── Stale keep-alive sockets ──────────────────────────────────────────
+    // A provider that closed an idle pooled connection used to leak a 502:
+    // Error::Read/Write on a reused socket was not classified as retryable.
+    // The mock RST-closes the pooled socket only after the next request
+    // arrives, so the failure lands inside send/read instead of being
+    // repaired by httplib's liveness pre-check.
+    {
+        const int listener = make_listener();
+        std::atomic<int> connections{0};
+        std::thread peer(stale_keepalive_peer, listener,
+                         http_ok_response("{\"first\":true}", "application/json"),
+                         http_ok_response("{\"retry\":true}", "application/json"),
+                         &connections);
+        const std::string origin = "http://127.0.0.1:" +
+                                   std::to_string(listener_port(listener));
+        const auto first = client.forward("GET", origin, "unused", "/stale", "",
+                                          "application/json", nullptr, opts);
+        assert(first.success && first.status_code == 200);
+        assert(first.body == "{\"first\":true}");
+        const auto second = client.forward("GET", origin, "unused", "/stale", "",
+                                           "application/json", nullptr, opts);
+        assert(second.success);
+        assert(second.status_code == 200);
+        assert(second.body == "{\"retry\":true}");
+        peer.join();
+        ::close(listener);
+        assert(connections.load() == 2);
+    }
+    {
+        const int listener = make_listener();
+        std::atomic<int> connections{0};
+        const std::string sse_first =
+            "data: {\"text\":\"first\"}\n\ndata: [DONE]\n\n";
+        const std::string sse_retry =
+            "data: {\"text\":\"retry\"}\n\ndata: [DONE]\n\n";
+        std::thread peer(stale_keepalive_peer, listener,
+                         http_ok_response(sse_first, "text/event-stream"),
+                         http_ok_response(sse_retry, "text/event-stream"),
+                         &connections);
+        const std::string origin = "http://127.0.0.1:" +
+                                   std::to_string(listener_port(listener));
+        auto stream_once = [&] {
+            ForwardOptions stream_opts;
+            stream_opts.streaming_first_byte_timeout = 5;
+            stream_opts.streaming_semantic_timeout = 5;
+            stream_opts.streaming_idle_timeout = 5;
+            auto terminal_seen = std::make_shared<std::atomic<bool>>(false);
+            stream_opts.terminal_seen = terminal_seen;
+            std::string forwarded;
+            auto result = client.forward(
+                "GET", origin, "unused", "/stale", "", "application/json",
+                [&forwarded, &terminal_seen](const char *data, size_t len) {
+                    forwarded.append(data, len);
+                    if (forwarded.find("[DONE]") != std::string::npos)
+                        terminal_seen->store(true, std::memory_order_release);
+                    return true;
+                },
+                stream_opts);
+            return std::make_pair(result, forwarded);
+        };
+        const auto first = stream_once();
+        assert(first.first.success && first.first.status_code == 200);
+        assert(first.second == sse_first);
+        const auto second = stream_once();
+        assert(second.first.success && second.first.status_code == 200);
+        assert(second.second == sse_retry);
+        peer.join();
+        ::close(listener);
+        assert(connections.load() == 2);
     }
 
     server.stop();

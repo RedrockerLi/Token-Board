@@ -240,7 +240,20 @@ UpstreamClient::forward(const std::string &method,
                e == httplib::Error::SSLConnection ||
                e == httplib::Error::ConnectionTimeout;
     };
+    // A pooled keep-alive socket the provider closed while idle fails the next
+    // request with Read/Write before any response byte arrives (a response
+    // status of 0 means no response line was parsed).  Only that reused-socket
+    // window earns the one-shot fresh-connection retry; once a response head
+    // arrived the faithful 502/truncation classification stays.
+    auto is_stale_reused_error = [](bool reused, int response_status,
+                                    bool timed_out, httplib::Error e) {
+        return reused && response_status == 0 && !timed_out &&
+               (e == httplib::Error::Read || e == httplib::Error::Write);
+    };
 
+    // Set by acquire() below on every attempt: whether this request is riding
+    // a pooled keep-alive socket.
+    bool connection_reused = false;
     auto attempt = [&](httplib::Client &cli) -> bool {
         result = ForwardResult{};
         timing->connect_ms = 0;
@@ -407,7 +420,9 @@ UpstreamClient::forward(const std::string &method,
                                std::string(httplib::to_string(err));
             return !ok && !watch->expired.load(std::memory_order_acquire) &&
                    !watch->client_disconnected.load(std::memory_order_acquire) &&
-                   is_connect_error(err);
+                   (is_connect_error(err) ||
+                    is_stale_reused_error(connection_reused, upstream_status,
+                                          result.is_timeout, err));
         }
     } else {
         int upstream_status = 0;
@@ -520,14 +535,15 @@ UpstreamClient::forward(const std::string &method,
             return !ok &&
                    !watch->expired.load(std::memory_order_acquire) &&
                    !watch->client_disconnected.load(std::memory_order_acquire) &&
-                   is_connect_error(request_err);
+                   (is_connect_error(request_err) ||
+                    is_stale_reused_error(connection_reused, upstream_status,
+                                          result.is_timeout, request_err));
         }
     }
         return false;
     };
     std::set<std::string> tried_addresses;
     size_t addr_index = 0;
-    bool connection_reused = false;
     auto acquire = [&]() -> PooledLease {
         if (auto pooled = ClientPool::instance().take(origin_parts.origin)) {
             connection_reused = true;
