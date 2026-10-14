@@ -1493,9 +1493,9 @@ code {
     box-shadow: var(--shadow-sm);
 }
 
-/* 账户名悬浮用量卡：锚点带虚线提示，卡片固定定位在锚点旁。 */
+/* 账户名用量卡锚点：悬浮出卡片、点击立即刷新用量。 */
 .usage-anchor {
-    cursor: help;
+    cursor: pointer;
     text-decoration-line: underline;
     text-decoration-style: dashed;
     text-decoration-color: var(--color-border-strong);
@@ -1562,6 +1562,13 @@ code {
 .usage-card__window .is-limit {
     color: var(--color-warning);
     font-weight: 600;
+}
+
+/* 点击刷新的中性状态行（「正在获取最新用量…」/「刷新较慢…」）。 */
+.usage-card__status {
+    margin-bottom: 9px;
+    color: var(--color-text-tertiary);
+    font-size: 12px;
 }
 
 .usage-card__error {

@@ -22,6 +22,18 @@ add_test(
             ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_key_order.js
 )
 
+add_test(
+    NAME frontend_proxy_manager_usage_card
+    COMMAND ${NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_usage_card.js
+)
+
+add_test(
+    NAME frontend_proxy_manager_usage_refresh
+    COMMAND ${NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_usage_refresh.js
+)
+
 foreach(FRONTEND_TZ Asia/Shanghai America/New_York UTC Pacific/Kiritimati)
     string(REPLACE "/" "_" FRONTEND_TZ_NAME "${FRONTEND_TZ}")
     add_test(

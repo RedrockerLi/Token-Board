@@ -27,6 +27,23 @@ class AccountSubtypeApiTest(AppDatabaseTestCase):
                 "SELECT subtype FROM upstreams WHERE account_id=?",
                 (account_id,)).fetchone()[0]
 
+    def _create_go_account(self, name: str, key: str | None = None) -> int:
+        payload = {"name": name, "account_type": "plan",
+                   "subtype": "opencode-go"}
+        if key:
+            payload["upstream_keys"] = [key]
+        created = self.client.post("/api/proxy/accounts", json=payload)
+        self.assertEqual(created.status_code, 201,
+                         created.get_data(as_text=True))
+        return created.get_json()["id"]
+
+    def _write_usage(self, account_id: int, payload: dict) -> None:
+        with sqlite_connection(self.proxy_path) as conn:
+            conn.execute(
+                "UPDATE upstream_credentials SET usage_json=? WHERE upstream_id="
+                "(SELECT id FROM upstreams WHERE account_id=? LIMIT 1)",
+                (json.dumps(payload), account_id))
+
     def test_plan_subtype_is_validated_stored_and_echoed(self) -> None:
         created = self.client.post("/api/proxy/accounts", json={
             "name": "go-plan",
@@ -328,3 +345,108 @@ class AccountSubtypeApiTest(AppDatabaseTestCase):
                          offline.get_data(as_text=True))
         self.assertEqual(
             self._account(offline.get_json()["id"])["subtype"], "opencode-go")
+
+    def test_usage_refresh_returns_the_fresh_account_row(self) -> None:
+        account_id = self._create_go_account("go-click", "sk-click-111111")
+        snapshot = {"checked_at": "2026-10-14T06:55:00Z", "error": None,
+                    "windows": {}}
+        # The wake's sendto commits a new observation inline: the wait loop
+        # compares before its first sleep, so the call returns with no delay.
+        with patch("app.services.runtime_tasks.socket.socket") as factory:
+            factory.return_value.__enter__.return_value.sendto.side_effect = (
+                lambda *_: self._write_usage(account_id, snapshot))
+            response = self.client.post(
+                f"/api/proxy/accounts/{account_id}/usage-refresh")
+        self.assertEqual(response.status_code, 200,
+                         response.get_data(as_text=True))
+        body = response.get_json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["account"]["keys"][0]["usage"], snapshot)
+        client = factory.return_value.__enter__.return_value
+        client.settimeout.assert_called_once_with(0.2)
+        client.sendto.assert_called_once_with(
+            b"USAGE_REFRESH", self.app.config["MAINTENANCE_SOCKET"])
+
+    def test_usage_refresh_reports_pending_without_a_new_snapshot(self) -> None:
+        account_id = self._create_go_account("go-pending", "sk-pending-111111")
+        with patch("app.services.runtime_tasks.socket.socket") as factory, \
+                patch("app.routes.proxy.accounts.USAGE_REFRESH_WAIT_SECONDS", 0.05), \
+                patch("app.routes.proxy.accounts.USAGE_REFRESH_POLL_SECONDS", 0.01):
+            response = self.client.post(
+                f"/api/proxy/accounts/{account_id}/usage-refresh")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), {"status": "pending"})
+        # The wake was still delivered; only the observation has not landed.
+        factory.return_value.__enter__.return_value.sendto.assert_called_once_with(
+            b"USAGE_REFRESH", self.app.config["MAINTENANCE_SOCKET"])
+
+    def test_usage_refresh_validates_the_account(self) -> None:
+        missing = self.client.post("/api/proxy/accounts/999/usage-refresh")
+        self.assertEqual(missing.status_code, 404)
+
+        plain = self.client.post("/api/proxy/accounts", json={
+            "name": "plain-refresh", "account_type": "api"})
+        self.assertEqual(plain.status_code, 201)
+        unsupported = self.client.post(
+            f"/api/proxy/accounts/{plain.get_json()['id']}/usage-refresh")
+        self.assertEqual(unsupported.status_code, 400)
+        self.assertEqual(unsupported.get_json()["error"],
+                         "该账户类型不支持用量查询")
+
+        keyless = self._create_go_account("go-keyless")
+        no_keys = self.client.post(
+            f"/api/proxy/accounts/{keyless}/usage-refresh")
+        self.assertEqual(no_keys.status_code, 400)
+        self.assertEqual(no_keys.get_json()["error"],
+                         "该账户没有可查询用量的本机密钥")
+
+    def test_usage_refresh_unavailable_without_the_maintenance_socket(self) -> None:
+        account_id = self._create_go_account("go-offline", "sk-offline-111111")
+        with patch("app.services.runtime_tasks.socket.socket",
+                   side_effect=OSError("no socket")):
+            response = self.client.post(
+                f"/api/proxy/accounts/{account_id}/usage-refresh")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["status"], "unavailable")
+
+    def test_usage_refresh_watches_only_the_requested_account(self) -> None:
+        account_a = self._create_go_account("go-watch-a", "sk-watch-aaaa")
+        account_b = self._create_go_account("go-watch-b", "sk-watch-bbbb")
+        snapshot = {"checked_at": "2026-10-14T06:56:00Z", "error": None,
+                    "windows": {}}
+        # The wake refreshes the whole poller cycle, but a waiter only resolves
+        # on its own account's snapshot: B committing must not resolve A.
+        with patch("app.services.runtime_tasks.socket.socket") as factory, \
+                patch("app.routes.proxy.accounts.USAGE_REFRESH_WAIT_SECONDS", 0.05), \
+                patch("app.routes.proxy.accounts.USAGE_REFRESH_POLL_SECONDS", 0.01):
+            factory.return_value.__enter__.return_value.sendto.side_effect = (
+                lambda *_: self._write_usage(account_b, snapshot))
+            untouched = self.client.post(
+                f"/api/proxy/accounts/{account_a}/usage-refresh")
+        self.assertEqual(untouched.status_code, 202,
+                         untouched.get_data(as_text=True))
+
+        fresh = {**snapshot, "checked_at": "2026-10-14T06:57:00Z"}
+        with patch("app.services.runtime_tasks.socket.socket") as factory:
+            factory.return_value.__enter__.return_value.sendto.side_effect = (
+                lambda *_: self._write_usage(account_b, fresh))
+            resolved = self.client.post(
+                f"/api/proxy/accounts/{account_b}/usage-refresh")
+        self.assertEqual(resolved.status_code, 200,
+                         resolved.get_data(as_text=True))
+        self.assertEqual(
+            resolved.get_json()["account"]["keys"][0]["usage"], fresh)
+
+    def test_usage_refresh_counts_a_failed_observation_as_fresh(self) -> None:
+        account_id = self._create_go_account("go-failed", "sk-failed-111111")
+        failure = {"checked_at": None, "error": "HTTP 500",
+                   "error_at": "2026-10-14T06:58:00Z", "windows": {}}
+        with patch("app.services.runtime_tasks.socket.socket") as factory:
+            factory.return_value.__enter__.return_value.sendto.side_effect = (
+                lambda *_: self._write_usage(account_id, failure))
+            response = self.client.post(
+                f"/api/proxy/accounts/{account_id}/usage-refresh")
+        self.assertEqual(response.status_code, 200,
+                         response.get_data(as_text=True))
+        self.assertEqual(response.get_json()["account"]["keys"][0]["usage"],
+                         failure)

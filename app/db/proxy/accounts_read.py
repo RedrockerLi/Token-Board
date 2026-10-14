@@ -121,6 +121,29 @@ class ProxyAccountReadMixin:
         finally:
             conn.close()
 
+    def usage_snapshot(self, account_id: int) -> dict[str, str | None] | None:
+        """Raw usage_json of every credential on this account's routed upstream.
+
+        The usage poller commits every refreshed payload in one transaction, so
+        any difference between two snapshots of the same account marks a
+        completed observation cycle (a success stamps ``checked_at``, a failure
+        stamps ``error``/``error_at``).  None means the account resolves to no
+        enabled upstream — nothing the poller could ever visit; an empty dict
+        means the upstream holds no credential rows at all.
+        """
+        conn = self._connect()
+        try:
+            route = self._v1_route_account(conn, account_id)
+            if route is None or route["upstream_id"] is None:
+                return None
+            rows = conn.execute(
+                "SELECT uuid,usage_json FROM upstream_credentials "
+                "WHERE upstream_id=? ORDER BY runtime_id",
+                (route["upstream_id"],)).fetchall()
+            return {row["uuid"]: row["usage_json"] for row in rows}
+        finally:
+            conn.close()
+
     @staticmethod
     def _normalize_keys_and_labels(data: dict) -> tuple[list[str], list[object]]:
         """Collect the intended upstream key list and its aligned labels.

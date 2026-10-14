@@ -538,7 +538,12 @@ function selectAccountsTab(type) {
 //
 // 子类型声明了用量查询路径（usage_path）的账户，在账户表里以「名称」为锚点：
 // 悬浮时在单元格旁弹出一张卡片，逐把密钥列出 5小时/本周/本月 用量与重置倒计时。
-// 倒计时按上游返回的重置时刻（resets_at）算出，统一成 d/h/m、最多两段。
+// 倒计时按上游返回的重置时刻（resets_at）算出，统一成 d/h/m、最多两段；只在
+// 窗口仍在计时、重置时刻才是真实截止时显示（判据同步调度，见 usageWindowState）：
+// 未开始计时的滚动窗口（state=idle，重置为上游占位值）显示「未开始」。
+// 点击名称还会立即唤醒一次用量轮询并等待本账户落库：卡片保持打开显示
+// 「正在获取最新用量…」，完成后就地换成新快照；移开鼠标仍按原规则关闭，
+// 请求在后台完成后只合并缓存——不重渲染表格，重渲染会关掉卡片。
 // 卡片挂在 document.body 上（.page-container 的入场动画带
 // transform，会把 position:fixed 的参照系挪走），且 pointer-events:none —
 // 卡片自己不得抢走单元格的悬浮。
@@ -567,11 +572,31 @@ function fmtResetIn(resetsAt) {
     return minutes ? `${minutes}m` : '<1m';
 }
 
-/** 一个窗口的展示值："36%(1h22m)"；上游没给重置时刻时只给百分比。 */
-function usageWindowText(win) {
+/** 窗口的调度生命周期：显式 state（started/idle/unknown）优先，读取规则与
+ *  router.cpp 解析 usage_json 一致；快照早于 state 字段（或该字段不是字符串）
+ *  时，周/月窗口有可解析的重置时刻即视为 started，滚动窗口保持 unknown 不猜。 */
+function usageWindowState(win, windowName) {
+    const state = win && win.state;
+    if (typeof state === 'string') {
+        return (state === 'started' || state === 'idle') ? state : 'unknown';
+    }
+    const resets = win && win.resets_at;
+    return windowName !== '5h' && typeof resets === 'string'
+        && Number.isFinite(Date.parse(resets)) ? 'started' : 'unknown';
+}
+
+/** 一个窗口的展示值："36%(1h22m)"。倒计时只在窗口仍在计时、重置时刻是真实
+ *  截止时显示，判据与候选排序的窗口压力一致（candidate_selection.h）：5h 认
+ *  started，周/月认非 unknown；idle 的 5h 是上游占位值（观测时刻+5h），显示
+ *  「未开始」而不是让占位值冒充截止时刻。unknown（无法判定）或上游没给重置
+ *  时刻时只给百分比。 */
+function usageWindowText(win, windowName) {
     const percent = win && win.percent != null ? Math.round(Number(win.percent)) : NaN;
     if (!Number.isFinite(percent)) return '—';
-    const reset = win && win.resets_at ? fmtResetIn(win.resets_at) : '';
+    const state = usageWindowState(win, windowName);
+    if (windowName === '5h' && state === 'idle') return `${percent}%(未开始)`;
+    const reset = state !== 'unknown' && win && win.resets_at
+        ? fmtResetIn(win.resets_at) : '';
     return reset ? `${percent}%(${reset})` : `${percent}%`;
 }
 
@@ -591,6 +616,10 @@ function tracksKeyUsage(account) {
 }
 
 let _usageCardEl = null;
+let _usageCardAnchor = null;     // 卡片当前锚点；刷新完成后就地重渲染/重定位用
+let _usageCardAccountId = null;  // 卡片当前展示的账户 id；null = 已关闭
+const _usageRefreshPending = new Set();  // 刷新请求进行中的账户 id（字符串）
+const _usageRefreshNotice = new Map();   // 刷新结果提示：账户 id → {level?, text}
 
 function _usageCardNode() {
     if (!_usageCardEl) {
@@ -603,11 +632,31 @@ function _usageCardNode() {
 }
 
 function hideUsageCard() {
+    _usageCardAnchor = null;
+    _usageCardAccountId = null;
     if (_usageCardEl) _usageCardEl.classList.remove('is-open');
 }
 
-/** 悬浮卡内容：账户名 + 类型徽章，逐把密钥列三个窗口的用量与倒计时。 */
-function usageCardHtml(account) {
+/** 事件发生时从缓存解析锚点对应的账户。监听器不得在绑定时捕获账户对象：
+ *  点击刷新的结果只合并进缓存、不重渲染表格（重渲染会关掉卡片、换掉锚点），
+ *  只有事件时解析才能让下一次悬浮/点击看到新数据。 */
+function _usageAnchorAccount(anchor) {
+    const id = anchor && anchor.dataset ? anchor.dataset.accountId : null;
+    return (_accountsCache || []).find((a) => String(a.id) === id) || null;
+}
+
+/** 悬浮卡内容：账户名 + 类型徽章，逐把密钥列三个窗口的用量与倒计时。
+ *  refresh = {pending, notice} 给出点击刷新的状态行：pending 期间显示
+ *  「正在获取最新用量…」，notice 是上一次刷新的超时/失败提示（error 级
+ *  用红字类）。旧数据的行照常渲染——刷新不清空已有快照。 */
+function usageCardHtml(account, refresh) {
+    const refreshState = refresh || {};
+    const status = refreshState.pending
+        ? '<div class="usage-card__status">正在获取最新用量…</div>'
+        : (refreshState.notice
+            ? `<div class="usage-card__${refreshState.notice.level === 'error'
+                ? 'error' : 'status'}">${esc(refreshState.notice.text)}</div>`
+            : '');
     let observed = '';
     const keys = sortKeysByName(account.keys).map((key) => {
         const usage = key.usage || null;
@@ -636,7 +685,7 @@ function usageCardHtml(account) {
             const percent = win && win.percent != null ? Math.round(Number(win.percent)) : NaN;
             const limit = Number.isFinite(percent) && percent >= 100;
             return `<div class="usage-card__window"><span>${label}</span>`
-                + `<span${limit ? ' class="is-limit"' : ''}>${esc(usageWindowText(win))}</span></div>`;
+                + `<span${limit ? ' class="is-limit"' : ''}>${esc(usageWindowText(win, windowName))}</span></div>`;
         }).join('');
         return `<div class="usage-card__key">
             <div class="usage-card__key-name">${name}</div>
@@ -647,20 +696,83 @@ function usageCardHtml(account) {
         ? `<div class="usage-card__foot">观测于 ${esc(fmtObservedAt(observed))}</div>` : '';
     return `<div class="usage-card__head">`
         + `<span class="usage-card__name">${esc(account.name)}</span>`
-        + `${accountTypeBadge(account.account_type)}</div>${keys}${foot}`;
+        + `${accountTypeBadge(account.account_type)}</div>${status}${keys}${foot}`;
 }
 
-/** 在锚点旁弹出用量卡；贴近视口边缘时向内收 / 翻到锚点上方。 */
-function showUsageCard(anchor, account) {
-    const card = _usageCardNode();
-    card.innerHTML = usageCardHtml(account);
-    card.classList.add('is-open');
+/** 把卡片摆到锚点旁；贴近视口边缘时向内收 / 翻到锚点上方。内容高度变化
+ *  （刷新状态行增减）后需重新调用，否则卡片可能越出视口。 */
+function _positionUsageCard(anchor, card) {
     const rect = anchor.getBoundingClientRect();
     const box = card.getBoundingClientRect();
     card.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - box.width - 8))}px`;
     const below = rect.bottom + 8;
     card.style.top = `${below + box.height <= window.innerHeight - 8
         ? below : Math.max(8, rect.top - box.height - 8)}px`;
+}
+
+function _renderUsageCard(anchor, account) {
+    const card = _usageCardNode();
+    const id = String(account.id);
+    card.innerHTML = usageCardHtml(account, {
+        pending: _usageRefreshPending.has(id),
+        notice: _usageRefreshNotice.get(id) || null,
+    });
+    card.classList.add('is-open');
+    _positionUsageCard(anchor, card);
+}
+
+/** 在锚点旁弹出用量卡。 */
+function showUsageCard(anchor, account) {
+    _usageCardAnchor = anchor;
+    _usageCardAccountId = String(account.id);
+    _renderUsageCard(anchor, account);
+}
+
+/** 点击账户名：唤醒维护进程的用量轮询并等待本账户的新快照落库（服务端有界
+ *  等待，落库即返回）。卡片保持打开、显示「正在获取最新用量…」并保留旧数据，
+ *  完成/超时/失败都就地更新状态行。鼠标移开仍按原规则关闭卡片——请求在后台
+ *  完成后只合并缓存（表格不重渲染，用量不出现在单元格，重渲染会关掉卡片）。 */
+async function refreshAccountUsage(anchor) {
+    const account = _usageAnchorAccount(anchor);
+    if (!account) return;
+    const id = String(account.id);
+    if (_usageRefreshPending.has(id)) return;  // 同一账户刷新中，重复点击忽略
+    _usageRefreshNotice.delete(id);
+    _usageRefreshPending.add(id);
+    showUsageCard(anchor, account);            // 点击无悬浮时也保证卡片可见
+    try {
+        const result = await proxyApi(
+            `/api/proxy/accounts/${id}/usage-refresh`, { method: 'POST' });
+        if (result && result.status === 'ok' && result.account) {
+            _mergeAccountIntoCache(result.account);
+        } else if (result && result.status === 'pending') {
+            _usageRefreshNotice.set(id, { text: '刷新较慢，稍后重新悬浮查看' });
+        } else {
+            _usageRefreshNotice.set(id, { level: 'error', text: '获取失败：响应状态异常' });
+        }
+    } catch (err) {
+        _usageRefreshNotice.set(id, { level: 'error',
+                                      text: `获取失败：${err.message || err}` });
+    } finally {
+        _usageRefreshPending.delete(id);
+        _renderOpenUsageCard();
+    }
+}
+
+/** 刷新结果合并回缓存：整行替换即可，所有取数都在事件时按 id 解析。 */
+function _mergeAccountIntoCache(account) {
+    if (!_accountsCache) return;
+    const index = _accountsCache.findIndex((a) => a.id === account.id);
+    if (index === -1) _accountsCache.push(account);
+    else _accountsCache[index] = account;
+}
+
+/** 卡片开着时就地重渲染。渲染目标是锚点当下解析出的账户——用户可能已把
+ *  卡片移到别的账户上，不能拿完成回调里旧账户的引用覆盖。 */
+function _renderOpenUsageCard() {
+    if (_usageCardAccountId === null || _usageCardAnchor === null) return;
+    const account = _usageAnchorAccount(_usageCardAnchor);
+    if (account) _renderUsageCard(_usageCardAnchor, account);
 }
 
 /** Render the current tab's account rows from the cached payload. */
@@ -685,7 +797,7 @@ function renderAccountsTable() {
                 : '';
             const pendingDeletion = isPendingAccountDeletion(a);
             const usageAnchor = tracksKeyUsage(a)
-                ? `<span class="usage-anchor" data-account-id="${a.id}">${esc(a.name)}</span>`
+                ? `<span class="usage-anchor" data-account-id="${a.id}" title="点击立即刷新用量">${esc(a.name)}</span>`
                 : esc(a.name);
             return `
             <tr>
@@ -711,12 +823,16 @@ function renderAccountsTable() {
             </tr>
         `;
         }).join('');
-        // 悬浮锚点在此重挂：tbody 刚被整体替换，旧监听随旧单元格一起消失。
+        // 悬浮/点击锚点在此重挂：tbody 刚被整体替换，旧监听随旧单元格一起消失。
+        // 账户对象在事件发生时从缓存解析（不在绑定时捕获）：点击刷新的结果只
+        // 合并缓存、不重渲染表格，下一次悬浮/点击才能看到新数据。
         tbody.querySelectorAll('.usage-anchor[data-account-id]').forEach((anchor) => {
-            const account = rows.find((a) => String(a.id) === anchor.dataset.accountId);
-            if (!account) return;
-            anchor.addEventListener('mouseenter', () => showUsageCard(anchor, account));
+            anchor.addEventListener('mouseenter', () => {
+                const account = _usageAnchorAccount(anchor);
+                if (account) showUsageCard(anchor, account);
+            });
             anchor.addEventListener('mouseleave', hideUsageCard);
+            anchor.addEventListener('click', () => refreshAccountUsage(anchor));
         });
     }
 }
@@ -725,6 +841,8 @@ async function loadAccountsTable() {
     const tbody = document.querySelector('#accountsTable tbody');
     if (!tbody) return;
     hideUsageCard();
+    // 整表重载后旧账户的刷新提示已没有载体；进行中的请求照常去重/合并。
+    _usageRefreshNotice.clear();
     tbody.innerHTML = '<tr><td colspan="8" class="td-loading">加载中...</td></tr>';
     try {
         await ensureTypeSpecs();

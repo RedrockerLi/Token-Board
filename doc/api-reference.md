@@ -64,6 +64,7 @@
 | `/api/proxy/accounts/<id>/models` | GET | 账户模型目录 |
 | `/api/proxy/accounts/<id>/models` | POST | 从上游模型目录端点拉取(默认 `{base}/models`,opencode-go 为 `{base}/v1/models`)并整体替换模型目录 |
 | `/api/proxy/accounts/<id>/test-concurrency` | POST | 并发测试:不经本机代理、直连上游并行发 N 个极小请求(body 可传 `concurrency` 覆盖已保存限额,上限 50),自动挑选定价最便宜的可用模型,返回各档成功的统计与失败原因 |
+| `/api/proxy/accounts/<id>/usage-refresh` | POST | 点击账户名触发:经本地 socket 唤醒用量轮询器并等待本账户新快照落库(上限 60 秒),返回 200 与新的账户行;超时返回 202 `{"status":"pending"}`(唤醒仍然有效、轮询继续跑完,稍后悬浮即为新数据);维护进程不可达返回 503 |
 | `/api/proxy/aggregates` | GET | 聚合账户列表(含模型映射) |
 | `/api/proxy/aggregates` | POST | 新建聚合账户(至少一条映射,pattern 禁止通配符) |
 | `/api/proxy/aggregates/<id>` | PUT | 更新聚合账户与映射 |

@@ -1,5 +1,7 @@
 """Functional proxy API route group."""
 
+import time
+
 from app.routes.proxy.common import (
     _proxy_db, api_error, bp_proxy, current_app, jsonify, request,
     require_json_object, require_config_writable,
@@ -276,3 +278,52 @@ def test_account_concurrency(account_id):
     return jsonify({"status": "ok", "concurrency": concurrency, "model": model_id,
                     "succeeded": succeeded, "failed": failed,
                     "failures": failures[:10], "message": message})
+
+
+# 点击刷新用量的有界等待：每次比较后睡眠的间隔 / 总等待上限。超时返回 202
+# （唤醒已发出、轮询继续跑完），模块级常量便于测试缩短。
+USAGE_REFRESH_POLL_SECONDS = 0.25
+USAGE_REFRESH_WAIT_SECONDS = 60.0
+
+
+@bp_proxy.route("/accounts/<int:account_id>/usage-refresh", methods=["POST"])
+def refresh_account_usage(account_id):
+    """点击账户名：唤醒用量轮询器并等待本账户的新快照落库。
+
+    轮询器每个周期把所有账户的观测保存在同一事务里提交，因此「本账户凭证
+    的 usage_json 变化」代表一次已完成的新观测（成功刷 checked_at，失败刷
+    error/error_at）。保证的是「请求之后有周期提交」，不是「点击之后观测」：
+    点击时已在进行的周期可能刚查询过该账户，返回的行最多旧一轮。等待有界，
+    超时返回 202，唤醒仍然有效、轮询继续跑完，由前端提示稍后重新悬浮查看。
+    """
+    from app.domain.account_types import spec
+    from app.services.runtime_tasks import trigger_usage_refresh
+
+    db = _proxy_db()
+    account = next((item for item in db.get_accounts()
+                    if item["id"] == account_id), None)
+    if account is None:
+        return api_error("Account not found", 404)
+    subtype_spec = spec(account.get("account_type")).subtypes.get(
+        account.get("subtype") or "")
+    if subtype_spec is None or not subtype_spec.usage_path:
+        return api_error("该账户类型不支持用量查询", 400)
+    # 快照必须先于唤醒：唤醒后先落的提交不能当基线，否则要白等下一个周期。
+    before = db.usage_snapshot(account_id)
+    if not before:
+        return api_error("该账户没有可查询用量的本机密钥", 400)
+    if not trigger_usage_refresh(current_app):
+        return jsonify({"status": "unavailable",
+                        "message": "用量轮询服务未运行"}), 503
+
+    deadline = time.monotonic() + USAGE_REFRESH_WAIT_SECONDS
+    while True:
+        if db.usage_snapshot(account_id) != before:
+            fresh = next((item for item in db.get_accounts()
+                          if item["id"] == account_id), None)
+            if fresh is None:
+                return api_error("Account not found", 404)
+            return jsonify({"status": "ok", "account": fresh})
+        if time.monotonic() >= deadline:
+            return jsonify({"status": "pending"}), 202
+        time.sleep(USAGE_REFRESH_POLL_SECONDS)
