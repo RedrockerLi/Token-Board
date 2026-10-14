@@ -81,9 +81,9 @@ add_executable(usage_accounting_test usage_accounting_test.cpp)
 target_include_directories(usage_accounting_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(usage_accounting_test PRIVATE cxx_std_17)
 
-# Protocol JSON/SSE extraction is a format concern. The store test above only
+# Protocol JSON extraction is a format concern. The store test above only
 # covers the database-compatible projection, while this fixture freezes the
-# relocated parser behavior and the single Anthropic cache fold.
+# non-streaming parser behavior and the single Anthropic cache fold.
 add_executable(usage_parser_test usage_parser_test.cpp)
 target_include_directories(usage_parser_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(usage_parser_test PRIVATE cxx_std_17)

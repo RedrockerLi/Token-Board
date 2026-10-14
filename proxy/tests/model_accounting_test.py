@@ -17,7 +17,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from support import stop_process
+from support import sqlite_connection, stop_process
 
 
 def free_port() -> int:
@@ -70,6 +70,21 @@ def latest_log(db_path: Path, previous_id: int) -> tuple[int, str, int, int]:
             return row
         time.sleep(0.03)
     raise AssertionError("request-log row never appeared")
+
+
+def log_usage(db_path: Path, log_id: int) -> tuple[int, int, int, int]:
+    """Token buckets of one logged request.
+
+    Returns (prompt, completion, cache_read, total) — usage is written with
+    the request_log row itself, so it is readable as soon as the row exists.
+    """
+    with sqlite_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT prompt_tokens,completion_tokens,cache_read_tokens,"
+            "total_tokens FROM request_log WHERE id=?", (log_id,)
+        ).fetchone()
+    assert row is not None, log_id
+    return row
 
 
 def main() -> None:
@@ -143,6 +158,9 @@ def main() -> None:
                 })
                 row = latest_log(db_path, previous_id)
                 assert row[1:] == ("server-stream-model", 1, 200), row
+                # The opencode inference-cost frame (inputTokens 11,
+                # outputTokens 7) must land in the row.
+                assert log_usage(db_path, row[0]) == (11, 7, 0, 18), row
                 previous_id = row[0]
 
                 send(proxy_port, "tb-model-accounting", "/v1/chat/completions", {
@@ -152,6 +170,19 @@ def main() -> None:
                 })
                 row = latest_log(db_path, previous_id)
                 assert row[1:] == ("routed-model", 1, 200), row
+                previous_id = row[0]
+
+                send(proxy_port, "tb-model-accounting", "/v1/chat/completions", {
+                    "model": "client-model", "stream": True,
+                    "mock_response_model": "server-stream-cache-model",
+                    "mock_normalized_usage": {"cacheReadTokens": 25},
+                    "messages": [{"role": "user", "content": "hi"}],
+                })
+                row = latest_log(db_path, previous_id)
+                assert row[1:] == ("server-stream-cache-model", 1, 200), row
+                # Cache reads fold back into prompt (11 + 25) and keep their
+                # own bucket; total follows prompt + completion.
+                assert log_usage(db_path, row[0]) == (36, 7, 25, 43), row
                 previous_id = row[0]
 
                 send(proxy_port, "tb-model-accounting", "/v1/embeddings", {

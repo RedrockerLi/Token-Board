@@ -191,15 +191,28 @@ bool Database::write_log_record_in_transaction(const LogRecord &record,
     }
     if (inserted) *inserted = true;
 
+    // doc/database.md defines request_log.total_tokens as prompt + completion.
+    // This INSERT is the shared landing boundary for live writes and durable
+    // spool replay, so the identity is enforced here: clamp the buckets and
+    // derive the total instead of storing a producer's total verbatim.  A
+    // frame spooled by an older binary therefore lands with the identity
+    // already restored, and replay cannot reintroduce the old total.
+    const int prompt_tokens = std::max(0, record.prompt_tokens);
+    const int completion_tokens = std::max(0, record.completion_tokens);
+    const long long identity_total = static_cast<long long>(prompt_tokens)
+                                   + completion_tokens;
+    const int total_tokens = identity_total <= std::numeric_limits<int>::max()
+        ? static_cast<int>(identity_total) : 0;
+
     sqlite3_reset(stmt_insert_log_);
     sqlite3_bind_int(stmt_insert_log_, 1, record.account_id);
     sqlite3_bind_int(stmt_insert_log_, 2, record.local_key_id);
     sqlite3_bind_text(stmt_insert_log_, 3, record.model.c_str(),
                       static_cast<int>(record.model.size()), SQLITE_STATIC);
-    sqlite3_bind_int(stmt_insert_log_, 4, record.prompt_tokens);
-    sqlite3_bind_int(stmt_insert_log_, 5, record.completion_tokens);
+    sqlite3_bind_int(stmt_insert_log_, 4, prompt_tokens);
+    sqlite3_bind_int(stmt_insert_log_, 5, completion_tokens);
     sqlite3_bind_int(stmt_insert_log_, 6, record.cache_read_tokens);
-    sqlite3_bind_int(stmt_insert_log_, 7, record.total_tokens);
+    sqlite3_bind_int(stmt_insert_log_, 7, total_tokens);
     sqlite3_bind_double(stmt_insert_log_, 8, record.cost);
     sqlite3_bind_int(stmt_insert_log_, 9, record.is_streaming ? 1 : 0);
     sqlite3_bind_int(stmt_insert_log_, 10, record.status_code);

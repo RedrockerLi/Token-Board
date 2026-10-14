@@ -14,7 +14,19 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V2.5 当前增量
+## V2.6 当前增量
+
+V2.6 把全库违反恒等式 `total_tokens = prompt_tokens + completion_tokens` 的行修回该恒等式。
+这些行的 `total_tokens` 来自流式解码器的旧口径，少记了缓存命中：
+`(prompt_tokens - cache_read_tokens) + completion_tokens`。迁移只写 `total_tokens` 一列，
+幂等（重跑影响 0 行），不改变任何已存金额：金额只按 `prompt_tokens - cache_read_tokens`、
+`cache_read_tokens` 和 `completion_tokens` 计算。
+
+落库边界（实时写入与 spool 重放共用的 INSERT）同样钳制该恒等式：`total_tokens` 由
+`prompt_tokens + completion_tokens` 派生（分量先钳非负），因此异常停机后重放补写的帧也按
+恒等式落库，不会把旧口径的 `total_tokens` 写回。
+
+## V2.5 历史增量
 
 V2.5 给上游增加一类子分类标识与密钥级展示/观测字段。`upstreams.subtype` 保存 plan 账户
 的子分类（NULL = 普通账户，当前取值 `opencode-go`）；`upstream_credentials.label` 是密钥

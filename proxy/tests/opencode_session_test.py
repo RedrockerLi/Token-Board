@@ -2,7 +2,7 @@
 """OpenCode Go session header + usage-aware key scheduling (end-to-end).
 
 Drives the real proxy against mock_upstream with "opencode-go" upstreams
-(upstreams.subtype='opencode-go', schema V2.5) and asserts:
+(upstreams.subtype='opencode-go', schema V2.6) and asserts:
 
   S1  a request without any downstream session identity still reaches the
       upstream with a `tb-…` x-opencode-session and User-Agent token-board/1.0

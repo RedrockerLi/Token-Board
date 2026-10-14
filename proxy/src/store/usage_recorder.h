@@ -7,7 +7,7 @@
 
 /// Records explicit database-compatible usage and request metadata.
 ///
-/// Protocol JSON/SSE parsing belongs to the format layer. Keeping this class
+/// Protocol JSON parsing belongs to the format layer. Keeping this class
 /// storage-only prevents a second parser from drifting away from codec
 /// semantics.
 class UsageRecorder {

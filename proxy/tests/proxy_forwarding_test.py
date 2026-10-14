@@ -79,7 +79,9 @@ class FakeUpstream(BaseHTTPRequestHandler):
                 ("message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": {"output_tokens": 1},
+                    "usage": {"output_tokens": 1,
+                              "cache_read_input_tokens": 5,
+                              "cache_creation_input_tokens": 2},
                 }),
                 ("message_stop", {"type": "message_stop"}),
             ]
@@ -194,6 +196,17 @@ def main() -> None:
                     "WHERE request_log_id=? ORDER BY attempt_index", (log[0],)
                 )]
                 assert statuses == [401, 503, 200], statuses
+
+                # Stored usage must fold the Anthropic cache buckets into the
+                # prompt bucket and recompute the total from the folded input:
+                # prompt 1 + 5 + 2 = 8, total 8 + 1 = 9.  The IR total for
+                # Anthropic streams is net input + completion (1 + 1 = 2) and
+                # must not be forwarded into the row.
+                tokens = conn.execute(
+                    "SELECT prompt_tokens,completion_tokens,cache_read_tokens,"
+                    "total_tokens FROM request_log WHERE id=?", (log[0],)
+                ).fetchone()
+                assert tokens == (8, 1, 5, 9), tokens
 
                 # V2 removes the live graph while retaining detached facts and
                 # the stable historical identity.

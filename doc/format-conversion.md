@@ -24,7 +24,7 @@ parse(harness 格式) → IR → serialize(上游格式)
 
 流式路径用 httplib 的 chunked provider。透传时上游 chunk 原样转发(OpenAI 上游额外过 `ThinkStreamFilter`);转换时上游字节喂给 `upstream_codec` 的 stream parser,产出的 `StreamEvent` 逐个交给 harness codec 的 emitter 转成客户端格式的 SSE 帧。
 
-usage 的解析,非流式直接 parse 响应体;流式从累积的 SSE 中取最后带 usage 的帧。`usage_tracker.cpp` 为三种格式各准备了非流式与 SSE 两套解析器,并额外兼容 opencode.ai 的非标准 `x-opencode-type: inference-cost` 帧(它携带 normalizedUsage 输入/输出/缓存读写 token,优先级最高)。Anthropic 上游把 `cache_read_input_tokens` / `cache_creation_input_tokens` 折进 `prompt_tokens`,保证 `prompt - cache_read` 在任意上游口径下都等于未命中输入。
+usage 的解析,非流式直接 parse 响应体(`usage_parser.cpp`);流式由各格式的增量解码器逐帧提取。openai 解码器额外识别 opencode.ai 的非标准 `x-opencode-type: inference-cost` / `normalizedUsage` 帧:inputTokens 为不含缓存读取的净输入,读取桶折回 prompt_tokens,5m/1h 写桶计入 cache_creation;该帧优先于标准 usage 对象。Anthropic 上游把 `cache_read_input_tokens` / `cache_creation_input_tokens` 折进 `prompt_tokens`,保证 `prompt - cache_read` 在任意上游口径下都等于未命中输入。
 
 ## think 内容抽取
 

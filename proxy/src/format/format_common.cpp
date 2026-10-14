@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -497,6 +498,82 @@ ir::Usage parse_usage_json(const json &u) {
     // above is preserved.
     if (auto v = read_cache_hit_tokens(u, out.prompt_tokens))
         out.cache_read_tokens = *v;
+    return out;
+}
+
+namespace {
+
+// Bucket fields the opencode gateway reports per inference-cost frame.
+constexpr const char *kOpencodeUsageFields[] = {
+    "inputTokens", "outputTokens", "cacheReadTokens",
+    "cacheWrite5mTokens", "cacheWrite1hTokens",
+};
+
+/// Guarded non-negative integer field read for the opencode usage frame.
+/// Fractional, negative, malformed and out-of-range values count as absent so
+/// accounting never sees a bad counter.  nlohmann's is_number_integer() covers
+/// unsigned values too.  noexcept: a usage frame must never be able to abort
+/// forwarding (same contract as usage_parser.cpp's guarded readers).
+std::optional<int> opencode_int(const json &object, const char *key) noexcept {
+    if (!object.is_object()) return std::nullopt;
+    auto it = object.find(key);
+    if (it == object.end() || !it->is_number_integer()) return std::nullopt;
+    if (it->is_number_unsigned()) {
+        const auto value = it->get<unsigned long long>();
+        if (value <= static_cast<unsigned long long>(
+                         std::numeric_limits<int>::max()))
+            return static_cast<int>(value);
+        return std::nullopt;
+    }
+    const auto value = it->get<long long>();
+    if (value < 0 || value > std::numeric_limits<int>::max())
+        return std::nullopt;
+    return static_cast<int>(value);
+}
+
+/// Sum of two non-negative buckets; an out-of-range sum collapses to 0, the
+/// same rule usage_parser.cpp applies to token sums.
+int opencode_sum(int first, int second) noexcept {
+    const long long total = static_cast<long long>(first) + second;
+    return total <= std::numeric_limits<int>::max()
+        ? static_cast<int>(total) : 0;
+}
+
+}  // namespace
+
+std::optional<ir::Usage> parse_opencode_usage_frame(const json &frame) {
+    if (!frame.is_object()) return std::nullopt;
+    if (!frame.contains("x-opencode-type") ||
+        !frame["x-opencode-type"].is_string() ||
+        frame["x-opencode-type"].get<std::string>() != "inference-cost")
+        return std::nullopt;
+    if (!frame.contains("normalizedUsage") ||
+        !frame["normalizedUsage"].is_object())
+        return std::nullopt;
+    const json &normalized = frame["normalizedUsage"];
+    // A frame naming none of the bucket fields carries no token information,
+    // so it stays unmatched instead of displacing a standard `usage` object
+    // with zeros.
+    bool names_bucket = false;
+    for (const char *field : kOpencodeUsageFields)
+        names_bucket = names_bucket || normalized.contains(field);
+    if (!names_bucket) return std::nullopt;
+    // zen's normalizeUsage already subtracted the cache read from the raw
+    // input, so it is folded back into prompt_tokens here; the cache-write
+    // buckets are still inside inputTokens and must not be added again.
+    const int input = opencode_int(normalized, "inputTokens").value_or(0);
+    const int read = opencode_int(normalized, "cacheReadTokens").value_or(0);
+    const int write_5m =
+        opencode_int(normalized, "cacheWrite5mTokens").value_or(0);
+    const int write_1h =
+        opencode_int(normalized, "cacheWrite1hTokens").value_or(0);
+    ir::Usage out;
+    out.prompt_tokens = opencode_sum(input, read);
+    out.completion_tokens =
+        opencode_int(normalized, "outputTokens").value_or(0);
+    out.cache_read_tokens = read;
+    out.cache_creation_tokens = opencode_sum(write_5m, write_1h);
+    out.total_tokens = opencode_sum(out.prompt_tokens, out.completion_tokens);
     return out;
 }
 

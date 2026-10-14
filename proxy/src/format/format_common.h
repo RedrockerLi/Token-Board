@@ -149,6 +149,30 @@ bool parse_sse_frame(const std::string &frame, std::string *event_name,
 /// Parse a wire `usage` object (OpenAI/Responses or Anthropic shape) into IR.
 ir::Usage parse_usage_json(const json &u);
 
+/// Parse an opencode.ai gateway (Console Go) streaming usage frame:
+///   {"x-opencode-type":"inference-cost","normalizedUsage":{…}}
+/// zen's normalizeUsage reports `inputTokens` with the cache read already
+/// subtracted (inputTokens = raw input − cacheReadTokens) and keeps the cache
+/// writes inside it, so the IR mapping folds the read bucket back into
+/// prompt_tokens while the write buckets map to cache_creation_tokens without
+/// being added to prompt again:
+///   prompt = inputTokens + cacheReadTokens; completion = outputTokens;
+///   cache_read = cacheReadTokens;
+///   cache_creation = cacheWrite5mTokens + cacheWrite1hTokens;
+///   total = prompt + completion (a `totalTokens` field in the frame is not
+///           part of the bucket breakdown and is ignored).
+/// `reasoningTokens` is informational and maps to no bucket.
+///
+/// Returns nullopt unless the frame is an object carrying
+/// `x-opencode-type == "inference-cost"` and a `normalizedUsage` object that
+/// names at least one of the five bucket fields above — a frame naming none of
+/// them says nothing about tokens and must not displace a standard `usage`
+/// object. Non-negative integers only: fractional (float-shaped, even when
+/// integral), negative, malformed and overflowing counts read as 0, and a
+/// bucket sum beyond INT_MAX collapses to 0 (same discipline as the other
+/// usage readers).
+std::optional<ir::Usage> parse_opencode_usage_frame(const json &frame);
+
 /// Best-effort read of the cache-hit input-token count from an OpenAI-family
 /// `usage` object.  Upstreams report it in several ways (see mock/real
 /// upstreams):

@@ -52,6 +52,9 @@ Response selection:
     memory tests.
   - "mock_simple_stream": true returns the plain content-only stream (no
     reasoning_content / cost frames).
+  - "mock_normalized_usage": {…} overlays fields onto the opencode
+    inference-cost frame's `normalizedUsage` in the default openai stream
+    shape (streaming accounting tests), e.g. {"cacheReadTokens": 25}.
   - Streaming: request body "stream": true returns an SSE stream.
   - Terminal-shape flags, for stream-completeness tests:
     "mock_omit_stop_reason" nulls the Anthropic message_delta.stop_reason;
@@ -678,10 +681,20 @@ class Handler(BaseHTTPRequestHandler):
         chunks.append(self._openai_chunk(cid, model, {"content": ""}, "stop"))
         frames = ["data: " + json.dumps(c) + "\n\n" for c in chunks]
         # opencode.ai-specific inference-cost usage frame (non-standard).
-        frames.append('data: {"choices":[],"x-opencode-type":"inference-cost",'
-                      '"cost":"0.00000123","normalizedUsage":{"inputTokens":11,'
-                      '"outputTokens":7,"reasoningTokens":5,"cacheReadTokens":0,'
-                      '"cacheWrite5mTokens":0,"cacheWrite1hTokens":0}}\n\n')
+        # "mock_normalized_usage" overlays fields onto its normalizedUsage
+        # (mirrors mock_usage_extra for the non-streaming bodies).
+        normalized_usage = {
+            "inputTokens": 11, "outputTokens": 7, "reasoningTokens": 5,
+            "cacheReadTokens": 0, "cacheWrite5mTokens": 0,
+            "cacheWrite1hTokens": 0,
+        }
+        overlay = req.get("mock_normalized_usage")
+        if isinstance(overlay, dict):
+            normalized_usage.update(overlay)
+        frames.append("data: " + json.dumps({
+            "choices": [], "x-opencode-type": "inference-cost",
+            "cost": "0.00000123", "normalizedUsage": normalized_usage,
+        }) + "\n\n")
         frames.append('data: [DONE]\n\n')
         return frames
 

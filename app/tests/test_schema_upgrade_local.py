@@ -56,6 +56,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         (legacy_schema / "token-board/v2/2-3_remove_agent_request_context.sql").unlink()
         (legacy_schema / "token-board/v2/2-4_agent_usage_receipts.sql").unlink()
         (legacy_schema / "token-board/v2/2-5_opencode_go_subtype.sql").unlink()
+        (legacy_schema / "token-board/v2/2-6_repair_total_tokens.sql").unlink()
 
         ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
         with sqlite_connection(proxy) as conn:
@@ -77,10 +78,13 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                 "PRAGMA table_info(request_log)")}
             self.assertNotIn("project", columns)
             self.assertNotIn("session_id", columns)
+            # V2.6 restores the token identity.  This row carries no
+            # prompt/completion buckets, so its violating total is rewritten
+            # to 0 + 0; model and status survive unchanged.
             self.assertEqual(conn.execute(
                 "SELECT model,total_tokens,status_code FROM request_log "
                 "WHERE event_id='v23-context'"
-            ).fetchone(), ("context-model", 12, 200))
+            ).fetchone(), ("context-model", 0, 200))
             self.assertEqual(conn.execute(
                 "SELECT event_id FROM agent_usage_receipts "
                 "WHERE event_id='v23-context'"

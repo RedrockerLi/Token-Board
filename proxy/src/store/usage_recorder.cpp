@@ -2,8 +2,9 @@
 
 #include "core/logging.h"
 
-// The recorder is deliberately storage-only. Protocol JSON/SSE parsing lives
-// in format/usage_parser.cpp and the runtime supplies UsageAccounting.
+// The recorder is deliberately storage-only. Protocol JSON parsing of
+// non-streaming response bodies lives in format/usage_parser.cpp and the
+// runtime supplies UsageAccounting.
 bool UsageRecorder::log_request(
     int account_id, int local_key_id, const UsageAccounting &usage,
     bool is_streaming, int status_code, int duration_ms, int upstream_key_id,

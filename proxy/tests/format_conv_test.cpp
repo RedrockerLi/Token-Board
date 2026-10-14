@@ -461,6 +461,119 @@ static void test_openai_done_only_tool_terminal(const CodecRegistry &reg) {
           "[DONE]-only tool: stream ends with [DONE]");
 }
 
+// The opencode.ai gateway ends an OpenAI-compatible stream with an
+// `x-opencode-type:"inference-cost"` frame instead of a standard `usage`
+// object; its buckets must reach the UsageEvent with the cache read folded
+// back into prompt and the cache writes kept out of it.
+static void test_openai_stream_opencode_usage_frame(const CodecRegistry &reg) {
+    printf("--- OpenAI stream opencode inference-cost usage frame ---\n");
+    const FormatCodec &oc = reg.get(ApiFormat::OpenAI);
+    auto decode = [&oc](const std::string &sse) {
+        auto parser = oc.make_stream_parser();
+        std::vector<Usage> usages;
+        auto emit = [&usages](const StreamEvent &ev) -> bool {
+            if (ev.type == StreamEventType::UsageEvent)
+                usages.push_back(ev.usage);
+            return true;
+        };
+        parser->feed(sse.data(), sse.size(), emit);
+        parser->finish(emit);
+        return usages;
+    };
+
+    // The frame the real gateway (and the mock upstream) sends: input 11 with
+    // no cache traffic → prompt 11, completion 7, total 18.
+    auto usages = decode(
+        "data: {\"choices\":[],\"x-opencode-type\":\"inference-cost\","
+        "\"cost\":\"0.00000123\",\"normalizedUsage\":{\"inputTokens\":11,"
+        "\"outputTokens\":7,\"reasoningTokens\":5,\"cacheReadTokens\":0,"
+        "\"cacheWrite5mTokens\":0,\"cacheWrite1hTokens\":0}}\n\n"
+        "data: [DONE]\n\n");
+    check(usages.size() == 1,
+          "opencode usage frame: exactly one UsageEvent");
+    if (usages.size() == 1) {
+        check(usages[0].prompt_tokens == 11 &&
+                  usages[0].completion_tokens == 7 &&
+                  usages[0].cache_read_tokens == 0 &&
+                  usages[0].cache_creation_tokens == 0 &&
+                  usages[0].total_tokens == 18,
+              "opencode usage frame: prompt 11 / completion 7 / total 18");
+    }
+
+    // Cache traffic: inputTokens excludes the cache read (fold it back in)
+    // while the write buckets stay inside it (do not add them to prompt).
+    usages = decode(
+        "data: {\"choices\":[],\"x-opencode-type\":\"inference-cost\","
+        "\"cost\":\"0.00000123\",\"normalizedUsage\":{\"inputTokens\":11,"
+        "\"outputTokens\":7,\"cacheReadTokens\":25,"
+        "\"cacheWrite5mTokens\":4,\"cacheWrite1hTokens\":2}}\n\n"
+        "data: [DONE]\n\n");
+    check(usages.size() == 1,
+          "opencode usage frame cache: exactly one UsageEvent");
+    if (usages.size() == 1) {
+        check(usages[0].prompt_tokens == 36 &&
+                  usages[0].completion_tokens == 7 &&
+                  usages[0].cache_read_tokens == 25 &&
+                  usages[0].cache_creation_tokens == 6 &&
+                  usages[0].total_tokens == 43,
+              "opencode usage frame cache: prompt 36 / read 25 / creation 6 / total 43");
+    }
+
+    // A frame carrying both shapes: the inference-cost frame wins and only one
+    // UsageEvent leaves the decoder.
+    usages = decode(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,"
+        "\"completion_tokens\":1,\"total_tokens\":2},"
+        "\"x-opencode-type\":\"inference-cost\",\"normalizedUsage\":"
+        "{\"inputTokens\":11,\"outputTokens\":7}}\n\n"
+        "data: [DONE]\n\n");
+    check(usages.size() == 1,
+          "opencode usage frame priority: exactly one UsageEvent");
+    if (usages.size() == 1)
+        check(usages[0].prompt_tokens == 11 &&
+                  usages[0].completion_tokens == 7 &&
+                  usages[0].total_tokens == 18,
+              "opencode usage frame priority: frame beats the usage object");
+
+    // Malformed counts read as absent, never as negative or partial values.
+    usages = decode(
+        "data: {\"choices\":[],\"x-opencode-type\":\"inference-cost\","
+        "\"normalizedUsage\":{\"inputTokens\":-3,\"outputTokens\":1.5,"
+        "\"cacheReadTokens\":\"x\",\"cacheWrite5mTokens\":null}}\n\n"
+        "data: [DONE]\n\n");
+    check(usages.size() == 1,
+          "opencode usage frame malformed: exactly one UsageEvent");
+    if (usages.size() == 1)
+        check(usages[0].prompt_tokens == 0 &&
+                  usages[0].completion_tokens == 0 &&
+                  usages[0].cache_read_tokens == 0 &&
+                  usages[0].cache_creation_tokens == 0 &&
+                  usages[0].total_tokens == 0,
+              "opencode usage frame malformed: bad counts read as 0");
+
+    // A normalizedUsage that names no bucket field says nothing about tokens:
+    // it must not displace an accompanying standard usage object, and on its
+    // own it yields no UsageEvent at all.
+    usages = decode(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":500,"
+        "\"completion_tokens\":100,\"total_tokens\":600},"
+        "\"x-opencode-type\":\"inference-cost\",\"normalizedUsage\":{}}\n\n"
+        "data: [DONE]\n\n");
+    check(usages.size() == 1,
+          "opencode usage frame empty: exactly one UsageEvent");
+    if (usages.size() == 1)
+        check(usages[0].prompt_tokens == 500 &&
+                  usages[0].completion_tokens == 100 &&
+                  usages[0].total_tokens == 600,
+              "opencode usage frame empty: usage object stays authoritative");
+    usages = decode(
+        "data: {\"choices\":[],\"x-opencode-type\":\"inference-cost\","
+        "\"normalizedUsage\":{}}\n\n"
+        "data: [DONE]\n\n");
+    check(usages.empty(),
+          "opencode usage frame empty: no UsageEvent without any bucket");
+}
+
 // The reverse shape: an Anthropic tool stream whose only terminal is
 // message_stop (message_delta carries usage, stop_reason null).  The absent
 // reason stays absent — no invented tool_calls, no downgraded stop.
@@ -1149,6 +1262,7 @@ static int self_test() {
     test_terminal_frame_without_blank_line(reg);
     test_responses_terminal_without_envelope(reg);
     test_openai_done_only_tool_terminal(reg);
+    test_openai_stream_opencode_usage_frame(reg);
     test_anthropic_tool_message_stop_only(reg);
     test_responses_completed_after_items(reg);
     test_responses_tool_done_once(reg);

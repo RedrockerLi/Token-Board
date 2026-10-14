@@ -11,6 +11,8 @@
 //      is released, no row.
 //   3. reserved and consumed by a normal log_request, then destroyed  ->  the
 //      normal row persists and no abort row is added.
+//   4. the shared INSERT (live writes and spool replay) derives
+//      total_tokens = prompt + completion, not the producer's total.
 //
 // Usage: accounting_abort_test <prepared_db>
 
@@ -79,6 +81,25 @@ bool stays_absent(const std::string &db_path, const std::string &model,
                   int status, int grace_ms = 1500) {
     usleep(grace_ms * 1000);
     return count_log(db_path, model, status) == 0;
+}
+
+// Stored total_tokens of the newest row for (model), or -1 without one.
+int read_total(const std::string &db_path, const std::string &model) {
+    sqlite3 *db = nullptr;
+    if (sqlite3_open(db_path.c_str(), &db) != SQLITE_OK) return -1;
+    int total = -1;
+    sqlite3_stmt *st = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT total_tokens FROM request_log "
+                               "WHERE model=?1 ORDER BY id DESC LIMIT 1", -1,
+                           &st, nullptr) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, model.c_str(), -1, SQLITE_TRANSIENT) ==
+            SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        total = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return total;
 }
 
 }  // namespace
@@ -164,6 +185,21 @@ int main(int argc, char **argv) {
     assert(wait_for_log(db_path, "consumed-model", 200));
     assert(stays_absent(db_path, "consumed-model", kInternalAbortStatus));
     printf("  3 OK: consumed event persists and adds no abort row\n");
+
+    // 4. The shared INSERT derives total_tokens = prompt + completion, so a
+    //    producer whose total is missing (0) lands as 8 + 2.
+    {
+        auto r = db.reserve_usage_event();
+        assert(r);
+        const bool accepted = db.log_request(
+            1, 1, "identity-model", 8, 2, 0, 0, 0.0, false, 200, 5,
+            0, -1, -1, -1.0, -1, -1, 1, {}, 0, nullptr, r.get());
+        assert(accepted);
+        r.reset();
+    }
+    assert(wait_for_log(db_path, "identity-model", 200));
+    assert(read_total(db_path, "identity-model") == 10);
+    printf("  4 OK: landing derives total_tokens = prompt + completion\n");
 
     db.close();  // stops and drains the writer
     printf("OK: UsageReservation internal_abort contract\n");

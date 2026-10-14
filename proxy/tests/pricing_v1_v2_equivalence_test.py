@@ -5,8 +5,8 @@ The old pricing gate compared two historical V0 trigger revisions.  That did
 not exercise the schema which the proxy runs today.  These checks build the
 published V1 tip, clone the same priced configuration, and compare new usage
 events against a V2-upgraded copy.  The recovery case deliberately stops at
-V2.0, then resumes through V2.4 and repeats the upgrade to prove the durable
-schema runner is restart-safe without rewriting frozen usage facts.
+V2.0, then resumes through the current V2 tip and repeats the upgrade to prove
+the durable schema runner is restart-safe without rewriting frozen usage facts.
 """
 
 from __future__ import annotations
@@ -149,7 +149,7 @@ def run_equivalence(schema_root: Path) -> None:
         _migrate_v1(v1, schema_root)
         _seed_current_pricing(v1)
         _clone_database(v1, v2)
-        _upgrade(v2, schema_root, 5)
+        _upgrade(v2, schema_root, 6)
 
         _insert_cases(v1, "v1")
         _insert_cases(v2, "v2")
@@ -177,18 +177,18 @@ def run_recovery(schema_root: Path) -> None:
         # later process must continue at the next file, not rebuild facts.
         _upgrade(db_path, schema_root, 0)
         assert _usage_rows(db_path) == before
-        _upgrade(db_path, schema_root, 5)
+        _upgrade(db_path, schema_root, 6)
         assert _usage_rows(db_path) == before
 
         # Re-running the completed upgrade is the restart path used after a
         # health-check timeout or a process replacement.
-        _upgrade(db_path, schema_root, 5)
+        _upgrade(db_path, schema_root, 6)
         assert _usage_rows(db_path) == before
         with sqlite_connection(db_path) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 20005
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 20006
             assert conn.execute(
                 "SELECT count(*) FROM schema_migrations WHERE major=2"
-            ).fetchone()[0] == 6
+            ).fetchone()[0] == 7
     print("V1/V2 pricing recovery passed")
 
 

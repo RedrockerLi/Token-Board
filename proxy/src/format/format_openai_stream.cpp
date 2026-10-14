@@ -184,10 +184,17 @@ private:
             if (!emit(ev)) return;
         }
 
-        if (j.contains("usage") && j["usage"].is_object()) {
+        // The opencode.ai gateway ends its chat-completions streams with an
+        // `x-opencode-type:"inference-cost"` frame that reports the usage
+        // buckets in `normalizedUsage` instead of a standard `usage` object.
+        // That frame wins over `usage`; at most one UsageEvent leaves a frame.
+        auto usage = fmt::parse_opencode_usage_frame(j);
+        if (!usage && j.contains("usage") && j["usage"].is_object())
+            usage = fmt::parse_usage_json(j["usage"]);
+        if (usage) {
             StreamEvent ev;
             ev.type = StreamEventType::UsageEvent;
-            ev.usage = fmt::parse_usage_json(j["usage"]);
+            ev.usage = *usage;
             if (!emit(ev)) return;
         }
 

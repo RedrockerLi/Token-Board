@@ -26,9 +26,9 @@ int main() {
     assert(projected.prompt_tokens == 15);
     assert(projected.total_tokens == 20);
 
-    const auto responses = fmt::parse_stream_usage_for_format(
+    const auto responses = fmt::parse_usage_for_format(
         ir::ApiFormat::OpenAIResponses,
-        "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"r-test\",\"usage\":{\"input_tokens\":7,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n");
+        R"({"model":"r-test","usage":{"input_tokens":7,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}})");
     assert(responses.has_value());
     assert(responses->model == "r-test");
     assert(responses->usage.prompt_tokens == 7);
@@ -37,7 +37,5 @@ int main() {
 
     assert(!fmt::parse_usage_for_format(ir::ApiFormat::OpenAI,
                                         "not-json").has_value());
-    assert(!fmt::parse_stream_usage_for_format(ir::ApiFormat::Anthropic,
-                                               "data: {broken}\n\n").has_value());
     return 0;
 }
