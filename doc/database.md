@@ -197,9 +197,9 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 ## dashboard.db
 
-可视化**存档**库,历史结构表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.7),当前运行结构由 `schema/dashboard/v2/2-*.sql` 升级到 V2.1。**纯存档**:只有用量与总价及不可见的账单导出状态,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
+可视化**存档**库,历史结构表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.7),当前运行结构为 `users` 与 `daily_model_usage` 两张表(由 `schema/dashboard/v2/2-*.sql` 升级到 V2.2)。**纯存档**:只有用量与总价及不可见的账单导出状态,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
-存档分桶键统一为 **`account_id`**(稳定身份),显示名字来自 `account_identities` 镜像；实时 `accounts` 删除后仍可继续导出历史请求和冻结费用。V2.1 Dashboard 不再使用 Dashboard 侧的账单回执表，导出事件在 Token Board 以 `(source_table,source_key)` 去重后按高水位导入；看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 ledger 行。
+存档分桶键统一为稳定账户身份(V2.2 落为 `users.id`,迁移把无法归属的既有聚合归入 id=0 的`归档`),显示名字来自 `account_identities` 镜像；实时账户删除后仍可继续导出历史请求和冻结费用。Dashboard 侧不再使用账单回执表，导出事件在 Token Board 以 `(source_table,source_key)` 去重后按高水位导入；看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 ledger 行。
 
 ### token_usage / request_usage
 

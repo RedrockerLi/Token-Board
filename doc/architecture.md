@@ -31,7 +31,7 @@ Token Board 由三个进程边界组成，共享同一份版本化数据库 sche
 
 schema 的单一来源是 `schema/` 目录下的版本化 SQL 与 transition，见
 [database-migrations.md](database-migrations.md)。历史 V1 tip 是 Token Board V1.21、
-Dashboard V1.7；当前运行 tip 是 Token Board V2.6、Dashboard V2.1，baseline 位于各自
+Dashboard V1.7；当前运行 tip 是 Token Board V2.6、Dashboard V2.2，baseline 位于各自
 `v1/1-0_baseline.sql`，V0 文件按原内容归档在各自 `v0/`。所有生产升级由 Python 的
 `app.db.schema_upgrade` 负责；C++ 只校验已准备好的 Proxy V2 数据库，不读取 SQL、不执行迁移。
 
@@ -83,11 +83,11 @@ Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查�
 
 请求进来先走代理。客户端密钥经 `Router::route` 找到上游账户，请求按客户端 URL 路径识别格式，与上游格式不同时经 IR 编解码转换，随后由 `UpstreamClient` 转发。每次请求的结果写进 `token-board.db` 的 `request_log`（计费与性能指标）和 `request_attempts`（每次上游尝试），流式响应实时透传。
 
-看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。代理和智能体用量都按日×统一身份×模型批量导出到 Dashboard V2.1 的 `daily_usage`；智能体订阅周期费用在物化时按当日有效绑定直接归属 Agent，写入 `monthly_recurring_costs`，再以云端权威模型同步到 WebDAV。
+看板写配置事务后 `config_state.generation` 自动递增；代理后台最多约 250ms 构建新的不可变 `RoutingSnapshot` 并原子替换，请求线程不查询 SQLite。代理和智能体用量都按日×稳定身份×模型批量导出到 Dashboard V2.2 的 `daily_model_usage`；智能体订阅周期费用在物化时按当日有效绑定直接归属 Agent，累计进 `users.actual_cost_micro_cny`，再以云端权威模型同步到 WebDAV。
 
 智能体用量由 `token-maintenance` 内的 importer worker 采集。服务启动立即执行一次，之后每 1800 秒执行一次；前端页面加载时通过 Unix datagram socket 异步唤醒同一个 worker。worker 串行扫描已登记的软件日志并写入 `token-board.db/request_log`，因此不会因定时任务和浏览器刷新并发扫描而重复计量。`project` 与 `session_id` 可在 adapter 解析期间短暂存在，但不再作为数据库字段保存。同一服务还运行用量轮询 worker：每 300 秒按上游子分类声明的用量查询路径探测密钥用量，把快照写入本机 `upstream_credentials.usage_json`，供账户页的账户名悬浮用量卡与代理的用量感知调度读取；账户页点击账户名时经同一 Unix socket 唤醒它并等待本账户新快照落库（上限 60 秒，超时唤醒仍然有效）。快照的 `checked_at` 是最近一次成功观测时刻，失败只记 `error` 并保留旧值；每个窗口带 `state`（已启动/空闲/未知），代理只在快照新鲜（10 分钟内）时采信窗口压力，已确认耗尽的窗口跨过期持续生效；观测只存本机，不参与配置同步。
 
-`dashboard.db` 是纯存档，V2.1 使用统一的 `accounts`、`daily_usage` 和 `monthly_recurring_costs`；`accounts.account_kind` 区分代理上游与智能体软件。它不保存价格表，也不承担重算配置价格的职责。V2.2 Agent 周期费用的导出事件按不可变的周期费用主键补发；V2.1 历史分摊仍按旧源键兼容读取，不按物化时间筛选。
+`dashboard.db` 是纯存档，Dashboard V2.2 使用 `users`（稳定身份与累计实际消费）和 `daily_model_usage`（用户×日×模型）两张表。它不保存价格表，也不承担重算配置价格的职责。V2.2 Agent 周期费用的导出事件按不可变的周期费用主键补发；V2.1 历史分摊仍按旧源键兼容读取，不按物化时间筛选。
 
 ## 关键设计决策
 
