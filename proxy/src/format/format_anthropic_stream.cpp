@@ -290,6 +290,9 @@ private:
 
 class AnthropicStreamEmitter : public StreamEmitter {
 public:
+    explicit AnthropicStreamEmitter(const ConversionContext *context)
+        : context_(context) {}
+
     bool emit(const StreamEvent &ev, const Sink &sink) override {
         switch (ev.type) {
             case StreamEventType::MessageStart:
@@ -400,6 +403,7 @@ public:
     }
 
 private:
+    const ConversionContext *context_ = nullptr;
     std::string id_ = "msg-proxy", model_ = "unknown";
     bool started_ = false;
     bool finished_ = false;
@@ -422,6 +426,18 @@ private:
         return "event: " + event + "\ndata: " + data.dump() + "\n\n";
     }
 
+    // Anthropic's input_tokens is the mutually exclusive net input: cache
+    // reads/writes live in their own buckets.  An IR prompt coming from an
+    // OpenAI-family wire already includes the cache traffic, so the mirror
+    // value is the prompt minus both cache buckets (never negative).
+    int net_input_tokens() const {
+        long long input = last_usage_.prompt_tokens;
+        if (context_ && context_->source != ApiFormat::Anthropic)
+            input -= static_cast<long long>(last_usage_.cache_read_tokens) +
+                     last_usage_.cache_creation_tokens;
+        return input < 0 ? 0 : static_cast<int>(input);
+    }
+
     bool emit_message_start(const Sink &sink) {
         started_ = true;
         json msg;
@@ -430,8 +446,7 @@ private:
         msg["role"] = "assistant";
         msg["model"] = model_;
         msg["content"] = json::array();
-        int input = last_usage_.prompt_tokens;
-        msg["usage"] = {{"input_tokens", input < 0 ? 0 : input},
+        msg["usage"] = {{"input_tokens", net_input_tokens()},
                         {"output_tokens", last_usage_.completion_tokens},
                         {"cache_read_input_tokens",
                          last_usage_.cache_read_tokens},
@@ -524,6 +539,7 @@ std::unique_ptr<ir::StreamParser> make_anthropic_stream_parser_impl(
     return std::make_unique<AnthropicStreamParser>(context);
 }
 
-std::unique_ptr<ir::StreamEmitter> make_anthropic_stream_emitter_impl() {
-    return std::make_unique<AnthropicStreamEmitter>();
+std::unique_ptr<ir::StreamEmitter> make_anthropic_stream_emitter_impl(
+    const ConversionContext *context) {
+    return std::make_unique<AnthropicStreamEmitter>(context);
 }

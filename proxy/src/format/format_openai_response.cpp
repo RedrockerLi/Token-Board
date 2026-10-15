@@ -1,5 +1,7 @@
 #include "format_openai_internal.h"
 
+#include <limits>
+
 using namespace ir;
 
 bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
@@ -189,8 +191,41 @@ bool OpenAICodec::parse_response(const json &in, ir::ChatResponse &out,
     return true;
 }
 
+namespace {
+
+// Client-visible usage projection for the OpenAI wire.
+//
+// Anthropic decoders build the IR over the provider's mutually-exclusive net
+// input (`input_tokens` excludes the cache buckets, which live in their own
+// fields), while OpenAI-family clients (and the stored row) expect the input
+// bucket to include the cache read.  Rendering an Anthropic upstream for this
+// client therefore folds both cache buckets into prompt and recomputes the
+// total, mirroring `UsageAccounting::from_ir`: same discrimination, same
+// integer discipline — sums in 64-bit, a result outside [0, INT_MAX]
+// collapses to 0.  A null context or a same-line context keeps the IR values
+// verbatim (including the IR total).
+Usage client_usage_view(const Usage &u, const ConversionContext *context) {
+    Usage view = u;
+    if (context && context->source == ApiFormat::Anthropic) {
+        const long long prompt = static_cast<long long>(view.prompt_tokens) +
+                                 view.cache_read_tokens +
+                                 view.cache_creation_tokens;
+        view.prompt_tokens = prompt >= 0 &&
+            prompt <= std::numeric_limits<int>::max()
+            ? static_cast<int>(prompt) : 0;
+        const long long total = static_cast<long long>(view.prompt_tokens) +
+                                view.completion_tokens;
+        view.total_tokens = total >= 0 &&
+            total <= std::numeric_limits<int>::max()
+            ? static_cast<int>(total) : 0;
+    }
+    return view;
+}
+
+}  // namespace
+
 json OpenAICodec::serialize_response(const ir::ChatResponse &in,
-                                     const ir::ConversionContext *) const {
+                                     const ir::ConversionContext *context) const {
     json out;
     out["id"] = in.id.empty() ? "chatcmpl-proxy" : in.id;
     out["object"] = "chat.completion";  // forced — never inherit source format
@@ -262,13 +297,14 @@ json OpenAICodec::serialize_response(const ir::ChatResponse &in,
     choice["finish_reason"] = fmt::stop_reason_to_openai(in.stop_reason);
     out["choices"] = json::array({std::move(choice)});
 
+    const Usage view = client_usage_view(in.usage, context);
     json usage;
-    usage["prompt_tokens"] = in.usage.prompt_tokens;
-    usage["completion_tokens"] = in.usage.completion_tokens;
-    usage["total_tokens"] = in.usage.total_tokens;
-    if (in.usage.cache_read_tokens > 0) {
+    usage["prompt_tokens"] = view.prompt_tokens;
+    usage["completion_tokens"] = view.completion_tokens;
+    usage["total_tokens"] = view.total_tokens;
+    if (view.cache_read_tokens > 0) {
         usage["prompt_tokens_details"] = json::object();
-        usage["prompt_tokens_details"]["cached_tokens"] = in.usage.cache_read_tokens;
+        usage["prompt_tokens_details"]["cached_tokens"] = view.cache_read_tokens;
     }
     if (in.usage.extra.contains("completion_tokens_details"))
         usage["completion_tokens_details"] = in.usage.extra["completion_tokens_details"];

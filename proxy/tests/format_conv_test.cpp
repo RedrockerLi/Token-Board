@@ -595,6 +595,172 @@ static void test_anthropic_tool_message_stop_only(const CodecRegistry &reg) {
           "message_stop-only tool: stream still ends with [DONE]");
 }
 
+// The Anthropic wire states input_tokens as the mutually exclusive net input:
+// cache reads/writes live in their own buckets and are not part of it.  An IR
+// prompt parsed from an OpenAI-family wire already includes the cache traffic,
+// so the Anthropic serializer (message_start and the non-streaming body) must
+// subtract it back out; a native Anthropic conversion and a context-less call
+// keep the raw value.
+static void test_anthropic_target_usage_mirror(const CodecRegistry &reg) {
+    printf("--- Anthropic target usage mirror ---\n");
+    const FormatCodec &oc = reg.get(ApiFormat::OpenAI);
+    const FormatCodec &ac = reg.get(ApiFormat::Anthropic);
+    ChatResponse ir;
+    std::string err;
+    if (!oc.parse_response(json::parse(kOpenaiResponse), ir, err)) {
+        check(false, "usage mirror: parse openai fixture: " + err);
+        return;
+    }
+    check(ir.usage.prompt_tokens == 11 && ir.usage.cache_read_tokens == 3 &&
+              ir.usage.completion_tokens == 7,
+          "usage mirror: OpenAI fixture IR is prompt 11 / read 3 / completion 7");
+
+    ConversionContext from_openai;
+    from_openai.source = ApiFormat::OpenAI;
+    from_openai.target = ApiFormat::Anthropic;
+    const json converted_usage =
+        ac.serialize_response(ir, &from_openai).value("usage", json());
+    check(converted_usage.value("input_tokens", -1) == 8,
+          "usage mirror: OpenAI source → exclusive input_tokens 8");
+    check(converted_usage.value("cache_read_input_tokens", -1) == 3 &&
+              converted_usage.value("cache_creation_input_tokens", -1) == 0 &&
+              converted_usage.value("output_tokens", -1) == 7,
+          "usage mirror: cache buckets and output stay untouched");
+
+    check(ac.serialize_response(ir).value("usage", json())
+              .value("input_tokens", -1) == 11,
+          "usage mirror: no context keeps the raw input_tokens 11");
+
+    ConversionContext from_anthropic;
+    from_anthropic.source = ApiFormat::Anthropic;
+    from_anthropic.target = ApiFormat::Anthropic;
+    check(ac.serialize_response(ir, &from_anthropic).value("usage", json())
+              .value("input_tokens", -1) == 11,
+          "usage mirror: Anthropic source keeps the raw input_tokens 11");
+
+    auto message_start_usage = [&](const ConversionContext *context) {
+        auto emitter = ac.make_stream_emitter(context);
+        std::string out;
+        auto sink = [&out](const std::string &chunk) -> bool {
+            out += chunk;
+            return true;
+        };
+        StreamEvent ev;
+        ev.type = StreamEventType::MessageStart;
+        ev.usage = ir.usage;
+        ev.extra["id"] = "msg-mirror";
+        ev.extra["model"] = "mm";
+        emitter->emit(ev, sink);
+        emitter->finish(sink);
+        for (const auto &frame : split_anthropic_frames(out))
+            if (frame.first == "message_start")
+                return frame.second.value("message", json()).value("usage", json());
+        return json();
+    };
+    const json start_usage = message_start_usage(&from_openai);
+    check(start_usage.value("input_tokens", -1) == 8 &&
+              start_usage.value("cache_read_input_tokens", -1) == 3 &&
+              start_usage.value("output_tokens", -1) == 7,
+          "usage mirror: OpenAI source message_start input_tokens 8");
+    check(message_start_usage(nullptr).value("input_tokens", -1) == 11,
+          "usage mirror: context-less message_start keeps input_tokens 11");
+}
+
+// OpenAI-family clients receive the cache-inclusive input view: an IR prompt
+// from the Anthropic wire (mutually exclusive net input) is folded together
+// with both cache buckets and the total is recomputed, mirroring the stored
+// row; a context-less call keeps the IR values verbatim.
+static void test_openai_target_usage_fold(const CodecRegistry &reg) {
+    printf("--- OpenAI/Responses target usage fold ---\n");
+    const FormatCodec &oc = reg.get(ApiFormat::OpenAI);
+    const FormatCodec &ac = reg.get(ApiFormat::Anthropic);
+    const FormatCodec &rc = reg.get(ApiFormat::OpenAIResponses);
+    ChatResponse ir;
+    std::string err;
+    if (!ac.parse_response(json::parse(kAnthropicResponse), ir, err)) {
+        check(false, "usage fold: parse anthropic fixture: " + err);
+        return;
+    }
+    check(ir.usage.prompt_tokens == 11 && ir.usage.cache_read_tokens == 3 &&
+              ir.usage.cache_creation_tokens == 2 &&
+              ir.usage.completion_tokens == 7,
+          "usage fold: Anthropic fixture IR is prompt 11 / read 3 / creation 2 / completion 7");
+
+    ConversionContext from_anthropic;
+    from_anthropic.source = ApiFormat::Anthropic;
+    from_anthropic.target = ApiFormat::OpenAI;
+    const json openai_usage =
+        oc.serialize_response(ir, &from_anthropic).value("usage", json());
+    check(openai_usage.value("prompt_tokens", -1) == 16 &&
+              openai_usage.value("completion_tokens", -1) == 7 &&
+              openai_usage.value("total_tokens", -1) == 23,
+          "usage fold: OpenAI target prompt 16 / total 23");
+    check(openai_usage.value("prompt_tokens_details", json::object())
+              .value("cached_tokens", -1) == 3,
+          "usage fold: OpenAI target cached_tokens 3");
+    check(oc.serialize_response(ir).value("usage", json())
+              .value("prompt_tokens", -1) == 11 &&
+              oc.serialize_response(ir).value("usage", json())
+              .value("total_tokens", -1) == 18,
+          "usage fold: no context keeps the raw prompt 11 / total 18");
+
+    ConversionContext to_responses = from_anthropic;
+    to_responses.target = ApiFormat::OpenAIResponses;
+    const json responses_usage =
+        rc.serialize_response(ir, &to_responses).value("usage", json());
+    check(responses_usage.value("input_tokens", -1) == 16 &&
+              responses_usage.value("output_tokens", -1) == 7 &&
+              responses_usage.value("total_tokens", -1) == 23,
+          "usage fold: Responses target input 16 / total 23");
+    check(responses_usage.value("input_tokens_details", json::object())
+              .value("cached_tokens", -1) == 3,
+          "usage fold: Responses target cached_tokens 3");
+    check(rc.serialize_response(ir).value("usage", json())
+              .value("input_tokens", -1) == 11,
+          "usage fold: no context keeps the raw Responses input 11");
+
+    // Streaming: the OpenAI usage chunk carries the same folded view.
+    auto usage_chunk_of = [](const std::string &out) {
+        json found;
+        size_t pos = 0;
+        while ((pos = out.find("data: ", pos)) != std::string::npos) {
+            const size_t end = out.find('\n', pos);
+            const std::string payload = out.substr(
+                pos + 6, end == std::string::npos ? end : end - pos - 6);
+            pos = end == std::string::npos ? out.size() : end;
+            json j = json::parse(payload, nullptr, false);
+            if (j.is_object() && j.contains("usage") &&
+                j.value("choices", json()) == json::array())
+                found = j["usage"];
+        }
+        return found;
+    };
+    auto emit_usage_chunk = [&](const ConversionContext *context) {
+        auto emitter = oc.make_stream_emitter(context);
+        std::string out;
+        auto sink = [&out](const std::string &chunk) -> bool {
+            out += chunk;
+            return true;
+        };
+        StreamEvent ev;
+        ev.type = StreamEventType::UsageEvent;
+        ev.usage = ir.usage;
+        emitter->emit(ev, sink);
+        emitter->finish(sink);
+        return usage_chunk_of(out);
+    };
+    const json chunk = emit_usage_chunk(&from_anthropic);
+    check(chunk.value("prompt_tokens", -1) == 16 &&
+              chunk.value("completion_tokens", -1) == 7 &&
+              chunk.value("total_tokens", -1) == 23,
+          "usage fold: OpenAI stream chunk prompt 16 / total 23");
+    check(chunk.value("prompt_tokens_details", json::object())
+              .value("cached_tokens", -1) == 3,
+          "usage fold: OpenAI stream chunk cached_tokens 3");
+    check(emit_usage_chunk(nullptr).value("prompt_tokens", -1) == 11,
+          "usage fold: context-less stream chunk keeps the raw prompt 11");
+}
+
 // Usage arriving before the terminal must not emit response.completed early;
 // the completion frame closes the stream after the item frames.
 static void test_responses_completed_after_items(const CodecRegistry &reg) {
@@ -1264,6 +1430,8 @@ static int self_test() {
     test_openai_done_only_tool_terminal(reg);
     test_openai_stream_opencode_usage_frame(reg);
     test_anthropic_tool_message_stop_only(reg);
+    test_anthropic_target_usage_mirror(reg);
+    test_openai_target_usage_fold(reg);
     test_responses_completed_after_items(reg);
     test_responses_tool_done_once(reg);
 

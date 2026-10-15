@@ -1,5 +1,7 @@
 #include "format_openai_internal.h"
 
+#include <limits>
+
 using namespace ir;
 
 namespace {
@@ -343,8 +345,40 @@ private:
 
 // ── Streaming: emitter (IR events → OpenAI SSE chunks) ──────────────────
 
+// Client-visible usage projection for the OpenAI wire.
+//
+// Anthropic decoders build the IR over the provider's mutually-exclusive net
+// input (`input_tokens` excludes the cache buckets, which live in their own
+// fields), while OpenAI-family clients (and the stored row) expect the input
+// bucket to include the cache read.  Rendering an Anthropic upstream for this
+// client therefore folds both cache buckets into prompt and recomputes the
+// total, mirroring `UsageAccounting::from_ir`: same discrimination, same
+// integer discipline — sums in 64-bit, a result outside [0, INT_MAX]
+// collapses to 0.  A null context or a same-line context keeps the IR values
+// verbatim (including the IR total).
+static Usage client_usage_view(const Usage &u, const ConversionContext *context) {
+    Usage view = u;
+    if (context && context->source == ApiFormat::Anthropic) {
+        const long long prompt = static_cast<long long>(view.prompt_tokens) +
+                                 view.cache_read_tokens +
+                                 view.cache_creation_tokens;
+        view.prompt_tokens = prompt >= 0 &&
+            prompt <= std::numeric_limits<int>::max()
+            ? static_cast<int>(prompt) : 0;
+        const long long total = static_cast<long long>(view.prompt_tokens) +
+                                view.completion_tokens;
+        view.total_tokens = total >= 0 &&
+            total <= std::numeric_limits<int>::max()
+            ? static_cast<int>(total) : 0;
+    }
+    return view;
+}
+
 class OpenAIStreamEmitter : public StreamEmitter {
 public:
+    explicit OpenAIStreamEmitter(const ConversionContext *context)
+        : context_(context) {}
+
     bool emit(const StreamEvent &ev, const Sink &sink) override {
         switch (ev.type) {
             case StreamEventType::MessageStart:
@@ -423,6 +457,7 @@ public:
 
 private:
     fmt::SseFrameBuffer sse_;
+    const ConversionContext *context_ = nullptr;
     std::string id_ = "chatcmpl-proxy", model_ = "unknown";
     bool started_ = false;
     std::string deferred_finish_;
@@ -479,6 +514,7 @@ private:
     }
 
     json usage_chunk(const Usage &u) {
+        const Usage view = client_usage_view(u, context_);
         json body;
         body["id"] = id_;
         body["object"] = "chat.completion.chunk";
@@ -486,9 +522,14 @@ private:
         body["model"] = model_;
         body["choices"] = json::array();
         json usage;
-        usage["prompt_tokens"] = u.prompt_tokens;
-        usage["completion_tokens"] = u.completion_tokens;
-        usage["total_tokens"] = u.total_tokens;
+        usage["prompt_tokens"] = view.prompt_tokens;
+        usage["completion_tokens"] = view.completion_tokens;
+        usage["total_tokens"] = view.total_tokens;
+        if (view.cache_read_tokens > 0) {
+            usage["prompt_tokens_details"] = json::object();
+            usage["prompt_tokens_details"]["cached_tokens"] =
+                view.cache_read_tokens;
+        }
         body["usage"] = std::move(usage);
         return body;
     }
@@ -516,6 +557,7 @@ std::unique_ptr<ir::StreamParser> make_openai_stream_parser_impl(
     return std::make_unique<OpenAIStreamParser>(context);
 }
 
-std::unique_ptr<ir::StreamEmitter> make_openai_stream_emitter_impl() {
-    return std::make_unique<OpenAIStreamEmitter>();
+std::unique_ptr<ir::StreamEmitter> make_openai_stream_emitter_impl(
+    const ConversionContext *context) {
+    return std::make_unique<OpenAIStreamEmitter>(context);
 }

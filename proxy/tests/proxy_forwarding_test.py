@@ -23,6 +23,8 @@ from support import stop_process
 BAD_AUTH = "bad-auth"
 STREAM_ERROR = "stream-error"
 GOOD = "good-key"
+CROSS = "cross-key"
+CROSS_CLIENT = "tb-cross"
 
 
 class FakeUpstream(BaseHTTPRequestHandler):
@@ -112,6 +114,31 @@ def wait_for_health(port: int) -> None:
     raise AssertionError("proxy did not become healthy")
 
 
+def post_stream(port: int, path: str, token: str, body: dict) -> str:
+    """POST a streaming request and return the raw SSE body."""
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return response.read().decode()
+
+
+def sse_json_frames(raw: str) -> list[dict]:
+    """Collect the JSON payloads of `data: ` SSE frames (skipping [DONE])."""
+    frames = []
+    for line in raw.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: "):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        frames.append(json.loads(payload))
+    return frames
+
+
 def main() -> None:
     proxy_binary = Path(sys.argv[1]).resolve()
     schema_dir = Path(sys.argv[2]).resolve()
@@ -137,6 +164,14 @@ def main() -> None:
             local_key = "tb-test"
             add_plain_route(conn, local_key, "test-route", upstream_id,
                             account_id)
+            # Single-key Anthropic upstream for the cross-format checks: the
+            # same FakeUpstream frames served to OpenAI-family clients.
+            cross_account_id, cross_upstream_id, _ = add_upstream(
+                conn, "cross", f"http://127.0.0.1:{upstream_port}",
+                [CROSS], api_format="anthropic", auth_scheme="bearer",
+                max_concurrency=8)
+            add_plain_route(conn, CROSS_CLIENT, "cross-route",
+                            cross_upstream_id, cross_account_id)
             conn.commit()
         finally:
             conn.close()
@@ -165,6 +200,36 @@ def main() -> None:
             with urllib.request.urlopen(request, timeout=5) as response:
                 response_body = response.read().decode()
             assert '"text":"ok"' in response_body.replace(" ", "")
+
+            # Cross-format: an Anthropic upstream rendered for an OpenAI-family
+            # client must fold the cache buckets into the client-visible input
+            # and recompute the total (8 = 1 + 5 + 2, 9 = 8 + 1), matching the
+            # cache-inclusive view the request log stores.
+            openai_usage = None
+            for frame in sse_json_frames(post_stream(
+                    proxy_port, "/v1/chat/completions", CROSS_CLIENT, {
+                        "model": "claude-test", "max_tokens": 16,
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hi"}]})):
+                if frame.get("choices") == [] and frame.get("usage"):
+                    openai_usage = frame["usage"]
+            assert openai_usage == {
+                "prompt_tokens": 8, "completion_tokens": 1,
+                "total_tokens": 9,
+                "prompt_tokens_details": {"cached_tokens": 5},
+            }, openai_usage
+
+            responses_usage = None
+            for frame in sse_json_frames(post_stream(
+                    proxy_port, "/v1/responses", CROSS_CLIENT, {
+                        "model": "claude-test", "stream": True,
+                        "input": [{"role": "user", "content": "hi"}]})):
+                if frame.get("type") == "response.completed":
+                    responses_usage = frame["response"]["usage"]
+            assert responses_usage == {
+                "input_tokens": 8, "output_tokens": 1, "total_tokens": 9,
+                "input_tokens_details": {"cached_tokens": 5},
+            }, responses_usage
 
             conn = sqlite3.connect(db_path)
             try:

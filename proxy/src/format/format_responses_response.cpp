@@ -1,6 +1,41 @@
 #include "format_responses_internal.h"
 
+#include <limits>
+
 using namespace ir;
+
+namespace {
+
+// Client-visible usage projection for the Responses wire.
+//
+// Anthropic decoders build the IR over the provider's mutually-exclusive net
+// input (`input_tokens` excludes the cache buckets, which live in their own
+// fields), while OpenAI-family clients (and the stored row) expect the input
+// bucket to include the cache read.  Rendering an Anthropic upstream for this
+// client therefore folds both cache buckets into input and recomputes the
+// total, mirroring `UsageAccounting::from_ir`: same discrimination, same
+// integer discipline — sums in 64-bit, a result outside [0, INT_MAX]
+// collapses to 0.  A null context or a same-line context keeps the IR values
+// verbatim (including the IR total).
+Usage client_usage_view(const Usage &u, const ConversionContext *context) {
+    Usage view = u;
+    if (context && context->source == ApiFormat::Anthropic) {
+        const long long prompt = static_cast<long long>(view.prompt_tokens) +
+                                 view.cache_read_tokens +
+                                 view.cache_creation_tokens;
+        view.prompt_tokens = prompt >= 0 &&
+            prompt <= std::numeric_limits<int>::max()
+            ? static_cast<int>(prompt) : 0;
+        const long long total = static_cast<long long>(view.prompt_tokens) +
+                                view.completion_tokens;
+        view.total_tokens = total >= 0 &&
+            total <= std::numeric_limits<int>::max()
+            ? static_cast<int>(total) : 0;
+    }
+    return view;
+}
+
+}  // namespace
 
 bool ResponsesCodec::parse_response(const json &in, ir::ChatResponse &out,
                                     std::string &err,
@@ -380,13 +415,14 @@ json ResponsesCodec::serialize_response(const ir::ChatResponse &in,
     }
     out["output"] = std::move(output);
 
+    const Usage view = client_usage_view(in.usage, context);
     json usage;
-    usage["input_tokens"] = in.usage.prompt_tokens;
-    usage["output_tokens"] = in.usage.completion_tokens;
-    usage["total_tokens"] = in.usage.total_tokens;
-    if (in.usage.cache_read_tokens > 0) {
+    usage["input_tokens"] = view.prompt_tokens;
+    usage["output_tokens"] = view.completion_tokens;
+    usage["total_tokens"] = view.total_tokens;
+    if (view.cache_read_tokens > 0) {
         usage["input_tokens_details"] = json::object();
-        usage["input_tokens_details"]["cached_tokens"] = in.usage.cache_read_tokens;
+        usage["input_tokens_details"]["cached_tokens"] = view.cache_read_tokens;
     }
     out["usage"] = std::move(usage);
     return out;

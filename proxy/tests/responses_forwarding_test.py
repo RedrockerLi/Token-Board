@@ -103,6 +103,20 @@ class FakeResponsesUpstream(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
         if self.path.endswith("/chat/completions"):
+            if not body.get("stream"):
+                payload = {
+                    "id": "chat-converted", "object": "chat.completion",
+                    "created": 1, "model": body.get("model", "chat-model"),
+                    "choices": [{"index": 0,
+                                  "message": {"role": "assistant",
+                                              "content": "converted-ok"},
+                                  "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 7,
+                              "total_tokens": 18,
+                              "prompt_tokens_details": {"cached_tokens": 3}},
+                }
+                self._send_json(payload)
+                return
             frames = [
                 {"id": "chat-converted", "object": "chat.completion.chunk",
                  "model": body.get("model", "chat-model"), "created": 1,
@@ -474,6 +488,29 @@ def main() -> None:
             assert target_anthropic["body"]["messages"][0]["role"] == "user"
             assert tool_content["type"] == "tool_result"
             assert tool_content["content"][0]["type"] == "image"
+
+            # An Anthropic client's non-streaming request routed to the OpenAI
+            # upstream: the Anthropic wire reports input_tokens as the
+            # exclusive net input (cache buckets are separate), so the
+            # OpenAI prompt that includes the cached tokens must not be
+            # mirrored verbatim (fixture: prompt 11, cached 3 → net 8).
+            anthropic_chat_usage = {
+                "model": "anthropic-chat-usage", "max_tokens": 20,
+                "stream": False,
+                "messages": [{"role": "user", "content": "usage"}],
+            }
+            status, usage_result = post_path(proxy_port, "tb-chat",
+                                             "/v1/messages", anthropic_chat_usage)
+            assert status == 200, usage_result
+            usage = json.loads(usage_result)["usage"]
+            assert usage["input_tokens"] == 8, usage
+            assert usage["cache_read_input_tokens"] == 3, usage
+            assert usage["output_tokens"] == 7, usage
+            with FakeResponsesUpstream.lock:
+                usage_request = next(item for item in reversed(FakeResponsesUpstream.requests)
+                                     if item["auth"] == "Bearer sk-chat" and
+                                     item["body"].get("model") == "anthropic-chat-usage")
+            assert not usage_request["body"].get("stream"), usage_request["body"]
 
             cross_format_context = {
                 "model": "anthropic-context-cross", "stream": False,

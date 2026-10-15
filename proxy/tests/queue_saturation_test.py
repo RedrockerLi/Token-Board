@@ -62,18 +62,100 @@ def wait_health(port: int) -> None:
     raise AssertionError("proxy did not become healthy")
 
 
-def send(port: int) -> tuple[int, str | None]:
+def send(port: int, *, tolerate_body_write_race: bool = False) -> tuple[int, str | None]:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     body = json.dumps({"model": "slow", "stream": False,
                        "messages": [{"role": "user", "content": "hi"}]})
-    conn.request("POST", "/v1/chat/completions", body,
-                 {"Authorization": "Bearer tb-queue",
-                  "Content-Type": "application/json"})
+    try:
+        conn.request("POST", "/v1/chat/completions", body,
+                     {"Authorization": "Bearer tb-queue",
+                      "Content-Type": "application/json"})
+    except (BrokenPipeError, ConnectionResetError):
+        # request() writes head and body as two socket writes.  A queue-full
+        # 503 is written and the rejected socket shut down before the body is
+        # read, so the body write can hit the closed connection.  The 503 is
+        # still readable here: http.client marks the request as sent before
+        # writing the body, which is all getresponse() below requires.
+        if not tolerate_body_write_race:
+            raise
     response = conn.getresponse()
     status, retry = response.status, response.getheader("Retry-After")
     response.read()
     conn.close()
     return status, retry
+
+
+def send_two_phase(port: int) -> None:
+    """Pin the product behaviour behind the tolerated write race in send().
+
+    The client here deliberately loses the race: it writes the head in one
+    call, waits until the queue-full 503 is visible on the socket, and only
+    then dribbles the body — so the body write must eventually fail (the proxy
+    shut the connection down) while the 503 must still be readable on that
+    same connection.  If the product stops serving the 503 to a client that
+    lost the write race, or stops failing the write, this case fails on
+    purpose and the tolerance in send() has to be re-justified.
+    """
+    body = json.dumps({"model": "slow", "stream": False,
+                       "messages": [{"role": "user", "content": "hi"}]}).encode()
+    head = (b"POST /v1/chat/completions HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{port}\r\n".encode()
+            + b"Authorization: Bearer tb-queue\r\n"
+              b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode())
+
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+        sock.settimeout(2)
+        # One write for the whole head: nothing can interleave with the
+        # proxy's close here, unlike http.client's two-write request().
+        sock.sendall(head)
+
+        # The rejected connection is answered before the request body is read.
+        # MSG_PEEK waits for the 503 without consuming the bytes read below.
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            sock.settimeout(0.05)
+            try:
+                peeked = sock.recv(4096, socket.MSG_PEEK)
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            if not peeked or b"HTTP/1.1 503" in peeked:
+                break
+            time.sleep(0.005)
+        sock.settimeout(2)
+
+        # Dribble the body one byte at a time; the proxy already closed this
+        # connection, so a write must fail once the local stack sees the RST.
+        write = "body-sent"
+        for _ in range(30):
+            try:
+                sock.sendall(body[:1])
+            except OSError as exc:
+                write = f"body-{type(exc).__name__}"
+                break
+            time.sleep(0.02)
+
+        # The 503 was already in the receive buffer when the writes started;
+        # gather it up to the end of the header block.
+        buffered = b""
+        deadline = time.monotonic() + 2
+        while b"\r\n\r\n" not in buffered and time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buffered += chunk
+
+    assert write != "body-sent", (
+        "writing a request body after the 503 must fail: the proxy is "
+        "expected to have closed the rejected connection")
+    status_line = buffered.split(b"\r\n", 1)[0]
+    assert status_line == b"HTTP/1.1 503 Service Unavailable", buffered
+    assert b"Retry-After: 1" in buffered, buffered
 
 
 def main() -> None:
@@ -133,7 +215,8 @@ def main() -> None:
             second = threading.Thread(target=lambda: second_result.append(send(proxy_port)))
             second.start()
             time.sleep(.1)
-            assert send(proxy_port) == (503, "1")
+            assert send(proxy_port, tolerate_body_write_race=True) == (503, "1")
+            send_two_phase(proxy_port)
             first.join(5); second.join(5)
             assert first_result == [(200, None)] and second_result == [(200, None)]
         finally:

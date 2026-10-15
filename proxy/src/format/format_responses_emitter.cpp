@@ -2,8 +2,42 @@
 #include "reasoning_bridge.h"
 
 #include <algorithm>
+#include <limits>
 
 using namespace ir;
+
+namespace {
+
+// Client-visible usage projection for the Responses wire.
+//
+// Anthropic decoders build the IR over the provider's mutually-exclusive net
+// input (`input_tokens` excludes the cache buckets, which live in their own
+// fields), while OpenAI-family clients (and the stored row) expect the input
+// bucket to include the cache read.  Rendering an Anthropic upstream for this
+// client therefore folds both cache buckets into input and recomputes the
+// total, mirroring `UsageAccounting::from_ir`: same discrimination, same
+// integer discipline — sums in 64-bit, a result outside [0, INT_MAX]
+// collapses to 0.  A null context or a same-line context keeps the IR values
+// verbatim (including the IR total).
+Usage client_usage_view(const Usage &u, const ConversionContext *context) {
+    Usage view = u;
+    if (context && context->source == ApiFormat::Anthropic) {
+        const long long prompt = static_cast<long long>(view.prompt_tokens) +
+                                 view.cache_read_tokens +
+                                 view.cache_creation_tokens;
+        view.prompt_tokens = prompt >= 0 &&
+            prompt <= std::numeric_limits<int>::max()
+            ? static_cast<int>(prompt) : 0;
+        const long long total = static_cast<long long>(view.prompt_tokens) +
+                                view.completion_tokens;
+        view.total_tokens = total >= 0 &&
+            total <= std::numeric_limits<int>::max()
+            ? static_cast<int>(total) : 0;
+    }
+    return view;
+}
+
+}  // namespace
 
 ResponsesStreamEmitter::ResponsesStreamEmitter(const ConversionContext *ctx)
     : context_(ctx), id_(ctx && !ctx->generated_response_id.empty()
@@ -489,11 +523,18 @@ bool ResponsesStreamEmitter::emit_completed(const Sink &sink) {
     completed_emitted_ = true;
     const std::string status = deferred_status_.empty() ? "completed"
                                                         : deferred_status_;
+    const Usage usage_view = client_usage_view(last_usage_, context_);
+    json usage{{"input_tokens", usage_view.prompt_tokens},
+               {"output_tokens", usage_view.completion_tokens},
+               {"total_tokens", usage_view.total_tokens}};
+    if (usage_view.cache_read_tokens > 0) {
+        usage["input_tokens_details"] = json::object();
+        usage["input_tokens_details"]["cached_tokens"] =
+            usage_view.cache_read_tokens;
+    }
     json response{{"id", id_}, {"object", "response"}, {"status", status},
                   {"model", model_}, {"output", build_output()},
-                  {"usage", json{{"input_tokens", last_usage_.prompt_tokens},
-                                  {"output_tokens", last_usage_.completion_tokens},
-                                  {"total_tokens", last_usage_.total_tokens}}},
+                  {"usage", std::move(usage)},
                   {"error", nullptr}, {"incomplete_details", nullptr}};
     if (terminal_extras_.contains("object"))
         response["object"] = terminal_extras_["object"];

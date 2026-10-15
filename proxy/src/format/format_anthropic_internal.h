@@ -32,4 +32,5 @@ json serialize_anthropic_blocks(
     const std::vector<ir::ContentBlock> &blocks);
 std::unique_ptr<ir::StreamParser> make_anthropic_stream_parser_impl(
     const ir::ConversionContext * = nullptr);
-std::unique_ptr<ir::StreamEmitter> make_anthropic_stream_emitter_impl();
+std::unique_ptr<ir::StreamEmitter> make_anthropic_stream_emitter_impl(
+    const ir::ConversionContext * = nullptr);

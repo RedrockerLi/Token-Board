@@ -120,7 +120,7 @@ bool AnthropicCodec::parse_response(const json &in, ir::ChatResponse &out,
 }
 
 json AnthropicCodec::serialize_response(const ir::ChatResponse &in,
-                                        const ir::ConversionContext *) const {
+                                        const ir::ConversionContext *context) const {
     json out;
     out["id"] = in.id.empty() ? "msg-proxy" : in.id;
     out["type"] = "message";  // forced — never inherit source format
@@ -135,7 +135,15 @@ json AnthropicCodec::serialize_response(const ir::ChatResponse &in,
     else
         out["stop_sequence"] = nullptr;
     json usage;
-    usage["input_tokens"] = in.usage.prompt_tokens;
+    // Anthropic's input_tokens is the mutually exclusive net input: cache
+    // reads/writes live in their own buckets.  An IR prompt coming from an
+    // OpenAI-family wire already includes the cache traffic, so the mirror
+    // value is the prompt minus both cache buckets (never negative).
+    long long input = in.usage.prompt_tokens;
+    if (context && context->source != ir::ApiFormat::Anthropic)
+        input -= static_cast<long long>(in.usage.cache_read_tokens) +
+                 in.usage.cache_creation_tokens;
+    usage["input_tokens"] = input < 0 ? 0 : static_cast<int>(input);
     usage["output_tokens"] = in.usage.completion_tokens;
     usage["cache_read_input_tokens"] = in.usage.cache_read_tokens;
     usage["cache_creation_input_tokens"] = in.usage.cache_creation_tokens;

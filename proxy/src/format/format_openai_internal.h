@@ -31,4 +31,5 @@ void append_openai_content_part(json &parts, json &tool_calls, bool &has_tools,
                                 const ir::ContentBlock &block);
 std::unique_ptr<ir::StreamParser> make_openai_stream_parser_impl(
     const ir::ConversionContext * = nullptr);
-std::unique_ptr<ir::StreamEmitter> make_openai_stream_emitter_impl();
+std::unique_ptr<ir::StreamEmitter> make_openai_stream_emitter_impl(
+    const ir::ConversionContext * = nullptr);

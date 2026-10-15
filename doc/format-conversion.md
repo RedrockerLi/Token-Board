@@ -24,7 +24,9 @@ parse(harness 格式) → IR → serialize(上游格式)
 
 流式路径用 httplib 的 chunked provider。透传时上游 chunk 原样转发(OpenAI 上游额外过 `ThinkStreamFilter`);转换时上游字节喂给 `upstream_codec` 的 stream parser,产出的 `StreamEvent` 逐个交给 harness codec 的 emitter 转成客户端格式的 SSE 帧。
 
-usage 的解析,非流式直接 parse 响应体(`usage_parser.cpp`);流式由各格式的增量解码器逐帧提取。openai 解码器额外识别 opencode.ai 的非标准 `x-opencode-type: inference-cost` / `normalizedUsage` 帧:inputTokens 为不含缓存读取的净输入,读取桶折回 prompt_tokens,5m/1h 写桶计入 cache_creation;该帧优先于标准 usage 对象。Anthropic 上游把 `cache_read_input_tokens` / `cache_creation_input_tokens` 折进 `prompt_tokens`,保证 `prompt - cache_read` 在任意上游口径下都等于未命中输入。
+usage 的解析,非流式直接 parse 响应体(`usage_parser.cpp`);流式由各格式的增量解码器逐帧提取。openai 解码器额外识别 opencode.ai 的非标准 `x-opencode-type: inference-cost` / `normalizedUsage` 帧:inputTokens 为不含缓存读取的净输入,读取桶折回 prompt_tokens,5m/1h 写桶计入 cache_creation;该帧优先于标准 usage 对象。
+
+客户端可见的 usage 帧按客户端线格式输出,判别依据只有一条:上游线格式是否为 anthropic。OpenAI chat 线与 Responses 线的输入都是含缓存的全部输入:chat 线字段为 `prompt_tokens` / `prompt_tokens_details.cached_tokens`,Responses 线为 `input_tokens` / `input_tokens_details.cached_tokens`,`cached_tokens` 只在 `cache_read > 0` 时附上,取值即 `cache_read`。上游为 anthropic 线时(其 `input_tokens` 为互斥净输入),发射时把 `cache_read_input_tokens + cache_creation_input_tokens` 折回 `prompt_tokens`(Responses 线为 `input_tokens`),令 `total_tokens = prompt_tokens + completion_tokens`(Responses 线为 `input_tokens + output_tokens`);上游本身为 OpenAI / Responses 线时输入已含缓存,不折叠。Anthropic 线的 `input_tokens` 为互斥净输入,`cache_read_input_tokens` / `cache_creation_input_tokens` 为独立桶;上游为 OpenAI / Responses 线时,发射时从 `input_tokens` 中减去这两个桶。落库投影(`UsageAccounting::from_ir`)与客户端发射共用同一判别:anthropic 上游把两个缓存桶折进 `prompt_tokens`,令 `total_tokens = prompt_tokens + completion_tokens`,`prompt - cache_read` 在任意上游口径下都等于未命中输入。
 
 ## think 内容抽取
 
