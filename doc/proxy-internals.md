@@ -152,7 +152,7 @@ plan 密钥进入配额冷却后,后台线程按两条通道观察恢复,任一�
 
 ## 超时与客户端断连
 
-上游超时按客户端线格式配置,存在 `proxy_timeout_config` 表(每行一组,默认值对齐 cc-switch:anthropic 90/180/600、openai_responses 与 openai 60/120/600),由仪表板「通用设置 → 设置」页编辑、代理每次转发时按 harness 线格式读取,改动即时生效、无需重启:
+上游超时按客户端线格式配置,存在 `proxy_timeout_config` 表(每行一组,默认值对齐 cc-switch:anthropic 90/180/600、openai_responses 与 openai 60/120/600),由仪表盘「通用设置 → 设置」页编辑、代理每次转发时按 harness 线格式读取,改动即时生效、无需重启:
 
 - `streaming_first_byte_timeout` — 流式等首个数据块的最大时间。
 - `streaming_idle_timeout` — 流式两个数据块之间的最大间隔,0=禁用。

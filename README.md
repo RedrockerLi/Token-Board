@@ -1,6 +1,6 @@
 # Token Board — AI API 代理 + 用量可视化
 
-一个集**高性能 API 代理**与**用量数据可视化**于一体的工具。代理把 AI 工具的请求按不同 API Key 路由到不同的上游账户,自动完成客户端与上游之间的格式转换,并记录每次请求的 Token 消耗与费用;仪表板把这些数据画成图表,还能把用量和配置同步到 WebDAV,多台电脑共用一套代理配置。
+一个集**高性能 API 代理**与**用量数据可视化**于一体的工具。代理把 AI 工具的请求按不同 API Key 路由到不同的上游账户,自动完成客户端与上游之间的格式转换,并记录每次请求的 Token 消耗与费用;仪表盘把这些数据画成图表,还能把用量和配置同步到 WebDAV,多台电脑共用一套代理配置。
 
 核心特性:
 
@@ -17,23 +17,23 @@
 ## 快速开始
 
 ```bash
-# 快速启动前台仪表板（不迁移数据库、不重启后台服务）
+# 快速启动前台仪表盘（不迁移数据库、不重启后台服务）
 bash start.sh
 
-# 系统升级：编译代理、按需升级数据库、重启 proxy/maintenance 后启动仪表板
+# 系统升级：编译代理、按需升级数据库、重启 proxy/maintenance 后启动仪表盘
 bash start.sh --all
 
 # 不自动打开浏览器
 bash start.sh --no-browser
 ```
 
-浏览器会打开前台仪表板，通过左侧导航栏切换功能页面。仪表板固定监听 **5000**，代理监听 **8800**。仪表板不会开机自启；需要查看页面时运行 `bash start.sh`，按 Ctrl+C 关闭。`token-proxy` 与 `token-maintenance` 由 systemd 用户服务常驻。
+浏览器会打开前台仪表盘，通过左侧导航栏切换功能页面。仪表盘固定监听 **5000**，代理监听 **8800**。仪表盘不会开机自启；需要查看页面时运行 `bash start.sh`，按 Ctrl+C 关闭。`token-proxy` 与 `token-maintenance` 由 systemd 用户服务常驻。
 
-> 旧的 `token-dashboard` 服务已单独禁用并移除。非 systemd 环境时，仪表板以前台方式运行。
+> 旧的 `token-dashboard` 服务已单独禁用并移除。非 systemd 环境时，仪表盘以前台方式运行。
 
 ## 配置 AI 工具
 
-先给工具配上代理的地址和本地密钥(密钥在仪表板生成,见下面的配置流程):
+先给工具配上代理的地址和本地密钥(密钥在仪表盘生成,见下面的配置流程):
 
 ```bash
 # OpenAI Chat Completions 工具(OpenAI SDK 等)
@@ -57,7 +57,7 @@ export OPENAI_API_KEY=<本地密钥>
 
 ## 配置流程
 
-1. 打开仪表板 → **代理管理 → 上游账户** → 添加账户,填上游 API 的 Base URL、Key,选 API 格式(OpenAI Chat Completions / OpenAI Responses / Anthropic Messages)
+1. 打开仪表盘 → **代理管理 → 上游账户** → 添加账户,填上游 API 的 Base URL、Key,选 API 格式(OpenAI Chat Completions / OpenAI Responses / Anthropic Messages)
 2. **代理管理 → 本地密钥** → 生成密钥,选关联的账户(密钥只显示一次,注意保存)
 3. 把密钥填入 AI 工具的 `API_KEY`(或 `AUTH_TOKEN`),Base URL 指到代理
 4. 发一个请求验证:用量会出现在 **消费报告** 和 **请求日志**,实时并发与延迟看 **性能监控**
@@ -92,7 +92,7 @@ export OPENAI_API_KEY=<本地密钥>
 
 消费口径的说明见 [doc/billing-pricing.md](doc/billing-pricing.md)。
 
-## 仪表板使用
+## 仪表盘使用
 
 侧边栏页面按“数据面板 / 智能体管理 / 代理管理 / 通用设置”分组,时间显示统一为电脑当前时区:
 
@@ -124,7 +124,7 @@ export OPENAI_API_KEY=<本地密钥>
 
 用量存档采用**追加模式**:每次导出上传生成带时间戳的文件,云端旧文件保留不删,拉取时自动取最新。**云端永远是最新版本**,每台机器的本地存档永远是云端的一个历史版本;上传失败自动回滚(本地与检查点不动)。
 
-配置同步是**云端权威镜像**：仪表板启动后异步拉取最新配置，拉取完成前设置为只读；管理页修改立即写入本机，离开设置页时整份配置上传。PUT 成功即视为成功；失败会立即恢复最近一次云端基线。单编辑者模型不做多机冲突检测。
+配置同步是**云端权威镜像**：仪表盘启动后异步拉取最新配置，拉取完成前设置为只读；管理页修改立即写入本机，离开设置页时整份配置上传。PUT 成功即视为成功；失败会立即恢复最近一次云端基线。单编辑者模型不做多机冲突检测。
 
 同步边界按数据性质划分：普通配置和本地代理客户端密钥上传；上游 API Key 明文、WebDAV bootstrap 凭证、请求日志、导入游标、账单物化结果、汇率缓存、性能数据和在途请求不上传。Dashboard 聚合结果走独立同步链路。配置云端文件使用 gzip 压缩的 `token-board_config_YYYYMMDD_HHMMSS.db.gz`（新版仍可读取旧 `.db` artifact），机制详见 [doc/sync.md](doc/sync.md)。
 
@@ -164,7 +164,7 @@ cd proxy
 
 ### systemd 服务
 
-`start.sh` 只启动前台仪表板。`start.sh --all` 编译并升级后安装/重启 `token-proxy` 与 `token-maintenance` 用户服务。单独管理:
+`start.sh` 只启动前台仪表盘。`start.sh --all` 编译并升级后安装/重启 `token-proxy` 与 `token-maintenance` 用户服务。单独管理:
 
 ```bash
 systemctl --user status token-maintenance   # FX、计费、Agent 导入
@@ -192,7 +192,7 @@ bash scripts/start-proxy.sh --debug      # Ctrl+C 后恢复原服务状态
 bash scripts/status.sh
 ```
 
-检查代理二进制、proxy/maintenance 服务、8800 健康检查、前台仪表板端口和数据库行数。
+检查代理二进制、proxy/maintenance 服务、8800 健康检查、前台仪表盘端口和数据库行数。
 
 ### 数据目录
 

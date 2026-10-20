@@ -79,7 +79,7 @@ python3 scripts/mock_upstream.py --port 9100
 
 用量数据来自代理转发和已注册智能体软件:消费报告页点「导出数据」触发 `sync_dashboard`(见 [sync.md](sync.md)),把 `request_log`
 按 日×账户/软件(id)×模型 增量聚合写进 `dashboard.db`(纯存档,写时固化的费用直接入库,改价不回溯)。
-Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由 `token-maintenance` 的通用 importer 负责游标、幂等和写入 `request_log`；仪表板打开时通过本地 socket 异步唤醒导入。会话日志导入时按日志时间戳估算请求耗时（claude-code、codex；grok 用原生 `apiDurationMs`），不估算 TTFT：估算耗时写入 `request_log.duration_ms`（不可估时为 0），输出 ≥200 token 且耗时 ≥1000ms 的行另写估算 `output_tps`（含首字等待）。请求日志页对导入行以 `≈N.NN tokens/s` 展示估算速度（无估算显示 `—`），TTFT 显示 `—`；性能监控接口只统计 `source_kind='proxy'` 的代理流量。`project`、`session_id` 只在导入过程的内存中使用,不作为数据库或 API 字段。
+Agent 用量导入参考 `ref/vibe-usage` 的各来源 parser：每个 adapter 先把 native 数据归一为 `UsageEvent`，再由 `token-maintenance` 的通用 importer 负责游标、幂等和写入 `request_log`；仪表盘打开时通过本地 socket 异步唤醒导入。会话日志导入时按日志时间戳估算请求耗时（claude-code、codex；grok 用原生 `apiDurationMs`），不估算 TTFT：估算耗时写入 `request_log.duration_ms`（不可估时为 0），输出 ≥200 token 且耗时 ≥1000ms 的行另写估算 `output_tps`（含首字等待）。请求日志页对导入行以 `≈N.NN tokens/s` 展示估算速度（无估算显示 `—`），TTFT 显示 `—`；性能监控接口只统计 `source_kind='proxy'` 的代理流量。`project`、`session_id` 只在导入过程的内存中使用,不作为数据库或 API 字段。
 
 ### Agent 用量 ref 基准
 

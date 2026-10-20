@@ -212,14 +212,14 @@ def _commit_dashboard_pending(token_board_db_path: str, dash_db_path: str,
     clear_sync_state_many(token_board_db_path, _DASHBOARD_PENDING_KEYS)
     upload_count = _count_dashboard_rows(dash_db_path)
     if export_result is None or operation != "export":
-        message = (f"仪表板：上传 {upload_count} 条至云端" if published
-                   else f"仪表板：本地提交 {upload_count} 条")
+        message = (f"仪表盘：上传 {upload_count} 条至云端" if published
+                   else f"仪表盘：本地提交 {upload_count} 条")
         exported = 0
     else:
         verb = "上传" if published is not None else "本地提交"
         suffix = "至云端" if published is not None else ""
         message = (
-            f"仪表板：导出 {export_result.get('record_count', 0)} 条，"
+            f"仪表盘：导出 {export_result.get('record_count', 0)} 条，"
             f"{verb} {upload_count} 条{suffix}"
         )
         exported = export_result.get("record_count", 0)

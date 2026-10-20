@@ -98,7 +98,7 @@ fi
 
 # ── Dashboard ──
 echo ""
-echo "── 仪表板 ──"
+echo "── 仪表盘 ──"
 PORT="${TB_DASHBOARD_PORT:-5000}"
 if curl -s --max-time 3 "http://localhost:$PORT/api/summary" > /dev/null 2>&1; then
     ok "API 响应正常: http://localhost:$PORT"

@@ -88,4 +88,4 @@ Agent 导入过程中的 `project` 与 `session_id` 不写入 `request_log`，�
 
 ## 运行时同步健康
 
-`sync_state.sync_health` 记录最近一次错误，性能 API 会把它反映为 degraded。配置会话状态由仪表板进程内维护，固定为 `syncing`、`writable`、`read_only`、`local_only`。WebDAV 未配置时配置上传只返回 `unconfigured`；Dashboard 导出仍按独立事务处理。Agent 导入、FX 和周期费用物化由 `token-maintenance` 服务负责。
+`sync_state.sync_health` 记录最近一次错误，性能 API 会把它反映为 degraded。配置会话状态由仪表盘进程内维护，固定为 `syncing`、`writable`、`read_only`、`local_only`。WebDAV 未配置时配置上传只返回 `unconfigured`；Dashboard 导出仍按独立事务处理。Agent 导入、FX 和周期费用物化由 `token-maintenance` 服务负责。

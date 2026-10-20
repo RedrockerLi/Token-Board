@@ -204,7 +204,7 @@ cleanup() {
     trap - EXIT INT TERM
     if [ -n "$DASHBOARD_PID" ] && kill -0 "$DASHBOARD_PID" 2>/dev/null; then
         echo ""
-        echo "[INFO] 正在关闭仪表板..."
+        echo "[INFO] 正在关闭仪表盘..."
         kill "$DASHBOARD_PID" 2>/dev/null || true
         sleep 1
         kill -0 "$DASHBOARD_PID" 2>/dev/null && kill -9 "$DASHBOARD_PID" 2>/dev/null || true
@@ -404,7 +404,7 @@ if [ -f "$DASHBOARD_PID_FILE" ]; then
     rm -f "$DASHBOARD_PID_FILE"
 fi
 
-echo "[dash] 启动前台仪表板（Ctrl+C 关闭）..."
+echo "[dash] 启动前台仪表盘（Ctrl+C 关闭）..."
 cd "$SCRIPT_DIR"
 PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" \
     "$SCRIPT_DIR/server.py" --port "$DASHBOARD_PORT" \
@@ -420,7 +420,7 @@ if ! wait_for_url "http://127.0.0.1:$DASHBOARD_PORT/api/summary" 30; then
 fi
 
 echo ""
-echo "  ➜  仪表板: http://localhost:$DASHBOARD_PORT"
+echo "  ➜  仪表盘: http://localhost:$DASHBOARD_PORT"
 echo "  ➜  配置: 启动后异步拉取云端，完成前只读"
 echo ""
 open_browser "http://localhost:$DASHBOARD_PORT"

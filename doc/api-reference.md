@@ -17,7 +17,7 @@
 | `/v1/*` | OPTIONS | CORS 预检,返回 204 |
 | `/health` | GET | 健康检查,返回 `{"status":"ok","service":"token-board-proxy","concurrency":N}`(concurrency 为进程内实时并发数) |
 
-## 仪表板数据 API
+## 仪表盘数据 API
 
 看板默认固定监听 5000（可用 `TB_DASHBOARD_PORT` 覆盖）。数据来自 `dashboard.db`(`DataStore` 加载)。
 

@@ -44,7 +44,7 @@ Dashboard V1.7；当前运行 tip 是 Token Board V2.6、Dashboard V2.2，baseli
 
 ```
 ├── server.py               看板入口
-├── start.sh                前台仪表板；--all 执行升级并重启后台服务
+├── start.sh                前台仪表盘；--all 执行升级并重启后台服务
 ├── maintenance.py          FX、账单物化和 Agent 导入维护服务
 ├── app/                    Flask 应用包
 │   ├── __init__.py         应用工厂与配置会话启动
