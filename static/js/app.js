@@ -135,7 +135,7 @@ const PAGES = [
     {
         hash: '#/dashboard',
         container: 'page-dashboard',
-        title: '用量仪表板 · Token Board',
+        title: '用量仪表盘 · Token Board',
         initFn: 'initDashboard',
         destroyFn: null,
     },
