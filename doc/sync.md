@@ -53,7 +53,7 @@ Agent 导入过程中的 `project` 与 `session_id` 不写入 `request_log`，�
 
 配置同步采用“启动拉取、单编辑者、云端权威”模型：
 
-1. 看板启动后立即开放用量查看，同时异步列出 `token-board_config_*.db.gz` 和旧 `token-board_config_*.db`，拉取最新文件，通过 `app.db.schema_upgrade.upgrade_downloaded_artifact` 在本地 shadow 中按版本 route 完成 SQL 和 transition，再合入本机配置。若工件被升级，则合并后的当前配置会重新发布为新的 `.db.gz` 工件；旧工件保留。拉取完成前配置 API 为只读。
+1. 仪表盘启动后立即开放用量查看，同时异步列出 `token-board_config_*.db.gz` 和旧 `token-board_config_*.db`，拉取最新文件，通过 `app.db.schema_upgrade.upgrade_downloaded_artifact` 在本地 shadow 中按版本 route 完成 SQL 和 transition，再合入本机配置。若工件被升级，则合并后的当前配置会重新发布为新的 `.db.gz` 工件；旧工件保留。拉取完成前配置 API 为只读。
 2. 管理页修改立即写入本机，代理可以立即使用；离开配置页时前端调用 `/api/proxy/sync/config/upload`。
 3. 配置上传只执行时间戳 artifact 的 WebDAV PUT；HTTP 2xx 即视为成功，不做 config hash/ETag 冲突检查，不做上传后 PROPFIND 确认。
 4. 上传副本保留普通配置和本地代理客户端密钥，删除运行时数据、导入游标、上游 API Key 明文与 WebDAV 密码；副本压缩后上传。成功后推进 `token-board_config_snapshot.db` 本地权威快照。V0 或 V1 minor/transition 工件都在本地 shadow 中升级，合并成功后才发布新的最新版本工件，远端旧文件不改写。
@@ -82,7 +82,7 @@ Agent 导入过程中的 `project` 与 `session_id` 不写入 `request_log`，�
 
 任一步失败都会删除 shadow，不推进高水位，不替换本地 dashboard，也不清理未确认上传的明细。多机器同时上传时仍要求避免并发，后完成的完整文件可能覆盖先完成的文件。
 
-### 删除看板用户
+### 删除仪表盘用户
 
 `DELETE /api/proxy/dashboard/users` 只在 Dashboard shadow 中合并目标用户到 `id=0` 并完成云端同步；它不导出本机 `request_log`、不推进导出高水位、不物化账单，也不清理本机日志。归档前尚未导出的用量会留在本机，后续普通导出时按增量规则写回 Dashboard，这是预期行为。已导出的旧周期账单不会因为归档再次写回；如需恢复旧历史，应从旧的 dashboard 存档恢复。
 

@@ -554,7 +554,7 @@ def _run_dashboard_transaction_once(
         })
         if transform_result.get("archived_user_ids"):
             result["message"] = (
-                f"已归档 {len(transform_result['archived_user_ids'])} 个用户的历史看板数据")
+                f"已归档 {len(transform_result['archived_user_ids'])} 个用户的历史仪表盘数据")
         return result
     finally:
         if os.path.exists(tmp_dir):

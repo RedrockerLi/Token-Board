@@ -174,4 +174,4 @@ HTTP 线程只移动一个 `UsageEvent` 到有界队列。writer 最多 64 条�
 
 ## 端点与健康检查
 
-`setup_routes` 注册的端点见 [api-reference.md](api-reference.md)。除转发端点外还有 `GET /health` 返回 `{"status":"ok","service":"token-board-proxy","concurrency":N}`(concurrency 是进程内实时并发数),供 `scripts/status.sh` 探活与看板实时并发展示。所有 `/v1/*` 端点都带 CORS 头,并处理 `OPTIONS` 预检(204)。
+`setup_routes` 注册的端点见 [api-reference.md](api-reference.md)。除转发端点外还有 `GET /health` 返回 `{"status":"ok","service":"token-board-proxy","concurrency":N}`(concurrency 是进程内实时并发数),供 `scripts/status.sh` 探活与仪表盘实时并发展示。所有 `/v1/*` 端点都带 CORS 头,并处理 `OPTIONS` 预检(204)。

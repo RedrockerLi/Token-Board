@@ -62,7 +62,7 @@
 
 - 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`。软件与订阅通过 `agent_subscription_bindings` 保存日期粒度的有效关系：同一有效日期至多归属一个 Agent，但绑定可以解绑或改绑；账单物化时按当时有效状态直接把费用归属到 Agent。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名和实例标签只是用户记忆用的属性，不是主键或历史关联键，同名订阅可以重建。
 - 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`。软件与订阅通过 `agent_subscription_bindings` 保存日期粒度的有效关系：同一有效日期至多归属一个 Agent，但绑定可以解绑或改绑；账单物化时按当时有效状态直接把费用归属到 Agent。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名、实例标签、软件名、账户名和路由名都只是用户记忆用的属性，不是主键、外键、唯一生命周期键或历史关联键，同名资源可以重建。
-- 用量来自**token-maintenance 导入服务**：[maintenance.py](../maintenance.py) 管理唯一 worker，在维护服务启动时立即运行、每 30 分钟运行，浏览器打开看板时通过 Unix datagram socket 异步唤醒；[agent_usage](../app/services/agent_usage/) 按 `agent_kind` 选择独立 adapter，把各来源归一为 Python Usage IR，再写成 `request_log` 行。`event_id` 幂等，`project` 与 `session_id` 只在导入过程的内存中使用。
+- 用量来自**token-maintenance 导入服务**：[maintenance.py](../maintenance.py) 管理唯一 worker，在维护服务启动时立即运行、每 30 分钟运行，浏览器打开仪表盘时通过 Unix datagram socket 异步唤醒；[agent_usage](../app/services/agent_usage/) 按 `agent_kind` 选择独立 adapter，把各来源归一为 Python Usage IR，再写成 `request_log` 行。`event_id` 幂等，`project` 与 `session_id` 只在导入过程的内存中使用。
 - dashboard 的条目以软件/智能体为单位：理论消费来自导入用量，实际消费来自周期物化时直接归属该软件的订阅费用；未绑定时不生成新的实际费用。没有绑定关系不会自动推断。
 
 ## 三、单上游多密钥
@@ -110,7 +110,7 @@
 - **模型改写**：转发前把请求体里的模型名替换成 `upstream_model`（`apply_body_model` / 转换路径 `cReq.model`）。
 - **回退时机**：候选在**尚未向客户端发出任何数据**时失败（429/5xx/超时/401/403）才回退；流式请求的响应头延迟到首次写出才提交，因此流式也能在首字节前换下一个候选。
 - **全部不可用**：返回 429（忙/冷却/全失败）；若最后是超时则 504（[proxy/src/core/proxy_server.cpp:1162-1211](proxy/src/core/proxy_server.cpp#L1162-L1211)）。
-- **模型目录**：`GET /v1/models` 是纯本地读——聚合账户返回所有 `pattern`；普通账户返回数据库里保存的目录（看板「更新模型」维护，从未刷新则为空列表）；带 `anthropic-version` 头的 Anthropic 客户端返回空目录（[proxy/src/core/proxy_models.cpp](proxy/src/core/proxy_models.cpp)）。任何情况都不请求上游。
+- **模型目录**：`GET /v1/models` 是纯本地读——聚合账户返回所有 `pattern`；普通账户返回数据库里保存的目录（仪表盘「更新模型」维护，从未刷新则为空列表）；带 `anthropic-version` 头的 Anthropic 客户端返回空目录（[proxy/src/core/proxy_models.cpp](proxy/src/core/proxy_models.cpp)）。任何情况都不请求上游。
 
 ### 关键区别：聚合不是「账户」
 
@@ -224,16 +224,16 @@
 | `presets` | `base_url` / `monthly_price` / `currency` / `api_format` | 选中该子分类时新建表单的预填值 |
 | `session_header` | true / false | 转发时是否注入 `x-opencode-session`（每对话稳定） |
 | `usage_path` | 相对路径 / null | 用量查询路径（`GET` + Bearer 认证）；null = 无用量查询 |
-| `models_path` | 相对路径 / null | 模型目录路径（看板"更新模型"用）；null = 默认 `{base}/models` |
+| `models_path` | 相对路径 / null | 模型目录路径（仪表盘"更新模型"用）；null = 默认 `{base}/models` |
 
-当前只有 `plan` 带子分类，仅一项 `opencode-go`：`label` 为 `OpenCode Go — $10/月 · 含用量查询`，预设 `base_url=https://opencode.ai/zen/go`、月费 $10（USD）、`anthropic` 线格式，用量查询 `/v1/usage`、模型目录 `/v1/models`。子分类写在账户上游行的 `upstreams.subtype`（NULL = 普通账户），只影响预设、上游会话头、看板"更新模型"、用量轮询及其派生的用量感知调度与冷却恢复：计费、路由分组、删除语义继续跟随 `plan` 类型，类型徽章也仍是类型的 `short_label`（opencode-go 账户显示 `Plan`）。
+当前只有 `plan` 带子分类，仅一项 `opencode-go`：`label` 为 `OpenCode Go — $10/月 · 含用量查询`，预设 `base_url=https://opencode.ai/zen/go`、月费 $10（USD）、`anthropic` 线格式，用量查询 `/v1/usage`、模型目录 `/v1/models`。子分类写在账户上游行的 `upstreams.subtype`（NULL = 普通账户），只影响预设、上游会话头、仪表盘"更新模型"、用量轮询及其派生的用量感知调度与冷却恢复：计费、路由分组、删除语义继续跟随 `plan` 类型，类型徽章也仍是类型的 `short_label`（opencode-go 账户显示 `Plan`）。
 
 前端据此渲染账户弹窗左栏：类型卡片来自 `ACCOUNT_TYPES` 的 `label` / `short_label`，选中带子分类的类型后再在其下渲染子分类卡片，子分类名不硬编码在前端；轮询写入的用量快照在账户页以账户名悬浮卡展示（逐把密钥列出 5小时/本周/本月 用量与重置倒计时；未开始计时的滚动窗口显示「未开始」，不拿占位值当截止；点击账户名经同一 socket 唤醒轮询器并原地刷新卡片，「刷新中…」→ 新观测）。代理的用量感知调度按同一份快照工作：`state=started` 的窗口提供"重置前把额度用掉"的压力信号，`state=idle` 的滚动窗口（重置为占位值）不提供信号，过期快照不参与——任一窗口 100% 且重置未到的密钥排到最后（完整语义见 [proxy-internals.md](proxy-internals.md)）。
 
 ### 添加步骤（三步 + 两个按需）
 
 1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label`（形如 `<type> — <说明>`，破折号后的说明进左栏卡片正文）是账户弹窗左栏类型选择卡文案、`short_label` 是类型徽章文案（账户列表与左栏卡片共用）。
-2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、代理的上游会话头注入、看板"更新模型"和用量轮询都从它派生。C++ 侧没有类型镜像表，但子分类的代理行为以 `CASE WHEN u.subtype='opencode-go'` 写在两处 SQL（路由快照的会话头标志、冷却探测目标的用量观察标志，[proxy/src/store/](proxy/src/store/)）；新增需要代理行为的子分类要在这两处同步。类型层的派生量另只有合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
+2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、代理的上游会话头注入、仪表盘"更新模型"和用量轮询都从它派生。C++ 侧没有类型镜像表，但子分类的代理行为以 `CASE WHEN u.subtype='opencode-go'` 写在两处 SQL（路由快照的会话头标志、冷却探测目标的用量观察标志，[proxy/src/store/](proxy/src/store/)）；新增需要代理行为的子分类要在这两处同步。类型层的派生量另只有合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
 3. **智能体扩展另走智能体管理**：在 `agent_software` 增加 `agent_kind`，为该类型注册一个返回统一 UsageEvent 的解析器；订阅继续保存在独立的 `agent_subscriptions`，通过绑定表连接到软件，不把订阅误当成代理上游。
 
 两个按需的 if：

@@ -195,7 +195,7 @@ def parse_usage_body(body: object, *, observed: datetime | None = None,
             # 上游本次返回的重置时刻，任何 percent 都存：percent=0 只说明本窗口
             # 用量不足 1%，窗口可能仍在计时（滚动窗口 = 末次使用 + 5h），也可能
             # 空闲（上游给观测时刻+时长的占位值）。state 区分两种情况；代理的
-            # 候选排序按它判断（proxy/src/core/candidate_selection.h），看板也
+            # 候选排序按它判断（proxy/src/core/candidate_selection.h），仪表盘也
             # 按它显示倒计时：idle 的滚动窗口显示「未开始」，不拿占位值当截止。
             "resets_at": (format_utc(resets)
                           if resets is not None else None),

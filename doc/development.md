@@ -1,6 +1,6 @@
 # 开发指南
 
-面向想在源码上改动的开发者。代码分三块:C++17 代理(`proxy/`)、Python/Flask 看板(`app/` + `server.py`)、前端 SPA(`static/` + `templates/`)。总体结构见 [architecture.md](architecture.md)。
+面向想在源码上改动的开发者。代码分三块:C++17 代理(`proxy/`)、Python/Flask 仪表盘(`app/` + `server.py`)、前端 SPA(`static/` + `templates/`)。总体结构见 [architecture.md](architecture.md)。
 
 ## 构建代理
 
@@ -68,12 +68,12 @@ python3 scripts/mock_upstream.py --port 9100
 
 | 脚本 | 用途 |
 |------|------|
-| `bash start.sh` | 快速前台启动固定端口 5000 的看板；不迁移数据库、不重启后台服务；启动后异步拉取云端配置；`--no-browser` 不开浏览器 |
-| `bash start.sh --all` | 编译代理、升级两个数据库、安装/重启 `token-proxy` 与 `token-maintenance`，然后启动前台看板 |
+| `bash start.sh` | 快速前台启动固定端口 5000 的仪表盘；不迁移数据库、不重启后台服务；启动后异步拉取云端配置；`--no-browser` 不开浏览器 |
+| `bash start.sh --all` | 编译代理、升级两个数据库、安装/重启 `token-proxy` 与 `token-maintenance`，然后启动前台仪表盘 |
 | `bash start.sh --debug` | 根目录入口:暂停 systemd 并在终端输出上下游完整 debug；Ctrl+C 后恢复原服务状态 |
 | `bash scripts/start-proxy.sh` | 代理:无参前台启动;`--debug` 暂停 systemd 并在终端输出完整 debug;`--daemon` 后台;`--install`/`--uninstall` 管理 systemd 用户服务 |
-| `bash scripts/start-dashboard.sh [--no-browser]` | 兼容入口，转发到统一的 `start.sh`（不再另起第二个看板进程） |
-| `bash scripts/status.sh` | 状态检查:代理二进制、proxy/maintenance systemd、8800 健康、看板端口、数据库行数 |
+| `bash scripts/start-dashboard.sh [--no-browser]` | 兼容入口，转发到统一的 `start.sh`（不再另起第二个仪表盘进程） |
+| `bash scripts/status.sh` | 状态检查:代理二进制、proxy/maintenance systemd、8800 健康、仪表盘端口、数据库行数 |
 
 ## 数据写入
 

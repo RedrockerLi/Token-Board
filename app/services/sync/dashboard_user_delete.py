@@ -38,7 +38,7 @@ def _archive_dashboard_users_transform(user_ids: list[int]) -> DashboardTransfor
         if not found:
             return {
                 "status": "not_found",
-                "message": "未找到指定用户的看板数据",
+                "message": "未找到指定用户的仪表盘数据",
                 "archived_user_ids": [],
                 "not_found_user_ids": missing,
                 "archived_rows": 0,

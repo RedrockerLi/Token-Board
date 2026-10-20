@@ -42,7 +42,7 @@ EntitlementError 拒绝且尚无成功观测推翻，`active` = 任一完整观�
 `error_at` 是最近一次失败尝试时刻（判定证据，每次失败刷新），`resumed_at` 是停付后首次
 成功观测时刻（复付计费的起点）。结构不完整的响应（任一窗口缺失或 percent 不可用）按查询
 失败处理，防止不完整的新观测解除已确认的耗尽。代理按 `checked_at` 判定快照新鲜度
-（10 分钟）并据 `state` 区分滚动窗口是否已启动，看板也据 `state` 显示重置倒计时
+（10 分钟）并据 `state` 区分滚动窗口是否已启动，仪表盘也据 `state` 显示重置倒计时
 （idle 的滚动窗口是占位值，显示「未开始」）、按 `subscription` 显示「订阅已停付」，
 代理把停付密钥沉到候选末尾——完整调度语义见
 [proxy-internals.md](proxy-internals.md)。计费消费同一判定：停付证据（`error_at`）在
@@ -102,7 +102,7 @@ Dashboard `monthly_recurring_costs` 使用 `is_frozen`/`frozen_on`，不再保�
 
 ### local_keys — 本地密钥
 
-客户端用 `tb-` + 32 位 hex 的密钥访问代理,一把密钥绑定一个上游账户。`account_id` 可空:删除账户时选「仅解绑」会让密钥的 `account_id` 置 NULL(前端显示"未分配",需重新选择);选「级联删除」则密钥随账户删除。删除密钥时 `request_log.local_key_id` 经 `ON DELETE SET NULL` 保留,历史计费不丢。密钥只在此表存明文,看板 API 返回时打码(前 6 后 4)。
+客户端用 `tb-` + 32 位 hex 的密钥访问代理,一把密钥绑定一个上游账户。`account_id` 可空:删除账户时选「仅解绑」会让密钥的 `account_id` 置 NULL(前端显示"未分配",需重新选择);选「级联删除」则密钥随账户删除。删除密钥时 `request_log.local_key_id` 经 `ON DELETE SET NULL` 保留,历史计费不丢。密钥只在此表存明文,仪表盘 API 返回时打码(前 6 后 4)。
 
 ### upstream_keys — 本地上游密钥生命周期
 
@@ -177,7 +177,7 @@ key/value 表。`last_exported_log_id` 是最近一次**完整成功**事务导�
 
 ### account_models — 账户模型目录
 
-`(account_id, model_id)` 唯一。看板"更新模型"从上游模型目录端点拉取后整体替换(路径默认 `{base}/models`;opencode-go 子类型声明为 `{base}/v1/models`)。代理对普通账户的 `GET /v1/models` 直接返回这份目录(纯本地读,不请求上游;从未刷新则为空列表),模型映射界面同样读它。
+`(account_id, model_id)` 唯一。仪表盘"更新模型"从上游模型目录端点拉取后整体替换(路径默认 `{base}/models`;opencode-go 子类型声明为 `{base}/v1/models`)。代理对普通账户的 `GET /v1/models` 直接返回这份目录(纯本地读,不请求上游;从未刷新则为空列表),模型映射界面同样读它。
 
 ### aggregate_entries — 聚合账户映射
 
@@ -199,7 +199,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 可视化**存档**库,历史结构表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.7),当前运行结构为 `users` 与 `daily_model_usage` 两张表(由 `schema/dashboard/v2/2-*.sql` 升级到 V2.2)。**纯存档**:只有用量与总价及不可见的账单导出状态,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
-存档分桶键统一为稳定账户身份(V2.2 落为 `users.id`,迁移把无法归属的既有聚合归入 id=0 的`归档`),显示名字来自 `account_identities` 镜像；实时账户删除后仍可继续导出历史请求和冻结费用。Dashboard 侧不再使用账单回执表，导出事件在 Token Board 以 `(source_table,source_key)` 去重后按高水位导入；看板按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 ledger 行。
+存档分桶键统一为稳定账户身份(V2.2 落为 `users.id`,迁移把无法归属的既有聚合归入 id=0 的`归档`),显示名字来自 `account_identities` 镜像；实时账户删除后仍可继续导出历史请求和冻结费用。Dashboard 侧不再使用账单回执表，导出事件在 Token Board 以 `(source_table,source_key)` 去重后按高水位导入；仪表盘按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 ledger 行。
 
 ### token_usage / request_usage
 

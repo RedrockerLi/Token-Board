@@ -1,6 +1,6 @@
 # API 参考
 
-代理与看板各自暴露 HTTP API。转发端点在 C++ 代理(`proxy/src/proxy_server.cpp::setup_routes`),管理端点在 Flask 看板(`app/routes.py` 与 `app/proxy_routes.py`)。端点表按代码逐条核对,与当前实现一致。
+代理与仪表盘各自暴露 HTTP API。转发端点在 C++ 代理(`proxy/src/proxy_server.cpp::setup_routes`),管理端点在 Flask 仪表盘(`app/routes.py` 与 `app/proxy_routes.py`)。端点表按代码逐条核对,与当前实现一致。
 
 ## 代理转发端点
 
@@ -12,14 +12,14 @@
 | `/v1/messages` | POST | Anthropic Messages 转发(harness 格式 Anthropic) |
 | `/v1/responses` | POST | OpenAI Responses 转发(harness 格式 Responses) |
 | `/v1/embeddings` | POST | 嵌入转发(无格式转换) |
-| `/v1/models` | GET | 模型列表(纯本地,不请求上游):聚合账户返回其 `pattern` 目录;普通账户返回数据库保存的目录(看板"更新模型"维护,从未刷新则为空列表);带 `anthropic-version` 头的 Anthropic 客户端返回空目录 `{"models":[]}` |
+| `/v1/models` | GET | 模型列表(纯本地,不请求上游):聚合账户返回其 `pattern` 目录;普通账户返回数据库保存的目录(仪表盘"更新模型"维护,从未刷新则为空列表);带 `anthropic-version` 头的 Anthropic 客户端返回空目录 `{"models":[]}` |
 | `/v1/v1/chat/completions` 等 | 同上 | 双 `/v1` 前缀别名 |
 | `/v1/*` | OPTIONS | CORS 预检,返回 204 |
 | `/health` | GET | 健康检查,返回 `{"status":"ok","service":"token-board-proxy","concurrency":N}`(concurrency 为进程内实时并发数) |
 
 ## 仪表盘数据 API
 
-看板默认固定监听 5000（可用 `TB_DASHBOARD_PORT` 覆盖）。数据来自 `dashboard.db`(`DataStore` 加载)。
+仪表盘默认固定监听 5000（可用 `TB_DASHBOARD_PORT` 覆盖）。数据来自 `dashboard.db`(`DataStore` 加载)。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
@@ -153,7 +153,7 @@
 | `--log-level` | `info` | 日志级别(debug/info/warn/error) |
 | `--help` | — | 显示帮助 |
 
-### 看板(server.py)
+### 仪表盘(server.py)
 
 | 参数 | 必填 | 说明 |
 |------|------|------|
