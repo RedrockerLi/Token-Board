@@ -231,11 +231,16 @@ def main() -> None:
             print("0 OK: framework route miss is logged")
 
             # ── 1. Chat OpenAI used-failure 500 → raw passthrough ──
+            upstream_marker = "marker-upstream-503-body"
             status, body, _ = send(proxy_port, "POST", "/v1/chat/completions",
                 "tb-chat500", {**chat, "model": "chat500-model",
-                               "mock_status_by_key": {"sk-chat-500": 500}})
+                               "mock_status_by_key": {"sk-chat-500": 500},
+                               "mock_error_body": {
+                                   "error": {"message": upstream_marker,
+                                             "type": "mock_error",
+                                             "code": 500}}})
             assert status == 500, f"chat 500 status {status}"
-            assert body == {"error": {"message": "mock error",
+            assert body == {"error": {"message": upstream_marker,
                                       "type": "mock_error", "code": 500}}, body
             print(f"1 OK: chat OpenAI used-failure 500 passthrough -> {body}")
 
@@ -270,12 +275,14 @@ def main() -> None:
                 proxy_port, "POST", "/v1/chat/completions", "tb-chatstream",
                 {**chat, "model": "chatstream-model", "stream": False})
             assert status == 503, f"post-timeout request: {status} {body}"
-            assert headers.get("Retry-After") == "1", headers
+            retry_after = headers.get("Retry-After")
+            assert retry_after is not None and 20 <= int(retry_after) <= 30, \
+                headers
             assert body["error"]["type"] == "service_unavailable", body
             assert body["error"]["message"] == \
                 "All upstream keys are temporarily unavailable", body
-            print("3b OK: proxy timeout -> short provider-fault avoid "
-                  "(immediate retry is a fast 503, not a re-hammer)")
+            print("3b OK: proxy timeout -> provider-fault avoid with the real "
+                  f"Retry-After ({retry_after}s), not a 1s re-hammer")
 
             # Local per-key capacity is a proxy resource condition, not an
             # upstream rate limit: it returns 503 while the slot is occupied.
@@ -403,6 +410,13 @@ def main() -> None:
                     "unknown_content_blocks_cannot_be_converted_losslessly"
                     in stderr_output
                 ), stderr_output
+                # A real upstream 5xx body is captured, truncated and
+                # single-line, so the next incident can tell capacity from
+                # gateway or account failures.
+                assert "upstream_body=" in stderr_output, stderr_output
+                assert "marker-upstream-503-body" in stderr_output, stderr_output
+                # The terminal log records the Retry-After the client saw.
+                assert "retry_after_seconds=" in stderr_output, stderr_output
                 # Request credentials and control payload fields must never be
                 # copied into the journal record.
                 assert "sk-chat-500" not in stderr_output, stderr_output

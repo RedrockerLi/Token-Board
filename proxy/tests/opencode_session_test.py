@@ -535,6 +535,39 @@ def main() -> None:
                 f"S9: recovery must restore normal scheduling ({statuses}, {keys})"
             print("S9 OK: the lapsed key stayed demoted and rejoined on recovery")
 
+            # ── S9b: every key lapsed → 503 without touching upstream ─────
+            previous = latest_attempts(db_path, "oc6-model")
+            previous_id = previous[0] if previous else 0
+            set_usage(db_path, lapsed_key, lapsed_snapshot())
+            set_usage(db_path, lapse_sibling, lapsed_snapshot())
+            time.sleep(0.5)  # let the new snapshots hot-reload
+            status, text = send(proxy_port, "tb-oc6", {
+                "stream": False, "model": "oc6-model",
+                "mock_marker": "s9b",
+                "messages": [{"role": "user", "content": "all lapsed"}]})
+            assert status == 503, (status, text)
+            assert "All upstream keys have an inactive subscription" in text, text
+            # The zero-usage row is persisted asynchronously; wait for the
+            # first row *after* the previous request instead of reading the
+            # previous request's row.
+            row = latest_attempts(db_path, "oc6-model", previous_id)
+            assert row is not None and row[1] == 0 and row[2] == [] \
+                and row[3] == [], f"S9b: no upstream attempt expected ({row})"
+            assert read_log(log_path, "s9b") == [], \
+                "S9b: a lapsed key must never reach the upstream"
+            # One subscription comes back: the healthy key serves again and
+            # the still-lapsed sibling stays out of the attempt chain.
+            set_usage(db_path, lapse_sibling, usage_snapshot(20, 7200))
+            time.sleep(0.5)
+            status, _ = send(proxy_port, "tb-oc6", {
+                "stream": False, "model": "oc6-model",
+                "messages": [{"role": "user", "content": "sibling recovered"}]})
+            rid, _, statuses, keys = latest_attempts(db_path, "oc6-model", row[0])
+            assert status == 200 and statuses == [200] \
+                and keys == [lapse_sibling], \
+                f"S9b: only the recovered key may serve ({status}, {statuses}, {keys})"
+            print("S9b OK: all-lapsed is a local 503; recovery restores one key")
+
             print("opencode session tests passed")
         finally:
             diagnostics = stop_process(proxy, check_returncode=False)

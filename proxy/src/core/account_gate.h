@@ -33,6 +33,10 @@
 ///     success clears it.
 /// Ordinary request-level failures (400-class) never create state.
 ///
+/// `kSubscriptionLapsed` is not gate state: AttemptExecutor::acquire() returns
+/// it from the usage snapshot before consulting the gate.  The gate itself
+/// never produces it.
+///
 /// Slots are never reclaimed solely because they are old: a healthy long
 /// stream must keep its reservation. Every successful acquire has a matching
 /// release in the request paths, and client disconnect handling releases it.
@@ -45,6 +49,10 @@ public:
         kRateLimited,
         kAuthError,
         kProviderFault,
+        /// Fresh usage evidence says the upstream refused this key's
+        /// subscription.  Produced by AttemptExecutor, not by the gate; the
+        /// key is excluded from this request without touching its state.
+        kSubscriptionLapsed,
     };
 
     static constexpr auto PLAN_COOLDOWN = std::chrono::hours(5);
@@ -155,10 +163,19 @@ public:
         if (it == state.avoid.end() || it->second.kind != AvoidKind::kRateLimit ||
             now >= it->second.until)
             return 0;
-        const auto remaining_ms = std::chrono::duration_cast<
-            std::chrono::milliseconds>(it->second.until - now).count();
-        return static_cast<int>(std::max<std::int64_t>(
-            1, (remaining_ms + 999) / 1000));
+        return remaining_seconds_locked(it->second, now);
+    }
+
+    /// Remaining seconds of any active short-lived avoid (0 = none).  The
+    /// executor reports the smallest value as the downstream Retry-After when
+    /// every candidate was skipped for an auth error or provider fault.
+    int avoid_remaining_seconds(int key_slot_id) const {
+        auto &state = shard(key_slot_id);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        auto it = state.avoid.find(key_slot_id);
+        if (it == state.avoid.end() || now >= it->second.until) return 0;
+        return remaining_seconds_locked(it->second, now);
     }
 
     /// Slots currently inside the quota cooldown window (probe candidates).
@@ -232,6 +249,16 @@ private:
         std::lock_guard<std::mutex> lock(state.mutex);
         state.avoid[key_slot_id] = Avoid{
             kind, std::chrono::steady_clock::now() + duration};
+    }
+
+    /// Whole seconds until `avoid.until`, rounded up so a live avoid never
+    /// reports 0 before it actually expires.
+    static int remaining_seconds_locked(
+        const Avoid &avoid, std::chrono::steady_clock::time_point now) {
+        const auto remaining_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(avoid.until - now).count();
+        return static_cast<int>(std::max<std::int64_t>(
+            1, (remaining_ms + 999) / 1000));
     }
 
     static bool in_cooldown_locked(

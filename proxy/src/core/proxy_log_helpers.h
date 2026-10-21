@@ -128,9 +128,13 @@ inline void log_proxy_accounting_failure(const ProxyLogContext &context) {
 inline void log_proxy_request_final(
     const ProxyLogContext &context, const char *reason, int status,
     int duration_ms, std::size_t attempts, int timeout_secs,
-    const UpstreamCandidate *candidate) {
+    const UpstreamCandidate *candidate, int retry_after_seconds = 0) {
+    const std::string extra = retry_after_seconds > 0
+        ? "retry_after_seconds=" + std::to_string(retry_after_seconds)
+        : std::string();
     log_proxy_failure(context, "request_final", reason, status, duration_ms,
-                      attempts, attempts, false, timeout_secs, candidate);
+                      attempts, attempts, false, timeout_secs, candidate,
+                      extra);
 }
 
 inline void log_proxy_converted_response_missing(
@@ -195,10 +199,20 @@ inline AttemptExecutor::AttemptFailed proxy_attempt_failure_logger(
                const AttemptRequest &attempt,
                const UpstreamClient::ForwardResult &result,
                std::size_t attempt_number, bool retrying) {
+        // A real upstream 5xx body is often the only clue (model capacity,
+        // gateway, account state).  Keep it single-line and bounded; never
+        // copy 401/403 bodies, which may carry credential material.
+        const std::string extra =
+            result.status_code >= 500 &&
+            result.failure_kind == UpstreamFailureKind::HttpStatus &&
+            !result.body.empty()
+                ? "upstream_body=" + proxy_log_value(result.body, 512)
+                : std::string();
         log_proxy_failure(context, "upstream_attempt",
                           proxy_failure_reason(result), result.status_code,
                           result.duration_ms, attempt_number, attempt_number,
-                          retrying, result.timeout_secs, &attempt.candidate);
+                          retrying, result.timeout_secs, &attempt.candidate,
+                          extra);
     };
 }
 
@@ -225,6 +239,8 @@ inline const char *proxy_no_candidate_reason_name(
             return "provider_quota_cooldown";
         case NoCandidateReason::kKeyRateLimited: return "key_rate_limited";
         case NoCandidateReason::kKeyUnavailable: return "key_unavailable";
+        case NoCandidateReason::kSubscriptionLapsed:
+            return "subscription_lapsed";
         case NoCandidateReason::kNone: break;
     }
     return "no_upstream_candidate";

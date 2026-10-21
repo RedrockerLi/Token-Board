@@ -26,6 +26,13 @@ Database::AttemptInfo to_attempt(const UpstreamCandidate &candidate,
 
 AccountGate::KeyAcquireResult AttemptExecutor::acquire(
     const UpstreamCandidate &candidate) const {
+    // A fresh "subscription inactive" verdict is a hard exclusion: the
+    // upstream already refused the key, so spending a request attempt (and
+    // then a 15-minute auth avoid) only delays the real fallback.  The poller
+    // keeps observing the key and a later "active" verdict puts it back into
+    // the candidate set on the next routing reload.
+    if (candidate_subscription_lapsed(candidate, wall_now_epoch()))
+        return AccountGate::KeyAcquireResult::kSubscriptionLapsed;
     return gate_.try_acquire_eligible(candidate.key_slot_id,
                                       candidate.account().max_concurrency);
 }
@@ -119,6 +126,9 @@ AttemptOutcome AttemptExecutor::run(
     bool saw_subscription_cooldown = false;
     bool saw_rate_limited = false;
     bool saw_key_unavailable = false;
+    bool saw_subscription_lapsed = false;
+    int min_rate_avoid = 0;
+    int min_any_avoid = 0;
     for (std::size_t position = 0; position < order.size(); ++position) {
         const std::size_t index = order[position];
         if (index >= candidates.size()) continue;
@@ -135,14 +145,19 @@ AttemptOutcome AttemptExecutor::run(
                 saw_rate_limited = true;
                 const int wait =
                     gate_.rate_limit_avoid_seconds(candidate.key_slot_id);
-                if (wait > 0 &&
-                    (outcome.no_candidate_retry_after == 0 ||
-                     wait < outcome.no_candidate_retry_after))
-                    outcome.no_candidate_retry_after = wait;
+                if (wait > 0 && (min_rate_avoid == 0 || wait < min_rate_avoid))
+                    min_rate_avoid = wait;
             } else if (acquire_result == AccountGate::KeyAcquireResult::kAuthError ||
                        acquire_result ==
                            AccountGate::KeyAcquireResult::kProviderFault) {
                 saw_key_unavailable = true;
+                const int wait =
+                    gate_.avoid_remaining_seconds(candidate.key_slot_id);
+                if (wait > 0 && (min_any_avoid == 0 || wait < min_any_avoid))
+                    min_any_avoid = wait;
+            } else if (acquire_result ==
+                       AccountGate::KeyAcquireResult::kSubscriptionLapsed) {
+                saw_subscription_lapsed = true;
             }
             continue;
         }
@@ -196,8 +211,17 @@ AttemptOutcome AttemptExecutor::run(
                 ? NoCandidateReason::kProviderQuotaCooldown
                 : saw_rate_limited
                     ? NoCandidateReason::kKeyRateLimited
-                    : saw_key_unavailable ? NoCandidateReason::kKeyUnavailable
-                                          : NoCandidateReason::kNone;
+                    : saw_key_unavailable
+                        ? NoCandidateReason::kKeyUnavailable
+                        : saw_subscription_lapsed
+                            ? NoCandidateReason::kSubscriptionLapsed
+                            : NoCandidateReason::kNone;
+        // The 429 path keeps its historical "nearest rate-limit expiry"
+        // meaning; the generic-unavailable path reports the nearest
+        // auth/provider avoid.  Mixing both minima would let a large
+        // auth avoid understate a rate-limit wait (or vice versa).
+        outcome.no_candidate_retry_after =
+            saw_rate_limited ? min_rate_avoid : min_any_avoid;
     }
     return outcome;
 }

@@ -123,11 +123,13 @@ inline std::int64_t candidate_exhausted_reset(
 inline constexpr std::int64_t kLapseEvidenceSeconds = 48 * 3600;
 
 /// True while the usage poller's "no active subscription" verdict holds.
-/// Lapsed keys are demoted behind every other candidate — exhausted ones
-/// included: a spent window reopens by itself at its trusted reset, a lapsed
-/// subscription only by an external action, so it is attempted when nothing
-/// else exists (the provider stays authoritative; local data never
-/// fabricates the refusal).
+/// Lapsed keys are excluded for the duration of the verdict: the upstream
+/// already refused the subscription, so spending an attempt on it (and then
+/// a 15-minute auth avoid) only delays the real fallback.  candidate_order()
+/// still sinks them behind every other candidate for callers that order
+/// without the executor; AttemptExecutor::acquire() is what refuses them.
+/// The poller keeps observing the key, so a later "active" verdict restores
+/// it on the next routing reload.
 inline bool candidate_subscription_lapsed(const UpstreamCandidate &candidate,
                                           std::int64_t now) {
     const auto *usage = candidate.usage();
@@ -345,6 +347,8 @@ inline std::vector<size_t> candidate_order(
     });
     // A lapsed subscription sinks behind even the exhausted: those recover
     // at their trusted reset, a lapsed key only by an external action.
+    // AttemptExecutor::acquire() refuses these candidates outright; the
+    // partition remains so ordering-only callers still see them last.
     std::stable_partition(order.begin(), order.end(), [&](size_t index) {
         return !candidate_subscription_lapsed(candidates[index], now);
     });

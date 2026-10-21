@@ -12,7 +12,9 @@
 #include <string>
 
 /// Request-local fields shared by every proxy error log.  Deliberately does
-/// not contain credentials, headers or request/response bodies.
+/// not contain credentials, headers or request/response bodies.  The one
+/// exception is the upstream_attempt logger's truncated `upstream_body=`
+/// field for 5xx responses (see proxy_attempt_failure_logger).
 struct ProxyLogContext {
     std::uint64_t request_id = 0;
     std::string method;
@@ -102,6 +104,8 @@ inline const char *proxy_gate_reason(
             return "auth_error";
         case AccountGate::KeyAcquireResult::kProviderFault:
             return "provider_fault";
+        case AccountGate::KeyAcquireResult::kSubscriptionLapsed:
+            return "subscription_inactive";
         case AccountGate::KeyAcquireResult::kAcquired:
             break;
     }

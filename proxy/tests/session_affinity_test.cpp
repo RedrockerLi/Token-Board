@@ -203,9 +203,9 @@ int main() {
     // A lapsed subscription (the upstream refused it with its entitlement
     // error; the snapshot then carries no windows) sinks behind every other
     // candidate — behind even the exhausted, because a spent window reopens
-    // at its trusted reset while a lapsed key needs an external action.  It
-    // is still attempted when nothing else can take the request: the
-    // provider stays authoritative.
+    // at its trusted reset while a lapsed key needs an external action.
+    // AttemptExecutor::acquire() refuses these candidates outright; this
+    // case pins the ordering-only contract that keeps them last.
     auto lapsed_usage = [&](std::int64_t error_at) {
         auto usage = std::make_shared<routing::CredentialUsage>();
         usage->subscription_inactive = true;
@@ -355,6 +355,7 @@ int main() {
     assert(gate2.try_acquire_eligible(101, 1) ==
            AccountGate::KeyAcquireResult::kRateLimited);
     assert(gate2.rate_limit_avoid_seconds(101) == 60);
+    assert(gate2.avoid_remaining_seconds(101) == 60);
     gate2.note_success(101);
     assert(gate2.try_acquire_eligible(101, 1) ==
            AccountGate::KeyAcquireResult::kAcquired);
@@ -363,9 +364,13 @@ int main() {
     gate2.mark_auth_error(201);
     assert(gate2.try_acquire_eligible(201, 1) ==
            AccountGate::KeyAcquireResult::kAuthError);
+    assert(gate2.avoid_remaining_seconds(201) > 14 * 60);
+    assert(gate2.avoid_remaining_seconds(201) <= 15 * 60);
     gate2.mark_provider_fault(301);
     assert(gate2.try_acquire_eligible(301, 1) ==
            AccountGate::KeyAcquireResult::kProviderFault);
+    assert(gate2.avoid_remaining_seconds(301) > 25);
+    assert(gate2.avoid_remaining_seconds(301) <= 30);
     gate2.note_success(201);
     gate2.note_success(301);
     assert(gate2.try_acquire_eligible(201, 1) ==

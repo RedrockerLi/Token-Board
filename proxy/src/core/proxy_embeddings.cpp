@@ -121,9 +121,16 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         const int final_status = no_upstream_status(
             fwd, attempts, outcome.no_candidate_reason);
         const char *reason = proxy_terminal_failure_reason(outcome, fwd);
-        log_proxy_failure(log_context, "request_final", reason, final_status,
-                          fwd.duration_ms, attempts.size(), attempts.size(),
-                          false, fwd.timeout_secs, last_attempted);
+        const int log_retry_after =
+            outcome.no_candidate_reason == NoCandidateReason::kLocalCapacity
+                ? 1 : outcome.no_candidate_retry_after;
+        log_proxy_failure(
+            log_context, "request_final", reason, final_status,
+            fwd.duration_ms, attempts.size(), attempts.size(), false,
+            fwd.timeout_secs, last_attempted,
+            log_retry_after > 0
+                ? "retry_after_seconds=" + std::to_string(log_retry_after)
+                : std::string());
         enqueue_zero_usage(last_attempted ? last_attempted->account().id
                                           : ar.route.account_id,
                            ar.route.local_key_id, req_model, false, final_status,
@@ -134,6 +141,8 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                            static_cast<int>(attempts.size()), attempts);
         TerminalErrorOptions error_options;
         error_options.no_candidate_reason = outcome.no_candidate_reason;
+        error_options.no_candidate_retry_after =
+            outcome.no_candidate_retry_after;
         const auto err = render_terminal_error(
             codecs_.get(policy.client_format), &codecs_.get(policy.client_format),
             fwd, attempts, error_options);

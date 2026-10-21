@@ -54,6 +54,8 @@ const char *no_candidate_message(NoCandidateReason reason,
             return "All upstream keys are rate limited";
         case NoCandidateReason::kKeyUnavailable:
             return "All upstream keys are temporarily unavailable";
+        case NoCandidateReason::kSubscriptionLapsed:
+            return "All upstream keys have an inactive subscription";
         case NoCandidateReason::kLocalCapacity:
         case NoCandidateReason::kNone:
             break;
@@ -126,11 +128,19 @@ TerminalError render_terminal_error(
             opts.no_candidate_reason == NoCandidateReason::kProviderQuotaCooldown;
         const bool rate_limited =
             opts.no_candidate_reason == NoCandidateReason::kKeyRateLimited;
+        const bool local_capacity =
+            opts.no_candidate_reason == NoCandidateReason::kLocalCapacity;
         const bool throttled = provider_cooldown || rate_limited;
         out.status = throttled ? 429 : 503;
+        // A cooling candidate recovers at its recorded avoid deadline, so the
+        // client is told the real wait instead of retrying every second.
+        // Local capacity has no avoid entry (a slot may free at any moment)
+        // and keeps the historical one-second hint.
         out.retry_after_seconds = provider_cooldown
             ? 0
-            : rate_limited ? std::max(1, opts.no_candidate_retry_after) : 1;
+            : rate_limited ? std::max(1, opts.no_candidate_retry_after)
+            : local_capacity ? 1
+            : opts.no_candidate_retry_after;
         const char *message =
             no_candidate_message(opts.no_candidate_reason, opts.busy_message);
         normalized = from_body(out.status, json{
@@ -199,6 +209,8 @@ NormalizedError render_stream_error(
             no_candidate_reason == NoCandidateReason::kProviderQuotaCooldown;
         const bool rate_limited =
             no_candidate_reason == NoCandidateReason::kKeyRateLimited;
+        const bool local_capacity =
+            no_candidate_reason == NoCandidateReason::kLocalCapacity;
         const bool throttled = provider_cooldown || rate_limited;
         const char *message =
             no_candidate_message(no_candidate_reason, busy_message);
@@ -208,9 +220,13 @@ NormalizedError render_stream_error(
                                           ? "rate_limit_error"
                                           : "service_unavailable"},
                              {"code", throttled ? 429 : 503}});
+        // Same rule as the terminal renderer: report the real avoid deadline
+        // for auth/provider skips; local capacity keeps the one-second hint.
         out.retry_after_seconds = provider_cooldown
             ? 0
-            : rate_limited ? std::max(1, no_candidate_retry_after) : 1;
+            : rate_limited ? std::max(1, no_candidate_retry_after)
+            : local_capacity ? 1
+            : no_candidate_retry_after;
     } else {
         out = from_body(out.status,
                         normalize_upstream_error(upstream_codec, fwd,

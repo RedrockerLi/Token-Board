@@ -21,6 +21,7 @@ enum class NoCandidateReason {
     kProviderQuotaCooldown,
     kKeyRateLimited,
     kKeyUnavailable,
+    kSubscriptionLapsed,
 };
 
 struct AttemptOutcome {
@@ -34,8 +35,10 @@ struct AttemptOutcome {
     bool successful = false;
     bool budget_exhausted = false;
     NoCandidateReason no_candidate_reason = NoCandidateReason::kNone;
-    // Smallest remaining rate-limit avoid among skipped candidates (seconds);
-    // the terminal renderer reports it as the downstream Retry-After.
+    // Smallest remaining avoid among the skipped candidates that drove the
+    // reason (seconds): rate-limit avoids for kKeyRateLimited, auth/provider
+    // avoids for kKeyUnavailable.  The terminal renderer reports it as the
+    // downstream Retry-After.
     int no_candidate_retry_after = 0;
 };
 

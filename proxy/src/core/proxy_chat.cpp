@@ -455,7 +455,13 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         const int final_status = no_upstream_status(
             fwd, attempts, outcome.no_candidate_reason);
         const char *reason = proxy_terminal_failure_reason(outcome, fwd);
-        log_proxy_request_final(log_context, reason, final_status, fwd.duration_ms, attempts.size(), fwd.timeout_secs, last_attempted);
+        const int log_retry_after =
+            outcome.no_candidate_reason == NoCandidateReason::kLocalCapacity
+                ? 1 : outcome.no_candidate_retry_after;
+        log_proxy_request_final(log_context, reason, final_status,
+                                fwd.duration_ms, attempts.size(),
+                                fwd.timeout_secs, last_attempted,
+                                log_retry_after);
         enqueue_zero_usage(last_attempted ? last_attempted->account().id
                                           : ar.route.account_id,
                            ar.route.local_key_id, model, false, final_status,
@@ -469,6 +475,8 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         // harness envelope (serialize_error_body).
         TerminalErrorOptions error_options;
         error_options.no_candidate_reason = outcome.no_candidate_reason;
+        error_options.no_candidate_retry_after =
+            outcome.no_candidate_retry_after;
         const auto err = render_terminal_error(
             harness_codec, &codecs_.get(used_upstream_fmt), fwd, attempts,
             error_options);

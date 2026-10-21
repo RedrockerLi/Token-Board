@@ -533,7 +533,11 @@ void ProxyServer::handle_streaming(
                 outcome.no_candidate_retry_after);
             const char *final_reason = proxy_stream_terminal_failure_reason(
                 outcome, final_result, last_stream_error);
-            log_proxy_request_final(log_context, final_reason, err.status, final_result.duration_ms, attempts.size(), final_result.timeout_secs, outcome.last_attempted);
+            log_proxy_request_final(log_context, final_reason, err.status,
+                                    final_result.duration_ms, attempts.size(),
+                                    final_result.timeout_secs,
+                                    outcome.last_attempted,
+                                    err.retry_after_seconds);
             res.status = err.status;
             if (err.retry_after_seconds > 0)
                 res.set_header("Retry-After", std::to_string(err.retry_after_seconds));
