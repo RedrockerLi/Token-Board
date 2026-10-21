@@ -193,6 +193,43 @@ inline void mark_proxy_client_disconnect(
     result.error = "Client disconnected while writing response";
 }
 
+// Journal the failed attempt's request body field by field: every top-level
+// JSON field becomes its own `upstream_request_<field>=` entry.  The 512-byte
+// budget applies to the field's serialized content; the surrounding journal
+// key and escaping are not counted, so an entry may run slightly longer.  A
+// body that is not a JSON object falls back to one truncated slice.  This runs
+// only from the failure logger: successful forwards never parse or copy it.
+inline std::string proxy_upstream_request_fields(const std::string &body) {
+    constexpr std::size_t kFieldLimit = 512;
+    constexpr std::size_t kMaxFields = 16;
+    json parsed;
+    try {
+        parsed = json::parse(body);
+    } catch (...) {
+        return " upstream_request=" + proxy_log_value(body, kFieldLimit);
+    }
+    if (!parsed.is_object())
+        return " upstream_request=" + proxy_log_value(body, kFieldLimit);
+    std::string out;
+    std::size_t emitted = 0;
+    for (auto it = parsed.begin(); it != parsed.end(); ++it) {
+        if (emitted == kMaxFields) {
+            out += " upstream_request_remaining_fields=" +
+                   std::to_string(parsed.size() - emitted);
+            break;
+        }
+        std::string content = it.value().dump();
+        if (content.size() > kFieldLimit) {
+            content.resize(kFieldLimit);
+            content += "...";
+        }
+        out += " upstream_request_" + proxy_log_value(it.key(), 64) + "=" +
+               proxy_log_value(content, kFieldLimit + 3);
+        ++emitted;
+    }
+    return out;
+}
+
 inline AttemptExecutor::AttemptFailed proxy_attempt_failure_logger(
     ProxyLogContext context) {
     return [context = std::move(context)](
@@ -201,13 +238,17 @@ inline AttemptExecutor::AttemptFailed proxy_attempt_failure_logger(
                std::size_t attempt_number, bool retrying) {
         // Any real upstream error body is often the only clue (request shape,
         // model capacity, gateway, account state), so every >=400 response is
-        // captured.  Keep it single-line and bounded.
-        const std::string extra =
-            result.status_code >= 400 &&
-            result.failure_kind == UpstreamFailureKind::HttpStatus &&
-            !result.body.empty()
-                ? "upstream_body=" + proxy_log_value(result.body, 512)
-                : std::string();
+        // captured.  Keep it single-line and bounded.  The request fields
+        // recorded by UpstreamClient for the same attempt follow it, so a
+        // rejected request can be read against the response that rejected it.
+        std::string extra;
+        if (result.failure_kind == UpstreamFailureKind::HttpStatus &&
+            result.status_code >= 400) {
+            if (!result.body.empty())
+                extra = "upstream_body=" + proxy_log_value(result.body, 512);
+            if (!result.request_body.empty())
+                extra += proxy_upstream_request_fields(result.request_body);
+        }
         log_proxy_failure(context, "upstream_attempt",
                           proxy_failure_reason(result), result.status_code,
                           result.duration_ms, attempt_number, attempt_number,

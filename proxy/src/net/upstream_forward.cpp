@@ -636,6 +636,12 @@ UpstreamClient::forward(const std::string &method,
         DnsResolver::instance().mark_success(origin_parts.hostname,
                                              lease.address());
 
+    // Confirmed failure only: keep the request that was actually sent so the
+    // failure logger can journal it field by field.  A normal forward copies
+    // nothing.
+    if (result.failure_kind == UpstreamFailureKind::HttpStatus &&
+        result.status_code >= 400)
+        result.request_body = body;
     return result;
 }
 

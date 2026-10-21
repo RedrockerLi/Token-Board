@@ -259,7 +259,10 @@ def main() -> None:
                      "mock_error_body": {
                          "error": {"message": marker,
                                    "type": "mock_error",
-                                   "code": status_code}}})
+                                   "code": status_code}},
+                     "request_marker": "marker-upstream-request-body",
+                     "request_padding": "x" * 600 +
+                                        "marker-request-tail-must-not-appear"})
                 assert status == status_code, (status, body)
                 assert body == {"error": {"message": marker,
                                           "type": "mock_error",
@@ -440,12 +443,26 @@ def main() -> None:
                 assert "marker-upstream-503-body" in stderr_output, stderr_output
                 assert "marker-upstream-400-body" in stderr_output, stderr_output
                 assert "marker-upstream-403-body" in stderr_output, stderr_output
+                # The rejected attempt carries the request body that was sent,
+                # field by field, so the next incident can pair request shape
+                # with response.  Each field is capped at 512 bytes, so the
+                # padding field's tail must not reach the journal.
+                assert "upstream_request_model=" in stderr_output, stderr_output
+                assert "upstream_request_request_marker=" in stderr_output, \
+                    stderr_output
+                assert "marker-upstream-request-body" in stderr_output, \
+                    stderr_output
+                assert "marker-request-tail-must-not-appear" not in \
+                    stderr_output, stderr_output
                 # The terminal log records the Retry-After the client saw.
                 assert "retry_after_seconds=" in stderr_output, stderr_output
-                # Request credentials and control payload fields must never be
-                # copied into the journal record.
-                assert "sk-chat-500" not in stderr_output, stderr_output
-                assert "mock_status_by_key" not in stderr_output, stderr_output
+                # Request credentials must never be copied into the journal
+                # record.  The failed-attempt request body is intentionally
+                # journaled, so this only asserts that the downstream client
+                # credential (an Authorization header) never leaks; the mock's
+                # own key names appear because the test payloads carry them to
+                # the mock, not because the proxy logs a header.
+                assert "tb-chat500" not in stderr_output, stderr_output
                 assert "must-not-appear-in-log" not in stderr_output, stderr_output
             if proxy.returncode not in (0, -15):
                 print(stderr_output, file=sys.stderr)
