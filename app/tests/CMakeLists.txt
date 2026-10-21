@@ -17,6 +17,12 @@ set_tests_properties(app_testbench PROPERTIES
 )
 
 add_test(
+    NAME frontend_proxy_billing_export
+    COMMAND ${NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_LIST_DIR}/test_proxy_billing_export.js
+)
+
+add_test(
     NAME frontend_proxy_manager_key_order
     COMMAND ${NODE_EXECUTABLE}
             ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_key_order.js

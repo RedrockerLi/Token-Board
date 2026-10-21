@@ -57,6 +57,8 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         (legacy_schema / "token-board/v2/2-4_agent_usage_receipts.sql").unlink()
         (legacy_schema / "token-board/v2/2-5_opencode_go_subtype.sql").unlink()
         (legacy_schema / "token-board/v2/2-6_repair_total_tokens.sql").unlink()
+        (legacy_schema / "token-board/v2/"
+         "2-7_repair_imported_prompt_tokens.sql").unlink()
 
         ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
         with sqlite_connection(proxy) as conn:
@@ -97,6 +99,46 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
                 "PRAGMA table_info(upstreams)")}
             self.assertIn("subtype", upstream_columns)
         self.assertEqual(self._version(proxy), self._latest("token-board"))
+
+    def test_v27_repairs_imported_prompt_tokens_once(self) -> None:
+        from app.db.proxy_db import ProxyDatabase
+
+        proxy = self.root / "data/token-board.db"
+        dashboard = self.root / "data/dashboard.db"
+        legacy_schema = self.root / "schema-v26"
+        shutil.copytree(self.root / "schema", legacy_schema)
+        (legacy_schema / "token-board/v2/"
+         "2-7_repair_imported_prompt_tokens.sql").unlink()
+        ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
+
+        database = ProxyDatabase(str(proxy), schema_dir=str(legacy_schema))
+        software_id = database.create_agent_software({
+            "name": "OpenCode", "agent_kind": "opencode", "config": {}})
+        self.assertTrue(database.insert_agent_usage(
+            software_id=software_id, model="deepseek-v4-flash-free",
+            prompt_tokens=108, completion_tokens=199, cache_read_tokens=13056,
+            total_tokens=307, requested_at="2026-08-07T09:01:24Z",
+            event_id="v27-opencode"))
+
+        ensure_local_databases(str(proxy), str(dashboard), self.root / "schema")
+
+        def usage() -> tuple:
+            with sqlite_connection(proxy) as conn:
+                return conn.execute(
+                    "SELECT prompt_tokens,completion_tokens,cache_read_tokens,"
+                    "total_tokens FROM request_log WHERE event_id='v27-opencode'"
+                ).fetchone()
+
+        # prompt 补上 cache.read(108 + 13056),total 按恒等式重算。
+        self.assertEqual(tuple(usage()), (13164, 199, 13056, 13363))
+        self.assertEqual(self._version(proxy), self._latest("token-board"))
+
+        # 重复执行同一个迁移文件不再改变任何行。
+        migration = (self.root / "schema/token-board/v2/"
+                     "2-7_repair_imported_prompt_tokens.sql")
+        with sqlite_connection(proxy) as conn:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        self.assertEqual(tuple(usage()), (13164, 199, 13056, 13363))
 
     def test_current_proxy_schema_treats_every_business_name_as_display_data(self) -> None:
         proxy = self.root / "data/token-board.db"

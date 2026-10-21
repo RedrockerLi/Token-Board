@@ -166,6 +166,10 @@ async function exportData() {
     btn.textContent = '导出中...';
     try {
         const result = await proxyApi('/api/proxy/export', { method: 'POST' });
+        // 路由始终返回 200,导出结果只体现在响应体里,必须按 status 判定。
+        if (!result || result.status !== 'ok') {
+            throw new Error((result && result.message) || '导出未完成');
+        }
         showToast('导出成功');
         try { await fetchRefresh(); } catch (e) { /* ignore */ }
     } catch (err) {

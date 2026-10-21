@@ -2130,10 +2130,11 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             item = opencode.discover({"config": {"data_root": str(path)}})[0]
             events = opencode.parse(item).events
             self.assertEqual(len(events), 1)
+            # prompt 是含缓存的输入:net input 10 + cache.write 0 + cache.read 5。
             self.assertEqual((events[0].model, events[0].prompt_tokens,
                               events[0].completion_tokens,
                               events[0].cache_read_tokens),
-                             ("opencode-model", 10, 3, 5))
+                             ("opencode-model", 15, 3, 5))
 
     def test_opencode_merges_duplicate_messages_across_stores(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2170,7 +2171,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual((events[0].prompt_tokens,
                               events[0].completion_tokens,
-                              events[0].cache_read_tokens), (20, 2, 1))
+                              events[0].cache_read_tokens), (21, 2, 1))
 
     def test_opencode_reads_v2_session_message_projection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2212,8 +2213,8 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             # role 取 type、model 取 data.model.id、created 取 data.time.created、
             # project 取 session_v2.directory;user/idle 行不计费。
             self.assert_one_event(
-                parsed, model="claude-opus-4-6", prompt=14, completion=4,
-                cache=2, total=18, project="v2-project", session_id="ses_v2")
+                parsed, model="claude-opus-4-6", prompt=16, completion=4,
+                cache=2, total=20, project="v2-project", session_id="ses_v2")
             self.assertEqual(
                 parsed.events[0].requested_at, "2026-06-29T08:00:01Z")
 
@@ -2282,8 +2283,8 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             # 两代存储共存:按 (session, message id) 只计一次,legacy 行先出,
             # 因此已上传过的 project 名不会被 2.x 的 directory 改写。
             self.assert_one_event(
-                parsed, model="opencode-model", prompt=10, completion=2,
-                cache=1, total=12, project="project", session_id="session-1")
+                parsed, model="opencode-model", prompt=11, completion=2,
+                cache=1, total=13, project="project", session_id="session-1")
 
     def test_opencode_unknown_store_schema_warns_and_skips(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2359,7 +2360,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
                 completion=1, cache=0, total=6, project="unknown",
                 session_id="ses_x")
 
-    def test_opencode_folds_cache_write_into_input(self) -> None:
+    def test_opencode_folds_cache_buckets_into_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "opencode.db"
             with sqlite_connection(path) as connection:
@@ -2376,11 +2377,41 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
                     }), "session-1"))
 
             items = opencode.discover({"config": {"data_root": str(path)}})
-            # tokens.cache.write 折进 input(IR 没有单独的写缓存列)。
+            # tokens.cache.write 折进 input(IR 没有单独的写缓存列),
+            # tokens.cache.read 由 IR 叠加到 prompt。
             self.assert_one_event(
-                opencode.parse(items[0]), model="opencode-model", prompt=17,
-                completion=2, cache=5, total=19, project="project",
+                opencode.parse(items[0]), model="opencode-model", prompt=22,
+                completion=2, cache=5, total=24, project="project",
                 session_id="session-1")
+
+    def test_opencode_cache_read_dominates_net_input(self) -> None:
+        """长会话的 cache.read 远大于净输入,prompt 仍必须含它。"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.db"
+            with sqlite_connection(path) as connection:
+                connection.execute(
+                    "CREATE TABLE message(id TEXT, data TEXT, session_id TEXT)")
+                connection.execute(
+                    "INSERT INTO message VALUES(?,?,?)",
+                    ("message-1", json.dumps({
+                        "role": "assistant", "time": {"created": 1782720000000},
+                        "modelID": "deepseek-v4-flash-free",
+                        "tokens": {"input": 108, "output": 185,
+                                    "reasoning": 14,
+                                    "cache": {"read": 13056, "write": 0}},
+                        "path": {"root": "/work/project"},
+                    }), "session-1"))
+
+            items = opencode.discover({"config": {"data_root": str(path)}})
+            event = opencode.parse(items[0]).events[0]
+            # prompt = net input 108 + cache.write 0 + cache.read 13056;
+            # completion 含 reasoning;total = prompt + completion。
+            self.assertEqual(
+                (event.prompt_tokens, event.completion_tokens,
+                 event.cache_read_tokens, event.total_tokens),
+                (13164, 199, 13056, 13363))
+            self.assertGreaterEqual(
+                event.prompt_tokens, event.cache_read_tokens)
 
     def test_opencode_windows_localappdata_root_is_additive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2468,7 +2499,7 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
                     "FROM request_log WHERE event_id LIKE 'opencode:%'"
                 ).fetchone()
             self.assertEqual(tuple(row), (
-                "claude-opus-4-6", 14, 4, 2, 18, "2026-06-29T08:00:00Z"))
+                "claude-opus-4-6", 16, 4, 2, 20, "2026-06-29T08:00:00Z"))
 
     def test_opencode_idless_rows_keep_distinct_event_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

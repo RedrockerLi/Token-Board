@@ -14,7 +14,21 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V2.6 当前增量
+## V2.7 当前增量
+
+V2.7 修回导入行里被丢掉的缓存读取份额。落库口径是 `prompt_tokens` 含缓存桶
+（`prompt_tokens = 未命中输入 + cache_write + cache_read`，`total_tokens = prompt_tokens + completion_tokens`）；
+来源若把 `tokens.input` 写成不含缓存读取的净输入（OpenCode），按该口径导入的行在补上缓存读取份额前
+`prompt_tokens` 会小于 `cache_read_tokens`，dashboard 存档 `daily_model_usage` 的
+`cache_read_tokens <= input_tokens` 约束会拒绝这类聚合行，使整批导出回滚。迁移把这些行的
+`prompt_tokens` 加上 `cache_read_tokens`、按恒等式重算 `total_tokens`；匹配范围是 OpenCode 软件写入的行，
+外加任何仍然倒挂两个桶的导入行。`equivalent_cost` 保持写时值（`price_usage_event` 是 INSERT 后触发器），
+所以这些行的 token 与金额不再互相自洽，这是「写时固化」的既定取舍。
+
+`data_repairs` 是一次性数据修复的标记表（`id`、`applied_at`），只在本机存在（配置上传按
+`V1_CONFIG_TABLES` 白名单，不含该表），标记行使修复文件重复执行时不再改动任何行。
+
+## V2.6 历史增量
 
 V2.6 把全库违反恒等式 `total_tokens = prompt_tokens + completion_tokens` 的行修回该恒等式。
 这些行的 `total_tokens` 来自流式解码器的旧口径，少记了缓存命中：
@@ -170,6 +184,13 @@ api_cost = (miss/1e6) × input_price
 key/value 表。`last_exported_log_id` 是最近一次**完整成功**事务导出的最大
 `request_log.id`；`last_exported_billing_event_id` 是同一事务确认的最大账单事件 ID。
 两个水位线都在 dashboard shadow 成功提交后推进。
+
+### data_repairs — 一次性数据修复标记
+
+`id` 是修复标识，`applied_at` 是 UTC 时间戳。标记只在本机存在：配置上传按
+`V1_CONFIG_TABLES` 白名单，不含该表；配置快照剥离的运行时表（`RUNTIME_TABLE_DELETE_ORDER`）
+也不含它，因此标记不会随快照回滚丢失。版本化 SQL 用它把不可重复执行的整列修复
+做成重复执行无变化的语句。
 
 ### pricing_rules 与 pricing_slots — 定价
 

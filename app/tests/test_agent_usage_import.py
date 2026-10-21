@@ -385,8 +385,9 @@ class AgentUsageImportTestCase(AppDatabaseTestCase):
                     "cache_read_tokens,total_tokens "
                     "FROM request_log WHERE event_id LIKE 'opencode:%'"
                 ).fetchone()
+            # prompt 含 cache.read:net input 10 + cache.write 0 + read 5。
             self.assertEqual(tuple(row),
-                             ("opencode-model", 10, 3, 5, 13))
+                             ("opencode-model", 15, 3, 5, 18))
 
     def test_fork_replay_history_is_not_counted_twice(self) -> None:
         from app.db.proxy_db import ProxyDatabase

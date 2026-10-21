@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from app.db.proxy.billing import materialize_period_charges
 from app.db.proxy_db import ProxyDatabase
+from app.services.agent_usage.importer import import_once
 from app.services.sync.dashboard_sync import sync_dashboard
 from app.services.sync.dashboard_user_delete import delete_dashboard_users
 from app.services.sync.state import get_sync_state
@@ -260,6 +263,80 @@ class BillingExportTest(AppDatabaseTestCase):
                 ).fetchone()[0],
                 legacy_unit_id,
             )
+
+
+    def _dashboard_usage_count(self) -> int:
+        with sqlite_connection(self.dashboard_path) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM daily_model_usage").fetchone()[0]
+
+    def _opencode_store(self, name: str = "opencode") -> Path:
+        """一个 cache.read 远大于净输入的 OpenCode 存储。"""
+        store = self.root / name
+        store.mkdir()
+        with sqlite_connection(store / "opencode.db") as connection:
+            connection.execute(
+                "CREATE TABLE message(id TEXT, data TEXT, session_id TEXT)")
+            connection.execute(
+                "INSERT INTO message VALUES(?,?,?)",
+                ("message-1", json.dumps({
+                    "role": "assistant",
+                    "time": {"created": 1782720000000},
+                    "modelID": "deepseek-v4-flash-free",
+                    "tokens": {"input": 108, "output": 185, "reasoning": 14,
+                               "cache": {"read": 13056, "write": 0}},
+                    "path": {"root": "/work/project"},
+                }), "session-1"),
+            )
+        return store
+
+    def test_imported_opencode_usage_reaches_the_dashboard(self) -> None:
+        database = self.proxy_database()
+        software_id = database.create_agent_software({
+            "name": "OpenCode", "agent_kind": "opencode",
+            "config": {"data_root": str(self._opencode_store())},
+        })
+        self.assertEqual(import_once(database), 1)
+
+        result = sync_dashboard(
+            self.proxy_path, self.dashboard_path,
+            schema_dir=str(self.root / "schema"),
+        )
+        self.assertEqual(result["status"], "ok", result)
+        with sqlite_connection(self.dashboard_path) as conn:
+            row = conn.execute(
+                "SELECT user_id, input_tokens, cache_read_tokens, output_tokens,"
+                " request_count FROM daily_model_usage"
+                " WHERE model='deepseek-v4-flash-free'").fetchone()
+        # prompt 含 cache.read:108 + 0 + 13056,completion 含 reasoning。
+        self.assertEqual(tuple(row), (software_id, 13164, 13056, 199, 1))
+
+    def test_violating_imported_row_fails_the_whole_export(self) -> None:
+        """缓存桶倒挂的行必须让整批导出失败,而不是被夹断后写进存档。"""
+        database = self.proxy_database()
+        software_id = database.create_agent_software({
+            "name": "Broken", "agent_kind": "opencode",
+            "config": {"data_root": str(self._opencode_store("broken"))},
+        })
+        database.insert_agent_usage(
+            software_id=software_id, model="opencode-model",
+            prompt_tokens=10, completion_tokens=1, cache_read_tokens=99,
+            total_tokens=11, requested_at="2026-06-29T08:00:00Z",
+            event_id="broken-1",
+        )
+        before = self._dashboard_usage_count()
+
+        result = sync_dashboard(
+            self.proxy_path, self.dashboard_path,
+            schema_dir=str(self.root / "schema"),
+        )
+
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("IntegrityError", result["message"])
+        self.assertEqual(self._dashboard_usage_count(), before)
+        self.assertIsNone(get_sync_state(self.proxy_path, "last_exported_log_id"))
+        self.assertTrue(str(get_sync_state(
+            self.proxy_path, "sync_health")).startswith("dashboard sync degraded"))
 
 
 if __name__ == "__main__":

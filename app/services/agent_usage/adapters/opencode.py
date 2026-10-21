@@ -262,8 +262,9 @@ def _event(item: UsageSource, row: dict, record_identity: str):
         requested_at=row.get("created") if isinstance(row.get("created"), str)
         else timestamp(row.get("created")),
         # 该存储只写一个未分类的 cache.write 总量,IR 没有单独的写缓存列,
-        # 按仓库惯例折进 input(与 mcode/alma/claude-code 相同);否则每个
-        # Claude/Anthropic run 都会漏计写缓存 token。
+        # 按仓库惯例折进 input(与 mcode/alma/claude-code 相同);tokens.input
+        # 是不含 cache.read 的净输入,cache.read 由 IR 叠加到 prompt,落库口径
+        # 为 prompt = input + cache.write + cache.read。
         input_tokens=safe_int(tokens.get("input")) + safe_int(cache.get("write")),
         output_tokens=tokens.get("output", 0),
         cached_input_tokens=cache.get("read", 0),
@@ -271,7 +272,6 @@ def _event(item: UsageSource, row: dict, record_identity: str):
         # 2.x 消息行没有 path,项目回退到 session 行的 directory。
         project=project_name(row.get("path_root") or row.get("directory")),
         session_id=session_id,
-        input_includes_cache=True,
     )
 
 

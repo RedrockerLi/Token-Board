@@ -97,7 +97,8 @@ git -C ref/vibe-usage diff 415443a3e9e2af0787ab3c2a460166603258a56d..HEAD -- src
 - **核心设计约定**：
   1. **路由档位命名空间隔离**：`qoder-*`、`codebuddy-*`、`droid-*` 等将本地路由档位（如 `auto`, `default`, `fast` 等）命名空间化，防止与上游公开定价模型产生价格误碰撞；
   2. **防静默变空哨兵**：外部接口或格式变更可能导致误读为 0 Token。`cursor`（表头缺少 Date/Model/Token 列时）与 `grok`（报告有轮次但未读出用量时）实施格式哨兵拦截，返回 `skipped=True` 与报警日志，防止增量同步清空正常用量；
-  3. **测试环境约定**：测试与回归验证必须在 `conda base` 环境中执行（`conda run -n base pytest app/tests`）。
+  3. **测试环境约定**：测试与回归验证必须在 `conda base` 环境中执行（`conda run -n base pytest app/tests`）；
+  4. **Token 桶口径**：落库的 `prompt_tokens` 含缓存桶（未命中输入 + cache-write + cache-read），`total_tokens = prompt_tokens + completion_tokens`。适配器把源数据的 cache-write 折进 `input_tokens`，cache-read 交给 IR 叠加；只有源数据的 input 本身已含 cache-read（如 `codex`）才传 `input_includes_cache=True`。否则 `prompt_tokens` 会小于 `cache_read_tokens`，dashboard 存档 `daily_model_usage` 的 `cache_read_tokens <= input_tokens` 约束会拒绝该聚合行，并让整批导出回滚。
 
 ## 前端
 
