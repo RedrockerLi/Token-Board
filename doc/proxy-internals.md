@@ -68,7 +68,7 @@ journalctl --user -u token-proxy -f
 标准输出接到当前终端。代理的请求用量、计费和性能字段仍按正常业务流程写入
 SQLite 的 `request_log`，与 stdout/stderr 日志策略无关。
 
-业务错误统一以 `[ProxyError]` 的 key=value 单行记录。每行包含请求与客户端元数据：`request_id`、`phase`、`method`、`endpoint`、`format`、`model`、`streaming`、`route_account_id`、`local_key_id`、`status`、`reason`、`attempt`/`attempts`/`retrying`、`duration_ms`、`timeout_secs`、上游账户/上游/密钥/优先级组、`remote_addr`、`user_agent`。`phase=upstream_attempt` 对真实上游错误响应（任何 `>=400`）额外带 `upstream_body=`：响应体截断到 512 字节，空白、`=` 与控制字符替换为 `_`；传输层失败（DNS、连接、TLS、读写、超时）带 `error=<清洗后的错误原文>`。**请求体（输入）从不写入 journal**：它可能包含 prompt、工具参数或内联媒体，失败日志只记录元数据、上游错误响应体和传输错误原文。上游错误响应体用于区分请求形状、模型容量、网关、账户层与凭据层故障。
+业务错误统一以 `[ProxyError]` 的 key=value 单行记录。每行包含请求与客户端元数据：`request_id`、`phase`、`method`、`endpoint`、`format`、`model`、`streaming`、`route_account_id`、`local_key_id`、`status`、`reason`、`attempt`/`attempts`/`retrying`、`duration_ms`、`timeout_secs`、上游账户/上游/密钥/优先级组、`remote_addr`、`user_agent`。`phase=upstream_attempt` 对真实上游错误响应（任何 `>=400`）额外带 `upstream_body=`：响应体截断到 512 字节，空白、`=` 与控制字符替换为 `_`；命中同 key 退避重试签名的首条 400 还带 `opaque_model_400=1`；传输层失败（DNS、连接、TLS、读写、超时）带 `error=<清洗后的错误原文>`。**请求体（输入）从不写入 journal**：它可能包含 prompt、工具参数或内联媒体，失败日志只记录元数据、上游错误响应体和传输错误原文。上游错误响应体用于区分请求形状、模型容量、网关、账户层与凭据层故障。
 
 候选跳过不再逐条写 WARN：每个请求只在第一次跳过时记录一条 `phase=candidate_selection`，其余候选明细在 `--log-level debug` 下可见；终态记录追加 `skipped=<N> skip_reasons=<reason:count,...>`，因此风暴时一个请求最多两条相关记录。终态失败记录还带 `event_id=<32 位 hex>`，可用它直接查询 `request_log` 中的对应行。
 
@@ -130,7 +130,7 @@ bash start.sh --debug
 - **流式**:chunked 响应头**故意延迟到首个数据块写出前才提交**,所以上游在首字节前返回 429/5xx 时可以在当前请求内换下一候选重试;一旦 `committed`(任何字节已发给客户端)则不再切换,剩余部分按上游流原样转发。首个错误帧仍可触发回退。
 - **非流式**:循环候选。上游返回 429 或 5xx、且还没向客户端发任何数据时,释放当前密钥槽的并发槽,试下一个;plan 密钥收到上游明确的配额耗尽 429 按失败分类进入冷却(只冷却这一把,时长优先取可信重置)。全部候选失败返回 429。
 
-可回退的失败是密钥级故障:401/403、"配额耗尽",普通 429、5xx 与超时;请求内容或参数错误(400 等)不换密钥重试。超时(`is_timeout`,504)属于"结果未知"——上游可能已经处理并计费,这里选择可用性优先,同时保留可审计轨迹(`request_attempts.is_timeout` + `attempt_index` 可还原哪次重试发生在未知结果之后),整条回退链共享一个首字节预算,避免 N 个坏密钥把一次请求拖成 N 倍超时。全部候选失败时,若最后失败是超时则返回 504,否则 429。每次尝试都会写一行 `request_attempts`,失败的上游不会从监控里消失。嵌入端点 `/v1/embeddings` 也是非流式,走同一套候选排序与失败状态,但没有格式转换。
+可回退的失败是密钥级故障:401/403、"配额耗尽",普通 429、5xx 与超时;请求内容或参数错误(400 等)不换密钥重试。唯一例外:上游返回 400 且响应体是含 `model`、不含 `error` 的 JSON 对象(OpenCode Zen/Go 间歇性返回的掩码响应,例如 31 字节的 `{"model":"deepseek-v4.1-flash"}`)时,代理在**同一密钥**上等待 1 秒重试一次——不换密钥,避免丢失 prompt 缓存;成功或失败都终结本次请求,第二行尝试即使返回 429/5xx 也不回退。该重试只在共享请求预算剩余超过 1 秒时执行,首条尝试日志带 `retrying=1 opaque_model_400=1`,第二条正常记录;其余 400 仍立即终结。同 key 重试会多写一行 `request_attempts`,`request_log.attempt_count=2`、`fallback_count=1`(`fallback_count` 表示额外尝试次数,不区分是否换了密钥)。超时(`is_timeout`,504)属于"结果未知"——上游可能已经处理并计费,这里选择可用性优先,同时保留可审计轨迹(`request_attempts.is_timeout` + `attempt_index` 可还原哪次重试发生在未知结果之后),整条回退链共享一个首字节预算,避免 N 个坏密钥把一次请求拖成 N 倍超时。全部候选失败时,若最后失败是超时则返回 504,否则 429。每次尝试都会写一行 `request_attempts`,失败的上游不会从监控里消失。嵌入端点 `/v1/embeddings` 也是非流式,走同一套候选排序与失败状态,但没有格式转换。
 
 ## 会话亲和与成本平衡
 

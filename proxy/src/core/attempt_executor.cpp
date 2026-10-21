@@ -1,8 +1,24 @@
 #include "attempt_executor.h"
 
+#include "upstream_error_body.h"
+
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <thread>
 
 namespace {
+// Same-key retry for the opaque model-only 400.  One second is enough for the
+// gateway to route to a different replica, and short enough that the blocked
+// worker thread stays cheap.
+constexpr std::int64_t kOpaqueModel400BackoffMs = 1000;
+
+std::int64_t remaining_budget_ms(
+    std::chrono::steady_clock::time_point deadline) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               deadline - std::chrono::steady_clock::now()).count();
+}
+
 Database::AttemptInfo to_attempt(const UpstreamCandidate &candidate,
                                  const UpstreamClient::ForwardResult &result) {
     Database::AttemptInfo out;
@@ -188,6 +204,43 @@ AttemptOutcome AttemptExecutor::run(
         outcome.result = forward(AttemptRequest{candidate, index, remaining});
         outcome.last_attempted = &candidate;
         outcome.attempts.push_back(to_attempt(candidate, outcome.result));
+
+        bool same_key_retried = false;
+        std::size_t logged_attempts = 0;
+        std::int64_t terminal_remaining = remaining;
+
+        // The opaque model-only 400 gets one retry on the SAME key.  The gate
+        // lease stays armed and complete() is deferred to the terminal
+        // result: a 400 records no gate state, so holding the slot is
+        // lossless and guarantees the retry cannot switch keys (a key switch
+        // would lose the prompt cache).
+        if (!disconnected(outcome.result) &&
+            is_opaque_model_400(outcome.result) &&
+            remaining_budget_ms(deadline) > kOpaqueModel400BackoffMs) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kOpaqueModel400BackoffMs));
+            if (remaining_budget_ms(deadline) > 0 &&
+                !disconnected(outcome.result)) {
+                // Log the first 400 only after the sleep and budget recheck,
+                // so retrying=1 is truthful rather than a promise the budget
+                // or a disconnect may break.
+                if (attempt_failed) {
+                    attempt_failed(
+                        AttemptRequest{candidate, index, remaining},
+                        outcome.result, outcome.attempts.size(),
+                        /*retrying=*/true);
+                    logged_attempts = outcome.attempts.size();
+                }
+                terminal_remaining = remaining_budget_ms(deadline);
+                outcome.result = forward(
+                    AttemptRequest{candidate, index, terminal_remaining});
+                outcome.last_attempted = &candidate;
+                outcome.attempts.push_back(
+                    to_attempt(candidate, outcome.result));
+                same_key_retried = true;
+            }
+        }
+
         const bool downstream_gone = disconnected(outcome.result);
         outcome.successful = outcome.result.success &&
             outcome.result.status_code >= 200 &&
@@ -195,10 +248,15 @@ AttemptOutcome AttemptExecutor::run(
         complete(candidate, outcome.result);
         lease.disarm();
 
-        const bool retry = should_retry(outcome.result, downstream_gone,
-                                        position + 1 < order.size());
-        if (!outcome.successful && attempt_failed)
-            attempt_failed(AttemptRequest{candidate, index, remaining},
+        // A same-key retry is terminal: even a retryable status on the second
+        // attempt must not fall through to another key.
+        const bool retry = !same_key_retried &&
+            should_retry(outcome.result, downstream_gone,
+                         position + 1 < order.size());
+        if (!outcome.successful && attempt_failed &&
+            outcome.attempts.size() > logged_attempts)
+            attempt_failed(AttemptRequest{candidate, index,
+                                          terminal_remaining},
                            outcome.result, outcome.attempts.size(), retry);
         if (retry) continue;
         outcome.used = &candidate;

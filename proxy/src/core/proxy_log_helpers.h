@@ -4,6 +4,7 @@
 #include "context_management.h"
 #include "json.hpp"
 #include "proxy_error_log.h"
+#include "upstream_error_body.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -225,6 +226,10 @@ inline AttemptExecutor::AttemptFailed proxy_attempt_failure_logger(
         if (result.failure_kind == UpstreamFailureKind::HttpStatus &&
             result.status_code >= 400 && !result.body.empty())
             extra = "upstream_body=" + proxy_log_value(result.body, 512);
+        if (is_opaque_model_400(result)) {
+            if (!extra.empty()) extra += ' ';
+            extra += "opaque_model_400=1";
+        }
         if (!result.error.empty())
             extra += " error=" + proxy_log_value(result.error, 240);
         log_proxy_failure(context, "upstream_attempt",

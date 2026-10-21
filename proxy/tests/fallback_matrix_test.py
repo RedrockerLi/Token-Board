@@ -43,6 +43,18 @@ Anthropic-wire ones drive the Claude Code /v1/messages passthrough):
       terminator (sloppy upstream close) → still a complete 200 stream, no
       error frame, no key fault.
 
+The D section covers the opaque model-only 400 (OpenCode Zen/Go):
+
+  D1  non-streaming 400 {"model":...} → same-key retry after ~1s → 200;
+      both attempts carry the same upstream_key_id, the fallback key is never
+      tried.
+  D2  the same-key retry also gets 400 {"model":...} → terminal, exactly two
+      attempts on one key, no fallback.
+  D3  a structured 400 ({"error":{...}}) is a request error: one attempt, no
+      backoff.
+  D4  streaming opaque 400 pre-commit → same-key retry → complete 200 stream.
+  D5  the Anthropic /v1/messages wire gets the same same-key retry.
+
 Usage:
   python3 fallback_matrix_test.py <token_proxy> <schema_dir> <project_root>
 """
@@ -139,6 +151,28 @@ def attempt_rows(db_path, request_log_id):
         conn.close()
 
 
+def attempt_detail(db_path, request_log_id):
+    """(status_code, upstream_key_id) per attempt, in attempt order."""
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT status_code, upstream_key_id FROM request_attempts "
+            "WHERE request_log_id=? ORDER BY attempt_index",
+            (request_log_id,)).fetchall()
+    finally:
+        conn.close()
+
+
+def ctrl(upstream_port, payload):
+    """Seed/clear the mock's out-of-band control surface."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{upstream_port}/__ctrl",
+        data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        r.read()
+
+
 def latest_attempts(db_path, model, min_id=0):
     conn = sqlite3.connect(db_path)
     try:
@@ -212,6 +246,17 @@ def main() -> None:
                 max_concurrency=1)
             add_plain_route(conn, "tb-c7", "tb-c7-route", c7_upstream,
                             c7_account)
+            # D-scenarios: opaque model-only 400 on aggregate routes (plan
+            # keys first, metered fallback last) plus one Anthropic route.
+            for local_key in ("tb-d1", "tb-d2", "tb-d3", "tb-d4"):
+                build_scenario(conn, local_key, f"{local_key[3:]}-model",
+                               [f"sk-{local_key[3:]}-p1",
+                                f"sk-{local_key[3:]}-p2"],
+                               f"sk-{local_key[3:]}-d")
+            d5_account, d5_upstream, _ = add_upstream(
+                conn, "tb-d5", "", ["sk-d5-p1"], api_format="anthropic")
+            add_plain_route(conn, "tb-d5", "tb-d5-route", d5_upstream,
+                            d5_account)
             conn.execute("UPDATE upstreams SET base_url=?", (base_url,))
             # Fast B3 baseline: shrink the OpenAI-format semantic idle timeout
             # so the commit-then-stall → 504 round-trip completes in seconds.
@@ -426,6 +471,99 @@ def main() -> None:
             _, n, st = latest_attempts(db_path, "c8-model")
             assert st == [200] and n == 1, f"C8 chain {st}"
             print("C8 OK: sloppy close without the chunked terminator stays a success")
+
+            # ── D: opaque model-only 400 → same-key retry after ~1s ───────
+            # D1: the first 400 {"model":...}, the retry succeeds on the SAME
+            # key; the metered fallback is never touched.
+            start = time.monotonic()
+            status = send(proxy_port, "tb-d1", {
+                **common, "model": "d1-model", "stream": False,
+                "mock_status_once_by_key": {"sk-d1-p1": 400,
+                                            "sk-d1-p2": 400},
+                "mock_error_body": {"model": "d1-model"}})
+            elapsed = time.monotonic() - start
+            rid, n, st = latest_attempts(db_path, "d1-model")
+            rows = attempt_detail(db_path, rid)
+            assert status == 200, f"D1 status {status}"
+            assert st == [400, 200] and n == 2, f"D1 chain {st} attempts {n}"
+            assert rows[0][1] == rows[1][1], f"D1 must retry the same key: {rows}"
+            assert elapsed >= 0.95, f"D1 retry must wait ~1s, took {elapsed:.2f}s"
+            print(f"D1 OK: opaque 400 retried on the same key after "
+                  f"{elapsed:.2f}s -> 200 ({st})")
+
+            # D2: the same-key retry also gets the opaque 400.  The request is
+            # terminal: exactly two attempts on one key, no fallback.
+            start = time.monotonic()
+            status = send(proxy_port, "tb-d2", {
+                **common, "model": "d2-model", "stream": False,
+                "mock_status_once_by_key": {"sk-d2-p1": 400,
+                                            "sk-d2-p2": 400},
+                "mock_status_by_key": {"sk-d2-p1": 400, "sk-d2-p2": 400,
+                                       "sk-d2-d": 200},
+                "mock_error_body": {"model": "d2-model"}})
+            elapsed = time.monotonic() - start
+            rid, n, st = latest_attempts(db_path, "d2-model")
+            rows = attempt_detail(db_path, rid)
+            assert status == 400, f"D2 status {status}"
+            assert st == [400, 400] and n == 2, f"D2 chain {st} attempts {n}"
+            assert rows[0][1] == rows[1][1], f"D2 must stay on one key: {rows}"
+            assert elapsed >= 0.95, f"D2 retry must wait ~1s, took {elapsed:.2f}s"
+            print(f"D2 OK: repeated opaque 400 stays terminal after "
+                  f"{elapsed:.2f}s ({st})")
+
+            # D3: a structured 400 is a request error — no retry, no backoff.
+            start = time.monotonic()
+            status = send(proxy_port, "tb-d3", {
+                **common, "model": "d3-model", "stream": False,
+                "mock_status": 400,
+                "mock_error_body": {"error": {
+                    "message": "bad request",
+                    "type": "invalid_request_error"}}})
+            elapsed = time.monotonic() - start
+            rid, n, st = latest_attempts(db_path, "d3-model")
+            assert status == 400, f"D3 status {status}"
+            assert st == [400] and n == 1, f"D3 must not retry: {st} {n}"
+            assert elapsed < 0.9, f"D3 must not sleep, took {elapsed:.2f}s"
+            print(f"D3 OK: structured 400 is terminal without backoff ({st})")
+
+            # D4: streaming pre-commit opaque 400 → same-key retry → complete
+            # 200 stream.
+            start = time.monotonic()
+            status, text = send_path(
+                proxy_port, "tb-d4", "/v1/chat/completions",
+                {**common, "model": "d4-model", "stream": True,
+                 "mock_status_once_by_key": {"sk-d4-p1": 400,
+                                             "sk-d4-p2": 400},
+                 "mock_error_body": {"model": "d4-model"}})
+            elapsed = time.monotonic() - start
+            rid, n, st = latest_attempts(db_path, "d4-model")
+            rows = attempt_detail(db_path, rid)
+            assert status == 200, f"D4 status {status}"
+            assert "[DONE]" in text, f"D4 must complete the stream: {text[-200:]}"
+            assert st == [400, 200] and n == 2, f"D4 chain {st} attempts {n}"
+            assert rows[0][1] == rows[1][1], f"D4 must retry the same key: {rows}"
+            assert elapsed >= 0.95, f"D4 retry must wait ~1s, took {elapsed:.2f}s"
+            print(f"D4 OK: streaming opaque 400 retried on the same key after "
+                  f"{elapsed:.2f}s -> 200 ({st})")
+
+            # D5: the Anthropic /v1/messages wire uses the same rule.  The
+            # one-shot is seeded out-of-band because the body flag would be a
+            # converted request field; the opaque body itself still travels
+            # through the passthrough path.
+            ctrl(upstream_port, {"set_once": {"sk-d5-p1": 400}})
+            status, text = send_path(
+                proxy_port, "tb-d5", "/v1/messages",
+                anthropic_body("d5-model",
+                               {"mock_error_body": {"model": "d5-model"}}))
+            ctrl(upstream_port, {"clear_once": ["sk-d5-p1"]})
+            rid, n, st = latest_attempts(db_path, "d5-model")
+            rows = attempt_detail(db_path, rid)
+            assert status == 200, f"D5 status {status}"
+            assert "event: message_stop" in text, (
+                f"D5 must complete the stream: {text[-200:]}")
+            assert st == [400, 200] and n == 2, f"D5 chain {st} attempts {n}"
+            assert rows[0][1] == rows[1][1], f"D5 must retry the same key: {rows}"
+            print(f"D5 OK: Anthropic wire opaque 400 retried on the same key ({st})")
 
             print("fallback matrix tests passed")
         finally:

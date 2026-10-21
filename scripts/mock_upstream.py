@@ -35,6 +35,11 @@ Response selection:
     returned instead (error-path testing; bypasses strict validation).
   - "mock_status_by_key": {"sk-key1": 429, "sk-key2": 200} selects a
     status from the incoming Authorization key, for fallback tests.
+  - "mock_status_once_by_key": {"sk-key1": 400} applies that status to the
+    first POST of the key only; later POSTs with the same body flag fall back
+    to the normal status.  POST /__ctrl {"set_once": {key: status}} seeds the
+    same one-shot out-of-band (for cross-format tests that drop body flags),
+    and {"clear_once": [key]} or {"clear": [key]} removes pending entries.
   - Error-body control (non-2xx responses): "mock_error_type" sets error.type
     (emitting the real {"type":"error","error":{…},"metadata":{…}} envelope when
     "GoUsageLimitError"); "mock_error_type_by_key" keys that by Authorization
@@ -94,8 +99,9 @@ LOG_FILE = "/tmp/mock_upstream.log"
 # overrides the response status for GETs (429 → GoUsageLimitError envelope);
 # `default_get_status` is the fallback (200 = existing behavior).
 CONTROL_LOCK = threading.Lock()
-CONTROL = {"status_by_key": {}, "default_get_status": 200, "usage": None,
-           "require_session": False}
+CONTROL = {"status_by_key": {}, "status_once_by_key": {},
+           "status_once_consumed": set(), "default_get_status": 200,
+           "usage": None, "require_session": False}
 PROBES = {}  # auth key → GET /models count (the proxy's probe hits this path)
 
 
@@ -285,8 +291,18 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(ctrl.get("set"), dict):
                     CONTROL["status_by_key"].update(
                         {str(k): int(v) for k, v in ctrl["set"].items()})
+                if isinstance(ctrl.get("set_once"), dict):
+                    # One-shot statuses are consumed by the next matching POST.
+                    for k, v in ctrl["set_once"].items():
+                        CONTROL["status_once_by_key"][str(k)] = int(v)
+                        CONTROL["status_once_consumed"].discard(str(k))
                 for k in (ctrl.get("clear") or []):
                     CONTROL["status_by_key"].pop(str(k), None)
+                    CONTROL["status_once_by_key"].pop(str(k), None)
+                    CONTROL["status_once_consumed"].discard(str(k))
+                for k in (ctrl.get("clear_once") or []):
+                    CONTROL["status_once_by_key"].pop(str(k), None)
+                    CONTROL["status_once_consumed"].discard(str(k))
                 if "default_get_status" in ctrl:
                     CONTROL["default_get_status"] = int(ctrl["default_get_status"])
                 if "usage" in ctrl:
@@ -322,6 +338,20 @@ class Handler(BaseHTTPRequestHandler):
         status_by_key = req.get("mock_status_by_key")
         authorization = self.headers.get("Authorization") or ""
         auth_key = authorization.removeprefix("Bearer ")
+        if not auth_key:
+            # Anthropic-format upstreams authenticate with x-api-key.
+            auth_key = (self.headers.get("x-api-key") or "").strip()
+        once_by_key = req.get("mock_status_once_by_key")
+        if isinstance(once_by_key, dict) and auth_key in once_by_key:
+            with CONTROL_LOCK:
+                # The proxy's same-key retry resends the same body flag; honor
+                # it only for the first request of this key.
+                if auth_key not in CONTROL["status_once_consumed"]:
+                    CONTROL["status_once_consumed"].add(auth_key)
+                    CONTROL["status_once_by_key"][auth_key] = int(
+                        once_by_key[auth_key])
+        with CONTROL_LOCK:
+            once_status = CONTROL["status_once_by_key"].pop(auth_key, None)
         if isinstance(status_by_key, dict) and auth_key in status_by_key:
             status = status_by_key[auth_key]
         else:
@@ -337,6 +367,8 @@ class Handler(BaseHTTPRequestHandler):
             status = 400  # model-based trigger survives format conversion
         if req.get("model") == "trigger-429":
             status = 429  # model-based 429 trigger (plan cooldown testing)
+        if once_status is not None:
+            status = int(once_status)  # one-shot wins over every static pin
 
         # Hold the connection open before responding — lets tests exercise the
         # proxy's upstream read timeout / client-disconnect abort.
