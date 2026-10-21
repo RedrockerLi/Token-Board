@@ -199,11 +199,11 @@ inline AttemptExecutor::AttemptFailed proxy_attempt_failure_logger(
                const AttemptRequest &attempt,
                const UpstreamClient::ForwardResult &result,
                std::size_t attempt_number, bool retrying) {
-        // A real upstream 5xx body is often the only clue (model capacity,
-        // gateway, account state).  Keep it single-line and bounded; never
-        // copy 401/403 bodies, which may carry credential material.
+        // Any real upstream error body is often the only clue (request shape,
+        // model capacity, gateway, account state), so every >=400 response is
+        // captured.  Keep it single-line and bounded.
         const std::string extra =
-            result.status_code >= 500 &&
+            result.status_code >= 400 &&
             result.failure_kind == UpstreamFailureKind::HttpStatus &&
             !result.body.empty()
                 ? "upstream_body=" + proxy_log_value(result.body, 512)

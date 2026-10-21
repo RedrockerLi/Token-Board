@@ -14,7 +14,7 @@
 /// Request-local fields shared by every proxy error log.  Deliberately does
 /// not contain credentials, headers or request/response bodies.  The one
 /// exception is the upstream_attempt logger's truncated `upstream_body=`
-/// field for 5xx responses (see proxy_attempt_failure_logger).
+/// field for upstream error responses (see proxy_attempt_failure_logger).
 struct ProxyLogContext {
     std::uint64_t request_id = 0;
     std::string method;

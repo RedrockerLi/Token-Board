@@ -164,6 +164,8 @@ def main() -> None:
             # Separate accounts so the cooldown state of one scenario can never
             # leak into another.
             plain("sk-chat-500", "chat500")
+            plain("sk-chat-400", "chat400")
+            plain("sk-chat-403", "chat403")
             plain("sk-chat-to", "chatto")
             plain("sk-chat-stream", "chatstream")
             plain("sk-chat-cap", "chatcap", max_concurrency=1)
@@ -243,6 +245,26 @@ def main() -> None:
             assert body == {"error": {"message": upstream_marker,
                                       "type": "mock_error", "code": 500}}, body
             print(f"1 OK: chat OpenAI used-failure 500 passthrough -> {body}")
+
+            # ── 1b. Request-level (400) and auth-level (403) upstream error
+            #        bodies are journaled exactly like 5xx bodies, so the
+            #        operator can see the reason the upstream gave. ──
+            for status_code, local_key, marker in (
+                    (400, "tb-chat400", "marker-upstream-400-body"),
+                    (403, "tb-chat403", "marker-upstream-403-body")):
+                status, body, _ = send(proxy_port, "POST",
+                    "/v1/chat/completions", local_key,
+                    {**chat, "model": f"chat{status_code}-model",
+                     "mock_status": status_code,
+                     "mock_error_body": {
+                         "error": {"message": marker,
+                                   "type": "mock_error",
+                                   "code": status_code}}})
+                assert status == status_code, (status, body)
+                assert body == {"error": {"message": marker,
+                                          "type": "mock_error",
+                                          "code": status_code}}, body
+                print(f"1b OK: upstream {status_code} body passthrough -> {body}")
 
             # ── 2. Chat used-failure timeout → 504 + Connection: close ──
             status, body, headers = send(proxy_port, "POST",
@@ -410,11 +432,14 @@ def main() -> None:
                     "unknown_content_blocks_cannot_be_converted_losslessly"
                     in stderr_output
                 ), stderr_output
-                # A real upstream 5xx body is captured, truncated and
-                # single-line, so the next incident can tell capacity from
-                # gateway or account failures.
+                # A real upstream error body is captured, truncated and
+                # single-line for every >=400 response, so the next incident
+                # can tell a request-shape 400 from capacity, gateway,
+                # account or credential failures.
                 assert "upstream_body=" in stderr_output, stderr_output
                 assert "marker-upstream-503-body" in stderr_output, stderr_output
+                assert "marker-upstream-400-body" in stderr_output, stderr_output
+                assert "marker-upstream-403-body" in stderr_output, stderr_output
                 # The terminal log records the Retry-After the client saw.
                 assert "retry_after_seconds=" in stderr_output, stderr_output
                 # Request credentials and control payload fields must never be

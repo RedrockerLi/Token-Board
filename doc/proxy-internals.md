@@ -64,7 +64,7 @@ journalctl --user -u token-proxy -f
 标准输出接到当前终端。代理的请求用量、计费和性能字段仍按正常业务流程写入
 SQLite 的 `request_log`，与 stdout/stderr 日志策略无关。
 
-业务错误统一以 `[ProxyError]` 的 key=value 单行记录。`phase=upstream_attempt` 对真实上游 5xx 额外带 `upstream_body=`：响应体截断到 512 字节，空白、`=` 与控制字符替换为 `_`；401/403 的响应体不记录。该字段用于区分模型容量、网关和账户层故障。
+业务错误统一以 `[ProxyError]` 的 key=value 单行记录。`phase=upstream_attempt` 对真实上游错误响应（任何 `>=400`）额外带 `upstream_body=`：响应体截断到 512 字节，空白、`=` 与控制字符替换为 `_`。该字段用于区分请求形状、模型容量、网关、账户层与凭据层故障。
 
 ### 按需前台 debug
 
