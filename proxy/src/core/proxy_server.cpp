@@ -1,4 +1,4 @@
-#include "proxy_server.h"
+#include "proxy_server_internal.h"
 #include "endpoint_policy.h"
 #include "db.h"
 #include "format_common.h"
@@ -105,13 +105,6 @@ std::string stream_error_message(const json &error) {
 
 // ── Auth / routing helpers ───────────────────────────────────────────────
 
-/// Result of extracting Bearer token + looking up route.
-struct AuthResult {
-    bool success = false;
-    Router::RouteResult route;   // valid only if success
-    std::string error_json;       // 401 JSON body when !success
-};
-
 /// Extract Bearer token from request and look up the upstream route.
 /// Returns 401 error info when authentication or routing fails.
 AuthResult extract_and_route(const httplib::Request &req,
@@ -139,13 +132,26 @@ AuthResult extract_and_route(const httplib::Request &req,
         local_key = req.get_header_value("x-api-key");
 
     if (local_key.empty()) {
+        ar.status = 401;
+        ar.reason = "missing_api_key";
         ar.error_json = json_error("Missing API key. "
                                     "Use: Authorization: Bearer <key>", 401);
         return ar;
     }
 
+    // A missing routing snapshot is a service-startup condition, not a bad
+    // credential: report it as a 503 so the journal and the client agree.
+    if (!router.snapshot_loaded()) {
+        ar.status = 503;
+        ar.reason = "routing_unavailable";
+        ar.error_json = json_error("Routing configuration unavailable", 503);
+        return ar;
+    }
+
     ar.route = router.route(local_key);
     if (!ar.route.success) {
+        ar.status = 401;
+        ar.reason = "invalid_api_key";
         ar.error_json = json_error(ar.route.error, 401);
         return ar;
     }

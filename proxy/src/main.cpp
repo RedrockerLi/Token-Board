@@ -153,6 +153,8 @@ int main(int argc, char *argv[]) {
             log_context.method = req.method;
             log_context.endpoint = req.path;
             log_context.format = "http";
+            log_context.remote_addr = req.remote_addr;
+            log_context.user_agent = req.get_header_value("User-Agent");
             const char *reason = res.status == 404 ? "route_not_found"
                 : res.status == 405 ? "method_not_allowed"
                 : res.status == 413 ? "request_body_too_large"
@@ -170,6 +172,8 @@ int main(int argc, char *argv[]) {
             log_context.method = req.method;
             log_context.endpoint = req.path;
             log_context.format = "http";
+            log_context.remote_addr = req.remote_addr;
+            log_context.user_agent = req.get_header_value("User-Agent");
             log_proxy_failure(log_context, "framework", "handler_exception", 500);
             res.status = 500;
             // Preserve cpp-httplib's existing response contract while keeping
@@ -206,6 +210,8 @@ int main(int argc, char *argv[]) {
             log_context.method = req.method;
             log_context.endpoint = req.path;
             log_context.format = "http";
+            log_context.remote_addr = req.remote_addr;
+            log_context.user_agent = req.get_header_value("User-Agent");
             const char *reason = res.status == 400 ? "http_bad_request"
                 : res.status == 404 ? "route_not_found"
                 : res.status == 405 ? "method_not_allowed"

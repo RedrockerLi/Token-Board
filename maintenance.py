@@ -27,6 +27,7 @@ from app.db.proxy.billing import materialize_all_period_charges
 from app.services import fx
 from app.services.agent_usage.importer import import_once
 from app.services.key_usage import poll_usage_once
+from app.services.logging_setup import configure_logging
 from app.services.runtime_tasks import (
     AGENT_USAGE_IMPORT_INTERVAL_SECONDS,
     AgentUsageImportWorker,
@@ -222,7 +223,11 @@ def main(argv=None) -> int:
     parser.add_argument("--health", required=True)
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO)
+    # Same file+stream layout as the dashboard; the systemd unit still feeds
+    # INFO records to the journal, while data/maintenance.log keeps a durable
+    # copy that survives journal rotation.
+    configure_logging(Path(args.token_board_db).resolve().parent,
+                      stream_level=logging.INFO, filename="maintenance.log")
     service = MaintenanceService(
         args.token_board_db, args.schema_dir, args.socket, args.health)
     stopping = threading.Event()

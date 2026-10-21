@@ -182,6 +182,8 @@ bash scripts/start-proxy.sh --debug      # Ctrl+C 后恢复原服务状态
 
 常驻的 `token-proxy` 服务会丢弃 info/debug 标准输出，避免大量日志进入磁盘；warning/error 仍保留在 journal 便于发现故障。需要完整请求级诊断时使用上面的 `--debug`，它会把上下游每一次 HTTP 请求、响应头、非流式 body 和流式 chunk 打到当前终端（认证头脱敏），不要把 systemd 服务改成 `--log-level debug`。
 
+仪表盘与 `token-maintenance` 的应用日志（含同步、导出、归档和后台任务异常）分别写入 `data/dashboard.log` 与 `data/maintenance.log`（各自 5 MB × 5 轮转，权限 0600，仅本机保留）；仪表盘由 `start.sh` 启动时 stderr 被重定向，因此排查 Python 侧问题以这两个文件为准。
+
 日志级别、输出流和前台调试生命周期的完整说明见[代理日志系统](doc/proxy-internals.md#日志系统)。
 
 用户服务通常在登录后启动;若需无人值守(开机未登录也启动),可执行 `sudo loginctl enable-linger <用户>` 启用 linger。`start.sh` 会检测并提示,不会自行提权。

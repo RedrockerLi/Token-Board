@@ -118,12 +118,8 @@ public:
     struct ForwardResult {
         int status_code = 0;
         std::string body;    // full response body (for non-streaming)
-        // The request body this attempt sent, kept only when the attempt
-        // ended in an upstream error status (HttpStatus, >=400).  Empty for
-        // every other outcome, so a normal forward pays a single comparison.
-        // The failure logger turns it into per-field, bounded journal fields
-        // next to `upstream_body=`.
-        std::string request_body;
+        // The request body is never retained: it can contain prompts, tool
+        // arguments or inline media, and the journal records only metadata.
         bool success = false;
         bool is_timeout = false;  // true: upstream read timed out / stream interrupted
         bool client_disconnected = false;

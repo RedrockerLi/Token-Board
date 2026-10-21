@@ -20,13 +20,15 @@ transition→解析 C++ CLI 参数→打开并校验已准备好的 V1 schema→
 
 代理日志由 `proxy/src/core/logging.h` 提供，级别从低到高为
 `error`、`warn`、`info`、`debug`。`--log-level` 设置阈值，默认是 `info`；例如
-`--log-level debug` 会启用全部四个级别。日志消息会立即 flush，适合观察前台进程。
+`--log-level debug` 会启用全部四个级别。每条输出带 `YYYY-MM-DDTHH:MM:SS.mmmZ LEVEL `
+前缀（UTC，毫秒），时间戳、级别与正文在同一把 stdio 锁内写完，并发线程不会交错；
+日志消息会立即 flush，适合观察前台进程。
 
 输出流按严重程度分开:
 
 - `error`、`warn` 写入 `stderr`。请求级代理错误使用单行 `key=value` 结构化格式，
-  经过 `proxy_log_value` 清理并限制长度；这类常规错误记录不包含 API Key、请求头
-  或请求/响应 body。
+  经过 `proxy_log_value` 清理并限制长度；记录不包含 API Key、认证头或请求 body，
+  响应 body 仅在上游错误时截断保留（`upstream_body=`），另有受限长度的 `user_agent`。
 - `info`、`debug` 写入 `stdout`。`debug` 包括 HTTP 请求、路由选择、请求级诊断等
   高频信息，只有显式启用 debug 级别才会产生。
 
@@ -54,7 +56,9 @@ StandardError=journal
 ```
 
 因此常驻服务会丢弃 `info`/`debug`，避免详细诊断进入持久化 journal；`warn`/`error`
-以及 systemd 自身的启动、停止、失败事件仍可通过下面的命令查看:
+以及 systemd 自身的启动、停止、失败事件仍可通过下面的命令查看。注意 journald 会把
+stderr 行按 `err` 优先级、stdout 行按 `info` 优先级记录，按 `PRIORITY=err` 过滤时
+普通告警也会出现。
 
 ```bash
 journalctl --user -u token-proxy -f
@@ -64,7 +68,17 @@ journalctl --user -u token-proxy -f
 标准输出接到当前终端。代理的请求用量、计费和性能字段仍按正常业务流程写入
 SQLite 的 `request_log`，与 stdout/stderr 日志策略无关。
 
-业务错误统一以 `[ProxyError]` 的 key=value 单行记录。`phase=upstream_attempt` 对真实上游错误响应（任何 `>=400`）额外带 `upstream_body=`：响应体截断到 512 字节，空白、`=` 与控制字符替换为 `_`。同一行还按字段记录这次尝试实际发出的请求体：顶层 JSON 的每个字段各自成为 `upstream_request_<字段>=`，字段内容截断到 512 字节（日志键名与转义不计入该预算，因此条目可能略长于 512；超长时末尾补 `...`），最多 16 个字段，其余记为 `upstream_request_remaining_fields=<个数>`；请求体不是 JSON 对象时退回单个 `upstream_request=` 截断切片。请求体的解析与裁剪只发生在失败日志里，正常转发路径只做一次状态判断。响应体用于区分请求形状、模型容量、网关、账户层与凭据层故障，请求字段让被拒的那次请求和拒绝它的响应能在同一条记录里对上。
+业务错误统一以 `[ProxyError]` 的 key=value 单行记录。每行包含请求与客户端元数据：`request_id`、`phase`、`method`、`endpoint`、`format`、`model`、`streaming`、`route_account_id`、`local_key_id`、`status`、`reason`、`attempt`/`attempts`/`retrying`、`duration_ms`、`timeout_secs`、上游账户/上游/密钥/优先级组、`remote_addr`、`user_agent`。`phase=upstream_attempt` 对真实上游错误响应（任何 `>=400`）额外带 `upstream_body=`：响应体截断到 512 字节，空白、`=` 与控制字符替换为 `_`；传输层失败（DNS、连接、TLS、读写、超时）带 `error=<清洗后的错误原文>`。**请求体（输入）从不写入 journal**：它可能包含 prompt、工具参数或内联媒体，失败日志只记录元数据、上游错误响应体和传输错误原文。上游错误响应体用于区分请求形状、模型容量、网关、账户层与凭据层故障。
+
+候选跳过不再逐条写 WARN：每个请求只在第一次跳过时记录一条 `phase=candidate_selection`，其余候选明细在 `--log-level debug` 下可见；终态记录追加 `skipped=<N> skip_reasons=<reason:count,...>`，因此风暴时一个请求最多两条相关记录。终态失败记录还带 `event_id=<32 位 hex>`，可用它直接查询 `request_log` 中的对应行。
+
+`status` 是客户端可见状态或该记录对应的响应状态。`phase=response_validation` 的 `upstream_response_invalid_json` 可能带 `status=200`（上游返回 200 但响应体无法解析），按 `status>=400` 过滤会漏掉它，应结合 phase/reason 查询。
+
+准入前的拒绝（缺失/无效 API Key 401、请求解析失败 400、功能不兼容 422、路由快照未就绪 503）只写 journal，不写 `request_log`：它们没有联系上游、没有计费身份。路由快照未就绪记为 `phase=routing reason=routing_unavailable`，不再误记为 `invalid_api_key`。队列满时连接尚未解析成请求，记录只有 `method=UNKNOWN endpoint=unknown`，无法带方法/路径。
+
+### Python 进程日志
+
+仪表盘与 `token-maintenance` 由 `app/services/logging_setup.py` 统一配置，但各写各的文件以避免多进程同时轮转：`data/dashboard.log` 与 `data/maintenance.log`（各自 5 MB × 5，0600，UTC 时间戳）+ stderr（仪表盘默认 WARNING，maintenance 为 INFO 以保留 journal）。仪表盘由 `start.sh` 启动时 stderr 仍重定向到 `/dev/null`，因此同步、导出、归档和后台任务的异常以文件日志为准；日志文件仅保存在本机，不参与配置同步。`werkzeug` 访问日志压到 WARNING，避免淹没应用错误。
 
 ### 按需前台 debug
 

@@ -1,6 +1,9 @@
 #include "format_anthropic_internal.h"
 #include "reasoning_bridge.h"
 
+#include <atomic>
+#include <cstdint>
+
 using namespace ir;
 
 bool AnthropicCodec::parse_request(const json &in, ir::ChatRequest &out,
@@ -192,8 +195,17 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in,
     int max_tokens = in.max_tokens.value_or(0);
     if (max_tokens <= 0) {
         max_tokens = 4096;
-        TB_LOG_ERROR( "[Anthropic] max_tokens missing, defaulting to %d\n",
-                max_tokens);
+        // Missing max_tokens is routine for OpenAI-shaped clients converted to
+        // the Anthropic wire, so it is informational rather than an error and
+        // is reported only on the first and every thousandth occurrence.
+        static std::atomic<std::uint64_t> missing_count{0};
+        const std::uint64_t occurrence =
+            missing_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (occurrence == 1 || occurrence % 1000 == 0)
+            TB_LOG_INFO(
+                "[Anthropic] max_tokens missing, defaulting to %d "
+                "(occurrence %llu)\n",
+                max_tokens, static_cast<unsigned long long>(occurrence));
     }
     body["max_tokens"] = max_tokens;
     body["stream"] = in.stream;

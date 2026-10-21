@@ -35,6 +35,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -443,25 +444,50 @@ def main() -> None:
                 assert "marker-upstream-503-body" in stderr_output, stderr_output
                 assert "marker-upstream-400-body" in stderr_output, stderr_output
                 assert "marker-upstream-403-body" in stderr_output, stderr_output
-                # The rejected attempt carries the request body that was sent,
-                # field by field, so the next incident can pair request shape
-                # with response.  Each field is capped at 512 bytes, so the
-                # padding field's tail must not reach the journal.
-                assert "upstream_request_model=" in stderr_output, stderr_output
-                assert "upstream_request_request_marker=" in stderr_output, \
-                    stderr_output
-                assert "marker-upstream-request-body" in stderr_output, \
+                # The input body is never journaled: it can carry prompts,
+                # tool arguments or inline media.  The rejected attempt is
+                # described by metadata plus the upstream error body only.
+                assert "upstream_request" not in stderr_output, stderr_output
+                assert "marker-upstream-request-body" not in stderr_output, \
                     stderr_output
                 assert "marker-request-tail-must-not-appear" not in \
                     stderr_output, stderr_output
                 # The terminal log records the Retry-After the client saw.
                 assert "retry_after_seconds=" in stderr_output, stderr_output
+                # Terminal failure lines carry the persisted row's idempotency
+                # key, so journal and SQLite can be joined directly.
+                event = re.search(r"event_id=([0-9a-f]{32})", stderr_output)
+                assert event, stderr_output
+                check = sqlite3.connect(db_path)
+                try:
+                    row = check.execute(
+                        "SELECT status_code FROM request_log WHERE event_id=?",
+                        (event.group(1),)).fetchone()
+                finally:
+                    check.close()
+                assert row is not None, "event_id must identify a request_log row"
+                # Gate skips are aggregated on the terminal record instead of
+                # one WARN per candidate.
+                assert "skipped=" in stderr_output, stderr_output
+                assert "skip_reasons=" in stderr_output, stderr_output
+                # Transport failures carry their human-readable error text.
+                timeout_lines = [
+                    line for line in stderr_output.splitlines()
+                    if "phase=upstream_attempt" in line
+                    and "reason=upstream_timeout" in line
+                ]
+                assert timeout_lines, stderr_output
+                assert all("error=" in line for line in timeout_lines), timeout_lines
+                # Client identity and the UTC timestamp/level prefix are part
+                # of every structured record.
+                assert "remote_addr=" in stderr_output, stderr_output
+                assert re.search(
+                    r"(?m)^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z "
+                    r"(WARN|ERROR) \[ProxyError\]", stderr_output), stderr_output
                 # Request credentials must never be copied into the journal
-                # record.  The failed-attempt request body is intentionally
-                # journaled, so this only asserts that the downstream client
-                # credential (an Authorization header) never leaks; the mock's
-                # own key names appear because the test payloads carry them to
-                # the mock, not because the proxy logs a header.
+                # record; the mock's own key names appear because the test
+                # payloads carry them to the mock, not because the proxy logs
+                # a header.
                 assert "tb-chat500" not in stderr_output, stderr_output
                 assert "must-not-appear-in-log" not in stderr_output, stderr_output
             if proxy.returncode not in (0, -15):

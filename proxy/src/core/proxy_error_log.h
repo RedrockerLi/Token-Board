@@ -9,21 +9,36 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <string>
 
+/// Per-request tally of candidates skipped by the routing gate.  The context
+/// is copied into the attempt lambdas; a shared pointer keeps one tally for
+/// every copy.  The candidate loop runs on a single request thread, so the
+/// tally needs no lock.
+struct ProxySkipTally {
+    std::size_t total = 0;
+    std::map<std::string, std::size_t> reasons;
+};
+
 /// Request-local fields shared by every proxy error log.  Deliberately does
-/// not contain credentials, headers or request/response bodies.  The one
-/// exception is the upstream_attempt logger's truncated `upstream_body=`
-/// field for upstream error responses (see proxy_attempt_failure_logger).
+/// not contain credentials or request bodies.  Header-derived data is limited
+/// to a bounded User-Agent; the one response-body exception is the
+/// upstream_attempt logger's truncated `upstream_body=` field for upstream
+/// error responses (see proxy_attempt_failure_logger).
 struct ProxyLogContext {
     std::uint64_t request_id = 0;
     std::string method;
     std::string endpoint;
     std::string format;
     std::string model;
+    std::string remote_addr;
+    std::string user_agent;
     bool streaming = false;
     int route_account_id = 0;
     int local_key_id = 0;
+    std::shared_ptr<ProxySkipTally> skips;
 };
 
 // cpp-httplib calls its logger after a route handler has returned. Keep a
@@ -123,6 +138,8 @@ inline void log_proxy_failure(
     const std::string endpoint = proxy_log_value(context.endpoint);
     const std::string format = proxy_log_value(context.format);
     const std::string model = proxy_log_value(context.model);
+    const std::string remote_addr = proxy_log_value(context.remote_addr, 64);
+    const std::string user_agent = proxy_log_value(context.user_agent, 96);
     const std::string suffix = extra_fields.empty() ? std::string()
                                                      : " " + extra_fields;
     TB_LOG_WARN(
@@ -130,7 +147,7 @@ inline void log_proxy_failure(
         "format=%s model=%s streaming=%d route_account_id=%d local_key_id=%d "
         "status=%d reason=%s attempt=%zu attempts=%zu retrying=%d "
         "duration_ms=%d timeout_secs=%d upstream_account_id=%d upstream_id=%d "
-        "upstream_key_id=%d priority_group=%d%s\n",
+        "upstream_key_id=%d priority_group=%d remote_addr=%s user_agent=%s%s\n",
         static_cast<unsigned long long>(context.request_id), phase, method.c_str(),
         endpoint.c_str(), format.c_str(), model.c_str(), context.streaming ? 1 : 0,
         context.route_account_id, context.local_key_id, status_code, reason,
@@ -138,5 +155,39 @@ inline void log_proxy_failure(
         candidate ? candidate->account().id : 0,
         candidate ? candidate->account().upstream_id : 0,
         candidate ? candidate->key_slot_id : 0,
-        candidate ? candidate->priority_group : 0, suffix.c_str());
+        candidate ? candidate->priority_group : 0, remote_addr.c_str(),
+        user_agent.c_str(), suffix.c_str());
+}
+
+/// Per-request gate-skips, summarised once on the terminal record instead of
+/// one WARN per candidate.  Bounded: the reason set is small.
+inline std::string proxy_skip_summary(const ProxyLogContext &context) {
+    if (!context.skips || context.skips->total == 0) return {};
+    std::string out = " skipped=" + std::to_string(context.skips->total) +
+                      " skip_reasons=";
+    bool first = true;
+    for (const auto &entry : context.skips->reasons) {
+        if (!first) out.push_back(',');
+        first = false;
+        out += proxy_log_value(entry.first, 32) + ":" +
+               std::to_string(entry.second);
+        if (out.size() > 240) {
+            out += ",...";
+            break;
+        }
+    }
+    return out;
+}
+
+inline std::string proxy_event_field(const std::string &event_id) {
+    return event_id.empty() ? std::string()
+                            : " event_id=" + proxy_log_value(event_id, 64);
+}
+
+inline std::string proxy_terminal_extra(const ProxyLogContext &context,
+                                        const std::string &event_id,
+                                        std::string other = {}) {
+    other += proxy_event_field(event_id);
+    other += proxy_skip_summary(context);
+    return other;
 }

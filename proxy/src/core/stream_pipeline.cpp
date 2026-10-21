@@ -15,6 +15,8 @@ void ProxyServer::handle_streaming(
     const FormatCodec &harness_codec = codecs_.get(harness);
     const auto &request_policy = endpoint_policy(endpoint_kind);
     auto log_context = make_proxy_log_context(request_id, req.method, req.path, ir::to_string(harness));
+    set_proxy_log_client_fields(log_context, req.remote_addr,
+                                req.get_header_value("User-Agent"));
     set_proxy_log_stream_fields(log_context, resolved_model, route_account_id, local_key_id);
     const std::string content_type = req.has_header("Content-Type") ? req.get_header_value("Content-Type") : "application/json";
     const std::string scope = affinity_scope(local_key_id, harness);
@@ -457,13 +459,16 @@ void ProxyServer::handle_streaming(
             last_duration_ms = final_result.duration_ms;
             inflight_guard.run_now();
             if (used && client_write_failed) {
-                log_proxy_client_disconnect(log_context, final_result.duration_ms,
-                                            attempts.size(), used);
-                enqueue_zero_usage(used->account().id, local_key_id,
-                                   resolved_model, true, 499,
-                                   final_result.duration_ms, used->key_slot_id,
-                                   static_cast<int>(attempts.size()), attempts,
-                                   final_result.duration_ms);
+                const std::string event_id =
+                    enqueue_zero_usage(used->account().id, local_key_id,
+                                       resolved_model, true, 499,
+                                       final_result.duration_ms,
+                                       used->key_slot_id,
+                                       static_cast<int>(attempts.size()),
+                                       attempts, final_result.duration_ms);
+                log_proxy_client_disconnect(log_context,
+                                            final_result.duration_ms,
+                                            attempts.size(), used, event_id);
                 return false;
             }
             // AttemptOutcome::used identifies the terminal candidate even when
@@ -515,15 +520,17 @@ void ProxyServer::handle_streaming(
             }
             if (client_write_failed || final_result.client_disconnected ||
                 client_socket_gone(client_sock)) {
-                log_proxy_client_disconnect(log_context, final_result.duration_ms,
-                                            attempts.size(), used);
+                std::string event_id;
                 if (last_account_id) {
-                    enqueue_zero_usage(last_account_id, local_key_id,
-                                       resolved_model, true, 499,
-                                       last_duration_ms, last_slot_id,
-                                       static_cast<int>(attempts.size()),
-                                       attempts, final_result.duration_ms);
+                    event_id = enqueue_zero_usage(
+                        last_account_id, local_key_id, resolved_model, true, 499,
+                        last_duration_ms, last_slot_id,
+                        static_cast<int>(attempts.size()), attempts,
+                        final_result.duration_ms);
                 }
+                log_proxy_client_disconnect(log_context,
+                                            final_result.duration_ms,
+                                            attempts.size(), used, event_id);
                 return false;
             }
             const auto err = render_stream_error(
@@ -533,11 +540,20 @@ void ProxyServer::handle_streaming(
                 outcome.no_candidate_retry_after);
             const char *final_reason = proxy_stream_terminal_failure_reason(
                 outcome, final_result, last_stream_error);
+            const std::string event_id = last_account_id
+                ? enqueue_zero_usage(last_account_id, local_key_id,
+                                     resolved_model, true, err.status,
+                                     last_duration_ms, last_slot_id,
+                                     attempts_made, attempts,
+                                     final_result.duration_ms)
+                : enqueue_zero_usage(cands.front().account().id, local_key_id,
+                                     resolved_model, true, err.status, 0, 0,
+                                     0, attempts);
             log_proxy_request_final(log_context, final_reason, err.status,
                                     final_result.duration_ms, attempts.size(),
                                     final_result.timeout_secs,
                                     outcome.last_attempted,
-                                    err.retry_after_seconds);
+                                    err.retry_after_seconds, event_id);
             res.status = err.status;
             if (err.retry_after_seconds > 0)
                 res.set_header("Retry-After", std::to_string(err.retry_after_seconds));
@@ -548,17 +564,6 @@ void ProxyServer::handle_streaming(
                 res.headers.erase("Keep-Alive");
                 res.headers.erase("Connection");
                 res.set_header("Connection", "close");
-            }
-            if (last_account_id) {
-                enqueue_zero_usage(last_account_id, local_key_id,
-                                   resolved_model, true, err.status,
-                                   last_duration_ms, last_slot_id,
-                                   attempts_made, attempts,
-                                   final_result.duration_ms);
-            } else {
-                enqueue_zero_usage(cands.front().account().id, local_key_id,
-                                   resolved_model, true, err.status, 0, 0,
-                                   0, attempts);
             }
             if (!committed || !terminal_error_forwarded) {
                 // A committed passthrough stream may have been cut mid-frame;

@@ -11,13 +11,14 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     const auto request_id = allocate_request_id();
     auto log_context = make_proxy_log_context(
         request_id, req.method, req.path, ir::to_string(policy.client_format));
+    set_proxy_log_client_fields(log_context, req.remote_addr,
+                                req.get_header_value("User-Agent"));
 
     // 1. Auth + route lookup
     auto ar = extract_and_route(req, router_);
     if (!ar.success) {
-        log_proxy_auth_failure(log_context, req.has_header("Authorization"),
-                               req.has_header("x-api-key"));
-        res.status = 401;
+        log_proxy_auth_failure(log_context, ar.reason, ar.status);
+        res.status = ar.status;
         res.set_content(ar.error_json, "application/json");
         return;
     }
@@ -124,21 +125,26 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         const int log_retry_after =
             outcome.no_candidate_reason == NoCandidateReason::kLocalCapacity
                 ? 1 : outcome.no_candidate_retry_after;
+        const std::string event_id =
+            enqueue_zero_usage(last_attempted ? last_attempted->account().id
+                                              : ar.route.account_id,
+                               ar.route.local_key_id, req_model, false,
+                               final_status,
+                               static_cast<int>(std::chrono::duration_cast<
+                                   std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count()),
+                               last_attempted ? last_attempted->key_slot_id : 0,
+                               static_cast<int>(attempts.size()), attempts);
         log_proxy_failure(
             log_context, "request_final", reason, final_status,
             fwd.duration_ms, attempts.size(), attempts.size(), false,
             fwd.timeout_secs, last_attempted,
-            log_retry_after > 0
-                ? "retry_after_seconds=" + std::to_string(log_retry_after)
-                : std::string());
-        enqueue_zero_usage(last_attempted ? last_attempted->account().id
-                                          : ar.route.account_id,
-                           ar.route.local_key_id, req_model, false, final_status,
-                           static_cast<int>(std::chrono::duration_cast<
-                               std::chrono::milliseconds>(
-                               std::chrono::steady_clock::now() - t0).count()),
-                           last_attempted ? last_attempted->key_slot_id : 0,
-                           static_cast<int>(attempts.size()), attempts);
+            proxy_terminal_extra(
+                log_context, event_id,
+                log_retry_after > 0
+                    ? "retry_after_seconds=" + std::to_string(log_retry_after)
+                    : std::string()));
         TerminalErrorOptions error_options;
         error_options.no_candidate_reason = outcome.no_candidate_reason;
         error_options.no_candidate_retry_after =
@@ -156,12 +162,13 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
 
     // ── Check if client disconnected while waiting for upstream ──
     if (fwd.client_disconnected || client_socket_gone(req.client_socket)) {
+            const std::string event_id =
+                enqueue_zero_usage(used->account().id, ar.route.local_key_id,
+                                   req_model, false, 499, fwd.duration_ms,
+                                   used->key_slot_id,
+                                   static_cast<int>(attempts.size()), attempts);
             log_proxy_client_disconnect(log_context, fwd.duration_ms,
-                                        attempts.size(), used);
-            enqueue_zero_usage(used->account().id, ar.route.local_key_id,
-                               req_model, false, 499, fwd.duration_ms,
-                               used->key_slot_id,
-                               static_cast<int>(attempts.size()), attempts);
+                                        attempts.size(), used, event_id);
             return;
     }
 
@@ -172,6 +179,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         log_context, fwd.body, fwd.status_code, fwd.duration_ms,
         attempts.size(), used);
     auto usage = parse_usage_for_format(used->account().api_format, fwd.body);
+    std::string event_id;
     if (usage.has_value()) {
         // Prefer the model reported by the successful upstream.  A provider
         // may omit it, so fall back to the model actually sent to that
@@ -186,15 +194,17 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                              -1, -1, -1.0, -1, -1,
                              static_cast<int>(attempts.size()), attempts);
     } else {
+        event_id =
+            enqueue_zero_usage(used->account().id, ar.route.local_key_id,
+                               fwd.success ? model_for_success_log("", *used)
+                                           : req_model,
+                               false, fwd.status_code, fwd.duration_ms,
+                               used->key_slot_id,
+                               static_cast<int>(attempts.size()), attempts);
         if (fwd.success && response_json_valid)
             log_proxy_usage_unavailable(log_context, fwd.status_code,
-                                        fwd.duration_ms, attempts.size(), used);
-        enqueue_zero_usage(used->account().id, ar.route.local_key_id,
-                           fwd.success ? model_for_success_log("", *used)
-                                       : req_model,
-                           false, fwd.status_code, fwd.duration_ms,
-                           used->key_slot_id,
-                           static_cast<int>(attempts.size()), attempts);
+                                        fwd.duration_ms, attempts.size(), used,
+                                        event_id);
     }
 
     if (fwd.success) {
@@ -204,7 +214,8 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         log_proxy_failure(log_context, "request_final",
                           proxy_failure_reason(fwd), fwd.status_code,
                           fwd.duration_ms, attempts.size(), attempts.size(),
-                          false, fwd.timeout_secs, used);
+                          false, fwd.timeout_secs, used,
+                          proxy_terminal_extra(log_context, event_id));
         const auto err = render_terminal_error(
             codecs_.get(policy.client_format), &codecs_.get(policy.client_format),
             fwd, attempts, {.used = true});

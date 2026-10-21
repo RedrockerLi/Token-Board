@@ -161,6 +161,7 @@ public:
                      const std::vector<AttemptInfo> &attempts = {},
                      int queue_ms = 0,
                      double *out_cost = nullptr,
+                     std::string *out_event_id = nullptr,
                      UsageReservation *reservation = nullptr);
     std::uint64_t log_spool_bytes();
     std::size_t log_queue_depth();

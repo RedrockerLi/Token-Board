@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -18,7 +19,18 @@ inline ProxyLogContext make_proxy_log_context(
     context.method = method;
     context.endpoint = endpoint;
     context.format = format;
+    context.skips = std::make_shared<ProxySkipTally>();
     return context;
+}
+
+/// Client identity is supplementary: it never affects routing, but a
+/// structured record without it cannot tell two clients on the same local
+/// key apart.
+inline void set_proxy_log_client_fields(ProxyLogContext &context,
+                                        const std::string &remote_addr,
+                                        const std::string &user_agent) {
+    context.remote_addr = remote_addr;
+    context.user_agent = user_agent;
 }
 
 inline void set_proxy_log_route_fields(
@@ -107,18 +119,19 @@ inline void log_context_management_downgrade(
 }
 
 inline void log_proxy_auth_failure(const ProxyLogContext &context,
-                                   bool has_authorization,
-                                   bool has_api_key) {
-    log_proxy_validation_failure(
-        context, has_authorization || has_api_key ? "invalid_api_key"
-                                                   : "missing_api_key", 401);
+                                   const char *reason, int status = 401) {
+    log_proxy_failure(
+        context, status == 503 ? "routing" : "request_validation", reason,
+        status);
 }
 
 inline void log_proxy_usage_unavailable(
     const ProxyLogContext &context, int status, int duration_ms,
-    std::size_t attempts, const UpstreamCandidate *candidate) {
+    std::size_t attempts, const UpstreamCandidate *candidate,
+    const std::string &event_id = {}) {
     log_proxy_failure(context, "accounting", "usage_unavailable", status,
-                      duration_ms, attempts, attempts, false, 0, candidate);
+                      duration_ms, attempts, attempts, false, 0, candidate,
+                      proxy_terminal_extra(context, event_id));
 }
 
 inline void log_proxy_accounting_failure(const ProxyLogContext &context) {
@@ -128,20 +141,22 @@ inline void log_proxy_accounting_failure(const ProxyLogContext &context) {
 inline void log_proxy_request_final(
     const ProxyLogContext &context, const char *reason, int status,
     int duration_ms, std::size_t attempts, int timeout_secs,
-    const UpstreamCandidate *candidate, int retry_after_seconds = 0) {
-    const std::string extra = retry_after_seconds > 0
-        ? "retry_after_seconds=" + std::to_string(retry_after_seconds)
-        : std::string();
+    const UpstreamCandidate *candidate, int retry_after_seconds = 0,
+    const std::string &event_id = {}) {
+    std::string other;
+    if (retry_after_seconds > 0)
+        other = "retry_after_seconds=" + std::to_string(retry_after_seconds);
     log_proxy_failure(context, "request_final", reason, status, duration_ms,
                       attempts, attempts, false, timeout_secs, candidate,
-                      extra);
+                      proxy_terminal_extra(context, event_id, other));
 }
 
 inline void log_proxy_converted_response_missing(
     const ProxyLogContext &context, int duration_ms, std::size_t attempts,
-    const UpstreamCandidate *candidate) {
+    const UpstreamCandidate *candidate, const std::string &event_id = {}) {
     log_proxy_failure(context, "response_validation", "converted_response_missing",
-                      502, duration_ms, attempts, attempts, false, 0, candidate);
+                      502, duration_ms, attempts, attempts, false, 0, candidate,
+                      proxy_terminal_extra(context, event_id));
 }
 
 inline UpstreamClient::ForwardResult proxy_request_conversion_failure(
@@ -193,43 +208,6 @@ inline void mark_proxy_client_disconnect(
     result.error = "Client disconnected while writing response";
 }
 
-// Journal the failed attempt's request body field by field: every top-level
-// JSON field becomes its own `upstream_request_<field>=` entry.  The 512-byte
-// budget applies to the field's serialized content; the surrounding journal
-// key and escaping are not counted, so an entry may run slightly longer.  A
-// body that is not a JSON object falls back to one truncated slice.  This runs
-// only from the failure logger: successful forwards never parse or copy it.
-inline std::string proxy_upstream_request_fields(const std::string &body) {
-    constexpr std::size_t kFieldLimit = 512;
-    constexpr std::size_t kMaxFields = 16;
-    json parsed;
-    try {
-        parsed = json::parse(body);
-    } catch (...) {
-        return " upstream_request=" + proxy_log_value(body, kFieldLimit);
-    }
-    if (!parsed.is_object())
-        return " upstream_request=" + proxy_log_value(body, kFieldLimit);
-    std::string out;
-    std::size_t emitted = 0;
-    for (auto it = parsed.begin(); it != parsed.end(); ++it) {
-        if (emitted == kMaxFields) {
-            out += " upstream_request_remaining_fields=" +
-                   std::to_string(parsed.size() - emitted);
-            break;
-        }
-        std::string content = it.value().dump();
-        if (content.size() > kFieldLimit) {
-            content.resize(kFieldLimit);
-            content += "...";
-        }
-        out += " upstream_request_" + proxy_log_value(it.key(), 64) + "=" +
-               proxy_log_value(content, kFieldLimit + 3);
-        ++emitted;
-    }
-    return out;
-}
-
 inline AttemptExecutor::AttemptFailed proxy_attempt_failure_logger(
     ProxyLogContext context) {
     return [context = std::move(context)](
@@ -238,17 +216,17 @@ inline AttemptExecutor::AttemptFailed proxy_attempt_failure_logger(
                std::size_t attempt_number, bool retrying) {
         // Any real upstream error body is often the only clue (request shape,
         // model capacity, gateway, account state), so every >=400 response is
-        // captured.  Keep it single-line and bounded.  The request fields
-        // recorded by UpstreamClient for the same attempt follow it, so a
-        // rejected request can be read against the response that rejected it.
+        // captured.  Keep it single-line and bounded.  The request body is
+        // never recorded: it can contain prompts, tool arguments or inline
+        // media.  Transport failures carry no body, so their human-readable
+        // error is recorded here instead of leaving only the classified
+        // reason.
         std::string extra;
         if (result.failure_kind == UpstreamFailureKind::HttpStatus &&
-            result.status_code >= 400) {
-            if (!result.body.empty())
-                extra = "upstream_body=" + proxy_log_value(result.body, 512);
-            if (!result.request_body.empty())
-                extra += proxy_upstream_request_fields(result.request_body);
-        }
+            result.status_code >= 400 && !result.body.empty())
+            extra = "upstream_body=" + proxy_log_value(result.body, 512);
+        if (!result.error.empty())
+            extra += " error=" + proxy_log_value(result.error, 240);
         log_proxy_failure(context, "upstream_attempt",
                           proxy_failure_reason(result), result.status_code,
                           result.duration_ms, attempt_number, attempt_number,
@@ -262,11 +240,29 @@ inline AttemptExecutor::CandidateSkipped proxy_candidate_skip_logger(
     return [context = std::move(context)](
                const UpstreamCandidate &candidate,
                AccountGate::KeyAcquireResult acquire_result) {
+        const char *reason = proxy_gate_reason(acquire_result);
+        bool first_skip = true;
+        if (context.skips) {
+            first_skip = context.skips->total++ == 0;
+            ++context.skips->reasons[reason];
+        }
+        // One WARN per request; the terminal record carries the full tally.
+        // Per-candidate detail stays available in foreground debug mode so a
+        // storm of unavailable keys cannot flood the journal.
+        if (!first_skip) {
+            TB_LOG_DEBUG(
+                "[Proxy] candidate skipped request_id=%llu reason=%s "
+                "upstream_account_id=%d upstream_id=%d upstream_key_id=%d "
+                "priority_group=%d\n",
+                static_cast<unsigned long long>(context.request_id), reason,
+                candidate.account().id, candidate.account().upstream_id,
+                candidate.key_slot_id, candidate.priority_group);
+            return;
+        }
         const bool throttled =
             acquire_result == AccountGate::KeyAcquireResult::kSubscriptionCooldown ||
             acquire_result == AccountGate::KeyAcquireResult::kRateLimited;
-        log_proxy_failure(context, "candidate_selection",
-                          proxy_gate_reason(acquire_result),
+        log_proxy_failure(context, "candidate_selection", reason,
                           throttled ? 429 : 503, -1, 0, 0, false, 0,
                           &candidate);
     };
@@ -329,9 +325,10 @@ inline void mark_proxy_stream_parser_exception(
 
 inline void log_proxy_client_disconnect(
     const ProxyLogContext &context, int duration_ms, std::size_t attempts,
-    const UpstreamCandidate *candidate) {
+    const UpstreamCandidate *candidate, const std::string &event_id = {}) {
     log_proxy_failure(context, "downstream", "client_disconnect", 499,
-                      duration_ms, attempts, attempts, false, 0, candidate);
+                      duration_ms, attempts, attempts, false, 0, candidate,
+                      proxy_terminal_extra(context, event_id));
 }
 
 inline const char *proxy_stream_terminal_failure_reason(

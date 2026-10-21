@@ -69,6 +69,8 @@ void ProxyServer::setup_routes(httplib::Server &server) {
         log_context.method = req.method;
         log_context.endpoint = req.path;
         log_context.format = "health";
+        log_context.remote_addr = req.remote_addr;
+        log_context.user_agent = req.get_header_value("User-Agent");
         json j;
         const auto dropped = accounting_dropped();
         const auto rejected = accounting_rejected();

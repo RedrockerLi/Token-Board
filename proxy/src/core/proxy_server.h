@@ -176,23 +176,26 @@ public:
 private:
     /// Enqueue a request-log record; the response thread pays only an
     /// in-memory move. Same signature/defaults as UsageRecorder::log_request.
-    void enqueue_log(int account_id, int local_key_id,
-                     const UsageAccounting &usage, bool is_streaming,
-                     int status_code, int duration_ms, int upstream_key_id,
-                     int ttft_ms, int generation_ms, double output_tps,
-                     int upstream_ttft_ms, int upstream_duration_ms,
-                     int attempt_count,
-                     const std::vector<Database::AttemptInfo> &attempts);
+    /// Returns the row's event_id (empty when the writer rejected it) so the
+    /// terminal journal line can point at the exact database row.
+    std::string enqueue_log(int account_id, int local_key_id,
+                            const UsageAccounting &usage, bool is_streaming,
+                            int status_code, int duration_ms,
+                            int upstream_key_id, int ttft_ms,
+                            int generation_ms, double output_tps,
+                            int upstream_ttft_ms, int upstream_duration_ms,
+                            int attempt_count,
+                            const std::vector<Database::AttemptInfo> &attempts);
 
     /// Record a failed/aborted request with zero token usage (status 499 on a
     /// client disconnect, otherwise the truthful upstream status).  Shared by
     /// every non-streaming/streaming tail so failure accounting stays uniform.
-    void enqueue_zero_usage(int account_id, int local_key_id,
-                            const std::string &model, bool is_streaming,
-                            int status_code, int duration_ms,
-                            int upstream_key_id, int attempt_count,
-                            const std::vector<Database::AttemptInfo> &attempts,
-                            int upstream_duration_ms = -1);
+    std::string enqueue_zero_usage(
+        int account_id, int local_key_id, const std::string &model,
+        bool is_streaming, int status_code, int duration_ms,
+        int upstream_key_id, int attempt_count,
+        const std::vector<Database::AttemptInfo> &attempts,
+        int upstream_duration_ms = -1);
 
     void handle_chat_request(const httplib::Request &req,
                              httplib::Response &res);

@@ -10,8 +10,10 @@ Usage: python3 server.py --port <PORT> [--token-board-db <PATH>] [--schema-dir <
 
 import argparse
 import signal
+from pathlib import Path
 
 from app import create_app, start_config_session
+from app.services.logging_setup import configure_logging
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI API Usage Dashboard Server")
@@ -36,6 +38,13 @@ if __name__ == "__main__":
         help="Path to the versioned schema root",
     )
     args = parser.parse_args()
+
+    # The launcher redirects stderr; keep a durable local log so sync and
+    # background-task failures are still diagnosable.
+    data_dir = (Path(args.token_board_db).resolve().parent
+                if args.token_board_db
+                else Path(__file__).resolve().parent / "data")
+    configure_logging(data_dir)
 
     # systemd stops services with SIGTERM.  Turn it into a normal Python exit
     # so the integrated scheduler is woken and joined in ``finally``.

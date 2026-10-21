@@ -11,7 +11,8 @@ bool UsageRecorder::log_request(
     int ttft_ms, int generation_ms, double output_tps,
     int upstream_ttft_ms, int upstream_duration_ms, int attempt_count,
     const std::vector<Database::AttemptInfo> &attempts, int queue_ms,
-    double *out_cost, UsageReservation *reservation) {
+    double *out_cost, std::string *out_event_id,
+    UsageReservation *reservation) {
     // Cost is computed by the V1 SQLite pricing trigger. Passing zero here
     // preserves the existing writer/database authority boundary.
     double cost = 0.0;
@@ -21,7 +22,7 @@ bool UsageRecorder::log_request(
         usage.cache_read_tokens, usage.total_tokens, cost, is_streaming,
         status_code, duration_ms, upstream_key_id, ttft_ms, generation_ms,
         output_tps, upstream_ttft_ms, upstream_duration_ms, attempt_count,
-        attempts, queue_ms, out_cost, reservation);
+        attempts, queue_ms, out_cost, out_event_id, reservation);
     if (!accepted) {
         TB_LOG_ERROR(
             "[Recorder] request log rejected/failed: account=%d model=%s status=%d\n",

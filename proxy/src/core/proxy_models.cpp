@@ -10,12 +10,13 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     const auto request_id = allocate_request_id();
     auto log_context = make_proxy_log_context(
         request_id, req.method, req.path, ir::to_string(policy.client_format));
+    set_proxy_log_client_fields(log_context, req.remote_addr,
+                                req.get_header_value("User-Agent"));
 
     auto ar = extract_and_route(req, router_);
     if (!ar.success) {
-        log_proxy_auth_failure(log_context, req.has_header("Authorization"),
-                               req.has_header("x-api-key"));
-        res.status = 401;
+        log_proxy_auth_failure(log_context, ar.reason, ar.status);
+        res.status = ar.status;
         res.set_content(ar.error_json, "application/json");
         return;
     }

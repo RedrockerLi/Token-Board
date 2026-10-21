@@ -146,7 +146,7 @@ Dashboard `monthly_recurring_costs` 使用 `is_frozen`/`frozen_on`，不再保�
 | `total_tokens` | 输入 + 输出 |
 | `api_cost` | api 等价价:api 账户 = 真实账单,plan/agent = 虚拟口径(买套餐省下的金额)。0007 起 `cost` + `virtual_cost` 两列合并为这一列,由数据库写入触发器按当前配置固化 |
 | `upstream_key_id` | 实际转发用的上游密钥(0007 起)。无外键,密钥删除后保留 NULL |
-| `event_id` | 幂等键(0012):事件日志重放(COMMIT 结果不确定)时保证同一事件只记一行。代理写入的行为 NULL,重放才填充 |
+| `event_id` | 幂等键(0012):事件日志重放(COMMIT 结果不确定)时保证同一事件只记一行。代理写入时生成 32 位十六进制随机值，重放沿用 spool 中的同一值；journal 的终态 `[ProxyError]` 行带 `event_id=`，可直接定位该行 |
 | `pricing_status` | 新写入先为 `pending`；当前规则和汇率可用时写为 `rated`，否则写为 `unrated`；历史导入行可保留 `frozen` |
 | `ttft_ms` / `generation_ms` / `output_tps` | 首字节延迟、生成耗时、输出速度(token/s),0009 起 |
 | `upstream_ttft_ms` / `upstream_duration_ms` | 上游侧首字节延迟与总耗时 |

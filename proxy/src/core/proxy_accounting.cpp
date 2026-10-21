@@ -11,17 +11,18 @@ void ProxyServer::mark_accounting_upstream_started(
     accounting_reservation_->mark_upstream_started();
 }
 
-void ProxyServer::enqueue_log(
+std::string ProxyServer::enqueue_log(
     int account_id, int local_key_id, const UsageAccounting &usage,
     bool is_streaming, int status_code, int duration_ms, int upstream_key_id,
     int ttft_ms, int generation_ms, double output_tps, int upstream_ttft_ms,
     int upstream_duration_ms, int attempt_count,
     const std::vector<Database::AttemptInfo> &attempts) {
+    std::string event_id;
     const bool accepted = recorder_.log_request(
             account_id, local_key_id, usage, is_streaming, status_code,
             duration_ms, upstream_key_id, ttft_ms, generation_ms, output_tps,
             upstream_ttft_ms, upstream_duration_ms, attempt_count, attempts,
-            current_request_queue_delay_ms(), nullptr,
+            current_request_queue_delay_ms(), nullptr, &event_id,
             accounting_reservation_.get());
     if (!accepted) {
         // The token remains live when record construction or queue admission
@@ -34,24 +35,25 @@ void ProxyServer::enqueue_log(
                     "[Proxy] usage event writer rejected %llu request-log "
                     "entries; health remains degraded\n",
                     static_cast<unsigned long long>(n));
-            return;
+        return {};
     }
     // Database::log_request consumed the token when it moved the event into
     // the writer queue.  Resetting the empty shared_ptr is intentionally
     // harmless and makes the ownership transition explicit.
     accounting_reservation_.reset();
+    return event_id;
 }
 
-void ProxyServer::enqueue_zero_usage(
+std::string ProxyServer::enqueue_zero_usage(
     int account_id, int local_key_id, const std::string &model,
     bool is_streaming, int status_code, int duration_ms, int upstream_key_id,
     int attempt_count, const std::vector<Database::AttemptInfo> &attempts,
     int upstream_duration_ms) {
     UsageAccounting zero;
     zero.model = model;
-    enqueue_log(account_id, local_key_id, zero, is_streaming, status_code,
-                duration_ms, upstream_key_id, -1, -1, -1.0, -1,
-                upstream_duration_ms, attempt_count, attempts);
+    return enqueue_log(account_id, local_key_id, zero, is_streaming,
+                       status_code, duration_ms, upstream_key_id, -1, -1, -1.0,
+                       -1, upstream_duration_ms, attempt_count, attempts);
 }
 
 // ── cooldown probe ──────────────────────────────────────────────────────

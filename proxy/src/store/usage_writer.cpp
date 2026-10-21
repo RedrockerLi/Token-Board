@@ -15,7 +15,7 @@ void UsageReservation::abandon() noexcept {
                 context_account_id_, context_local_key_id_, context_model_,
                 0, 0, 0, 0, 0.0, context_streaming_,
                 kInternalAbortStatus, 0, 0, -1, -1, -1.0, -1, -1,
-                0, {}, 0, nullptr, this);
+                0, {}, 0, nullptr, nullptr, this);
         } catch (...) {
             // Never let a destructor throw; the slot is released below.
         }
@@ -378,6 +378,7 @@ bool Database::log_request(int account_id, int local_key_id,
                            const std::vector<AttemptInfo> &attempts,
                            int queue_ms,
                            double *out_cost,
+                           std::string *out_event_id,
                            UsageReservation *reservation) {
     // Hold the admission slot until the fully-owned event is in the writer
     // queue.  A failed allocation or a writer shutdown therefore leaves the
@@ -482,6 +483,9 @@ bool Database::log_request(int account_id, int local_key_id,
         }
         --log_reservations_;
         if (reservation) reservation->consume();
+        // Hand the caller the idempotency key before the record is moved into
+        // the queue so the journal line can point at this exact row.
+        if (out_event_id) *out_event_id = record.event_id;
         log_memory_queue_.push_back(std::move(record));
     }
     log_queue_cv_.notify_one();

@@ -85,6 +85,8 @@ private:
 
 struct AuthResult {
     bool success = false;
+    int status = 401;
+    const char *reason = "invalid_api_key";
     Router::RouteResult route;
     std::string error_json;
 };

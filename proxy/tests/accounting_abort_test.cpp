@@ -178,7 +178,7 @@ int main(int argc, char **argv) {
         assert(r);
         const bool accepted = db.log_request(
             1, 1, "consumed-model", 10, 20, 0, 30, 0.0, false, 200, 5,
-            0, -1, -1, -1.0, -1, -1, 1, {}, 0, nullptr, r.get());
+            0, -1, -1, -1.0, -1, -1, 1, {}, 0, nullptr, nullptr, r.get());
         assert(accepted);
         r.reset();
     }
@@ -193,7 +193,7 @@ int main(int argc, char **argv) {
         assert(r);
         const bool accepted = db.log_request(
             1, 1, "identity-model", 8, 2, 0, 0, 0.0, false, 200, 5,
-            0, -1, -1, -1.0, -1, -1, 1, {}, 0, nullptr, r.get());
+            0, -1, -1, -1.0, -1, -1, 1, {}, 0, nullptr, nullptr, r.get());
         assert(accepted);
         r.reset();
     }

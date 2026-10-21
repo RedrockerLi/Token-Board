@@ -25,6 +25,7 @@ public:
                      int attempt_count = 1,
                      const std::vector<Database::AttemptInfo> &attempts = {},
                      int queue_ms = 0, double *out_cost = nullptr,
+                     std::string *out_event_id = nullptr,
                      UsageReservation *reservation = nullptr);
 
 private:
