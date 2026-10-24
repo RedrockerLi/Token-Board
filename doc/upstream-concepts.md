@@ -233,7 +233,7 @@
 ### 添加步骤（三步 + 两个按需）
 
 1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label`（形如 `<type> — <说明>`，破折号后的说明进左栏卡片正文）是账户弹窗左栏类型选择卡文案、`short_label` 是类型徽章文案（账户列表与左栏卡片共用）。
-2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、代理的上游会话头注入、仪表盘"更新模型"和用量轮询都从它派生。C++ 侧没有类型镜像表，但子分类的代理行为以 `CASE WHEN u.subtype='opencode-go'` 写在两处 SQL（路由快照的会话头标志、冷却探测目标的用量观察标志，[proxy/src/store/](proxy/src/store/)）；新增需要代理行为的子分类要在这两处同步。类型层的派生量另只有合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
+2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、仪表盘"更新模型"和用量轮询都从它派生。代理侧对应一张 `UpstreamProfile` 表（[proxy/src/core/upstream_profile.h](proxy/src/core/upstream_profile.h)）：SQL 只读 `upstreams.subtype` 原文，路由快照与冷却探测目标各解析一次指针，运行时按 `needs_session`、`cooldown_recovery` 与头部装饰函数分派，不再比较子类型字符串。新增需要代理行为的子分类 = 该表加一行 + 这里的 spec 一行；声明侧 `session_header=true` 与表里 `needs_session` 必须一致，`usage_path` 非空时才应选择 `kUsageSnapshot` 冷却恢复通道。类型层的派生量另只有合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
 3. **智能体扩展另走智能体管理**：在 `agent_software` 增加 `agent_kind`，为该类型注册一个返回统一 UsageEvent 的解析器；订阅继续保存在独立的 `agent_subscriptions`，通过绑定表连接到软件，不把订阅误当成代理上游。
 
 两个按需的 if：

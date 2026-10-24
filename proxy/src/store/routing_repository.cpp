@@ -78,8 +78,9 @@ bool Database::load_routing_config(RoutingConfig &config) {
         "'subscription_5h' THEN 1 ELSE 0 END,"
         "u.max_concurrency,c.runtime_id,s.secret_value,c.position,"
         // V2.5 columns are appended (never inserted): the row reader indexes
-        // every field positionally.
-        "CASE WHEN u.subtype='opencode-go' THEN 1 ELSE 0 END,"
+        // every field positionally.  The sub-type is read verbatim; the
+        // profile table resolves it once, so SQL carries no sub-type names.
+        "COALESCE(u.subtype,''),"
         "COALESCE(c.usage_json,'') "
         "FROM route_rules rr JOIN upstreams u ON u.id=rr.upstream_id "
         "JOIN accounts a ON a.id=u.account_id "
@@ -134,7 +135,10 @@ bool Database::load_routing_config(RoutingConfig &config) {
             a.upstream_id = upstream_id;
             a.extended_usage_limit_cooldown = sqlite3_column_int(stmt, 11) != 0;
             a.max_concurrency = sqlite3_column_int(stmt, 12);
-            a.opencode_session = sqlite3_column_int(stmt, 16) != 0;
+            const auto *subtype =
+                sqlite3_column_text(stmt, 16);
+            a.profile = upstream_profile_for_subtype(
+                subtype ? reinterpret_cast<const char *>(subtype) : "");
             a.deleted = false;
             auto account_it = account_refs.try_emplace(
                 upstream_id, std::make_shared<const AccountInfo>(account)).first;
@@ -244,14 +248,16 @@ std::optional<Database::ProbeTarget> Database::lookup_probe_target(
             sqlite3_column_text(stmt_lookup_probe_target_, 2));
         t.auth_header = reinterpret_cast<const char *>(
             sqlite3_column_text(stmt_lookup_probe_target_, 3));
-        t.opencode_session = sqlite3_column_int(stmt_lookup_probe_target_, 4) != 0;
-        t.usage_watch = sqlite3_column_int(stmt_lookup_probe_target_, 5) != 0;
+        const unsigned char *subtype_text =
+            sqlite3_column_text(stmt_lookup_probe_target_, 4);
+        t.profile = upstream_profile_for_subtype(
+            subtype_text ? reinterpret_cast<const char *>(subtype_text) : "");
         const unsigned char *usage_json_text =
-            sqlite3_column_text(stmt_lookup_probe_target_, 6);
+            sqlite3_column_text(stmt_lookup_probe_target_, 5);
         t.usage_json = usage_json_text
             ? reinterpret_cast<const char *>(usage_json_text) : "";
         const unsigned char *probe_model_text =
-            sqlite3_column_text(stmt_lookup_probe_target_, 7);
+            sqlite3_column_text(stmt_lookup_probe_target_, 6);
         t.probe_model = probe_model_text
             ? reinterpret_cast<const char *>(probe_model_text) : "";
         t.valid = !t.base_url.empty() && !t.key_value.empty();

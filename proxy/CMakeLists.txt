@@ -18,6 +18,7 @@ set(SQLITE_SOURCE third_party/sqlite3.c)
 
 set(FORMAT_SOURCES
     src/format/ir.cpp src/format/codec.cpp src/format/format_common.cpp
+    src/format/sse_cycle_guard.cpp
     src/format/format_openai.cpp src/format/format_openai_helpers.cpp
     src/format/format_openai_request.cpp src/format/format_openai_response.cpp
     src/format/format_openai_stream.cpp src/format/format_anthropic.cpp
@@ -46,6 +47,7 @@ set(STORE_SOURCES
 set(RUNTIME_SOURCES
     src/core/config.cpp
     src/core/endpoint_policy.cpp
+    src/core/upstream_profile.cpp
     src/core/attempt_executor.cpp
     src/core/request_context.cpp
     src/core/error_render.cpp

@@ -195,16 +195,16 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         }
         cands = std::move(compatible);
     }
-    // Session id forwarded to "opencode-go" upstreams, resolved once per
-    // request after the candidate set is final (a rejected request never pays
-    // for the conversation fingerprint) and captured by value by every
-    // attempt.  Routes without such an account carry no value at all.
-    const bool opencode_route =
+    // Session id forwarded to upstreams whose profile needs one, resolved once
+    // per request after the candidate set is final (a rejected request never
+    // pays for the conversation fingerprint) and captured by value by every
+    // attempt.  Routes without such a profile carry no value at all.
+    const bool session_route =
         std::any_of(cands.begin(), cands.end(), [](const UpstreamCandidate &c) {
-            return c.account().opencode_session;
+            return c.account().profile->needs_session;
         });
-    const std::string opencode_session =
-        opencode_route ? opencode_session_value(req, context) : std::string();
+    const std::string upstream_session =
+        session_route ? opencode_session_value(req, context) : std::string();
     RequestBodyCache body_cache(req.body, context.parsed_json, context.model,
                                 ir::to_string(harness));
 
@@ -261,7 +261,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                              ? std::make_shared<const std::vector<json>>(
                                    context.state_current_input)
                              : nullptr,
-                         reservation, opencode_session, anthropic_beta, req, res,
+                         reservation, upstream_session, anthropic_beta, req, res,
                          t0);
         return;
     }
@@ -335,17 +335,18 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             attempt_timeouts.non_streaming_timeout,
             static_cast<int>((attempt.remaining_budget_ms + 999) / 1000)));
         TB_LOG_DEBUG("[Proxy] %s %s request from key_id=%d to account=%d "
-                        "credential=%d model=%s (concurrent=%d)\n",
+                        "credential=%d profile=%s model=%s (concurrent=%d)\n",
                 ir::to_string(harness).c_str(),
                 (harness == upstream) ? "passthrough" : "convert",
                 ar.route.local_key_id, c.account().id, c.key_slot_id,
-                c.upstream_model().c_str(), concurrent_count);
+                c.account().profile->name, c.upstream_model().c_str(),
+                concurrent_count);
 
         UpstreamClient::ForwardResult result;
         const auto configure_forward = [&](ForwardOptions &opts) {
             if (upstream == ir::ApiFormat::Anthropic)
                 opts.anthropic_beta = anthropic_beta;
-            configure_opencode_session(opts, c, opencode_session);
+            configure_upstream_profile(opts, c, upstream_session);
         };
         if (harness == upstream && !responses_item_adapter) {
             if (harness == ir::ApiFormat::OpenAIResponses && conversion_needed) {

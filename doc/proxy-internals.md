@@ -106,7 +106,7 @@ bash start.sh --debug
 
 认证同时接受两种头:`Authorization: Bearer <密钥>` 与 `x-api-key: <密钥>`,与客户端用什么格式无关,密钥只用来选账户。
 
-转发到上游的请求头由代理自己组装:认证头(anthropic 线格式用 `x-api-key` + `anthropic-version`,其余用 `Authorization: Bearer`)、`Content-Type`,以及下游带来的 `anthropic-beta`;下游的 User-Agent 不转发。带 OpenCode-Go 子分类(规格里 `session_header=true`)的账户另注入 `x-opencode-session`(下游透传 → 会话标识 → 稳定会话指纹 → 随机),并带固定 `User-Agent: token-board/1.0`。
+转发到上游的请求头由代理自己组装:认证头(anthropic 线格式用 `x-api-key` + `anthropic-version`,其余用 `Authorization: Bearer`)、`Content-Type`,以及下游带来的 `anthropic-beta`;下游的 User-Agent 不转发。上游子分类的行为收敛在 `UpstreamProfile`([proxy/src/core/upstream_profile.h](proxy/src/core/upstream_profile.h)):快照构建时把 `upstreams.subtype` 解析成指针,每次尝试由 profile 的头部装饰函数一次性追加附加头。带会话要求的子分类(当前 `opencode-go`,`needs_session=true`)注入 `x-opencode-session`(下游透传 → 会话标识 → 稳定会话指纹 → 随机)和固定 `User-Agent: token-board/1.0`;默认 profile 的装饰函数为空,转发路径不判断子类型字符串。
 
 ## 候选选择与回退
 
@@ -179,6 +179,8 @@ plan 密钥进入配额冷却后,后台线程按两条通道观察恢复,任一�
 超时(`is_timeout=true`)对客户端统一给 `{"error":{"type":"timeout_error","code":504}}`,错误消息带实际触发的秒数。流式路径按客户端格式发终止错误帧:Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`,让客户端知道上游没回,而不是静默断连。
 
 流式请求另有**终端事件校验**:上游 2xx 流干净结束(chunked 正常收尾或读到 EOF)时,若解析器从未发布终止事件,按截断失败处理——对外状态 502、消息 `Upstream stream truncated before terminal event`,已向客户端提交过的流向其补发终止错误帧,截断的密钥按 5xx 规则获得 30 秒上游故障避让;未提交的截断(空体 200)可换候选重试。终止事件按上游线格式认定:Anthropic `message_delta.stop_reason` 或 `message_stop`,OpenAI chat `choices[].finish_reason` 或 `data: [DONE]`,Responses `response.completed`/`response.incomplete`;结束前仍驻留在 SSE 帧缓冲里的终止帧先冲净再判定。非 2xx 响应不参与该校验(按 HTTP 状态分类)。环境变量 `PROXY_STRICT_TERMINAL=0` 关闭校验(干净结束即按成功计费),默认开启。已知限制:上游忽略 `stream:true`、以整包 JSON 200(无 `data:` 帧)应答时没有终止事件,按截断处理。
+
+流式请求另有**单消息周期守卫**:部分网关(实测 opencode.ai Zen/Go 的 Anthropic 端点)会在同一个 HTTP 响应里拼接两条完整消息——第一个终止帧之后又出现一个 `message_start`(或 OpenAI 的新 completion id / Responses 的新 `response.created`)。passthrough 转发按帧切分:`fmt::SseCycleGuard`([proxy/src/format/sse_cycle_guard.h](proxy/src/format/sse_cycle_guard.h))只缓冲当前未完成的那一帧,放行首个终止帧(Anthropic `message_stop`、OpenAI `data: [DONE]`、Responses `response.completed|incomplete|failed`)及其之前的全部字节,之后的字节丢弃并计数;上游省略终止帧时,第二个周期起点即切点。被丢弃的字节不再喂给 metrics 解析器,记账与请求日志保留第一段的 usage。守卫真正放行终止帧后,剩余读取即使被看门狗判成超时也按成功收尾(客户端写失败仍走 499);切点落在"第二个周期起点"时第一段本身没有终止,仍按截断失败处理,客户端会收到已提交内容加一个错误帧。转换路径不建守卫,由三个 stream parser 的周期抑制处理。`PROXY_STREAM_CYCLE_GUARD=0` 关闭 passthrough 守卫。
 
 客户端断连的检测用 `spawn_client_monitor`:一个线程每 250ms poll 客户端 socket,发现 `POLLHUP / POLLERR / POLLRDHUP` 就 `shutdown()` 上游 socket,把阻塞中的上游读立刻打断,释放线程池线程,而不是干等满超时。注意 TCP 对端 FIN 只表现为 `POLLIN + POLLRDHUP`,所以 poll 必须显式请求 `POLLRDHUP`。非流式路径也有等价的 `client_disconnected` 检查,确认客户端已走就把这次请求记为 499(零 token)结束。
 

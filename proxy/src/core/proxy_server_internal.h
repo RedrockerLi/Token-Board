@@ -91,23 +91,19 @@ struct AuthResult {
     std::string error_json;
 };
 
-/// Mark an attempt to an "opencode-go" upstream: those gateways route by
-/// session and drop clients that do not identify one, so the session header
-/// and the proxy User-Agent are set together.  Callers with a conversation of
-/// their own pass its session id; callers without one (model catalog,
-/// embeddings, cooldown probe) pass an empty `session` and get a one-off
-/// random id.  Candidates on any other sub-type are left untouched.
-inline void configure_opencode_session(ForwardOptions &opts,
+/// Mark an attempt with the candidate's upstream profile.  Callers with a
+/// conversation of their own pass its request-scoped session id; callers
+/// without one (embeddings, cooldown probe) pass an empty string and let the
+/// profile decide whether a one-off random id is needed.
+inline void configure_upstream_profile(ForwardOptions &opts,
                                        const UpstreamCandidate &candidate,
                                        const std::string &session) {
-    if (!candidate.account().opencode_session) return;
-    opts.opencode_upstream = true;
-    opts.opencode_session =
-        session.empty() ? opencode_random_session_value() : session;
+    apply_upstream_profile(opts, *candidate.account().profile, session);
 }
 
 std::string affinity_scope(int local_key_id, ir::ApiFormat harness);
 bool strict_terminal_enabled();
+bool stream_cycle_guard_enabled();
 /// The session's live binding within this request's candidate list, or
 /// nothing.  The index only pins its own priority group's start inside
 /// candidate_order; it never reorders groups.

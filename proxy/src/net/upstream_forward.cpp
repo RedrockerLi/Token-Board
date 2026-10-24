@@ -184,10 +184,13 @@ UpstreamClient::forward(const std::string &method,
     }
     if (!opts.anthropic_beta.empty())
         headers.emplace("anthropic-beta", opts.anthropic_beta);
-    if (opts.opencode_upstream) {
-        headers.emplace("x-opencode-session", opts.opencode_session);
-        headers.emplace("User-Agent", "token-board/1.0");
-    }
+    // Sub-type headers come from the profile's decorator; the default
+    // profile's decorator adds nothing, so this is unconditional.
+    UpstreamHeaderList profile_headers;
+    opts.upstream_profile->decorate_headers(profile_headers,
+                                            opts.upstream_session);
+    for (const auto &header : profile_headers)
+        headers.emplace(header.first, header.second);
 
     if (streaming) {
         watch->set_initial_deadlines(deadline_started_ms,

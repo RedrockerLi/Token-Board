@@ -1368,6 +1368,142 @@ static void test_native_media_bridges(const CodecRegistry &reg) {
           "media: residual base64-like text is clamped after media detection");
 }
 
+// ── Duplicate message cycle suppression ─────────────────────────────────
+// A gateway may splice a retried generation into the same response: a second
+// message_start (Anthropic/Responses) or a fresh completion id (OpenAI) after
+// the first cycle ended.  The parsers must deliver one cycle and keep the
+// first cycle's usage.
+
+struct CycleTally {
+    int starts = 0;
+    int finishes = 0;
+    int text_deltas = 0;
+    int completion_tokens = -1;
+    bool suppressed = false;
+};
+
+static CycleTally tally_cycles(const CodecRegistry &reg, ApiFormat from,
+                               const std::string &sse) {
+    CycleTally t;
+    auto parser = reg.get(from).make_stream_parser();
+    if (!parser) return t;
+    auto emit = [&t](const StreamEvent &ev) -> bool {
+        if (ev.type == StreamEventType::MessageStart) t.starts++;
+        if (ev.type == StreamEventType::MessageFinish) t.finishes++;
+        if (ev.type == StreamEventType::ContentTextDelta) t.text_deltas++;
+        if (ev.type == StreamEventType::UsageEvent &&
+            ev.usage.completion_tokens > 0)
+            t.completion_tokens = ev.usage.completion_tokens;
+        return true;
+    };
+    parser->feed(sse.data(), sse.size(), emit);
+    parser->finish(emit);
+    t.suppressed = parser->suppressed_after_terminal();
+    return t;
+}
+
+static const char *kAnthropicCycle1 =
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":"
+    "{\"id\":\"m1\",\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\n"
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\","
+    "\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n"
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":"
+    "{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n"
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+static const char *kAnthropicCycle2 =
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":"
+    "{\"id\":\"m2\",\"usage\":{\"input_tokens\":111,\"output_tokens\":1}}}\n\n"
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\","
+    "\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"second\"}}\n\n"
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":"
+    "{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":777}}\n\n"
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+static const char *kOpenaiCycle1 =
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":"
+    "{\"role\":\"assistant\"}}]}\n\n"
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":"
+    "{\"content\":\"first\"}}]}\n\n"
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},"
+    "\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,"
+    "\"completion_tokens\":7,\"total_tokens\":18}}\n\n"
+    "data: [DONE]\n\n";
+
+static const char *kOpenaiCycle2 =
+    "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":"
+    "{\"role\":\"assistant\"}}]}\n\n"
+    "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":"
+    "{\"content\":\"second\"}}]}\n\n"
+    "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{},"
+    "\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":111,"
+    "\"completion_tokens\":777,\"total_tokens\":888}}\n\n"
+    "data: [DONE]\n\n";
+
+static const char *kResponsesCycle1 =
+    "event: response.created\ndata: {\"type\":\"response.created\","
+    "\"response\":{\"id\":\"r1\",\"model\":\"m\"}}\n\n"
+    "event: response.output_text.delta\ndata: {\"type\":"
+    "\"response.output_text.delta\",\"delta\":\"first\",\"item_id\":\"i1\","
+    "\"output_index\":0,\"content_index\":0}\n\n"
+    "event: response.completed\ndata: {\"type\":\"response.completed\","
+    "\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"usage\":"
+    "{\"input_tokens\":11,\"output_tokens\":7,\"total_tokens\":18}}}\n\n";
+
+static const char *kResponsesCycle2 =
+    "event: response.created\ndata: {\"type\":\"response.created\","
+    "\"response\":{\"id\":\"r2\",\"model\":\"m\"}}\n\n"
+    "event: response.completed\ndata: {\"type\":\"response.completed\","
+    "\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"usage\":"
+    "{\"input_tokens\":111,\"output_tokens\":777,\"total_tokens\":888}}}\n\n";
+
+static void test_duplicate_cycle_suppression(const CodecRegistry &reg) {
+    {
+        const std::string sse =
+            std::string(kAnthropicCycle1) + kAnthropicCycle2;
+        const CycleTally t = tally_cycles(reg, ApiFormat::Anthropic, sse);
+        check(t.starts == 1, "duplicate cycle: anthropic keeps one message_start");
+        check(t.finishes == 1, "duplicate cycle: anthropic keeps one terminal");
+        check(t.text_deltas == 1, "duplicate cycle: anthropic drops second text");
+        check(t.completion_tokens == 7,
+              "duplicate cycle: anthropic keeps first usage");
+        check(t.suppressed, "duplicate cycle: anthropic reports suppression");
+
+        const CycleTally single =
+            tally_cycles(reg, ApiFormat::Anthropic, kAnthropicCycle1);
+        check(single.starts == 1 && single.finishes == 1,
+              "single cycle: anthropic unchanged");
+        check(!single.suppressed,
+              "single cycle: trailing message_stop is not suppression");
+    }
+    {
+        const std::string sse = std::string(kOpenaiCycle1) + kOpenaiCycle2;
+        const CycleTally t = tally_cycles(reg, ApiFormat::OpenAI, sse);
+        check(t.text_deltas == 1,
+              "duplicate cycle: openai drops second completion text");
+        check(t.completion_tokens == 7,
+              "duplicate cycle: openai keeps first usage");
+        check(t.suppressed, "duplicate cycle: openai reports suppression");
+
+        const CycleTally single =
+            tally_cycles(reg, ApiFormat::OpenAI, kOpenaiCycle1);
+        check(!single.suppressed, "single cycle: openai is not suppression");
+    }
+    {
+        const std::string sse =
+            std::string(kResponsesCycle1) + kResponsesCycle2;
+        const CycleTally t =
+            tally_cycles(reg, ApiFormat::OpenAIResponses, sse);
+        check(t.starts == 1,
+              "duplicate cycle: responses keeps one response.created");
+        check(t.finishes == 1,
+              "duplicate cycle: responses keeps one terminal");
+        check(t.completion_tokens == 7,
+              "duplicate cycle: responses keeps first usage");
+        check(t.suppressed, "duplicate cycle: responses reports suppression");
+    }
+}
+
 static int self_test() {
     CodecRegistry reg;
     reg.add(make_openai_codec());
@@ -1434,6 +1570,7 @@ static int self_test() {
     test_openai_target_usage_fold(reg);
     test_responses_completed_after_items(reg);
     test_responses_tool_done_once(reg);
+    test_duplicate_cycle_suppression(reg);
 
     printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILED",
            g_failures, g_failures == 1 ? "" : "s");

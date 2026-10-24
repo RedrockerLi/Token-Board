@@ -37,6 +37,16 @@ bool strict_terminal_enabled() {
     return std::string(v) != "0";
 }
 
+/// Single-cycle guard: a passthrough stream stops forwarding at the first
+/// terminal frame so a gateway that splices a retried generation into the same
+/// response cannot make the client render two replies.  Default: on; set
+/// PROXY_STREAM_CYCLE_GUARD=0 to forward upstream bytes verbatim again.
+bool stream_cycle_guard_enabled() {
+    const char *v = std::getenv("PROXY_STREAM_CYCLE_GUARD");
+    if (v == nullptr) return true;
+    return std::string(v) != "0";
+}
+
 std::optional<size_t> affinity_bound_index(
     SessionAffinity &affinity, const std::string &scope,
     const std::string &session_id,

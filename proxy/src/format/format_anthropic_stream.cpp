@@ -28,7 +28,13 @@ public:
             } catch (...) {
                 return;
             }
+            if (cycle_finished_) {
+                if (is_cycle_start(event_name, j)) suppressed_after_terminal_ = true;
+                return;
+            }
+            const bool had_finish = finish_emitted_;
             handle_frame(event_name, j, guard);
+            if (!had_finish && finish_emitted_) cycle_finished_ = true;
         });
         if (!buffered) emit_failure(guard, "SSE frame exceeds 4 MiB limit");
         return ok && !failed_;
@@ -52,10 +58,20 @@ public:
             } catch (...) {
                 return;
             }
+            if (cycle_finished_) {
+                if (is_cycle_start(event_name, j)) suppressed_after_terminal_ = true;
+                return;
+            }
+            const bool had_finish = finish_emitted_;
             handle_frame(event_name, j, guard);
+            if (!had_finish && finish_emitted_) cycle_finished_ = true;
         });
         if (!buffered) emit_failure(guard, "SSE frame exceeds 4 MiB limit");
         return ok && !failed_;
+    }
+
+    bool suppressed_after_terminal() const noexcept override {
+        return suppressed_after_terminal_;
     }
 
 private:
@@ -71,7 +87,19 @@ private:
     // not publish a second one with a defaulted stop_reason (emitters keep
     // the first finish they see).
     bool finish_emitted_ = false;
+    // A terminal event closed the cycle: later frames belong to a second
+    // generation spliced into the same response and are dropped.  The
+    // suppression flag distinguishes "a second cycle really appeared" from
+    // the ordinary trailing message_stop of the same cycle.
+    bool cycle_finished_ = false;
+    bool suppressed_after_terminal_ = false;
     json pending_context_management_;
+
+    static bool is_cycle_start(const std::string &event_name, const json &j) {
+        if (event_name == "message_start") return true;
+        return j.contains("type") && j["type"].is_string() &&
+               j["type"].get<std::string>() == "message_start";
+    }
 
     const ToolMapping *mapping_for(const std::string &name) const {
         if (!context_) return nullptr;

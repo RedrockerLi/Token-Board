@@ -104,7 +104,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
             // Like the model catalog, an embedding request carries no
             // conversation of its own.
             [&](ForwardOptions &opts) {
-                configure_opencode_session(opts, c, std::string());
+                configure_upstream_profile(opts, c, std::string());
             });
         },
         [&](const UpstreamClient::ForwardResult &result) {

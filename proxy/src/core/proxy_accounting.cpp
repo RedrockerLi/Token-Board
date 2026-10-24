@@ -136,7 +136,9 @@ void ProxyServer::run_usage_watch_cycle() {
         const auto target = db_.lookup_probe_target(key_slot_id);
         if (!target) continue;  // key/account deleted meanwhile — cooldown is
                                 // in-memory and will expire on its own.
-        if (!target->usage_watch) continue;  // HTTP probe cycle handles it
+        if (target->profile->cooldown_recovery !=
+            CooldownRecoveryChannel::kUsageSnapshot)
+            continue;  // the HTTP probe cycle handles this key
         AccountGate::CooldownEvidence evidence;
         if (!gate_.cooldown_evidence(key_slot_id, &evidence)) continue;
         const auto usage =
@@ -209,20 +211,18 @@ void ProxyServer::run_cooldown_probe_cycle() {
         const auto target = db_.lookup_probe_target(key_slot_id);
         if (!target) continue;  // key/account deleted meanwhile — cooldown is
                                 // in-memory and will expire on its own.
-        if (target->usage_watch) continue;  // usage-watch cycle handles it
+        if (target->profile->cooldown_recovery !=
+            CooldownRecoveryChannel::kHttpProbe)
+            continue;  // the usage-watch cycle handles this key
         ForwardOptions opts;
         opts.non_streaming_timeout = 10;
         opts.non_streaming_total_timeout = 10;
         opts.auth_scheme = resolve_auth_scheme(target->api_format,
                                                target->auth_header);
-        // An opencode-go gateway rejects a session-less probe (400), which
-        // would read as "still cooling" forever.  The probe carries no
-        // conversation, so it identifies itself with a one-off session (the
-        // handler-path helper takes a candidate, which a probe has none of).
-        if (target->opencode_session) {
-            opts.opencode_upstream = true;
-            opts.opencode_session = opencode_random_session_value();
-        }
+        // A gateway whose profile needs a session rejects a session-less probe
+        // (400), which would read as "still cooling" forever.  The probe has no
+        // conversation, so the profile supplies a one-off random id.
+        apply_upstream_profile(opts, *target->profile, std::string());
         std::string method = "GET";
         std::string probe_path = "/models";
         std::string probe_body;
@@ -253,13 +253,14 @@ void ProxyServer::run_cooldown_probe_cycle() {
             // quota cooldown can be cleared.
             gate_.clear_cooldown(key_slot_id);
             TB_LOG_DEBUG(
-                    "[Proxy] cooldown probe: key %d healthy, cooldown cleared "
-                    "early (status %d)\n",
-                    key_slot_id, fwd.status_code);
+                    "[Proxy] cooldown probe: key %d profile=%s healthy, "
+                    "cooldown cleared early (status %d)\n",
+                    key_slot_id, target->profile->name, fwd.status_code);
         } else {
             TB_LOG_DEBUG(
-                    "[Proxy] cooldown probe: key %d still cooling (status %d)\n",
-                    key_slot_id, fwd.status_code);
+                    "[Proxy] cooldown probe: key %d profile=%s still cooling "
+                    "(status %d)\n",
+                    key_slot_id, target->profile->name, fwd.status_code);
         }
     }
 }

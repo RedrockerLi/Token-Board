@@ -1,4 +1,6 @@
 #include "proxy_server_internal.h"
+
+#include "sse_cycle_guard.h"
 void ProxyServer::handle_streaming(
     const std::vector<UpstreamCandidate> &cands,
     const std::vector<CandidateRequestBody> &candidate_bodies,
@@ -9,7 +11,7 @@ void ProxyServer::handle_streaming(
     const std::string &resolved_model, std::shared_ptr<const json> parsed_json,
     std::shared_ptr<const ir::ChatRequest> parsed_request, std::shared_ptr<const ir::ConversionContext> conversion_context,
     std::shared_ptr<const std::vector<json>> state_current_input, std::shared_ptr<UsageReservation> reservation,
-    const std::string &opencode_session,
+    const std::string &upstream_session,
     const std::string &anthropic_beta, const httplib::Request &req,
     httplib::Response &res, std::chrono::steady_clock::time_point t0) {
     const FormatCodec &harness_codec = codecs_.get(harness);
@@ -31,7 +33,7 @@ void ProxyServer::handle_streaming(
          local_key_id,
          endpoint_kind, harness, resolved_model, parsed_json, parsed_request, conversion_context,
          state_current_input, reservation,
-         opencode_session, anthropic_beta,
+         upstream_session, anthropic_beta,
          base_timeouts, deadline, budget_seconds,
          content_type, t0, &res,
          client_sock = req.client_socket,
@@ -287,11 +289,41 @@ void ProxyServer::handle_streaming(
                     return on_event(event);
                 };
                 bool metrics_enabled = true;
+                // Passthrough only: a gateway may splice a retried generation
+                // into the same response.  The guard delivers exactly one
+                // message cycle and drops whatever follows; the converted path
+                // is covered by the stream parsers' own cycle suppression.
+                const bool cycle_guard_enabled =
+                    passthrough && stream_cycle_guard_enabled();
+                fmt::SseCycleGuard cycle_guard(upstream);
+                std::string guarded;
+                bool cycle_cut_logged = false;
+                auto note_cycle_cut = [&] {
+                    if (!cycle_guard.suppressed_after_terminal() ||
+                        cycle_cut_logged)
+                        return;
+                    cycle_cut_logged = true;
+                    log_upstream_duplicate_cycle(log_context, candidate,
+                                                 cycle_guard.dropped_bytes());
+                };
                 auto on_chunk = [&](const char *data, size_t len) -> bool {
+                    const char *forward_data = data;
+                    size_t forward_len = len;
+                    if (cycle_guard_enabled) {
+                        guarded.clear();
+                        cycle_guard.feed(data, len, guarded);
+                        forward_data = guarded.data();
+                        forward_len = guarded.size();
+                        if (cycle_guard.terminal_frame_seen())
+                            attempt_terminal_seen->store(
+                                true, std::memory_order_release);
+                        note_cycle_cut();
+                    }
                     if (metrics_enabled) {
                         try {
                             const bool observed = passthrough
-                                ? parser->feed(data, len, on_metrics_event)
+                                ? parser->feed(forward_data, forward_len,
+                                               on_metrics_event)
                                 : true;
                             if (!observed && !attempt_has_stream_error) {
                                 metrics_enabled = false;
@@ -307,9 +339,11 @@ void ProxyServer::handle_streaming(
                         if (!passthrough) {
                             forwarded = parser->feed(data, len, on_combined_event);
                         } else if (!filter_thinking) {
-                            forwarded = write_attempt(std::string(data, len));
+                            forwarded = write_attempt(
+                                std::string(forward_data, forward_len));
                         } else {
-                            std::string filtered = think_filter.feed(data, len);
+                            std::string filtered =
+                                think_filter.feed(forward_data, forward_len);
                             forwarded = filtered.empty() || write_attempt(filtered);
                         }
                     } catch (...) {
@@ -332,11 +366,74 @@ void ProxyServer::handle_streaming(
                         opts.streaming_body_buffer_limit = 256 * 1024;
                         if (upstream == ir::ApiFormat::Anthropic)
                             opts.anthropic_beta = anthropic_beta;
-                        configure_opencode_session(opts, candidate,
-                                                   opencode_session);
+                        configure_upstream_profile(opts, candidate,
+                                                   upstream_session);
                         if (strict_terminal_enabled())
                             opts.terminal_seen = attempt_terminal_seen;
                     });
+                if (cycle_guard_enabled) {
+                    // Flush the last partial frame (a terminal without its
+                    // trailing blank line still counts) before the parser's
+                    // own EOF flush runs.
+                    std::string cycle_tail;
+                    cycle_guard.finish(cycle_tail);
+                    if (cycle_guard.terminal_frame_seen())
+                        attempt_terminal_seen->store(true,
+                                                     std::memory_order_release);
+                    note_cycle_cut();
+                    if (!cycle_tail.empty()) {
+                        if (metrics_enabled) {
+                            try {
+                                parser->feed(cycle_tail.data(),
+                                             cycle_tail.size(),
+                                             on_metrics_event);
+                            } catch (...) {
+                                metrics_enabled = false;
+                            }
+                        }
+                        if (!filter_thinking) {
+                            write_attempt(cycle_tail);
+                        } else {
+                            std::string filtered =
+                                think_filter.feed(cycle_tail.data(),
+                                                  cycle_tail.size());
+                            if (!filtered.empty()) write_attempt(filtered);
+                        }
+                        // An upstream that closes without the final blank
+                        // line leaves the terminal frame undispatchable for
+                        // the client's SSE parser; close it the same way the
+                        // truncation repair does.
+                        const bool ends_blank =
+                            (cycle_tail.size() >= 2 &&
+                             cycle_tail.compare(cycle_tail.size() - 2, 2,
+                                                "\n\n") == 0) ||
+                            (cycle_tail.size() >= 4 &&
+                             cycle_tail.compare(cycle_tail.size() - 4, 4,
+                                                "\r\n\r\n") == 0);
+                        if (!ends_blank && cycle_guard.terminal_frame_seen()) {
+                            if (!filter_thinking) {
+                                write_attempt("\n\n");
+                            } else {
+                                std::string closing =
+                                    think_filter.feed("\n\n", 2);
+                                if (!closing.empty()) write_attempt(closing);
+                            }
+                        }
+                    }
+                }
+                // The guard delivered one complete cycle.  Whatever the
+                // drained remainder produced — a spliced second generation
+                // running to completion, an idle timeout while it ran, a
+                // reset — must not turn a finished answer into an error (the
+                // client would get an error frame after complete content).
+                if (cycle_guard_enabled && cycle_guard.terminal_frame_seen() &&
+                    !result.client_disconnected && !client_write_failed) {
+                    result.success = true;
+                    result.status_code = 200;
+                    result.is_timeout = false;
+                    result.failure_kind = UpstreamFailureKind::None;
+                    result.error.clear();
+                }
                     if (metrics_enabled || !passthrough ||
                         result.failure_kind == UpstreamFailureKind::StreamTruncated) {
                     try {
@@ -348,6 +445,13 @@ void ProxyServer::handle_streaming(
                         log_proxy_stream_protocol_error(log_context, candidate, result.duration_ms);
                         mark_proxy_stream_protocol_failure(result, 502, "upstream stream parser failure");
                     }
+                }
+                // Converted attempts have no byte-level guard: the parser
+                // itself drops frames after the terminal event.
+                if (!cycle_guard_enabled && parser->suppressed_after_terminal() &&
+                    !cycle_cut_logged) {
+                    cycle_cut_logged = true;
+                    log_upstream_duplicate_cycle(log_context, candidate, 0);
                 }
                 // upstream_forward classified the attempt before the parser
                 // flushed its SSE frame buffer.  A terminal event still

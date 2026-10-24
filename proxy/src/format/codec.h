@@ -18,6 +18,10 @@ public:
     /// Returns false when an EmitFn returned false (abort upstream).
     virtual bool feed(const char *data, size_t len, const EmitFn &emit) = 0;
     virtual bool finish(const EmitFn &emit) = 0;  // flush partial event, pending ToolCallDone
+    /// True when a second message cycle was found after the response's
+    /// terminal event and its frames were dropped instead of emitted.  Some
+    /// gateways splice a retried generation into the same HTTP response.
+    virtual bool suppressed_after_terminal() const noexcept { return false; }
 };
 
 /// Serializes StreamEvents into harness SSE chunks written to a Sink.

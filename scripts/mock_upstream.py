@@ -69,6 +69,9 @@ Response selection:
     line after the last SSE frame; "mock_empty_stream" sends no frames at all
     (a clean, terminal-less 200 body); "mock_omit_chunk_terminator" sends the
     frames but closes without the final 0-chunk (a sloppy upstream close).
+    "mock_duplicate_cycle" appends a second, complete message cycle with a
+    different id and inflated usage (7→777, 11→111, 18→888), reproducing the
+    gateway that splices a retried generation into one response.
 
 GET endpoints:
   - /__ctrl/status and POST /__ctrl drive the test control surface (per-key GET
@@ -565,7 +568,34 @@ class Handler(BaseHTTPRequestHandler):
             elif last.endswith("\r\n\r\n"):
                 last = last[:-4]
             chunks = chunks[:-1] + [last]
+        # The body flag survives a passthrough hop; the model-name trigger is
+        # for converted routes, where IR conversion drops unknown body fields.
+        duplicate = req.get("mock_duplicate_cycle") or str(
+            req.get("model", "")).startswith("mock-dup-cycle")
+        if duplicate and chunks:
+            chunks = chunks + [self._second_cycle(c) for c in chunks]
         return chunks
+
+    @staticmethod
+    def _second_cycle(frame):
+        """Copy one frame as a second generation with a distinct id/usage.
+
+        The inflated token counts let a test prove the recorded usage came
+        from the first cycle (7) rather than the discarded one (777).
+        """
+        def bump(text, key, old, new):
+            return re.sub(rf'"{key}"\s*:\s*{old}(?![0-9])',
+                          f'"{key}": {new}', text)
+
+        text = (frame.replace('"m1"', '"m2"')
+                     .replace("chatcmpl-mock1", "chatcmpl-mock2")
+                     .replace("resp1", "resp2")
+                     .replace('"i1"', '"i2"'))
+        text = bump(text, "output_tokens", 7, 777)
+        text = bump(text, "input_tokens", 11, 111)
+        text = bump(text, "completion_tokens", 7, 777)
+        text = bump(text, "prompt_tokens", 11, 111)
+        return bump(text, "total_tokens", 18, 888)
 
     def _write_chunk(self, c):
         """Write one HTTP/1.1 chunked-encoding frame; False if client closed."""

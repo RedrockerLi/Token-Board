@@ -312,6 +312,25 @@ inline bool proxy_response_json_valid(
     }
 }
 
+/// The upstream delivered a second, complete message cycle after the first
+/// one ended.  The guard kept the first cycle and dropped the rest; this is a
+/// WARN (not a ProxyError) because the client received a complete answer.
+inline void log_upstream_duplicate_cycle(
+    const ProxyLogContext &context, const UpstreamCandidate &candidate,
+    std::size_t dropped_bytes) {
+    const std::string format = proxy_log_value(context.format);
+    const std::string model = proxy_log_value(context.model);
+    const std::string endpoint = proxy_log_value(context.endpoint);
+    TB_LOG_WARN(
+        "[Proxy] upstream_duplicate_cycle request_id=%llu format=%s model=%s "
+        "endpoint=%s upstream_account_id=%d upstream_id=%d upstream_profile=%s "
+        "upstream_key_id=%d dropped_bytes=%zu action=cut\n",
+        static_cast<unsigned long long>(context.request_id), format.c_str(),
+        model.c_str(), endpoint.c_str(), candidate.account().id,
+        candidate.account().upstream_id, candidate.account().profile->name,
+        candidate.key_slot_id, dropped_bytes);
+}
+
 inline void log_proxy_stream_protocol_error(
     const ProxyLogContext &context, const UpstreamCandidate &candidate,
     int duration_ms) {

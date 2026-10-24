@@ -23,13 +23,27 @@ public:
             std::string event_name, payload;
             if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
             if (is_done_payload(payload)) {
+                if (cycle_finished_) return;
                 handle_done(guard);
+                cycle_finished_ = true;
                 return;
             }
             json j;
             try {
                 j = json::parse(payload);
             } catch (...) {
+                return;
+            }
+            if (cycle_finished_) {
+                if (is_cycle_start(j)) suppressed_after_terminal_ = true;
+                return;
+            }
+            // A finish_reason closes the message but a usage-only chunk and
+            // [DONE] may still follow, so only a genuine next-cycle frame
+            // (new id or a fresh assistant role) ends the cycle here.
+            if (terminal_emitted_ && is_cycle_start(j)) {
+                cycle_finished_ = true;
+                suppressed_after_terminal_ = true;
                 return;
             }
             handle_frame(j, guard);
@@ -50,13 +64,24 @@ public:
             std::string event_name, payload;
             if (!fmt::parse_sse_frame(frame, &event_name, &payload)) return;
             if (is_done_payload(payload)) {
+                if (cycle_finished_) return;
                 handle_done(guard);
+                cycle_finished_ = true;
                 return;
             }
             json j;
             try {
                 j = json::parse(payload);
             } catch (...) {
+                return;
+            }
+            if (cycle_finished_) {
+                if (is_cycle_start(j)) suppressed_after_terminal_ = true;
+                return;
+            }
+            if (terminal_emitted_ && is_cycle_start(j)) {
+                cycle_finished_ = true;
+                suppressed_after_terminal_ = true;
                 return;
             }
             handle_frame(j, guard);
@@ -66,7 +91,28 @@ public:
         return ok && !failed_;
     }
 
+    bool suppressed_after_terminal() const noexcept override {
+        return suppressed_after_terminal_;
+    }
+
 private:
+    /// A frame that starts a fresh completion: a different top-level id, or
+    /// an assistant role delta that appears after the first finish_reason.
+    bool is_cycle_start(const json &j) const {
+        if (j.contains("id") && j["id"].is_string()) {
+            const std::string id = j["id"].get<std::string>();
+            if (!id.empty() && !id_.empty() && id != id_) return true;
+        }
+        if (j.contains("choices") && j["choices"].is_array() &&
+            !j["choices"].empty() && j["choices"][0].is_object()) {
+            const json &choice = j["choices"][0];
+            if (choice.contains("delta") && choice["delta"].is_object() &&
+                choice["delta"].value("role", "") == "assistant")
+                return true;
+        }
+        return false;
+    }
+
     struct ActiveTool {
         std::string id, name, arguments;
         bool start_emitted = false;
@@ -80,6 +126,9 @@ private:
     // A finish_reason has already been published; a later [DONE] must not
     // publish a second, defaulted terminal event.
     bool terminal_emitted_ = false;
+    // A second message cycle spliced into the same response was dropped.
+    bool cycle_finished_ = false;
+    bool suppressed_after_terminal_ = false;
 
     const ToolMapping *mapping_for(const std::string &name) const {
         if (!context_) return nullptr;

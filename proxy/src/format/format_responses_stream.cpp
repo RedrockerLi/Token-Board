@@ -10,10 +10,15 @@ public:
     explicit ResponsesStreamParser(const ConversionContext *ctx) : context_(ctx) {}
     bool feed(const char *data, size_t len, const EmitFn &emit) override { return frames(data, len, emit, false); }
     bool finish(const EmitFn &emit) override { return frames(nullptr, 0, emit, true); }
+    bool suppressed_after_terminal() const noexcept override { return suppressed_after_terminal_; }
 private:
     const ConversionContext *context_ = nullptr;
     fmt::SseFrameBuffer sse_;
     std::map<int, json> pending_items_;
+    // A terminal event closed the response: later frames belong to a second
+    // generation spliced into the same stream and are dropped.
+    bool cycle_finished_ = false;
+    bool suppressed_after_terminal_ = false;
 
     const ToolMapping *mapping_for(const std::string &wire_name,
                                    const std::string &namespace_name) const {
@@ -59,8 +64,17 @@ private:
             std::string event, payload;
             if (!fmt::parse_sse_frame(frame, &event, &payload) || payload.empty()) return;
             json j; try { j = json::parse(payload); } catch (...) { return; }
+            const std::string type = j.value("type", event);
+            if (cycle_finished_) {
+                if (type == "response.created") suppressed_after_terminal_ = true;
+                return;
+            }
             EmitFn downstream = [&](const StreamEvent &ev) { ok = ok && emit(ev); return ok; };
             handle_frame(j, event, downstream);
+            if (type == "response.completed" || type == "response.incomplete" ||
+                type == "response.failed" || type == "response.error" ||
+                type == "error")
+                cycle_finished_ = true;
         };
         if (final) sse_.finish(handle); else sse_.feed(data, len, handle);
         return ok;

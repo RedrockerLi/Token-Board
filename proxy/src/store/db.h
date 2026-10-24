@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/upstream_profile.h"
 #include "usage_reservation.h"
 
 struct sqlite3;
@@ -65,9 +66,9 @@ public:
         int upstream_id = 0;
         bool extended_usage_limit_cooldown = false;
         int max_concurrency = 0;
-        // upstreams.subtype == 'opencode-go': the gateway routes by session id
-        // and rejects clients that do not identify one.
-        bool opencode_session = false;
+        // Resolved once from upstreams.subtype when the routing snapshot is
+        // built.  Never null; ordinary upstreams share the default profile.
+        const UpstreamProfile *profile = &default_upstream_profile();
         bool deleted = false;
     };
 
@@ -81,14 +82,9 @@ public:
         std::string key_value;
         std::string api_format;
         std::string auth_header;
-        // The upstream belongs to the "opencode-go" sub-type: its gateway
-        // requires the session header, so a cooldown probe must send one.
-        bool opencode_session = false;
-        // The sub-type declares a usage query (opencode-go): quota recovery
-        // is read from the usage snapshot the dashboard poller refreshes —
-        // the gateway's catalog endpoint answers 200 for any or no key and
-        // cannot witness recovery, so no HTTP probe is sent for these keys.
-        bool usage_watch = false;
+        // Resolved from upstreams.subtype by lookup_probe_target().  Carries
+        // both the session requirement and the cooldown-recovery channel.
+        const UpstreamProfile *profile = &default_upstream_profile();
         // Raw upstream_credentials.usage_json for the usage-watch path.
         std::string usage_json;
         // First catalog model of the upstream ("" = 更新模型 never ran): the

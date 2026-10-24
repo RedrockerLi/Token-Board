@@ -8,6 +8,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "upstream_profile.h"
+
 /// Auth scheme + path handling for an upstream forward call.
 struct ForwardOptions {
     std::string auth_scheme = "bearer";  // "bearer" → Authorization: Bearer <key>
@@ -15,12 +17,11 @@ struct ForwardOptions {
     // Allowlisted Anthropic beta features from the client request.  The
     // proxy rebuilds upstream headers, so this must be carried explicitly.
     std::string anthropic_beta;
-    // "opencode-go" upstreams route every request by session: the gateway
-    // rejects clients that do not identify one, and it filters on the client
-    // User-Agent (which the proxy never forwards downstream).  Callers set
-    // both fields together and must supply a non-empty opencode_session.
-    bool opencode_upstream = false;
-    std::string opencode_session;
+    // Resolved upstream sub-type behaviour (see core/upstream_profile.h).
+    // Never null: ordinary upstreams share the default profile, whose header
+    // decorator is a no-op, so building headers needs no null check.
+    const UpstreamProfile *upstream_profile = &default_upstream_profile();
+    std::string upstream_session;
     bool path_is_full = false;           // true → use `path` verbatim (skip base_url path prepend)
 
     // Upstream timeouts, in seconds (0 = disabled).

@@ -147,13 +147,15 @@ inline void log_proxy_failure(
         "format=%s model=%s streaming=%d route_account_id=%d local_key_id=%d "
         "status=%d reason=%s attempt=%zu attempts=%zu retrying=%d "
         "duration_ms=%d timeout_secs=%d upstream_account_id=%d upstream_id=%d "
-        "upstream_key_id=%d priority_group=%d remote_addr=%s user_agent=%s%s\n",
+        "upstream_profile=%s upstream_key_id=%d priority_group=%d "
+        "remote_addr=%s user_agent=%s%s\n",
         static_cast<unsigned long long>(context.request_id), phase, method.c_str(),
         endpoint.c_str(), format.c_str(), model.c_str(), context.streaming ? 1 : 0,
         context.route_account_id, context.local_key_id, status_code, reason,
         attempt, attempts, retrying ? 1 : 0, duration_ms, timeout_secs,
         candidate ? candidate->account().id : 0,
         candidate ? candidate->account().upstream_id : 0,
+        candidate ? candidate->account().profile->name : "default",
         candidate ? candidate->key_slot_id : 0,
         candidate ? candidate->priority_group : 0, remote_addr.c_str(),
         user_agent.c_str(), suffix.c_str());

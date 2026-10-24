@@ -74,6 +74,17 @@ add_executable(endpoint_policy_test
 target_include_directories(endpoint_policy_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(endpoint_policy_test PRIVATE cxx_std_17)
 
+# Upstream sub-type dispatch table (header-only; nothing to link).
+add_executable(upstream_profile_test upstream_profile_test.cpp)
+target_include_directories(upstream_profile_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(upstream_profile_test PRIVATE cxx_std_17)
+
+# Frame-aware single-cycle guard for passthrough streams.
+add_executable(sse_cycle_guard_test sse_cycle_guard_test.cpp)
+target_include_directories(sse_cycle_guard_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(sse_cycle_guard_test PRIVATE cxx_std_17)
+target_link_libraries(sse_cycle_guard_test PRIVATE token_proxy_format)
+
 # Wire/IR -> database accounting projection.  Cache creation remains an
 # explicit wire field while the existing DB prompt bucket retains its frozen
 # Anthropic compatibility fold.
@@ -292,6 +303,8 @@ add_test(NAME session_affinity COMMAND session_affinity_test)
 add_test(NAME responses_state_store COMMAND responses_state_store_test)
 add_test(NAME responses_semantics COMMAND responses_semantics_test)
 add_test(NAME endpoint_policy COMMAND endpoint_policy_test)
+add_test(NAME upstream_profile COMMAND upstream_profile_test)
+add_test(NAME sse_cycle_guard COMMAND sse_cycle_guard_test)
 add_test(NAME usage_accounting COMMAND usage_accounting_test)
 add_test(NAME usage_parser COMMAND usage_parser_test)
 add_test(NAME spool_codec COMMAND spool_codec_test)
@@ -343,6 +356,14 @@ add_test(
             ${CMAKE_CURRENT_SOURCE_DIR}/pricing_v1_v2_equivalence_test.py
             recovery
             ${CMAKE_SOURCE_DIR}/../schema
+)
+add_test(
+    NAME stream_cycle_guard
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/stream_cycle_guard_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
 )
 add_test(
     NAME proxy_forwarding

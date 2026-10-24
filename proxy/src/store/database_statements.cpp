@@ -55,8 +55,7 @@ bool Database::prepare_statements() {
             stmt_insert_attempt_);
         PREPARE_ON(read_db_,
             "SELECT u.base_url,s.secret_value,u.api_format,u.auth_scheme,"
-            "CASE WHEN u.subtype='opencode-go' THEN 1 ELSE 0 END,"
-            "CASE WHEN u.subtype='opencode-go' THEN 1 ELSE 0 END,"
+            "COALESCE(u.subtype,''),"
             "COALESCE(c.usage_json,''),"
             "COALESCE((SELECT mc.model_id FROM upstream_model_catalog mc "
             "WHERE mc.upstream_id=u.id ORDER BY mc.model_id LIMIT 1),'') "
