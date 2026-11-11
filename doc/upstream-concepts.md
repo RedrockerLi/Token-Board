@@ -73,7 +73,7 @@
 
 - **每把 Key 一个并发槽位**：`max_concurrency` 按 Key 计数，一把 Key 打满后请求溢流到下一把（[proxy/src/core/account_gate.h:13-16](proxy/src/core/account_gate.h#L13-L16)）。
 - **每把 Key 一个故障单元**：plan 的配额冷却与各类失败避让都按 `key_slot_id` 隔离（配额耗尽按可信重置冷却；普通 429 / 401 / 403 / 5xx / 超时各有短避让），兄弟 Key 不受连坐。
-- **候选顺序**：同一账户的密钥按 `(position, runtime_id)` 排列，组内排序（[proxy/src/core/candidate_selection.h](proxy/src/core/candidate_selection.h)）：耗尽窗口（≥100% 且重置未到）的 Key 排最后并按最早可信重置排序；订阅已停付（用量查询 403 EntitlementError 判定，`error_at` 在 48 小时内）的 Key 不进入尝试——排序仍把它放到最末，`AttemptExecutor::acquire()` 在取并发槽前直接跳过，全部候选都停付时下游收到 503 `All upstream keys have an inactive subscription`，复付观测翻回 active 后热重载即恢复。其余顺序：会话绑定的 Key 最前 → 月/周/5h 窗口压力（剩余额度 ÷ 距重置时间，无容差）逐级 → 累计消耗最少 → 请求轮转兜底。带用量快照的 Key 只在快照新鲜（10 分钟）且窗口已启动时提供压力信号；没有用量数据的 Key 按累计消耗竞争，不因缺数据受损（完整语义见 [proxy-internals.md](proxy-internals.md)）。
+- **候选顺序**：同一账户的密钥按 `(position, runtime_id)` 排列，组内排序（[proxy/src/core/candidate_selection.h](proxy/src/core/candidate_selection.h)）：耗尽窗口（≥100% 且重置未到）的 Key 排最后并按最早可信重置排序；订阅已停付（用量查询 403 EntitlementError 判定，`error_at` 在 48 小时内）的 Key 不进入尝试——排序仍把它放到最末，`AttemptExecutor::acquire()` 在取并发槽前直接跳过，全部候选都停付时下游收到 503 `All upstream keys have an inactive subscription`，复付观测翻回 active 后热重载即恢复。其余顺序：月窗口距重置严格小于 7 天且快照新鲜的 Key 优先（斩杀线，压过会话绑定）→ 会话绑定的 Key 最前 → 月/周/5h 窗口压力（剩余额度 ÷ 距重置时间，无容差）逐级 → 累计消耗最少 → 请求轮转兜底。带用量快照的 Key 只在快照新鲜（10 分钟）且窗口已启动时提供压力信号；没有用量数据的 Key 按累计消耗竞争，不因缺数据受损（完整语义见 [proxy-internals.md](proxy-internals.md)）。
 - **会话亲和(session affinity)**：同一会话（请求头 `x-session-id` / `x-claude-code-session-id` / `x-conversation-id`，否则取 body 的 OpenAI `user` 或 Anthropic `metadata.user_id`）在成功一次后**绑定到实际服务的 Key**，换取上游 prompt 缓存命中；绑定只在成功后发生，失败的 Key 永远不会成为会话的下一次首选（[proxy/src/core/session_affinity.h](proxy/src/core/session_affinity.h)）。
 - **成本平衡**：没有会话绑定（或没有用量信号可比）时，优先选**累计消耗最少**的 Key——`KeyCostLedger` 每 5 分钟从 `request_log` 聚合等价成本（已计价为 0 但消耗了 token 的行按全局单价折算，账单为零不等于消耗为零），排序成本含在途请求的预期花费，重启后由首次聚合恢复（[proxy/src/core/key_cost_ledger.h](proxy/src/core/key_cost_ledger.h)）。
 - **上游会话头与 User-Agent**：带 OpenCode-Go 子分类的账户注入 `x-opencode-session`，取值依次为下游透传的该头 → 请求解析出的会话标识 → 稳定会话指纹（`tb-` + SHA-256(system 指令 + 首条 user 消息，去掉 cache_control) 的前 32 位）→ 随机值；这些上游请求另带固定 `User-Agent: token-board/1.0`（代理不转发下游的 User-Agent，普通账户不加这两个头）。
@@ -106,7 +106,7 @@
 ```
 
 - **候选展开**：一条 entry 指向一个真实账户，该账户名下每把 Key 又是一个候选；一个模型配了 2 个账户、各 2 把 Key，就是 4 个候选。
-- **优先级组**：`priority_group` 来自 `aggregate_entries.id`，组间**严格按 sort_order 顺序**尝试（更便宜/更靠前的先用）；组内多把 Key 按候选顺序轮转，起点为会话亲和 → 成本台账 → 轮转，带用量快照的 Key 再做「最早重置优先、已耗尽最后」的微调（[proxy/src/core/candidate_selection.h:27-46](proxy/src/core/candidate_selection.h#L27-L46)）。
+- **优先级组**：`priority_group` 来自 `aggregate_entries.id`，组间**严格按 sort_order 顺序**尝试（更便宜/更靠前的先用）；组内多把 Key 按候选顺序轮转，起点为会话亲和 → 成本台账 → 轮转，带用量快照的 Key 再做「月窗口 <7 天重置的斩杀线优先、已耗尽最后」的微调（[proxy/src/core/candidate_selection.h](proxy/src/core/candidate_selection.h)）。
 - **模型改写**：转发前把请求体里的模型名替换成 `upstream_model`（`apply_body_model` / 转换路径 `cReq.model`）。
 - **回退时机**：候选在**尚未向客户端发出任何数据**时失败（429/5xx/超时/401/403）才回退；流式请求的响应头延迟到首次写出才提交，因此流式也能在首字节前换下一个候选。
 - **全部不可用**：返回 429（忙/冷却/全失败）；若最后是超时则 504（[proxy/src/core/proxy_server.cpp:1162-1211](proxy/src/core/proxy_server.cpp#L1162-L1211)）。
@@ -187,7 +187,7 @@
 | 聚合账户和 plan/api 是一类吗？ | 不是。聚合是路由分组（`is_aggregate=1`），plan/api 是上游计费类型。智能体由独立的订阅/软件表管理。聚合永远不入账。 |
 | 智能体为什么不能发代理请求？ | 智能体软件不是上游账户，不参与本地密钥路由；它只读取本机软件日志并导入用量。 |
 | 一把 plan 密钥 429 了，整个 plan 账户停摆？ | 不会。冷却按密钥，同账户其他密钥立即接管。 |
-| 一个聚合模型配了 3 个账户，请求先试哪个？ | 先试 `sort_order` 最小的 entry（及其账户的多把 Key）；同一账户内的起点按会话亲和 → 成本台账 → 轮转定，带用量快照的 Key 再按「最早重置优先、已耗尽最后」微调。该 entry 全不可用才轮到下一个。 |
+| 一个聚合模型配了 3 个账户，请求先试哪个？ | 先试 `sort_order` 最小的 entry（及其账户的多把 Key）；同一账户内的起点按会话亲和 → 成本台账 → 轮转定，带用量快照的 Key 再按「月窗口 <7 天重置的斩杀线优先、已耗尽最后」微调。该 entry 全不可用才轮到下一个。 |
 | 请求日志里 account_id 是谁？ | 实际服务的**真实账户**；只有「全候选都忙/冷却」的零 token 失败行才挂在聚合账户下，导出时会排除。 |
 | 真实上游 Key 会上云吗？ | 不会。`upstream_secrets` 和 WebDAV 密码只保存在本机；普通配置、本地代理密钥和请求聚合存档按各自同步规则上传。 |
 
@@ -228,7 +228,7 @@
 
 当前只有 `plan` 带子分类，仅一项 `opencode-go`：`label` 为 `OpenCode Go — $10/月 · 含用量查询`，预设 `base_url=https://opencode.ai/zen/go`、月费 $10（USD）、`anthropic` 线格式，用量查询 `/v1/usage`、模型目录 `/v1/models`。子分类写在账户上游行的 `upstreams.subtype`（NULL = 普通账户），只影响预设、上游会话头、仪表盘"更新模型"、用量轮询及其派生的用量感知调度与冷却恢复：计费、路由分组、删除语义继续跟随 `plan` 类型，类型徽章也仍是类型的 `short_label`（opencode-go 账户显示 `Plan`）。
 
-前端据此渲染账户弹窗左栏：类型卡片来自 `ACCOUNT_TYPES` 的 `label` / `short_label`，选中带子分类的类型后再在其下渲染子分类卡片，子分类名不硬编码在前端；轮询写入的用量快照在账户页以账户名悬浮卡展示（逐把密钥列出 5小时/本周/本月 用量与重置倒计时；未开始计时的滚动窗口显示「未开始」，不拿占位值当截止；点击账户名经同一 socket 唤醒轮询器并原地刷新卡片，「刷新中…」→ 新观测）。代理的用量感知调度按同一份快照工作：`state=started` 的窗口提供"重置前把额度用掉"的压力信号，`state=idle` 的滚动窗口（重置为占位值）不提供信号，过期快照不参与——任一窗口 100% 且重置未到的密钥排到最后（完整语义见 [proxy-internals.md](proxy-internals.md)）。
+前端据此渲染账户弹窗左栏：类型卡片来自 `ACCOUNT_TYPES` 的 `label` / `short_label`，选中带子分类的类型后再在其下渲染子分类卡片，子分类名不硬编码在前端；轮询写入的用量快照在账户页以账户名悬浮卡展示（逐把密钥列出 5小时/本周/本月 用量与重置倒计时；未开始计时的滚动窗口显示「未开始」，不拿占位值当截止；点击账户名经同一 socket 唤醒轮询器并原地刷新卡片，「刷新中…」→ 新观测）。代理的用量感知调度按同一份快照工作：`state=started` 的窗口提供"重置前把额度用掉"的压力信号，`state=idle` 的滚动窗口（重置为占位值）不提供信号，过期快照不参与——任一窗口 100% 且重置未到的密钥排到最后；月窗口距重置严格小于 7 天且快照新鲜的密钥，在同一 priority 组内排到最前（斩杀线，压过会话绑定）。完整语义见 [proxy-internals.md](proxy-internals.md)。
 
 ### 添加步骤（三步 + 两个按需）
 

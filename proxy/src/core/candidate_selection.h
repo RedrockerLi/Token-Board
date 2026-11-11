@@ -45,11 +45,22 @@ struct UpstreamCandidate {
 // than a floating-point division, and exactness comes free) with no
 // tolerance band — strictly greater wins, exactly equal falls through —
 // which keeps the ordering a strict weak ordering for std::stable_sort.
+//
+// A month window resetting in strictly less than kKillLineSeconds is a hard
+// tier ahead of that pressure comparison: the remaining quota expires with the
+// current cycle, so the credential is tried before non-kill-line siblings in
+// its own priority group (see candidate_in_kill_line).
 inline constexpr int kExhaustedPercent = 100;
 
 // A snapshot older than this supplies no pressure signal: stale data must not
 // drive window comparisons (two poller periods at the 300s cadence).
 inline constexpr std::int64_t kUsageFreshSeconds = 600;
+
+// A month window resetting in strictly less than seven days puts the
+// credential on the "kill line": the remaining quota expires with the current
+// cycle, so the credential is tried before non-kill-line siblings in its own
+// priority group (never across groups).
+inline constexpr std::int64_t kKillLineSeconds = 7 * 24 * 3600;
 
 /// Wall-clock epoch seconds (the resets_at / observed_at domain).
 inline std::int64_t wall_now_epoch() {
@@ -178,6 +189,20 @@ inline bool window_pressure(const UpstreamCandidate &candidate,
     return out->remaining > 0;
 }
 
+/// True when the credential's month window resets in strictly less than
+/// kKillLineSeconds.  window_pressure() supplies every trust guard: fresh
+/// snapshot, month window present, state != kUnknown, percent < 100, and
+/// resets_at strictly after now.  Exhaustion is deliberately not folded in
+/// here: candidate_order() compares exhaustion first and the global partition
+/// sinks exhausted keys regardless.
+inline bool candidate_in_kill_line(const UpstreamCandidate &candidate,
+                                   std::int64_t now) {
+    WindowPressure month;
+    return window_pressure(candidate, UsageWindowKind::kMonthly, now,
+                           &month) &&
+           month.seconds < kKillLineSeconds;
+}
+
 /// Recovery plan for an explicit quota-exhaustion 429: prefer the soonest
 /// trusted reset among the exhausted windows, then the window the upstream
 /// envelope named, then the PLAN_COOLDOWN fallback.  Evidence records which
@@ -252,15 +277,19 @@ inline QuotaCooldownPlan quota_cooldown_plan(
 /// groups first): balancing may only reorder inside a group, never steer a
 /// request onto a more expensive upstream.  Inside a group, ascending:
 ///   1. exhausted last (keys whose limiting window is spent);
-///   2. the session-bound key first (cache affinity wins over balancing;
-///      exhaustion still outranks it — a bound key that is unusable is
-///      skipped like any other);
-///   3. month, week, 5h pressure compared directly; a candidate with a
+///   2. the kill-line tier: a credential whose month window resets in under
+///      seven days leads other credentials in the same group; the session
+///      binding below cannot lift a non-kill-line key over it, but a bound
+///      key inside the tier still leads the tier;
+///   3. the session-bound key first (cache affinity wins over balancing;
+///      exhaustion and the kill line still outrank it — a bound key that is
+///      unusable is skipped like any other);
+///   4. month, week, 5h pressure compared directly; a candidate with a
 ///      signal beats one without, and equal pressures fall through;
-///   4. least cumulative cost (the cost ledger; in-flight allocations are
+///   5. least cumulative cost (the cost ledger; in-flight allocations are
 ///      already folded in) — the only stage a candidate without usage data
 ///      competes on;
-///   5. the base order: the group rotated by `rr_offset`, so exact ties
+///   6. the base order: the group rotated by `rr_offset`, so exact ties
 ///      spread across requests instead of pinning the lowest index.
 /// The final stable partitions lift exhausted candidates of every group
 /// behind all usable ones (ordered by their earliest trusted reset), and
@@ -300,6 +329,13 @@ inline std::vector<size_t> candidate_order(
             if (a_cost != b_cost) return a_cost < b_cost;
             return false;
         }
+        // Kill line: inside this priority group only, a credential whose
+        // month window resets in under seven days leads — even over the
+        // session binding.  Two kill-line candidates fall through to the
+        // existing bound/pressure/cost order.
+        const bool a_kill = candidate_in_kill_line(a, now);
+        const bool b_kill = candidate_in_kill_line(b, now);
+        if (a_kill != b_kill) return a_kill;
         const bool a_bound = bound_index.has_value() && *bound_index == lhs;
         const bool b_bound = bound_index.has_value() && *bound_index == rhs;
         if (a_bound != b_bound) return a_bound;

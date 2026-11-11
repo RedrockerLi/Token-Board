@@ -22,14 +22,15 @@ void ProxyServer::handle_streaming(
     set_proxy_log_stream_fields(log_context, resolved_model, route_account_id, local_key_id);
     const std::string content_type = req.has_header("Content-Type") ? req.get_header_value("Content-Type") : "application/json";
     const std::string scope = affinity_scope(local_key_id, harness);
+    const std::int64_t now = wall_now_epoch();
     const auto order = candidate_order(
         cands, bound_index, routing_rr_.fetch_add(1, std::memory_order_relaxed),
-        wall_now_epoch(), &cost_ledger_, &gate_);
+        now, &cost_ledger_, &gate_);
     const auto base_timeouts = timeout_config_cached(request_policy.kind);
     const int budget_seconds = base_timeouts.streaming_first_byte_timeout > 0 ? base_timeouts.streaming_first_byte_timeout : 60; const auto deadline = t0 + std::chrono::seconds(budget_seconds);
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, cands, candidate_bodies, order, session_id, scope, log_context,
+        [this, cands, candidate_bodies, order, now, session_id, scope, log_context,
          local_key_id,
          endpoint_kind, harness, resolved_model, parsed_json, parsed_request, conversion_context,
          state_current_input, reservation,
@@ -104,6 +105,12 @@ void ProxyServer::handle_streaming(
                  {}, {},
                  [&](const AttemptRequest &attempt_request) {
                 const auto &candidate = attempt_request.candidate;
+                TB_LOG_DEBUG(
+                    "[Proxy] streaming attempt request_id=%llu credential=%d "
+                    "kill_line=%d\n",
+                    static_cast<unsigned long long>(log_context.request_id),
+                    candidate.key_slot_id,
+                    candidate_in_kill_line(candidate, now) ? 1 : 0);
                 terminal_error_forwarded = false;
                 if (inflight_id == 0) {
                     inflight_id = request_started(log_context.request_id,

@@ -257,6 +257,172 @@ int main() {
     assert((order_of(bound, now, /*bound=*/2) ==
             std::vector<size_t>{0, 1, 2}));
 
+    // ── Month reset kill line ─────────────────────────────────────────
+    // A month window resetting in strictly less than seven days leads its
+    // priority group, even over a higher pressure and over the session
+    // binding.  Exhaustion, lapse, group boundaries and data freshness keep
+    // their existing precedence.
+
+    // The tier beats raw pressure: the kill-line key has only 1% left and
+    // resets in six days, while the sibling has the full quota over 30 days.
+    std::vector<UpstreamCandidate> kill_pressure(2);
+    kill_pressure[0].key_slot_id = 10;
+    kill_pressure[0].usage_ref = fresh({win("month", 99, now + 6 * day)});
+    kill_pressure[1].key_slot_id = 11;
+    kill_pressure[1].usage_ref = fresh({win("month", 0, now + 30 * day)});
+    assert(candidate_in_kill_line(kill_pressure[0], now));
+    assert(!candidate_in_kill_line(kill_pressure[1], now));
+    assert((order_of(kill_pressure, now) == std::vector<size_t>{0, 1}));
+
+    // Strict boundary: exactly seven days is outside; one second less is in.
+    std::vector<UpstreamCandidate> boundary(2);
+    boundary[0].key_slot_id = 10;
+    boundary[0].usage_ref = fresh(
+        {win("month", 0, now + kKillLineSeconds)});
+    boundary[1].key_slot_id = 11;  // no usage data, session-bound
+    assert(!candidate_in_kill_line(boundary[0], now));
+    assert((order_of(boundary, now, /*bound=*/1) ==
+            std::vector<size_t>{1, 0}));
+    boundary[0].usage_ref = fresh(
+        {win("month", 0, now + kKillLineSeconds - 1)});
+    assert(candidate_in_kill_line(boundary[0], now));
+    assert((order_of(boundary, now, /*bound=*/1) ==
+            std::vector<size_t>{0, 1}));
+
+    // Inside the tier the session binding still leads; without it the
+    // pressure stage would prefer the sibling with more remaining quota.
+    std::vector<UpstreamCandidate> kill_bound(2);
+    kill_bound[0].key_slot_id = 10;
+    kill_bound[0].usage_ref = fresh({win("month", 99, now + 6 * day)});
+    kill_bound[1].key_slot_id = 11;
+    kill_bound[1].usage_ref = fresh({win("month", 0, now + 6 * day)});
+    assert((order_of(kill_bound, now) == std::vector<size_t>{1, 0}));
+    assert((order_of(kill_bound, now, /*bound=*/0) ==
+            std::vector<size_t>{0, 1}));
+
+    // The tier never crosses priority groups: a non-kill-line group stays
+    // ahead, and the tier only reorders inside its own group.
+    std::vector<UpstreamCandidate> kill_groups(3);
+    kill_groups[0].key_slot_id = 10;
+    kill_groups[0].priority_group = 0;
+    kill_groups[0].usage_ref = fresh({win("month", 0, now + 30 * day)});
+    kill_groups[1].key_slot_id = 11;
+    kill_groups[1].priority_group = 1;
+    kill_groups[1].usage_ref = fresh({win("month", 99, now + 6 * day)});
+    kill_groups[2].key_slot_id = 12;
+    kill_groups[2].priority_group = 1;
+    kill_groups[2].usage_ref = fresh({win("month", 0, now + 30 * day)});
+    assert((order_of(kill_groups, now, /*bound=*/2) ==
+            std::vector<size_t>{0, 1, 2}));
+
+    // Exhaustion outranks the tier: the 100% month key stays last even
+    // though its reset is inside the window.  The helper is month-only, so a
+    // key exhausted by another window reads in the kill line but is still
+    // sunk by the exhaustion partition.
+    std::vector<UpstreamCandidate> kill_exhausted(3);
+    kill_exhausted[0].key_slot_id = 10;
+    kill_exhausted[0].usage_ref = fresh({win("month", 100, now + 2 * day)});
+    kill_exhausted[1].key_slot_id = 11;
+    kill_exhausted[1].usage_ref = fresh({win("month", 0, now + 30 * day)});
+    kill_exhausted[2].key_slot_id = 12;
+    kill_exhausted[2].usage_ref = fresh({win("month", 99, now + 6 * day)});
+    assert(candidate_usage_exhausted(kill_exhausted[0], now));
+    assert(!candidate_in_kill_line(kill_exhausted[0], now));
+    assert((order_of(kill_exhausted, now) ==
+            std::vector<size_t>{2, 1, 0}));
+    std::vector<UpstreamCandidate> kill_week_exhausted(2);
+    kill_week_exhausted[0].key_slot_id = 10;
+    kill_week_exhausted[0].usage_ref = fresh(
+        {win("month", 0, now + 6 * day),
+         win("week", 100, now + 2 * day)});
+    kill_week_exhausted[1].key_slot_id = 11;
+    kill_week_exhausted[1].usage_ref = fresh(
+        {win("month", 0, now + 30 * day)});
+    assert(candidate_in_kill_line(kill_week_exhausted[0], now));
+    assert(candidate_usage_exhausted(kill_week_exhausted[0], now));
+    assert((order_of(kill_week_exhausted, now) ==
+            std::vector<size_t>{1, 0}));
+
+    // Untrusted month signals never qualify: stale snapshots, unknown state,
+    // a reset at/past now, or no month window at all.  The bound sibling
+    // wins whenever the candidate is outside the tier.
+    std::vector<UpstreamCandidate> kill_stale(2);
+    kill_stale[0].key_slot_id = 10;
+    kill_stale[0].usage_ref = usage_of(
+        now - kUsageFreshSeconds - 1, {win("month", 0, now + 1 * day)});
+    kill_stale[1].key_slot_id = 11;
+    assert(!candidate_in_kill_line(kill_stale[0], now));
+    assert((order_of(kill_stale, now, /*bound=*/1) ==
+            std::vector<size_t>{1, 0}));
+    kill_stale[0].usage_ref = fresh(
+        {win("month", 0, now + 1 * day, routing::WindowState::kUnknown)});
+    assert(!candidate_in_kill_line(kill_stale[0], now));
+    assert((order_of(kill_stale, now, /*bound=*/1) ==
+            std::vector<size_t>{1, 0}));
+    kill_stale[0].usage_ref = fresh({win("month", 0, now)});
+    assert(!candidate_in_kill_line(kill_stale[0], now));
+    assert((order_of(kill_stale, now, /*bound=*/1) ==
+            std::vector<size_t>{1, 0}));
+    kill_stale[0].usage_ref = fresh({win("month", 0, now - 10)});
+    assert(!candidate_in_kill_line(kill_stale[0], now));
+    assert((order_of(kill_stale, now, /*bound=*/1) ==
+            std::vector<size_t>{1, 0}));
+
+    // Month-only: a near-reset week or rolling window does not qualify, and
+    // the normal month pressure stage still prefers the month signal.
+    std::vector<UpstreamCandidate> kill_month_only(2);
+    kill_month_only[0].key_slot_id = 10;
+    kill_month_only[0].usage_ref = fresh(
+        {win("week", 0, now + 1 * day)});
+    kill_month_only[1].key_slot_id = 11;
+    kill_month_only[1].usage_ref = fresh(
+        {win("month", 0, now + 30 * day)});
+    assert(!candidate_in_kill_line(kill_month_only[0], now));
+    assert((order_of(kill_month_only, now) ==
+            std::vector<size_t>{1, 0}));
+    kill_month_only[0].usage_ref = fresh(
+        {win("5h", 0, now + 1 * day, routing::WindowState::kStarted)});
+    assert(!candidate_in_kill_line(kill_month_only[0], now));
+    assert((order_of(kill_month_only, now) ==
+            std::vector<size_t>{1, 0}));
+
+    // A lapsed key with a near-reset month reads in the tier, but the global
+    // lapsed partition still sinks it behind every other candidate.
+    auto lapsed_near = std::make_shared<routing::CredentialUsage>();
+    lapsed_near->observed_at = now;
+    lapsed_near->subscription_inactive = true;
+    lapsed_near->error_at = now;
+    lapsed_near->windows.push_back(win("month", 0, now + 1 * day));
+    std::vector<UpstreamCandidate> kill_lapsed(2);
+    kill_lapsed[0].key_slot_id = 10;
+    kill_lapsed[0].usage_ref = lapsed_near;
+    kill_lapsed[1].key_slot_id = 11;
+    kill_lapsed[1].usage_ref = fresh({win("month", 0, now + 30 * day)});
+    assert(candidate_in_kill_line(kill_lapsed[0], now));
+    assert(candidate_subscription_lapsed(kill_lapsed[0], now));
+    assert((order_of(kill_lapsed, now) == std::vector<size_t>{1, 0}));
+
+    // Both in the tier: all stages tie, so the request rotation still decides.
+    std::vector<UpstreamCandidate> kill_tied(2);
+    kill_tied[0].key_slot_id = 10;
+    kill_tied[0].usage_ref = fresh({win("month", 0, now + 6 * day)});
+    kill_tied[1].key_slot_id = 11;
+    kill_tied[1].usage_ref = fresh({win("month", 0, now + 6 * day)});
+    assert((order_of(kill_tied, now, std::nullopt, 0) ==
+            std::vector<size_t>{0, 1}));
+    assert((order_of(kill_tied, now, std::nullopt, 1) ==
+            std::vector<size_t>{1, 0}));
+
+    // Existing tiers exercise both sides of the tier boundary; pin that the
+    // membership predicate agrees with the intended construction.
+    assert(candidate_in_kill_line(urgency[0], now));
+    assert(candidate_in_kill_line(urgency[1], now));
+    assert(candidate_in_kill_line(proportional[0], now));
+    assert(candidate_in_kill_line(proportional[1], now));
+    assert(!candidate_in_kill_line(tiers[0], now));
+    assert(!candidate_in_kill_line(mixed[2], now));
+    assert(!candidate_in_kill_line(lapsed[1], now));
+
     // Exact ties keep the rotated base order: the request round-robin spreads
     // them instead of pinning the lowest index.
     std::vector<UpstreamCandidate> tied(3);

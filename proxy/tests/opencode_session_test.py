@@ -23,6 +23,9 @@ Drives the real proxy against mock_upstream with "opencode-go" upstreams
   S9  a lapsed subscription (EntitlementError verdict in usage_json) is
       demoted behind healthy and exhausted keys and rejoins normal
       scheduling as soon as an observation says the subscription is back.
+  S10 a month window resetting in under seven days (the kill line) moves its
+      credential ahead of the session-bound sibling inside the same
+      priority group, even though the sibling's month pressure is higher.
 
 Usage:
   python3 opencode_session_test.py <token_proxy> <schema_dir> <project_root>
@@ -82,8 +85,18 @@ def _iso_epoch(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
-def usage_snapshot(percent: int, resets_in: float) -> str:
-    """The frozen usage_json shape the Python poller writes."""
+def usage_snapshot(percent: int, resets_in: float, *,
+                   month_percent: int = 2,
+                   month_resets_in: float | None = None) -> str:
+    """The frozen usage_json shape the Python poller writes.
+
+    ``month_resets_in`` is relative to now when supplied; the default keeps
+    the pinned calendar boundary so sibling ordering in the older scenarios
+    stays decided by the rolling window.
+    """
+    month_resets = (_iso_epoch(_BOUNDARY_EPOCH + 20 * 86400)
+                    if month_resets_in is None
+                    else iso_after(month_resets_in))
     return json.dumps({
         "checked_at": iso_after(0),
         "error": None,
@@ -94,8 +107,8 @@ def usage_snapshot(percent: int, resets_in: float) -> str:
             "week": {"percent": 3,
                      "resets_at": _iso_epoch(_BOUNDARY_EPOCH + 3 * 86400),
                      "state": "started"},
-            "month": {"percent": 2,
-                      "resets_at": _iso_epoch(_BOUNDARY_EPOCH + 20 * 86400),
+            "month": {"percent": month_percent,
+                      "resets_at": month_resets,
                       "state": "started"},
         },
         "monthly_period": {"start": iso_after(-86400),
@@ -169,7 +182,7 @@ def set_usage(db_path, runtime_id, snapshot):
 
 
 def send_until_served(db_path, proxy_port, local_key, body, model, key_id,
-                      min_id, deadline=8.0):
+                      min_id, deadline=8.0, headers=None):
     """Send until a request is served by *key_id*.
 
     The usage watch lifts a cooldown on its own cadence, so recovery is
@@ -179,7 +192,7 @@ def send_until_served(db_path, proxy_port, local_key, body, model, key_id,
     rid = min_id
     statuses, keys = [], []
     while time.monotonic() < end:
-        send(proxy_port, local_key, body)
+        send(proxy_port, local_key, body, headers=headers)
         rid, _, statuses, keys = latest_attempts(db_path, model, rid)
         if keys and keys[0] == key_id:
             return rid, statuses, keys
@@ -255,6 +268,12 @@ def main() -> None:
             _, lapse_keys, _ = build_aggregate_scenario(
                 conn, "tb-oc6", "oc6-model", ["sk-oc6-p1", "sk-oc6-p2"], None,
                 subtype="opencode-go")
+            # S10: two healthy siblings.  The second one later gains a month
+            # reset inside the kill line, so only the new tier can move it
+            # ahead of the session-bound first key.
+            _, kill_keys, _ = build_aggregate_scenario(
+                conn, "tb-oc7", "oc7-model", ["sk-oc7-p1", "sk-oc7-p2"],
+                None, subtype="opencode-go")
             # Cooldown-recovery scenario (cooled key) and a plain account
             # whose catalog/embeddings calls hit the upstream directly.
             _, probe_keys, _ = build_aggregate_scenario(
@@ -291,6 +310,14 @@ def main() -> None:
             conn.execute(
                 "UPDATE upstream_credentials SET usage_json=? WHERE runtime_id=?",
                 (usage_snapshot(20, 7200), lapse_sibling))
+            # S10: both start month 2% / 20d; p1's higher rolling pressure
+            # binds the session first.
+            for runtime_id, (percent, resets_in) in zip(
+                    kill_keys, [(30, 600), (20, 7200)]):
+                conn.execute(
+                    "UPDATE upstream_credentials SET usage_json=? "
+                    "WHERE runtime_id=?",
+                    (usage_snapshot(percent, resets_in), runtime_id))
             # S7: tb-oc5's plain account carries a stored catalog.
             conn.executemany(
                 "INSERT INTO upstream_model_catalog(upstream_id, model_id) "
@@ -567,6 +594,33 @@ def main() -> None:
                 and keys == [lapse_sibling], \
                 f"S9b: only the recovered key may serve ({status}, {statuses}, {keys})"
             print("S9b OK: all-lapsed is a local 503; recovery restores one key")
+
+            # ── S10: month kill line overrides session affinity ───────────
+            kill_p1, kill_p2 = kill_keys
+            kill_headers = {"x-claude-code-session-id": "kill-line-e2e"}
+            status, _ = send(proxy_port, "tb-oc7", {
+                "stream": False, "model": "oc7-model",
+                "messages": [{"role": "user", "content": "kill line bind"}]},
+                headers=kill_headers)
+            rid, _, statuses, keys = latest_attempts(db_path, "oc7-model")
+            assert status == 200 and statuses == [200] and keys == [kill_p1], \
+                f"S10: the higher rolling pressure must bind p1 first " \
+                f"({status}, {statuses}, {keys})"
+            # p2's month pressure is much lower than p1's (1% left over six
+            # days vs 98% over twenty), so only the kill-line tier can move
+            # it over the session-bound p1.
+            set_usage(db_path, kill_p2, usage_snapshot(
+                20, 7200, month_percent=99, month_resets_in=6 * 86400))
+            rid, statuses, keys = send_until_served(
+                db_path, proxy_port, "tb-oc7",
+                {"stream": False, "model": "oc7-model",
+                 "messages": [{"role": "user",
+                               "content": "kill line take over"}]},
+                "oc7-model", kill_p2, rid, headers=kill_headers)
+            assert statuses == [200] and keys == [kill_p2], \
+                f"S10: the kill-line key must override the binding " \
+                f"({statuses}, {keys})"
+            print("S10 OK: month kill line overrides session affinity")
 
             print("opencode session tests passed")
         finally:

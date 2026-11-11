@@ -301,9 +301,10 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
     const auto scope = affinity_scope(ar.route.local_key_id, harness);
     const auto bound = affinity_bound_index(affinity_, scope, session_id,
                                             cands);
+    const std::int64_t now = wall_now_epoch();
     const auto order = candidate_order(
         cands, bound, routing_rr_.fetch_add(1, std::memory_order_relaxed),
-        wall_now_epoch(), &cost_ledger_, &gate_);
+        now, &cost_ledger_, &gate_);
     const auto base_timeouts = timeout_config_cached(request_policy.kind);
     const int budget_seconds = base_timeouts.non_streaming_timeout > 0
         ? base_timeouts.non_streaming_timeout : 600;
@@ -335,10 +336,12 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
             attempt_timeouts.non_streaming_timeout,
             static_cast<int>((attempt.remaining_budget_ms + 999) / 1000)));
         TB_LOG_DEBUG("[Proxy] %s %s request from key_id=%d to account=%d "
-                        "credential=%d profile=%s model=%s (concurrent=%d)\n",
+                        "credential=%d kill_line=%d profile=%s model=%s "
+                        "(concurrent=%d)\n",
                 ir::to_string(harness).c_str(),
                 (harness == upstream) ? "passthrough" : "convert",
                 ar.route.local_key_id, c.account().id, c.key_slot_id,
+                candidate_in_kill_line(c, now) ? 1 : 0,
                 c.account().profile->name, c.upstream_model().c_str(),
                 concurrent_count);
 

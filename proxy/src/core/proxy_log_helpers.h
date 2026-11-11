@@ -258,10 +258,11 @@ inline AttemptExecutor::CandidateSkipped proxy_candidate_skip_logger(
             TB_LOG_DEBUG(
                 "[Proxy] candidate skipped request_id=%llu reason=%s "
                 "upstream_account_id=%d upstream_id=%d upstream_key_id=%d "
-                "priority_group=%d\n",
+                "priority_group=%d kill_line=%d\n",
                 static_cast<unsigned long long>(context.request_id), reason,
                 candidate.account().id, candidate.account().upstream_id,
-                candidate.key_slot_id, candidate.priority_group);
+                candidate.key_slot_id, candidate.priority_group,
+                candidate_in_kill_line(candidate, wall_now_epoch()) ? 1 : 0);
             return;
         }
         const bool throttled =

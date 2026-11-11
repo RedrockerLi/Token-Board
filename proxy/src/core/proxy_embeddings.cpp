@@ -76,11 +76,12 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
     const auto embedding_deadline = t0 + std::chrono::seconds(embedding_budget_seconds);
 
     // Embeddings carry no conversation, so no session binding applies; the
-    // same ordering still vetoes exhausted keys and balances by pressure and
-    // cumulative cost.
+    // same ordering still vetoes exhausted keys, honors the month kill line,
+    // and balances by pressure and cumulative cost.
+    const std::int64_t now = wall_now_epoch();
     const auto order = candidate_order(
         cands, std::nullopt, routing_rr_.fetch_add(1, std::memory_order_relaxed),
-        wall_now_epoch(), &cost_ledger_, &gate_);
+        now, &cost_ledger_, &gate_);
     AttemptExecutor executor(gate_);
     auto outcome = executor.execute(
         {&cands, order, embedding_deadline, embedding_budget_seconds,
@@ -93,8 +94,9 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
         concurrent_count = in_flight_count();
 
         TB_LOG_DEBUG("[Proxy] embedding request from key_id=%d to account=%d "
-                        "model=%s (concurrent=%d)\n",
-                ar.route.local_key_id, c.account().id,
+                        "credential=%d kill_line=%d model=%s (concurrent=%d)\n",
+                ar.route.local_key_id, c.account().id, c.key_slot_id,
+                candidate_in_kill_line(c, now) ? 1 : 0,
                 c.upstream_model().c_str(), concurrent_count);
 
         return forward_endpoint_attempt(
