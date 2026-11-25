@@ -4,7 +4,7 @@
 -- charges as separate ledgers.  The homepage only needs a stable user
 -- identity with its cumulative actual spend and a daily model usage grain.
 -- Rebuild the archive in that shape while preserving the existing visible
--- token/request/theoretical/actual totals.
+-- token/request/api-equivalent/actual totals.
 
 PRAGMA foreign_keys = OFF;
 

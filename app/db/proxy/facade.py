@@ -69,13 +69,13 @@ class ProxyDatabase(
             start_text = format_utc(now - timedelta(days=30))
             usage = conn.execute(
                 "SELECT COUNT(*) total_requests,COALESCE(SUM(total_tokens),0) total_tokens,"
-                "COALESCE(SUM(equivalent_cost),0) theoretical_cost,"
+                "COALESCE(SUM(equivalent_cost),0) api_equivalent_cost,"
                 "COALESCE(SUM(billed_usage_cost),0) billed_usage_cost "
                 "FROM request_log r " + attributed_request_sql("r"),
                 {"start": start_text, "end": now_text},
             ).fetchone()
             daily = conn.execute(
-                "SELECT COUNT(*) requests,COALESCE(SUM(equivalent_cost),0) theoretical,"
+                "SELECT COUNT(*) requests,COALESCE(SUM(equivalent_cost),0) api_equivalent,"
                 "COALESCE(SUM(billed_usage_cost),0) metered FROM request_log r "
                 + attributed_request_sql("r") + " AND date(r.requested_at)=:today",
                 {"start": f"{today}T00:00:00Z", "end": now_text, "today": today},
@@ -102,8 +102,8 @@ class ProxyDatabase(
                 "metered_cost": round(costs["metered_cost"], 4),
                 "recurring_cost": round(costs["recurring_cost"], 4),
                 "total_cost": round(costs["total_cost"], 4),
-                "today_cost": round(daily["theoretical"], 4),
-                "theoretical_cost": round(usage["theoretical_cost"], 4),
+                "today_cost": round(daily["api_equivalent"], 4),
+                "api_equivalent_cost": round(usage["api_equivalent_cost"], 4),
                 "today_actual_cost": round(daily["metered"], 4),
                 "total_tokens": usage["total_tokens"],
                 "active_upstreams": active_upstreams,

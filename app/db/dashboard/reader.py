@@ -73,7 +73,7 @@ class DashboardReaderMixin:
             request_usages.append({**base, "count": int(row["request_count"])})
             equivalent = int(row["api_equivalent_cost_micro_cny"] or 0) / 1_000_000
             cost_entries.append({
-                **base, "cost": equivalent, "theoretical_cost": equivalent,
+                **base, "cost": equivalent, "api_equivalent_cost": equivalent,
                 "actual_cost": 0.0,
             })
             months_set.add((year, month))

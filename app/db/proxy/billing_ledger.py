@@ -36,13 +36,13 @@ class ProxyBillingLedgerMixin:
                        CASE WHEN ai.account_kind='agent' THEN 'agent'
                             ELSE r.source_kind END AS source_kind,
                        COALESCE(SUM(r.billed_usage_cost), 0) AS real_cost,
-                       COALESCE(SUM(r.equivalent_cost), 0) AS theoretical_cost,
+                       COALESCE(SUM(r.equivalent_cost), 0) AS api_equivalent_cost,
                        COALESCE(SUM(r.total_tokens), 0) AS tokens,
                        COUNT(*) AS requests
                 FROM request_log r
             """ + attributed_request_sql("r") + """ AND date(r.requested_at)=:today
                 GROUP BY ai.id
-                ORDER BY theoretical_cost DESC
+                ORDER BY api_equivalent_cost DESC
             """, {"start": f"{today}T00:00:00Z", "end": format_utc(now),
                   "today": today}).fetchall()
             return [dict(r) for r in rows]

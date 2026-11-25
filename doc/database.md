@@ -8,9 +8,9 @@
 
 Proxy V1 将历史身份、实时转发与计费拆开：`account_identities` 保存不可删除的历史 ID/UUID/名称，`accounts` 只表示当前实时资源；`upstreams` 是 endpoint/auth/concurrency；`route_sets` 与 `route_rules` 是唯一的路由模型；`client_keys` 只绑定 route set；`upstream_credentials` 保存稳定 UUID、掩码和生命周期，配置的明文位于 `upstream_secrets`。智能体订阅和软件来源分别位于 `agent_subscriptions` / `agent_software`，不再作为上游账户；订阅与实例另有不可删除的 `agent_subscription_identities` / `agent_subscription_instance_identities`，实时订阅图可以物理删除而不影响历史账单。
 
-计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 theoretical `equivalent_cost` 与 actual usage `billed_usage_cost`；冻结后的周期账单会产生一条不可变的 `billing_export_events`，供 dashboard 独立增量导出；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
+计费由 `billing_contracts`、`billing_rate_events`、`billing_period_charges`、`pricing_rules/slots`、`fx_rates` 驱动。`request_log` 每请求一行，保存 API 等值口径的 `equivalent_cost` 与按量实付的 `billed_usage_cost`；冻结后的周期账单会产生一条不可变的 `billing_export_events`，供 dashboard 独立增量导出；`request_attempts` 保存每次候选尝试和分段网络耗时。所有时间为 UTC，日志分页索引是 `(requested_at,id)`。
 
-Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、理论消费和实际消费，`monthly_recurring_costs` 保存直接归属或历史分摊后的实际周期费用。实时软件配置和 Agent 订阅配置可以物理删除，历史 identity、请求归属和冻结账务继续保留。所有名称字段（账户、路由、软件、订阅、实例标签）都只是展示属性，不能作为关联键、主键、外键或唯一生命周期键；这条规则由 schema 不变量测试逐表强制（name 必须伴随 id 列，不进主键、不进唯一索引、不作外键任一侧）。
+Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `monthly_recurring_costs`。`accounts.account_kind='agent'` 表示智能体软件，代理库中的 `agent_software.id` 与它共享同一个整数身份；`daily_usage` 的 grain 为 `UTC date × account × model`，同时保存 token、request、API 等值消费和实际消费，`monthly_recurring_costs` 保存直接归属或历史分摊后的实际周期费用。实时软件配置和 Agent 订阅配置可以物理删除，历史 identity、请求归属和冻结账务继续保留。所有名称字段（账户、路由、软件、订阅、实例标签）都只是展示属性，不能作为关联键、主键、外键或唯一生命周期键；这条规则由 schema 不变量测试逐表强制（name 必须伴随 id 列，不进主键、不进唯一索引、不作外键任一侧）。
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
@@ -93,7 +93,7 @@ V2.2 保留 V1/V2.1 的身份、请求和高水位结构，并将 Agent 计费�
 `source_key` 为 `agent_subscription_period_charges.id`，导出扫描所有已冻结周期费用并按源键补发，
 不依赖物化时间。V2.1 历史分摊仍使用 `period_charge_id:software_id` 旧源键兼容导出。源事实重新
 比对载荷时 `account_name` 按展示属性跳过——账户改名不构成载荷变更，事件保留首次冻结时的名字。
-Dashboard `monthly_recurring_costs` 使用 `is_frozen`/`frozen_on`，不再保存 `charge_frozen_at`。
+Dashboard 存档不保留周期费用明细,冻结费用导出后只累加进 `users.actual_cost_micro_cny`。
 
 ## V0 token-board.db（历史参考）
 
@@ -151,7 +151,7 @@ Dashboard `monthly_recurring_costs` 使用 `is_frozen`/`frozen_on`，不再保�
 | `completion_tokens` | 输出 |
 | `cache_read_tokens` | 输入缓存命中部分 |
 | `total_tokens` | 输入 + 输出 |
-| `api_cost` | api 等价价:api 账户 = 真实账单,plan/agent = 虚拟口径(买套餐省下的金额)。0007 起 `cost` + `virtual_cost` 两列合并为这一列,由数据库写入触发器按当前配置固化 |
+| `api_cost` | `equivalent_cost` 的生成列(只读):api 账户 = 真实账单,plan/agent = 虚拟口径(买套餐省下的金额);由数据库触发器按当前配置固化 |
 | `upstream_key_id` | 实际转发用的上游密钥(0007 起)。无外键,密钥删除后保留 NULL |
 | `event_id` | 幂等键(0012):事件日志重放(COMMIT 结果不确定)时保证同一事件只记一行。代理写入时生成 32 位十六进制随机值，重放沿用 spool 中的同一值；journal 的终态 `[ProxyError]` 行带 `event_id=`，可直接定位该行 |
 | `pricing_status` | 新写入先为 `pending`；当前规则和汇率可用时写为 `rated`，否则写为 `unrated`；历史导入行可保留 `frozen` |
@@ -225,13 +225,15 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 ## dashboard.db
 
-可视化**存档**库,历史结构表定义在 `schema/dashboard/v1/1-*.sql`(V1.0–V1.7),当前运行结构为 `users` 与 `daily_model_usage` 两张表(由 `schema/dashboard/v2/2-*.sql` 升级到 V2.2)。**纯存档**:只有用量与总价及不可见的账单导出状态,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
+可视化**存档**库,历史结构表定义在 `schema/dashboard/v0/0-*.sql` 与 `schema/dashboard/v1/1-*.sql`(V1.0–V1.7),当前运行结构为 `users` 与 `daily_model_usage` 两张表(由 `schema/dashboard/v2/2-*.sql` 升级到 V2.2)。**纯存档**:只有用量与总价及不可见的账单导出状态,无价格表、无任何重算能力。写入是**增量**的(`ON CONFLICT DO UPDATE … +=`),每批导出只加一次,永不双计、永不被改价回溯。
 
 存档分桶键统一为稳定账户身份(V2.2 落为 `users.id`,迁移把无法归属的既有聚合归入 id=0 的`归档`),显示名字来自 `account_identities` 镜像；实时账户删除后仍可继续导出历史请求和冻结费用。Dashboard 侧不再使用账单回执表，导出事件在 Token Board 以 `(source_table,source_key)` 去重后按高水位导入；仪表盘按用户筛选即按账户筛选，费用直接汇总该账户名下已归属的 ledger 行。
 
+以下三节是已被迁移删除的 V0/V1 旧存档表,仅作迁移审计参考;当前结构只有 `users` 与 `daily_model_usage`。
+
 ### token_usage / request_usage
 
-`token_usage` 每行一天某账户某模型某 token 类型的量,`token_type` 取值 `output` / `input_cache_hit` / `input_cache_miss`,唯一键 `(date, model, account_id, token_type)`。`request_usage` 同理记请求数,唯一键 `(date, model, account_id)`。V1 的 `daily_usage` 同时保存 `equivalent_cost`（理论成本）和 `billed_usage_cost`（实际用量成本），报表不再按 token 占比分摊。
+`token_usage` 每行一天某账户某模型某 token 类型的量,`token_type` 取值 `output` / `input_cache_hit` / `input_cache_miss`,唯一键 `(date, model, account_id, token_type)`。`request_usage` 同理记请求数,唯一键 `(date, model, account_id)`。V1 的 `daily_usage` 同时保存 `equivalent_cost`（API 等值成本）和 `billed_usage_cost`（实际用量成本），报表不再按 token 占比分摊。
 
 ### cost_entry
 

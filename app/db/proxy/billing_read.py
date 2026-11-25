@@ -230,7 +230,7 @@ class ProxyBillingReadMixin:
             conn.close()
 
     def get_daily_billing_by_model(self, days: int = 30) -> list[dict]:
-        """Daily traffic with separate actual and theoretical cost fields."""
+        """Daily traffic with separate actual and API-equivalent cost fields."""
         conn = self._connect()
         try:
             start, end = self._utc_window(days)

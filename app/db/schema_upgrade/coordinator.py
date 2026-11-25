@@ -109,7 +109,7 @@ def _dashboard_v22_totals(path: Path, *, new: bool) -> dict[str, float] | None:
             return {
                 "input": int(row[0]), "cache": int(row[1]),
                 "output": int(row[2]), "requests": int(row[3]),
-                "theoretical": float(row[4]) / 1_000_000,
+                "api_equivalent": float(row[4]) / 1_000_000,
                 "actual": float(actual) / 1_000_000,
             }
         if not table_exists(conn, "daily_usage"):
@@ -136,7 +136,7 @@ def _dashboard_v22_totals(path: Path, *, new: bool) -> dict[str, float] | None:
         return {
             "input": int(row[0]), "cache": int(row[1]),
             "output": int(row[2]), "requests": int(row[3]),
-            "theoretical": float(row[4]),
+            "api_equivalent": float(row[4]),
             "actual": float(row[5]) + float(recurring),
         }
     finally:
@@ -152,7 +152,7 @@ def _validate_dashboard_v22_migration(path: Path, before: dict) -> dict:
                 f"{before[field]} != {after[field]}")
     differences = {
         field: round(after[field] - before[field], 6)
-        for field in ("theoretical", "actual")
+        for field in ("api_equivalent", "actual")
     }
     if any(abs(value) > 0.01 for value in differences.values()):
         raise UpgradeError(

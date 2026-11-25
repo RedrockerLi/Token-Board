@@ -31,8 +31,8 @@
 | 是否可被本地密钥路由 | 是 | 是 |
 | 调用量来源 | 代理转发自动记账 | 代理转发自动记账 |
 | 子分类 | 无 | 有（如 `opencode-go`）：预设 + 用量查询 + 上游会话头 |
-| `request_log.api_cost` 含义 | 真实账单 | 虚拟/理论消费(套餐省下的钱) |
-| 真实成本存档 | 进 `cost_entry` | 进 `proxy_plan_summary.subscription_cost` |
+| `request_log.api_cost` 含义 | 真实账单 | 虚拟消费(API 等值,套餐省下的钱) |
+| 真实成本存档 | 请求行 `billed_usage_cost` 累加进 dashboard `users.actual_cost_micro_cny` | 冻结周期费用经 `billing_export_events` 累加进同一处 |
 | 429 处理 | 本次请求回退到下一候选，不记忆冷却 | 配额耗尽的密钥**冷却 5 小时** |
 
 ### api 账户（按量计费）
@@ -63,7 +63,7 @@
 - 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`。软件与订阅通过 `agent_subscription_bindings` 保存日期粒度的有效关系：同一有效日期至多归属一个 Agent，但绑定可以解绑或改绑；账单物化时按当时有效状态直接把费用归属到 Agent。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名和实例标签只是用户记忆用的属性，不是主键或历史关联键，同名订阅可以重建。
 - 智能体不属于上游账户，也不参与本地密钥路由。软件身份使用与上游统一的整数 ID；订阅保存在 `agent_subscriptions`，订阅和实例的 `valid_from` 只保存 UTC 日期并默认从该日 `00:00Z` 生效，可有多个 `agent_subscription_instances`。软件与订阅通过 `agent_subscription_bindings` 保存日期粒度的有效关系：同一有效日期至多归属一个 Agent，但绑定可以解绑或改绑；账单物化时按当时有效状态直接把费用归属到 Agent。订阅/实例的稳定历史身份分别保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`；实时订阅图删除后，冻结账单仍按 `id`/`uuid` 导出。订阅名、实例标签、软件名、账户名和路由名都只是用户记忆用的属性，不是主键、外键、唯一生命周期键或历史关联键，同名资源可以重建。
 - 用量来自**token-maintenance 导入服务**：[maintenance.py](../maintenance.py) 管理唯一 worker，在维护服务启动时立即运行、每 30 分钟运行，浏览器打开仪表盘时通过 Unix datagram socket 异步唤醒；[agent_usage](../app/services/agent_usage/) 按 `agent_kind` 选择独立 adapter，把各来源归一为 Python Usage IR，再写成 `request_log` 行。`event_id` 幂等，`project` 与 `session_id` 只在导入过程的内存中使用。
-- dashboard 的条目以软件/智能体为单位：理论消费来自导入用量，实际消费来自周期物化时直接归属该软件的订阅费用；未绑定时不生成新的实际费用。没有绑定关系不会自动推断。
+- dashboard 的条目以软件/智能体为单位：API 等值消费来自导入用量，实际消费来自周期物化时直接归属该软件的订阅费用；未绑定时不生成新的实际费用。没有绑定关系不会自动推断。
 
 ## 三、单上游多密钥
 
@@ -157,21 +157,21 @@
 
 ## 七、数据导出链路行为
 
-「导出数据」（或 WebDAV 同步里的导出步骤）把 `request_log` 中 `(高水位 mark, max_id]` 的增量聚合成 `dashboard.db` 存档（[app/db/proxy_db.py:1551-1662](app/db/proxy_db.py#L1551-L1662)）。
+「导出数据」（或 WebDAV 同步里的导出步骤）把 `request_log` 中 `(高水位 mark, max_id]` 的用量增量与 `billing_export_events` 中未导出的冻结费用聚合成 `dashboard.db` 存档（[app/db/proxy/export.py](app/db/proxy/export.py)）。
 
-### 用量：日×账户×模型 → 存档
+### 用量：日×身份×模型 → 存档
 
-- 按 `(date, account_id, model)` 聚合：token 分三种类型进 `token_usage`（output / input_cache_hit / input_cache_miss），请求数进 `request_usage`，`SUM(api_cost)` 进 `cost_entry`。
-- **过滤条件**：
-  - 排除 `model='unknown'` / 空模型；
-  - **排除聚合账户**——聚合产生的零 token 失败行绝不允许污染用量存档（[app/db/proxy_db.py:1590-1596](app/db/proxy_db.py#L1590-L1596)）。
-- `api_cost` 是**写时固化**的值，导出直接加总，不再重算——改价不影响已导出金额。
-- 存档按 `account_id` 分桶，显示名来自 `accounts` 镜像（账户改名回放见 [sync.md](sync.md)）。
+- 按 `(date, COALESCE(account_identity_id, account_id), model)` 聚合：token（输入 / 缓存读 / 输出）与请求数写入 `daily_model_usage`，`SUM(equivalent_cost)` 写入 `api_equivalent_cost_micro_cny`，`SUM(billed_usage_cost)` 累加进 `users.actual_cost_micro_cny`。
+- 冻结的周期费用（plan 每把 Key 与智能体订阅）经 `billing_export_events` 同样累加进 `users.actual_cost_micro_cny`。
+- **过滤条件**：只导成功请求（`status_code` 200–299），排除 `model='unknown'` / 空模型；失败/中断产生的零 token 行留在 `request_log` 供诊断，不进入存档。
+- `equivalent_cost`（即 `api_cost`）是**写时固化**的值，导出直接加总，不再重算——改价不影响已导出金额。
+- 存档按稳定身份（`users.id`）分桶，显示名同步自 `account_identities`（账户改名回放见 [sync.md](sync.md)）。
+- 已导出的请求行 30 天后清理，历史金额以存档为准。
 
 ### plan / 智能体经济账
 
-- **订阅费**是派生状态：plan 按每把 Key 的生命周期进入 `proxy_plan_summary`；智能体订阅实例按自身生命周期并依据绑定关系分摊进入统一的 `monthly_recurring_costs`。金额按**计费周期开始日的汇率**换算并锁定，过去周期冻结。
-- **虚拟消费**是追加式：订阅类型的 `request_log` 行按 `(行政月, 账户, masked Key)` 累加进 `virtual_cost`，30 天后日志清理无法回填（[app/db/proxy_db.py:1635-1652](app/db/proxy_db.py#L1635-L1652)）。
+- **订阅费**是派生状态：plan 每把 Key 与智能体订阅的周期费用在冻结时按**计费周期开始日的汇率**换算并锁定，经 `billing_export_events` 增量导出到 dashboard，过去周期冻结。
+- **API 等值消费**是追加式：订阅类型请求行的 `equivalent_cost` 即虚拟口径金额，随用量行汇入 `daily_model_usage.api_equivalent_cost_micro_cny`；日志 30 天后清理，历史金额以存档为准。
 - USD 订阅按**计费周期开始日**的 USD→CNY 汇率换算并锁定；缺失时通过 frankfurter 历史接口（`?date=period_start`）补拉，失败则用最近已存汇率作临时值持续重试（[app/db/proxy/billing.py](app/db/proxy/billing.py) `_normalized_charge`）。
 
 ### 高水位与云同步

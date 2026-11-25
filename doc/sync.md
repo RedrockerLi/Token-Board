@@ -28,7 +28,7 @@ Token Board 使用两条 WebDAV 数据链路：`token-board.db` 的配置镜像�
 
 dashboard 导出文件只包含聚合存档及必要的名称镜像：
 
-- 统一用量与费用：`accounts`、`daily_usage`、`monthly_recurring_costs`；其中 `accounts.account_kind` 标识代理上游或智能体软件。
+- 统一用量与费用：`users`、`daily_model_usage`；`users` 保存稳定账户/软件身份与累计实际消费。
 
 Agent 导入过程中的 `project` 与 `session_id` 不写入 `request_log`，因此不会进入 dashboard，也不会从请求日志 API 返回。
 

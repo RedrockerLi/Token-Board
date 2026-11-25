@@ -18,7 +18,7 @@ from app.tests.support import AppDatabaseTestCase, sqlite_connection
 # billing-health fields intentionally stay live-configuration readings.
 ATTRIBUTED_STATS = (
     "total_requests", "today_requests", "metered_cost", "recurring_cost",
-    "total_cost", "today_cost", "theoretical_cost", "today_actual_cost",
+    "total_cost", "today_cost", "api_equivalent_cost", "today_actual_cost",
     "total_tokens", "active_upstreams",
 )
 

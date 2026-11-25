@@ -103,4 +103,4 @@ Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查�
 版本选择插件，再由统一升级边界在 shadow 上执行。业务 facade、reconcile 和
 C++ 请求路径不承担迁移职责。
 
-**计费是合同驱动。** 路由核心只处理 `api/plan` 上游。智能体订阅使用独立的 `agent_subscriptions`、实例、价格历史和周期费用表；软件用量使用独立的 `agent_software`，周期费用在物化时直接写入当时有效的 Agent。绑定可以解绑或改绑；理论消费来自软件用量，未绑定时不生成新的实际费用。
+**计费是合同驱动。** 路由核心只处理 `api/plan` 上游。智能体订阅使用独立的 `agent_subscriptions`、实例、价格历史和周期费用表；软件用量使用独立的 `agent_software`，周期费用在物化时直接写入当时有效的 Agent。绑定可以解绑或改绑；API 等值消费来自软件用量，未绑定时不生成新的实际费用。

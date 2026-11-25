@@ -157,7 +157,7 @@ class AppContractTest(AppDatabaseTestCase):
         self.assertEqual(rows[1][0]["count"], 2)
         self.assertAlmostEqual(rows[2][0]["cost"], 1.25)
         self.assertAlmostEqual(rows[9][7], 1.0)
-        self.assertAlmostEqual(rows[2][0]["theoretical_cost"], 1.25)
+        self.assertAlmostEqual(rows[2][0]["api_equivalent_cost"], 1.25)
 
     def test_account_templates_aggregate_and_credential_identity(self) -> None:
         database = self.proxy_database()
@@ -289,7 +289,7 @@ class AppContractTest(AppDatabaseTestCase):
                        if item["id"] == account_id)
         self.assertEqual(account["key_count"], 1)
 
-    def test_actual_and_theoretical_cost_are_not_added_together(self) -> None:
+    def test_actual_and_api_equivalent_cost_are_not_added_together(self) -> None:
         database = self.proxy_database()
         account_id = database.create_account({
             "name": "cost-account", "account_type": "api",

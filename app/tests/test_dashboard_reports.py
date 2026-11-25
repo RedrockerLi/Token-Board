@@ -11,7 +11,7 @@ class DashboardReportsTest(AppDatabaseTestCase):
     """Golden-cost assertions for the dashboard report routes.
 
     These pin the V2.2 dashboard contract: actual cost is stored on stable
-    users, while daily model rows provide token counts and theoretical cost.
+    users, while daily model rows provide token counts and API-equivalent cost.
     """
 
     def setUp(self) -> None:
@@ -97,17 +97,17 @@ class DashboardReportsTest(AppDatabaseTestCase):
     def test_summary_uses_canonical_ledger(self) -> None:
         summary = self.client.get("/api/summary").get_json()
         # V2.2 stores actual cost on the stable user identity and keeps model
-        # costs theoretical in the daily projection.
+        # costs API-equivalent in the daily projection.
         self.assertAlmostEqual(summary["actual_cost"], 17.0)
-        self.assertAlmostEqual(summary["theoretical_total_cost"], 20.0)
+        self.assertAlmostEqual(summary["api_equivalent_total_cost"], 20.0)
         self.assertEqual(summary["total_tokens"], 90)
         self.assertEqual(summary["total_requests"], 4)
         self.assertAlmostEqual(
-            summary["model_breakdown"]["model-a"]["theoretical_cost"], 7.0)
+            summary["model_breakdown"]["model-a"]["api_equivalent_cost"], 7.0)
         self.assertAlmostEqual(
-            summary["model_breakdown"]["model-b"]["theoretical_cost"], 4.0)
+            summary["model_breakdown"]["model-b"]["api_equivalent_cost"], 4.0)
         self.assertAlmostEqual(
-            summary["model_breakdown"]["plan-model"]["theoretical_cost"], 9.0)
+            summary["model_breakdown"]["plan-model"]["api_equivalent_cost"], 9.0)
         self.assertAlmostEqual(summary["model_breakdown"]["plan-model"]["cost"], 9.0)
 
     def test_summary_monthly_decay_uses_explicit_baseline_without_writing(self) -> None:
@@ -142,7 +142,7 @@ class DashboardReportsTest(AppDatabaseTestCase):
         )
         self.assertEqual(summary["total_requests"], before["total_requests"])
         self.assertAlmostEqual(
-            summary["theoretical_total_cost"], before["theoretical_total_cost"])
+            summary["api_equivalent_total_cost"], before["api_equivalent_total_cost"])
         self.assertAlmostEqual(
             summary["model_breakdown"]["recent-model"]["weighted_total_tokens"],
             100,
@@ -225,14 +225,14 @@ class DashboardReportsTest(AppDatabaseTestCase):
         self.app.config["DATA_STORE"].load()
         after = self.client.get("/api/summary").get_json()
         self.assertAlmostEqual(
-            after["theoretical_total_cost"], before["theoretical_total_cost"])
+            after["api_equivalent_total_cost"], before["api_equivalent_total_cost"])
         self.assertAlmostEqual(after["actual_cost"], before["actual_cost"])
 
         # The local consumption report is attributed by identity: the same
         # delete changes every number by exactly nothing.
         stats_after = database.get_stats()
         for key in ("total_requests", "metered_cost", "recurring_cost",
-                    "total_cost", "theoretical_cost", "total_tokens"):
+                    "total_cost", "api_equivalent_cost", "total_tokens"):
             self.assertEqual(stats_after[key], stats_before[key], key)
         self.assertEqual(database.get_daily_billing(), daily_before)
 

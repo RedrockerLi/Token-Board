@@ -75,7 +75,7 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
         stats = self.client.get("/api/proxy/stats").get_json()
         self.assertTrue({
             "total_requests", "today_requests", "metered_cost", "recurring_cost",
-            "total_cost", "today_cost", "theoretical_cost", "today_actual_cost",
+            "total_cost", "today_cost", "api_equivalent_cost", "today_actual_cost",
             "total_tokens", "active_upstreams", "active_accounts",
             "billing_incomplete_count", "billing_health",
         } <= stats.keys())
@@ -146,7 +146,7 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
             "total_output_tokens", "total_input_cache_hit_tokens",
             "total_input_cache_miss_tokens", "total_input_tokens", "total_tokens",
             "weighted_total_tokens", "total_requests", "actual_cost",
-            "theoretical_total_cost",
+            "api_equivalent_total_cost",
             "model_breakdown", "users", "models", "available_months",
         })
         daily = self.client.get("/api/daily?year=2026&month=8").get_json()

@@ -69,17 +69,14 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 
 ## 仪表盘上的消费口径
 
-数据来源:代理导出的数据按 `request_log.api_cost`(写时固化)聚合写入 `cost_entry`。CSV 导入已弃用,
-存量 CSV 数据已并入 DeepSeek 账户,`cost_entry` 不再有 `source` 列。
+数据来源:代理导出的数据按 `request_log.api_cost`(写时固化)聚合写入 dashboard 存档的 `daily_model_usage`(每日 × 稳定身份 × 模型);`billed_usage_cost` 与冻结的账单导出事件累加进 `users.actual_cost_micro_cny`。
 
 - **总消费(真实)**:api 账户按量费用 + plan/智能体月费。主仪表盘为存档全量口径;代理账单页为**近 30 天滚动、按历史身份归属**口径
   (近 30 天请求行按 `COALESCE(account_identity_id, account_id)` 归属的按量费用 + 窗口内已冻结的周期费用事实——每把 plan 密钥月费与智能体周期费用;USD 订阅费按冻结时锁定的汇率折 CNY)。归属不要求实时账户/密钥/软件存在，删除或改名不改变历史金额。
 - **今日消费**:今日全部 `SUM(api_cost)`(api 真实账单 + plan 虚拟口径,`get_stats` 限今日)。
-- **理论消费**:api 按量 + plan 虚拟消费,即完全不买 plan 全按 api 计费应花的金额；智能体理论用量可在独立软件用量存档查看。
+- **API 等值消费**:api 按量 + plan 虚拟消费,即完全不买 plan、全部按 api 计价应花的金额；智能体按 API 计价折算的用量可在独立软件用量存档查看。主仪表盘展示存档全量口径,代理账单页展示**近 30 天滚动**口径。
 
-`proxy_plan_summary` 表按“行政月 × 账户 × masked 密钥”保存。订阅费由生命周期和价格历史校准，
-虚拟消费仍是追加式归档。`/api/summary` 据此返回 `plan_subscription_cost` 与 `plan_virtual_cost`,
-前端把月费加进总消费、把虚拟消费显示为"理论消费"。日志导出 30 天后清理，因此无法回填已清理的历史虚拟消费。
+`proxy_plan_summary` 已不再参与当前存档(dashboard 的 `accumulate_plan_summary` 是兼容空操作):plan 的虚拟金额随请求行一并汇入 `daily_model_usage.api_equivalent_cost_micro_cny`,订阅月费由冻结的账单导出事件累加进 `users.actual_cost_micro_cny`。`/api/summary` 返回 `actual_cost` 与 `api_equivalent_total_cost`,前端把前者作为总消费、后者显示为"API 等值消费"。日志导出 30 天后清理,历史金额以存档为准。
 
 ## 智能体订阅与软件用量
 
@@ -87,7 +84,7 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 
 - 用量由**token-maintenance 进程内的单一 worker** 导入:维护服务启动时立即运行一次,之后每 30 分钟运行一次;浏览器每次打开仪表盘还会通过本地 Unix datagram socket 异步唤醒同一个 worker。启动、定时和浏览器触发串行执行,不会并发争抢 SQLite 游标。
 - 各 agent adapter 读取自己的本地 JSONL、SQLite、JSON 或云端导出源，统一输出 `UsageEvent`；通用 importer 按 `event_id` 幂等，把用量写入 `request_log` 的统一智能体身份。`project` 与 `session_id` 只在导入过程的内存中使用，不持久化。
-- 智能体用量和代理用量统一进入 dashboard 的 `daily_usage`；绑定变更不按操作时刻切分费用，账单物化时读取当日有效 Agent 并把归属直接固化到周期费用；已生成的费用不会因之后解绑或改绑而迁移。首次绑定当前周期时会在同一事务中触发物化，导出无需等待 UTC 日切换；之后按周期开始日生成后续费用，不做 intraday/proration。Dashboard 条目仍以软件为单位：实际消费来自周期费用，理论消费来自软件用量；没有绑定时不生成新的实际费用。订阅与实例的历史身份独立保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`，删除实时订阅不会删除已冻结账单；名称只是展示属性，同名订阅可以重建。V2.2 新导出事件以 `agent_subscription_period_charges` 的 `period_charge_id` 为源键补发，重复导出幂等；V2.1 旧分摊事件继续按旧源键读取。
+- 智能体用量和代理用量统一进入 dashboard 的 `daily_model_usage`；绑定变更不按操作时刻切分费用，账单物化时读取当日有效 Agent 并把归属直接固化到周期费用；已生成的费用不会因之后解绑或改绑而迁移。首次绑定当前周期时会在同一事务中触发物化，导出无需等待 UTC 日切换；之后按周期开始日生成后续费用，不做 intraday/proration。Dashboard 条目仍以软件为单位：实际消费来自周期费用，API 等值消费来自软件用量；没有绑定时不生成新的实际费用。订阅与实例的历史身份独立保存在 `agent_subscription_identities` / `agent_subscription_instance_identities`，删除实时订阅不会删除已冻结账单；名称只是展示属性，同名订阅可以重建。V2.2 新导出事件以 `agent_subscription_period_charges` 的 `period_charge_id` 为源键补发，重复导出幂等；V2.1 旧分摊事件继续按旧源键读取。
 
 ## 币种与汇率(CNY / USD)
 

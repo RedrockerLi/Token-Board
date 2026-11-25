@@ -265,7 +265,7 @@ function modelTokenCount(modelData) {
 function mergeModelStat(target, source) {
     var fields = [
         'output_tokens', 'input_cache_hit_tokens', 'input_cache_miss_tokens',
-        'total_tokens', 'requests', 'cost', 'theoretical_cost', 'actual_cost',
+        'total_tokens', 'requests', 'cost', 'api_equivalent_cost', 'actual_cost',
         'metered_cost', 'recurring_cost'
     ];
     fields.forEach(function (field) {
@@ -281,14 +281,14 @@ function aggregateModelBreakdown(data) {
         if (!units[modelName]) units[modelName] = {
             tokens: 0,
             weighted_tokens: 0,
-            theoretical_cost: 0,
+            api_equivalent_cost: 0,
         };
         units[modelName].tokens += modelTokenCount(modelData);
         var weighted = Number(modelData.weighted_total_tokens);
         units[modelName].weighted_tokens += isFinite(weighted)
             ? Math.max(0, weighted) : modelTokenCount(modelData);
-        units[modelName].theoretical_cost += Number(
-            modelData.theoretical_cost || 0);
+        units[modelName].api_equivalent_cost += Number(
+            modelData.api_equivalent_cost || 0);
     });
     return units;
 }
@@ -313,7 +313,7 @@ function buildModelEntries(data) {
                 name: name,
                 tokens: units[name].tokens,
                 weighted_tokens: units[name].weighted_tokens,
-                theoretical_cost: units[name].theoretical_cost,
+                api_equivalent_cost: units[name].api_equivalent_cost,
                 fullShare: weightedTotal > 0
                     ? units[name].weighted_tokens / weightedTotal : 0,
             };
@@ -365,8 +365,8 @@ function buildCalendarModelEntries(data) {
             weighted_tokens: hidden.reduce(function (sum, entry) {
                 return sum + entry.weighted_tokens;
             }, 0),
-            theoretical_cost: hidden.reduce(function (sum, entry) {
-                return sum + entry.theoretical_cost;
+            api_equivalent_cost: hidden.reduce(function (sum, entry) {
+                return sum + entry.api_equivalent_cost;
             }, 0),
             visible: false,
             rank: null,
@@ -420,11 +420,11 @@ async function loadSummary() {
     if (elStatRequests) elStatRequests.textContent = fmtNum(data.total_requests);
 
     // Actual consumption is the cumulative value stored on the selected
-    // stable user identity; theoretical consumption comes from daily model use.
+    // stable user identity; API-equivalent consumption comes from daily model use.
     if (elStatCost) elStatCost.textContent = fmtCost(data.actual_cost || 0);
     var statCostSub = document.getElementById('statCostSub');
     if (statCostSub) {
-        statCostSub.textContent = '理论消费 ' + fmtCost(data.theoretical_total_cost || 0);
+        statCostSub.textContent = 'API 等值消费 ' + fmtCost(data.api_equivalent_total_cost || 0);
     }
 
     var months = data.available_months || [];
@@ -492,7 +492,7 @@ function emptyCalendarDay(date) {
         total_tokens: 0,
         requests: 0,
         cost: 0,
-        theoretical_cost: 0,
+        api_equivalent_cost: 0,
         actual_cost: 0,
         metered_cost: 0,
         recurring_cost: 0,
@@ -503,7 +503,7 @@ function emptyCalendarDay(date) {
 function mergeCalendarDay(target, source) {
     var numericFields = [
         'output_tokens', 'input_cache_hit_tokens', 'input_cache_miss_tokens',
-        'input_tokens', 'total_tokens', 'requests', 'cost', 'theoretical_cost',
+        'input_tokens', 'total_tokens', 'requests', 'cost', 'api_equivalent_cost',
         'actual_cost', 'metered_cost', 'recurring_cost'
     ];
     numericFields.forEach(function (field) {
@@ -518,7 +518,7 @@ function mergeCalendarDay(target, source) {
             total_tokens: 0,
             requests: 0,
             cost: 0,
-            theoretical_cost: 0,
+            api_equivalent_cost: 0,
         };
         mergeModelStat(target.by_model[modelName], source.by_model[modelName]);
     });
@@ -753,7 +753,7 @@ async function loadModelPie() {
                 name: entry.name,
                 value: entry.weighted_tokens,
                 real_tokens: entry.tokens,
-                theoretical_cost: entry.theoretical_cost,
+                api_equivalent_cost: entry.api_equivalent_cost,
                 rank: entry.rank,
                 color: entry.color,
             };

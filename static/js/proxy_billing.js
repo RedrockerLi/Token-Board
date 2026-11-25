@@ -13,7 +13,7 @@ async function loadBillingStats() {
         document.getElementById('billTotalRequests').textContent = fmtNum(stats.total_requests);
         document.getElementById('billTodayRequests').textContent = fmtNum(stats.today_requests);
         document.getElementById('billTotalCost').textContent = '¥' + (stats.total_cost || 0).toFixed(2);
-        document.getElementById('billTheoreticalCost').textContent = '¥' + (stats.theoretical_cost || 0).toFixed(2);
+        document.getElementById('billApiEquivalentCost').textContent = '¥' + (stats.api_equivalent_cost || 0).toFixed(2);
         document.getElementById('billTotalTokens').textContent = fmtNum(stats.total_tokens);
     } catch (err) {
         console.error('Failed to load billing stats:', err);
@@ -34,7 +34,7 @@ async function loadTodayUpstreamTable() {
             <tr>
                 <td><code>${esc(r.account_name)}</code></td>
                 <td>${fmtCost(r.real_cost)}</td>
-                <td>${fmtCost(r.theoretical_cost)}</td>
+                <td>${fmtCost(r.api_equivalent_cost)}</td>
                 <td>${fmtNum(r.tokens)}</td>
                 <td>${fmtNum(r.requests)}</td>
             </tr>
@@ -208,7 +208,7 @@ function initBillingPage() {
             <div class="stat-card stat-card--cost">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#A75558;"></span><span class="stat-card__label-text">近30天消费（实际）</span></div>
                 <div class="stat-card__value number-lg" id="billTotalCost">--</div>
-                <div class="stat-card__sub">近30天消费（理论）: <span id="billTheoreticalCost">--</span></div>
+                <div class="stat-card__sub">近30天消费（API 等值）: <span id="billApiEquivalentCost">--</span></div>
             </div>
         </div>
 
@@ -231,7 +231,7 @@ function initBillingPage() {
                 <div class="chart-card__title">今日活跃上游用量</div>
                 <div class="table-scroll">
                     <table class="mgmt-table" id="todayUpstreamTable">
-                        <thead><tr><th>上游</th><th>实际消费</th><th>理论消费</th><th>Token 数</th><th>调用次数</th></tr></thead>
+                        <thead><tr><th>上游</th><th>实际消费</th><th>API 等值消费</th><th>Token 数</th><th>调用次数</th></tr></thead>
                         <tbody></tbody>
                     </table>
                 </div>

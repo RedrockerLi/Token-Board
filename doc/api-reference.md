@@ -28,7 +28,7 @@
 |------|------|------|
 | `/` | GET | 渲染 `templates/index.html`(SPA) |
 | `/api/refresh` | GET | 重新扫描数据目录/重载数据库 |
-| `/api/summary` | GET | 全量汇总:各 token 类型总量、请求数、费用、模型分解、plan 经济账 |
+| `/api/summary` | GET | 全量汇总:各 token 类型总量、请求数、实际消费与 API 等值消费、模型分解 |
 | `/api/daily` | GET | 指定月份的每日明细(含按模型) |
 | `/api/token_types` | GET | Token 类型分布(输出/缓存命中/缓存未命中) |
 
@@ -58,7 +58,7 @@
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/proxy/stats` | GET | 概览:总/今日请求数、总/今日费用、token 总量、今日活跃上游 |
+| `/api/proxy/stats` | GET | 概览:近 30 天/今日请求数、近 30 天实际消费与 API 等值消费、token 总量、今日活跃上游 |
 | `/api/proxy/accounts` | GET | 上游账户列表 |
 | `/api/proxy/accounts` | POST | 新建账户(name + upstream_key 必填) |
 | `/api/proxy/accounts/<id>` | PUT | 更新账户字段 |
@@ -113,7 +113,7 @@
 | `/api/proxy/billing/daily` | GET | 近 `days` 天(默认 30)每日账单,滚动窗口 |
 | `/api/proxy/billing/daily-by-model` | GET | 近 `days` 天每日所有非聚合上游的输入/输出/缓存命中 Token 分解(堆叠柱状图用);`cost` 仅统计 `api` 类型实际费用 |
 | `/api/proxy/billing/recent-days` | GET | 近 `days` 天有数据的日期列表 |
-| `/api/proxy/billing/today-upstreams` | GET | 今日各真实上游的 真实/理论费用、token、请求数 |
+| `/api/proxy/billing/today-upstreams` | GET | 今日各真实上游的实际/API 等值费用、token、请求数 |
 | `/api/proxy/logs` | GET | 简单分页请求日志(仅参数 `page`、`per_page`；不包含 `project` 与 `session_id`) |
 
 ### 导出与同步

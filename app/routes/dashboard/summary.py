@@ -92,10 +92,10 @@ def api_summary():
         if user_id is None or entry["user_id"] == user_id
     ]
     model_cost = defaultdict(float)
-    theoretical_total = 0.0
+    api_equivalent_total = 0.0
     for entry in selected_costs:
-        value = float(entry.get("theoretical_cost", 0) or 0)
-        theoretical_total += value
+        value = float(entry.get("api_equivalent_cost", 0) or 0)
+        api_equivalent_total += value
         model_cost[entry["model"]] += value
 
     model_breakdown = {}
@@ -108,7 +108,7 @@ def api_summary():
             "total_tokens": stats["output"] + stats["input_hit"] + stats["input_miss"],
             "weighted_total_tokens": model_weighted_tokens.get(model, 0.0),
             "requests": stats["requests"],
-            "theoretical_cost": round(model_cost.get(model, 0), 6),
+            "api_equivalent_cost": round(model_cost.get(model, 0), 6),
             "cost": round(model_cost.get(model, 0), 6),
         }
 
@@ -128,7 +128,7 @@ def api_summary():
         "weighted_total_tokens": weighted_total_tokens,
         "total_requests": total_requests,
         "actual_cost": round(actual, 6),
-        "theoretical_total_cost": round(theoretical_total, 6),
+        "api_equivalent_total_cost": round(api_equivalent_total, 6),
         "model_breakdown": model_breakdown,
         "users": store.users,
         "models": store.models,
