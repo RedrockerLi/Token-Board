@@ -4,15 +4,18 @@
 
 ## 代理转发端点
 
-代理监听 8800(可配)。三个 chat 端点共用同一条管线,客户端格式由 URL 路径识别;`/v1/v1/*` 是兼容 base URL 已带 `/v1` 的客户端的别名。认证接受 `Authorization: Bearer <本地密钥>` 或 `x-api-key: <本地密钥>`。
+代理监听 8800(可配)。chat 端点共用同一条管线,客户端格式由 URL 路径识别;`/v1/v1/*` 是兼容 base URL 已带 `/v1` 的客户端的别名。认证接受 `Authorization: Bearer <本地密钥>`、`x-api-key: <本地密钥>`、`x-goog-api-key: <本地密钥>` 或 `?key=<本地密钥>`。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/v1/chat/completions` | POST | OpenAI Chat Completions 转发(harness 格式 OpenAI) |
 | `/v1/messages` | POST | Anthropic Messages 转发(harness 格式 Anthropic) |
 | `/v1/responses` | POST | OpenAI Responses 转发(harness 格式 Responses) |
+| `/v1beta/models/{model}:generateContent` | POST | Google Gemini 转发(harness 格式 Gemini);模型取自路径,`/v1/models/{model}:generateContent` 与双前缀变体同样接受 |
+| `/v1beta/models/{model}:streamGenerateContent` | POST | Gemini 流式转发;`alt` 查询参数接受但忽略,始终以 SSE 输出 |
 | `/v1/embeddings` | POST | 嵌入转发(无格式转换) |
 | `/v1/models` | GET | 模型列表(纯本地,不请求上游):聚合账户返回其 `pattern` 目录;普通账户返回数据库保存的目录(仪表盘"更新模型"维护,从未刷新则为空列表);带 `anthropic-version` 头的 Anthropic 客户端返回空目录 `{"models":[]}` |
+| `/v1beta/models` | GET | Gemini 形态的模型列表 `{"models":[{"name":"models/<id>",…}]}`,同样是纯本地读 |
 | `/v1/v1/chat/completions` 等 | 同上 | 双 `/v1` 前缀别名 |
 | `/v1/*` | OPTIONS | CORS 预检,返回 204 |
 | `/health` | GET | 健康检查,返回 `{"status":"ok","service":"token-board-proxy","concurrency":N}`(concurrency 为进程内实时并发数) |

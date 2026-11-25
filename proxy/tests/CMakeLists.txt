@@ -41,6 +41,12 @@ add_executable(format_conv_test format_conv_test.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_response.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_responses_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_google.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_google_helpers.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_google_parts.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_google_request.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_google_response.cpp
+    ${CMAKE_SOURCE_DIR}/src/format/format_google_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/format/format_media.cpp
     ${CMAKE_SOURCE_DIR}/src/format/reasoning_bridge.cpp
 )
@@ -414,6 +420,14 @@ add_test(
             ${CMAKE_SOURCE_DIR}/..
 )
 add_test(
+    NAME google_forwarding
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/google_forwarding_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
     NAME v1_admin
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/v1_admin_test.py
@@ -561,7 +575,7 @@ set_tests_properties(format_conversion session_affinity endpoint_policy source_s
     PROPERTIES LABELS "unit")
 set_tests_properties(upstream_client PROPERTIES LABELS "integration")
 set_tests_properties(
-    proxy_forwarding v1_routing model_accounting responses_forwarding v1_admin cooldown_discrimination
+    proxy_forwarding v1_routing model_accounting responses_forwarding google_forwarding v1_admin cooldown_discrimination
     fallback_matrix cooldown_probe error_shape opencode_session
     PROPERTIES LABELS "integration"
 )

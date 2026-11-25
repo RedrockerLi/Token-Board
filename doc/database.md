@@ -14,7 +14,13 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V2.7 当前增量
+## V2.8 当前增量
+
+V2.8 为 Gemini GenerateContent 增加独立的超时分组：`proxy_timeout_config` 新增一行
+`endpoint_kind='generate'`，与 chat / messages / responses 三行并列，仪表盘「通用设置 → 设置」把它作为
+`google` 一组呈现，代理按 Gemini 客户端线格式读取。该行沿用表默认值，此后由设置页维护。
+
+## V2.7 历史增量
 
 V2.7 修回导入行里被丢掉的缓存读取份额。落库口径是 `prompt_tokens` 含缓存桶
 （`prompt_tokens = 未命中输入 + cache_write + cache_read`，`total_tokens = prompt_tokens + completion_tokens`）；
@@ -104,10 +110,10 @@ Dashboard `monthly_recurring_costs` 使用 `is_frozen`/`frozen_on`，不再保�
 | `upstream_key` | 上游 API Key |
 | `deleted_at` | 到期删除的临时截止时间；生效后实时 `accounts` 行可物理删除，历史身份由 `account_identities` 保留 |
 | `base_url` | 上游 Base URL,如 `https://uni-api.cstcloud.cn/v1` |
-| `api_format` | `openai` / `openai_responses` / `anthropic`,上游线格式 |
+| `api_format` | `openai` / `openai_responses` / `anthropic` / `google`,上游线格式(读入时也接受 `gemini`) |
 | `is_aggregate` | 是否聚合账户(聚合的模型映射在 `aggregate_entries`) |
-| `endpoint_path` | 自定义上游路径;为空则按 `api_format` 推导(`/chat/completions`、`/responses`、`/v1/messages`) |
-| `auth_header` | `bearer` / `x-api-key` / `auto`(auto 按格式推导:anthropic 用 x-api-key,其余用 Bearer) |
+| `endpoint_path` | 自定义上游路径;为空则按 `api_format` 推导(`/chat/completions`、`/responses`、`/v1/messages`、`models/{model}:generateContent`)。Gemini 的覆盖路径可含 `{model}` / `{method}` 占位符 |
+| `auth_header` | `bearer` / `x-api-key` / `x-goog-api-key` / `auto`(auto 按格式推导:anthropic 用 x-api-key、google 用 x-goog-api-key,其余用 Bearer) |
 | `account_type` | `api`(按量计费)或 `plan`(订阅套餐,调用免费)。智能体不再是上游账户类型 |
 | `currency` | 订阅价原生币种 `CNY` / `USD`,默认 CNY |
 | `max_concurrency` | 并发限额,NULL=不限;达到限额的请求返回 429(聚合链内自动切下一个) |

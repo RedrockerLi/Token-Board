@@ -140,6 +140,12 @@ AuthResult extract_and_route(const httplib::Request &req,
     }
     if (local_key.empty() && req.has_header("x-api-key"))
         local_key = req.get_header_value("x-api-key");
+    // Gemini clients send their key in this header (or, historically, in the
+    // `key` query parameter).
+    if (local_key.empty() && req.has_header("x-goog-api-key"))
+        local_key = req.get_header_value("x-goog-api-key");
+    if (local_key.empty() && req.has_param("key"))
+        local_key = req.get_param_value("key");
 
     if (local_key.empty()) {
         ar.status = 401;

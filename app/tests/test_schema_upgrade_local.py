@@ -16,6 +16,21 @@ from app.db.schema_upgrade import upgrade_shadow
 from app.tests.support import sqlite_connection
 
 
+def truncate_migrations(schema_dir: Path, keep_major: int,
+                        keep_minor: int) -> None:
+    """Delete every migration after (keep_major, keep_minor) in a copied schema.
+
+    Reproducing a historical tip this way keeps these tests honest when a new
+    minor is added: a leftover later file would otherwise apply out of order
+    and record a version the upgrade then trusts.
+    """
+    for path in (schema_dir / "token-board").glob("v*/*.sql"):
+        major, minor = (int(part) for part in
+                        path.name.split("_", 1)[0].split("-"))
+        if (major, minor) > (keep_major, keep_minor):
+            path.unlink()
+
+
 class LocalSchemaUpgradeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -53,12 +68,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         dashboard = self.root / "data/dashboard.db"
         legacy_schema = self.root / "schema-v22"
         shutil.copytree(self.root / "schema", legacy_schema)
-        (legacy_schema / "token-board/v2/2-3_remove_agent_request_context.sql").unlink()
-        (legacy_schema / "token-board/v2/2-4_agent_usage_receipts.sql").unlink()
-        (legacy_schema / "token-board/v2/2-5_opencode_go_subtype.sql").unlink()
-        (legacy_schema / "token-board/v2/2-6_repair_total_tokens.sql").unlink()
-        (legacy_schema / "token-board/v2/"
-         "2-7_repair_imported_prompt_tokens.sql").unlink()
+        truncate_migrations(legacy_schema, 2, 2)
 
         ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
         with sqlite_connection(proxy) as conn:
@@ -107,8 +117,7 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
         dashboard = self.root / "data/dashboard.db"
         legacy_schema = self.root / "schema-v26"
         shutil.copytree(self.root / "schema", legacy_schema)
-        (legacy_schema / "token-board/v2/"
-         "2-7_repair_imported_prompt_tokens.sql").unlink()
+        truncate_migrations(legacy_schema, 2, 6)
         ensure_local_databases(str(proxy), str(dashboard), legacy_schema)
 
         database = ProxyDatabase(str(proxy), schema_dir=str(legacy_schema))

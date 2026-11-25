@@ -1,24 +1,24 @@
 # 格式转换
 
-代理支持三种线格式:OpenAI Chat Completions(`/v1/chat/completions`)、OpenAI Responses(`/v1/responses`)、Anthropic Messages(`/v1/messages`)。客户端(harness)与上游各用任意一种,代理在中间转换。转换逻辑全部收敛在 `proxy/src/` 的 IR + codec 层,三个 chat 端点共用同一条管线。
+代理支持四种线格式:OpenAI Chat Completions(`/v1/chat/completions`)、OpenAI Responses(`/v1/responses`)、Anthropic Messages(`/v1/messages`)、Google Gemini GenerateContent(`/v1beta/models/{model}:generateContent`)。客户端(harness)与上游各用任意一种,代理在中间转换。转换逻辑全部收敛在 `proxy/src/` 的 IR + codec 层,各 chat 端点共用同一条管线。
 
 ## 中间表示 IR
 
 `ir.h` 定义了一组平台无关的结构:`ChatRequest`(messages、tools、tool_choice、reasoning、max_tokens 等)、`ChatResponse`(content blocks、stop_reason、usage)、`StreamEvent`(文本/思考/tool 增量、消息起止、usage、错误事件)、`ContentBlock`(Text / Image / ToolUse / ToolResult / Thinking 五种)、`Usage`。
 
-三种格式的 codec 都做同一件事:把自己的线格式解析成 IR,再把 IR 序列化回自己的线格式。因此任意格式互转就是组合:
+四种格式的 codec 都做同一件事:把自己的线格式解析成 IR,再把 IR 序列化回自己的线格式。因此任意格式互转就是组合:
 
 ```
 parse(harness 格式) → IR → serialize(上游格式)
 ```
 
-`codec.h` 的 `FormatCodec` 抽象接口包括:请求解析/序列化、响应解析/序列化、流式 parser / emitter(按 `StreamEvent` 喂入喂出)、错误体归一化。三个 codec(`format_openai.cpp`、`format_anthropic.cpp`、`format_responses.cpp`)在 `main.cpp` 里注册进 `CodecRegistry`。
+`codec.h` 的 `FormatCodec` 抽象接口包括:请求解析/序列化、响应解析/序列化、流式 parser / emitter(按 `StreamEvent` 喂入喂出)、错误体归一化。四个 codec(`format_openai.cpp`、`format_anthropic.cpp`、`format_responses.cpp`、`format_google.cpp`)在 `main.cpp` 里注册进 `CodecRegistry`。
 
 ## 格式识别与透传
 
-客户端格式由请求 URL 路径识别(`harness_format_from_path`):`/v1/messages` → Anthropic,`/v1/responses` → Responses,其余按 OpenAI。客户端 base URL 若已带 `/v1` 再拼一次端点会产生 `/v1/v1/...` 双前缀,代理同时注册了 `/v1/v1/*` 别名兼容这类客户端。
+客户端格式由请求 URL 路径识别(`harness_format_from_path`):`/v1/messages` → Anthropic,`/v1/responses` → Responses,路径含 `:generateContent` / `:streamGenerateContent` → Gemini,其余按 OpenAI。Gemini 的模型是路径变量(`models/{model}:RPC`),所以该端点同时从路径取模型、从 RPC 后缀取流式开关,请求体里既没有 `model` 也没有 `stream`。客户端 base URL 若已带 `/v1` 再拼一次端点会产生 `/v1/v1/...` 双前缀,代理同时注册了 `/v1/v1/*` 别名兼容这类客户端;Gemini 的版本段与双前缀(`/v1beta/models/…`、`/v1/models/…`、`/v1/v1beta/…`)由同一条模式路由覆盖。
 
-同格式走透传快速路径:body 只做 `[1m]` 后缀剥离与模型名改写,不经 IR,流式时最多过一个 think 过滤器。跨格式才走完整的 parse → IR → serialize。流式请求是一次性选择候选,头一旦发出就无法回退;非流式请求可以按 429/5xx 回退下一个候选,见 [proxy-internals.md](proxy-internals.md)。
+同格式走透传快速路径:body 只做 `[1m]` 后缀剥离与模型名改写,不经 IR,流式时最多过一个 think 过滤器。Gemini 是例外中的更简单一档:模型只出现在 URL 里,所以同格式转发时请求体原样不动,路由改写只换路径。跨格式才走完整的 parse → IR → serialize。流式请求是一次性选择候选,头一旦发出就无法回退;非流式请求可以按 429/5xx 回退下一个候选,见 [proxy-internals.md](proxy-internals.md)。
 
 ## 流式处理
 
@@ -26,7 +26,7 @@ parse(harness 格式) → IR → serialize(上游格式)
 
 usage 的解析,非流式直接 parse 响应体(`usage_parser.cpp`);流式由各格式的增量解码器逐帧提取。openai 解码器额外识别 opencode.ai 的非标准 `x-opencode-type: inference-cost` / `normalizedUsage` 帧:inputTokens 为不含缓存读取的净输入,读取桶折回 prompt_tokens,5m/1h 写桶计入 cache_creation;该帧优先于标准 usage 对象。
 
-客户端可见的 usage 帧按客户端线格式输出,判别依据只有一条:上游线格式是否为 anthropic。OpenAI chat 线与 Responses 线的输入都是含缓存的全部输入:chat 线字段为 `prompt_tokens` / `prompt_tokens_details.cached_tokens`,Responses 线为 `input_tokens` / `input_tokens_details.cached_tokens`,`cached_tokens` 只在 `cache_read > 0` 时附上,取值即 `cache_read`。上游为 anthropic 线时(其 `input_tokens` 为互斥净输入),发射时把 `cache_read_input_tokens + cache_creation_input_tokens` 折回 `prompt_tokens`(Responses 线为 `input_tokens`),令 `total_tokens = prompt_tokens + completion_tokens`(Responses 线为 `input_tokens + output_tokens`);上游本身为 OpenAI / Responses 线时输入已含缓存,不折叠。Anthropic 线的 `input_tokens` 为互斥净输入,`cache_read_input_tokens` / `cache_creation_input_tokens` 为独立桶;上游为 OpenAI / Responses 线时,发射时从 `input_tokens` 中减去这两个桶。落库投影(`UsageAccounting::from_ir`)与客户端发射共用同一判别:anthropic 上游把两个缓存桶折进 `prompt_tokens`,令 `total_tokens = prompt_tokens + completion_tokens`,`prompt - cache_read` 在任意上游口径下都等于未命中输入。
+客户端可见的 usage 帧按客户端线格式输出,判别依据只有一条:上游线格式是否为 anthropic。Gemini 与 OpenAI 同族——`promptTokenCount` 本身就是含缓存的全部输入,`cachedContentTokenCount` 是其中的缓存读取,输出侧 `candidatesTokenCount + thoughtsTokenCount` 才是完整输出,total 取上游 `totalTokenCount`。OpenAI chat 线与 Responses 线的输入都是含缓存的全部输入:chat 线字段为 `prompt_tokens` / `prompt_tokens_details.cached_tokens`,Responses 线为 `input_tokens` / `input_tokens_details.cached_tokens`,`cached_tokens` 只在 `cache_read > 0` 时附上,取值即 `cache_read`。上游为 anthropic 线时(其 `input_tokens` 为互斥净输入),发射时把 `cache_read_input_tokens + cache_creation_input_tokens` 折回 `prompt_tokens`(Responses 线为 `input_tokens`),令 `total_tokens = prompt_tokens + completion_tokens`(Responses 线为 `input_tokens + output_tokens`);上游本身为 OpenAI / Responses 线时输入已含缓存,不折叠。Anthropic 线的 `input_tokens` 为互斥净输入,`cache_read_input_tokens` / `cache_creation_input_tokens` 为独立桶;上游为 OpenAI / Responses 线时,发射时从 `input_tokens` 中减去这两个桶。落库投影(`UsageAccounting::from_ir`)与客户端发射共用同一判别:anthropic 上游把两个缓存桶折进 `prompt_tokens`,令 `total_tokens = prompt_tokens + completion_tokens`,`prompt - cache_read` 在任意上游口径下都等于未命中输入。
 
 ## think 内容抽取
 
@@ -47,7 +47,17 @@ usage 的解析,非流式直接 parse 响应体(`usage_parser.cpp`);流式由各
 - `parse_data_uri` / `build_data_uri`:图片 content 在 data URI 与 base64 字段之间互转。
 - `parse_sse_frame`:SSE 分帧,兼容 `data:` 有无空格、事件名、注释行。
 - `read_cache_hit_tokens`:从各格式的缓存字段里取命中 token 数(deepseek 的 `prompt_cache_hit_tokens`、OpenAI 的 `prompt_tokens_details.cached_tokens`、Responses 的 `input_tokens_details.cached_tokens`,或由 miss 推导),minimax 这类不报缓存的返回 0。
-- 超时错误帧:上游读超时(按客户端线格式的三档超时配置触发,见 [proxy-internals.md](proxy-internals.md))时按客户端格式发终止错误帧——Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`,而不是静默断连。
+- 超时错误帧:上游读超时(按客户端线格式的三档超时配置触发,见 [proxy-internals.md](proxy-internals.md))时按客户端格式发终止错误帧——Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`、Gemini `data: {"error":{…}}`,而不是静默断连。
+
+## Gemini 线的细节
+
+- **模型在路径**:上游路径按目标是 Gemini 推导为 `models/{model}:generateContent`(流式加 `?alt=sse`);base URL 已带 `/v1`、`/v1beta` 或 `/v1alpha` 时直接用,否则补 `/v1beta`。`endpoint_path` 覆盖时可写 `{model}` / `{method}` 占位符。
+- **角色**:只有 `user` / `model` 两个 role;系统提示进 `systemInstruction`,工具结果进 `user` 轮的 `functionResponse`,连续同角色消息合并成一个 `Content`。
+- **工具**:`functionCall.id` 常缺省,解析时补合成 id;回传时 `functionResponse.response` 必须是 JSON 对象(`{name, content}`,错误带 `error`),媒体走 `functionResponse.parts`。`parameters` 用 OpenAPI 子集,JSON Schema 里子集表达不了的键(`oneOf`/`$ref`/`additionalProperties`)改发 `parametersJsonSchema`。
+- **思考**:`thought: true` 的 part ↔ IR 思考块;每 part 的 `thoughtSignature` 原样保留并回传,Gemini 3 回放函数调用缺签名时补 `skip_thought_signature_validator` 哨兵。`thinkingBudget`(-1 动态、0 关闭)与 `thinkingLevel` 二选一。
+- **停止原因**:`STOP`(带工具调用时记为 tool_use)、`MAX_TOKENS`/`CONTINUATION` → length、安全类 → content_filter、其余未知枚举保留为 unknown,缺省不编造。
+- **拦截**:无 candidates 且 `promptFeedback.blockReason` 存在时按 content_filter 停,不当成空成功。
+- **错误体**:上游 `{error:{code,message,status,details}}` → 归一化 `{message,type,code}`;转换后的错误把 429 的 `RetryInfo.retryDelay` 作为 `Retry-After` 重试提示,同格式透传则保持上游原始错误体(其中已含 details)。回给 Gemini 客户端时按 google.rpc 码与状态名重建。
 
 ## 自测
 

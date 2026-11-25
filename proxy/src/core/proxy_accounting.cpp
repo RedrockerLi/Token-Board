@@ -86,6 +86,13 @@ std::string cooldown_probe_body(ir::ApiFormat format,
         return json{{"model", model}, {"input", "你好"},
                     {"max_output_tokens", 1}}.dump();
     }
+    if (format == ir::ApiFormat::Google) {
+        // This wire has no model field: the probe model names the URL.
+        return json{{"contents", json::array({{{"role", "user"},
+                                              {"parts", json::array(
+                                                  {{{"text", "你好"}}})}}})},
+                    {"generationConfig", {{"maxOutputTokens", 1}}}}.dump();
+    }
     return json{{"model", model}, {"max_tokens", 1},
                 {"messages", json::array({{{"role", "user"},
                                            {"content", "你好"}}})}}.dump();
@@ -233,8 +240,8 @@ void ProxyServer::run_cooldown_probe_cycle() {
             const auto &policy = chat_endpoint_policy(format);
             bool path_is_full = false;
             resolve_upstream_path(policy, target->api_format,
-                                  target->base_url, "", probe_path,
-                                  path_is_full);
+                                  target->base_url, "", target->probe_model,
+                                  false, probe_path, path_is_full);
             probe_body = cooldown_probe_body(format, target->probe_model);
             method = "POST";
         }

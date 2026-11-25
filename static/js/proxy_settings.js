@@ -12,6 +12,7 @@ const TIMEOUT_GROUPS = [
     { key: 'anthropic',        label: 'Anthropic Messages',      hint: 'Claude Code · /v1/messages' },
     { key: 'openai_responses', label: 'OpenAI Responses',        hint: 'codex · /v1/responses' },
     { key: 'openai',           label: 'OpenAI Chat Completions', hint: 'OpenAI SDK · /v1/chat/completions' },
+    { key: 'google',           label: 'Google Gemini',            hint: 'Gemini CLI · /v1beta/models/{model}:generateContent' },
 ];
 
 /** Fallback values for "恢复默认" (mirror cc-switch's per-app defaults). */
@@ -19,6 +20,7 @@ const TIMEOUT_DEFAULTS = {
     anthropic:        { streaming_first_byte_timeout: 90, streaming_idle_timeout: 180, non_streaming_timeout: 600 },
     openai_responses: { streaming_first_byte_timeout: 60, streaming_idle_timeout: 120, non_streaming_timeout: 600 },
     openai:           { streaming_first_byte_timeout: 60, streaming_idle_timeout: 120, non_streaming_timeout: 600 },
+    google:           { streaming_first_byte_timeout: 60, streaming_idle_timeout: 120, non_streaming_timeout: 600 },
 };
 
 const TIMEOUT_FIELD_LABELS = {

@@ -363,7 +363,7 @@ void ProxyServer::handle_streaming(
                 };
                 const auto attempt_started = std::chrono::steady_clock::now();
                 auto result = forward_endpoint_attempt(
-                    upstream_, request_policy, candidate, *body,
+                    upstream_, request_policy, candidate, true, *body,
                     passthrough ? content_type : "application/json",
                     attempt_request.remaining_budget_ms, attempt_timeouts,
                     client_sock, on_chunk,

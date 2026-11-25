@@ -91,7 +91,8 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
             } <= payload.keys())
 
         timeout = self.client.get("/api/proxy/timeout-config").get_json()
-        self.assertEqual(set(timeout), {"anthropic", "openai", "openai_responses"})
+        self.assertEqual(set(timeout),
+                         {"anthropic", "openai", "openai_responses", "google"})
         for group in timeout.values():
             self.assertTrue({
                 "app_type", "streaming_first_byte_timeout",

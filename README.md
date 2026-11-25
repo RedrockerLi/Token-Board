@@ -4,7 +4,7 @@
 
 核心特性:
 
-- 三种线格式互相转换:OpenAI Chat Completions(`/v1/chat/completions`)、OpenAI Responses(`/v1/responses`)、Anthropic Messages(`/v1/messages`)。Claude Code、codex、OpenAI SDK 等工具可以同时接进来,客户端格式由请求 URL 自动识别
+- 四种线格式互相转换:OpenAI Chat Completions(`/v1/chat/completions`)、OpenAI Responses(`/v1/responses`)、Anthropic Messages(`/v1/messages`)、Google Gemini GenerateContent(`/v1beta/models/{model}:generateContent`)。Claude Code、codex、OpenAI SDK、Gemini CLI 等工具可以同时接进来,客户端格式由请求 URL 自动识别
 - 多账户路由:一个本地密钥绑定一个上游账户;聚合账户把多个上游合并成一个模型列表,同一模型可配置多个账户自动回退
 - 峰谷定价:按时段给模型定价配倍率,成本在请求写入时按当时价格固化,改价不回溯
 - 用量仪表盘:模型趋势、Token 类型分布、按用户分摊费用;存档只存用量与总价,改价不回溯
@@ -52,7 +52,7 @@ export OPENAI_API_KEY=<本地密钥>
 几点说明:
 
 - Base URL 的路径是 `/v1`,不是 `/v1/chat/completions`。SDK 会自己拼端点。代理同时兼容 `/v1/v1/...` 这种重复前缀,已把 `/v1` 写进 base URL 的客户端也能直接用
-- 本地密钥对三种格式通用,一把密钥可以同时给 OpenAI 和 Anthropic 工具用
+- 本地密钥对四种格式通用,一把密钥可以同时给 OpenAI、Anthropic 与 Gemini 工具用
 - 工具请求的模型名要能被「模型定价」里的 pattern 匹配到,否则请求仍会转发,但计费会按 0 处理
 
 ## 配置流程

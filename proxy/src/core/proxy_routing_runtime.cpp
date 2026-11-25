@@ -13,8 +13,8 @@ void ProxyServer::add_cors_headers(httplib::Response &res) {
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.set_header("Access-Control-Allow-Headers",
-                   "Authorization, Content-Type, X-API-Key, X-Session-ID, "
-                   "X-Conversation-ID");
+                   "Authorization, Content-Type, X-API-Key, X-Goog-Api-Key, "
+                   "X-Session-ID, X-Conversation-ID");
 }
 
 // ── Format resolution helpers ────────────────────────────────────────────
@@ -50,7 +50,10 @@ std::vector<CandidateRequestBody> candidate_request_bodies(
             bodies.emplace_back();
             continue;
         }
-        if (candidate.upstream_model() == requested_model) {
+        if (candidate.upstream_model() == requested_model ||
+            client_format == ir::ApiFormat::Google) {
+            // Gemini names the model in the URL, never in the body, so a model
+            // rewrite leaves the request bytes untouched.
             bodies.push_back(original_body);
             continue;
         }
@@ -71,11 +74,13 @@ UpstreamTarget resolve_upstream_target(const EndpointPolicy &policy,
                                        const std::string &api_format,
                                        const std::string &base_url,
                                        const std::string &endpoint_path,
+                                       const std::string &model,
+                                       bool streaming,
                                        const std::string &auth_header,
                                        const Database::TimeoutConfig &tc) {
     UpstreamTarget t;
-    resolve_upstream_path(policy, api_format, base_url, endpoint_path, t.path,
-                          t.opts.path_is_full);
+    resolve_upstream_path(policy, api_format, base_url, endpoint_path, model,
+                          streaming, t.path, t.opts.path_is_full);
     t.opts.auth_scheme = resolve_auth_scheme(api_format, auth_header);
     t.opts.streaming_first_byte_timeout = tc.streaming_first_byte_timeout;
     t.opts.streaming_semantic_timeout = tc.streaming_first_byte_timeout;
@@ -88,20 +93,26 @@ UpstreamTarget resolve_upstream_target(const EndpointPolicy &policy,
 std::string resolve_auth_scheme(const std::string &api_format,
                                 const std::string &configured) {
     const auto format = ir::parse_api_format(api_format);
+    // Gemini documents `x-goog-api-key`; Vertex-style gateways expect a bearer
+    // token, which the explicit setting can still select.
+    const char *automatic = format == ir::ApiFormat::Anthropic ? "x-api-key"
+        : format == ir::ApiFormat::Google ? "x-goog-api-key"
+        : "bearer";
     // Snapshot loading already emits these canonical spellings for normal
     // configuration. Keep the hot path allocation-free for that common case.
-    if (configured == "bearer" || configured == "x-api-key") return configured;
-    if (configured == "auto")
-        return format == ir::ApiFormat::Anthropic ? "x-api-key" : "bearer";
+    if (configured == "bearer" || configured == "x-api-key" ||
+        configured == "x-goog-api-key")
+        return configured;
+    if (configured == "auto") return automatic;
     std::string scheme = configured;
     std::transform(scheme.begin(), scheme.end(), scheme.begin(),
                    [](unsigned char value) {
                        return static_cast<char>(std::tolower(value));
                    });
-    if (scheme.empty() || scheme == "auto")
-        return format == ir::ApiFormat::Anthropic ? "x-api-key" : "bearer";
-    if (scheme == "x-api-key" || scheme == "bearer") return scheme;
-    // UpstreamClient supports only these two wire forms. Preserve the
+    if (scheme.empty() || scheme == "auto") return automatic;
+    if (scheme == "x-api-key" || scheme == "bearer" || scheme == "x-goog-api-key")
+        return scheme;
+    // UpstreamClient supports only these three wire forms. Preserve the
     // historical safe default for malformed configuration rather than
     // accidentally sending an unsupported authentication header.
     return "bearer";
@@ -220,9 +231,10 @@ bool client_socket_gone(int sock) {
 
 UpstreamClient::ForwardResult forward_endpoint_attempt(
     UpstreamClient &upstream, const EndpointPolicy &policy,
-    const UpstreamCandidate &candidate, const std::string &body,
-    const std::string &content_type, int remaining_budget_ms,
-    const Database::TimeoutConfig &timeouts, int client_socket,
+    const UpstreamCandidate &candidate, bool streaming,
+    const std::string &body, const std::string &content_type,
+    int remaining_budget_ms, const Database::TimeoutConfig &timeouts,
+    int client_socket,
     const std::function<bool(const char *, size_t)> &on_chunk,
     const std::function<void(ForwardOptions &)> &configure) {
     auto bounded = timeouts;
@@ -233,11 +245,14 @@ UpstreamClient::ForwardResult forward_endpoint_attempt(
     else
         bounded.non_streaming_timeout = std::min(
             bounded.non_streaming_timeout, seconds);
+    // The target model (not the client's) names the upstream resource: for
+    // Gemini it is a path variable, and for every other wire the body rewrite
+    // uses the same value.
     auto target = resolve_upstream_target(
         policy,
         candidate.account().api_format, candidate.account().base_url,
-        candidate.account().endpoint_path, candidate.account().auth_header,
-        bounded);
+        candidate.account().endpoint_path, candidate.upstream_model(),
+        streaming, candidate.account().auth_header, bounded);
     target.opts.attempt_budget_ms = remaining_budget_ms;
     target.opts.downstream_socket = client_socket;
     if (configure) configure(target.opts);

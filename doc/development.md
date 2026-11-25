@@ -40,11 +40,12 @@ Release 构建额外加 `-O3 -march=native -flto`。构建产物有两个:`token
 ./build/format_conv_test --request --from openai --to anthropic < body.json
 ./build/format_conv_test --response --from anthropic --to openai < resp.json
 ./build/format_conv_test --stream --from openai --to responses < body.json
+./build/format_conv_test --request --from anthropic --to google < body.json
 ```
 
 ## 模拟上游
 
-`scripts/mock_upstream.py` 起一个模拟 opencode.ai "Console Go" 的服务,支持全部三种格式,用于无真实上游时调试代理。请求会写进 `/tmp/mock_upstream.log`。
+`scripts/mock_upstream.py` 起一个模拟 opencode.ai "Console Go" 的服务,支持全部四种格式,用于无真实上游时调试代理。请求会写进 `/tmp/mock_upstream.log`。
 
 ```bash
 python3 scripts/mock_upstream.py --port 9100

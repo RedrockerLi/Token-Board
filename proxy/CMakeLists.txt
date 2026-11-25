@@ -28,6 +28,9 @@ set(FORMAT_SOURCES
     src/format/format_responses_request.cpp src/format/format_responses_request_items.cpp
     src/format/format_responses_response.cpp
     src/format/format_responses_stream.cpp src/format/format_responses_emitter.cpp
+    src/format/format_google.cpp src/format/format_google_helpers.cpp
+    src/format/format_google_parts.cpp src/format/format_google_request.cpp
+    src/format/format_google_response.cpp src/format/format_google_stream.cpp
     src/format/format_media.cpp
     src/format/usage_parser.cpp
     src/format/reasoning_bridge.cpp

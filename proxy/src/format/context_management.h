@@ -86,6 +86,14 @@ inline ContextManagementDecision context_management_decision(
         return decision;
     }
 
+    if (target == ir::ApiFormat::Google) {
+        decision.action = ContextManagementAction::Drop;
+        decision.reason =
+            "context_management is not representable by Google Gemini; "
+            "the control field is dropped";
+        return decision;
+    }
+
     decision.action = ContextManagementAction::Reject;
     decision.reason =
         "context_management cannot be represented by Anthropic Messages from "

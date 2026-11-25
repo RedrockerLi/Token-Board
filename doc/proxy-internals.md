@@ -169,7 +169,7 @@ plan 密钥进入配额冷却后,后台线程按两条通道观察恢复,任一�
 
 ## 超时与客户端断连
 
-上游超时按客户端线格式配置,存在 `proxy_timeout_config` 表(每行一组,默认值对齐 cc-switch:anthropic 90/180/600、openai_responses 与 openai 60/120/600),由仪表盘「通用设置 → 设置」页编辑、代理每次转发时按 harness 线格式读取,改动即时生效、无需重启:
+上游超时按客户端线格式配置,存在 `proxy_timeout_config` 表(每行一组,默认值对齐 cc-switch:anthropic 90/180/600、openai_responses、openai 与 google 60/120/600),由仪表盘「通用设置 → 设置」页编辑、代理每次转发时按 harness 线格式读取,改动即时生效、无需重启:
 
 - `streaming_first_byte_timeout` — 流式等首个数据块的最大时间。
 - `streaming_idle_timeout` — 流式两个数据块之间的最大间隔,0=禁用。
@@ -177,9 +177,9 @@ plan 密钥进入配额冷却后,后台线程按两条通道观察恢复,任一�
 
 流式的首字节/静默区分用 `net/upstream_client.cpp` 里的**超时看门狗线程**:httplib 客户端的读超时是 select-based、连接期固定,无法区分"等首块"和"块间间隔",所以看门狗在首字节截止点(请求发出后 `streaming_first_byte_timeout`)和每个块到达后重置的静默截止点(`now + streaming_idle_timeout`)检测超时,到点就 `shutdown()` 上游 socket 打断阻塞读(与客户端断连监视 `spawn_client_monitor` 同机制),阻塞读因此以读错误返回、记 `is_timeout`。httplib 自身读超时设成大的 backstop,只兜底。两个超时都配 0 时不开看门狗。回退链上多次尝试共享一个首字节预算(`clamp_to_remaining_budget`),避免 N 个坏密钥把一次 60s 请求拖成 N×60s。
 
-超时(`is_timeout=true`)对客户端统一给 `{"error":{"type":"timeout_error","code":504}}`,错误消息带实际触发的秒数。流式路径按客户端格式发终止错误帧:Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`,让客户端知道上游没回,而不是静默断连。
+超时(`is_timeout=true`)对客户端统一给 `{"error":{"type":"timeout_error","code":504}}`,错误消息带实际触发的秒数。流式路径按客户端格式发终止错误帧:Anthropic `event: error`、Responses `response.failed`、OpenAI `data: {error}` + `[DONE]`、Gemini `data: {"error":{…}}`,让客户端知道上游没回,而不是静默断连。
 
-流式请求另有**终端事件校验**:上游 2xx 流干净结束(chunked 正常收尾或读到 EOF)时,若解析器从未发布终止事件,按截断失败处理——对外状态 502、消息 `Upstream stream truncated before terminal event`,已向客户端提交过的流向其补发终止错误帧,截断的密钥按 5xx 规则获得 30 秒上游故障避让;未提交的截断(空体 200)可换候选重试。终止事件按上游线格式认定:Anthropic `message_delta.stop_reason` 或 `message_stop`,OpenAI chat `choices[].finish_reason` 或 `data: [DONE]`,Responses `response.completed`/`response.incomplete`;结束前仍驻留在 SSE 帧缓冲里的终止帧先冲净再判定。非 2xx 响应不参与该校验(按 HTTP 状态分类)。环境变量 `PROXY_STRICT_TERMINAL=0` 关闭校验(干净结束即按成功计费),默认开启。已知限制:上游忽略 `stream:true`、以整包 JSON 200(无 `data:` 帧)应答时没有终止事件,按截断处理。
+流式请求另有**终端事件校验**:上游 2xx 流干净结束(chunked 正常收尾或读到 EOF)时,若解析器从未发布终止事件,按截断失败处理——对外状态 502、消息 `Upstream stream truncated before terminal event`,已向客户端提交过的流向其补发终止错误帧,截断的密钥按 5xx 规则获得 30 秒上游故障避让;未提交的截断(空体 200)可换候选重试。终止事件按上游线格式认定:Anthropic `message_delta.stop_reason` 或 `message_stop`,OpenAI chat `choices[].finish_reason` 或 `data: [DONE]`,Responses `response.completed`/`response.incomplete`,Gemini `candidates[].finishReason`;结束前仍驻留在 SSE 帧缓冲里的终止帧先冲净再判定。非 2xx 响应不参与该校验(按 HTTP 状态分类)。环境变量 `PROXY_STRICT_TERMINAL=0` 关闭校验(干净结束即按成功计费),默认开启。已知限制:上游忽略 `stream:true`、以整包 JSON 200(无 `data:` 帧)应答时没有终止事件,按截断处理。
 
 流式请求另有**单消息周期守卫**:部分网关(实测 opencode.ai Zen/Go 的 Anthropic 端点)会在同一个 HTTP 响应里拼接两条完整消息——第一个终止帧之后又出现一个 `message_start`(或 OpenAI 的新 completion id / Responses 的新 `response.created`)。passthrough 转发按帧切分:`fmt::SseCycleGuard`([proxy/src/format/sse_cycle_guard.h](proxy/src/format/sse_cycle_guard.h))只缓冲当前未完成的那一帧,放行首个终止帧(Anthropic `message_stop`、OpenAI `data: [DONE]`、Responses `response.completed|incomplete|failed`)及其之前的全部字节,之后的字节丢弃并计数;上游省略终止帧时,第二个周期起点即切点。被丢弃的字节不再喂给 metrics 解析器,记账与请求日志保留第一段的 usage。守卫真正放行终止帧后,剩余读取即使被看门狗判成超时也按成功收尾(客户端写失败仍走 499);切点落在"第二个周期起点"时第一段本身没有终止,仍按截断失败处理,客户端会收到已提交内容加一个错误帧。转换路径不建守卫,由三个 stream parser 的周期抑制处理。`PROXY_STREAM_CYCLE_GUARD=0` 关闭 passthrough 守卫。
 

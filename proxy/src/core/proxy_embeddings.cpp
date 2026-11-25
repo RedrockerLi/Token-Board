@@ -100,7 +100,7 @@ void ProxyServer::handle_embeddings(const httplib::Request &req,
                 c.upstream_model().c_str(), concurrent_count);
 
         return forward_endpoint_attempt(
-            upstream_, policy, c, body_cache.for_candidate(c), content_type,
+            upstream_, policy, c, false, body_cache.for_candidate(c), content_type,
             static_cast<int>(attempt.remaining_budget_ms), embedding_timeouts,
             req.client_socket, nullptr,
             // Like the model catalog, an embedding request carries no

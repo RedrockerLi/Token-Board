@@ -136,19 +136,30 @@ bool parse_request_context(const httplib::Request &request,
         error = "request body must be a JSON object";
         return false;
     }
-    if (!context.parsed_json.contains("model") ||
-        !context.parsed_json["model"].is_string() ||
-        context.parsed_json["model"].get_ref<const std::string &>().empty()) {
-        error = "model must be a non-empty string";
-        return false;
+    if (policy.client_format == ir::ApiFormat::Google) {
+        // Gemini names the model in the URL and selects streaming with the RPC
+        // suffix; the body carries neither field.
+        context.model = google_model_from_path(request.path);
+        if (context.model.empty()) {
+            error = "model must appear in the path as models/{model}";
+            return false;
+        }
+        context.streaming = google_stream_from_path(request.path);
+    } else {
+        if (!context.parsed_json.contains("model") ||
+            !context.parsed_json["model"].is_string() ||
+            context.parsed_json["model"].get_ref<const std::string &>().empty()) {
+            error = "model must be a non-empty string";
+            return false;
+        }
+        context.model = context.parsed_json["model"].get<std::string>();
+        if (context.parsed_json.contains("stream") &&
+            !context.parsed_json["stream"].is_boolean()) {
+            error = "stream must be a boolean";
+            return false;
+        }
+        context.streaming = context.parsed_json.value("stream", false);
     }
-    context.model = context.parsed_json["model"].get<std::string>();
-    if (context.parsed_json.contains("stream") &&
-        !context.parsed_json["stream"].is_boolean()) {
-        error = "stream must be a boolean";
-        return false;
-    }
-    context.streaming = context.parsed_json.value("stream", false);
     if (context.streaming && !policy.allows_streaming) {
         error = "streaming is not supported for this endpoint";
         return false;
@@ -178,6 +189,10 @@ bool ensure_request_ir(const CodecRegistry &codecs, RequestContext &context,
         error = "invalid request fields";
         return false;
     }
+    // Endpoints that carry these in the URL (Gemini) leave them out of the
+    // body; the HTTP layer is authoritative for every wire.
+    if (context.parsed_ir.model.empty()) context.parsed_ir.model = context.model;
+    context.parsed_ir.stream = context.streaming;
     context.ir_ready = true;
     return true;
 }

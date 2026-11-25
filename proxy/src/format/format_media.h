@@ -43,6 +43,10 @@ struct MediaRequirements {
     bool file_url = false;
     bool file_unresolved = false;
     bool audio_invalid = false;
+    /// An image supplied as a remote URL instead of inline bytes.
+    bool image_url = false;
+    /// Every remote file URI, in request order, for target-specific checks.
+    std::vector<std::string> file_urls;
 };
 
 MediaRequirements request_media_requirements(const ir::ChatRequest &request);

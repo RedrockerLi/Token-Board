@@ -147,13 +147,12 @@ def update_account_models(account_id):
     key = keys[0] if keys else ""
 
     try:
-        from app.services.upstream_probe import model_probe
+        from app.services.upstream_probe import model_probe, parse_model_catalog
         resp = model_probe(acc, key)
         if not resp.ok:
             return api_error(
                 f"Upstream HTTP {resp.status_code}: {resp.text[:200]}", 400)
-        data = resp.json()
-        models = [m["id"] for m in data.get("data", [])]
+        models = parse_model_catalog(acc.get("api_format"), resp.json())
         count = db.update_account_models(account_id, models)
         return jsonify({"status": "ok", "count": count, "models": models})
     except Exception as e:
@@ -205,10 +204,11 @@ def test_account_concurrency(account_id):
     models = db.get_account_models(account_id)
     if not models:  # 复用 update_account_models 的实时拉取模式
         try:
-            from app.services.upstream_probe import model_probe
+            from app.services.upstream_probe import (
+                model_probe, parse_model_catalog)
             resp = model_probe(acc, key)
             if resp.ok:
-                models = [m["id"] for m in resp.json().get("data", [])]
+                models = parse_model_catalog(acc.get("api_format"), resp.json())
                 db.update_account_models(account_id, models)
         except Exception as exc:
             current_app.logger.warning(
@@ -242,6 +242,10 @@ def test_account_concurrency(account_id):
                     "messages": [{"role": "user", "content": "ping"}]}
         if fmt == "openai_responses":
             return {"model": model_id, "input": "ping", "max_output_tokens": 8}
+        if fmt in ("google", "gemini"):
+            # Gemini carries the model in the URL, not the body.
+            return {"contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                    "generationConfig": {"maxOutputTokens": 8}}
         return {"model": model_id, "messages": [{"role": "user", "content": "ping"}],
                 "max_tokens": 8, "stream": False}
 
@@ -250,7 +254,7 @@ def test_account_concurrency(account_id):
 
     def _one(_i):
         try:
-            resp = request_probe(acc, key, body)
+            resp = request_probe(acc, key, body, model=model_id)
             if 200 <= resp.status_code < 300:
                 return (True, None)
             return (False, f"HTTP {resp.status_code}")

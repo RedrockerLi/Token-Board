@@ -12,12 +12,13 @@ using json = nlohmann::json;
 /// Intermediate representation (IR) for chat requests/responses/streams.
 ///
 /// Every wire format (OpenAI chat completions, OpenAI Responses, Anthropic
-/// Messages) parses into this IR and serializes from it, so any harness
-/// format can be converted to any upstream format by composing
+/// Messages, Google Gemini GenerateContent) parses into this IR and serializes
+/// from it, so any harness format can be converted to any upstream format by
+/// composing
 ///   parse(harness) → IR → serialize(upstream).
 namespace ir {
 
-enum class ApiFormat { OpenAI, OpenAIResponses, Anthropic };
+enum class ApiFormat { OpenAI, OpenAIResponses, Anthropic, Google };
 ApiFormat parse_api_format(const std::string &s);
 std::string to_string(ApiFormat f);
 

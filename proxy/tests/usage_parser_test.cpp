@@ -35,6 +35,24 @@ int main() {
     assert(responses->usage.cache_read_tokens == 4);
     assert(responses->usage.total_tokens == 9);
 
+    // Gemini: promptTokenCount already includes the cached content, and
+    // thinking tokens are billed as output.
+    const auto google = fmt::parse_usage_for_format(
+        ir::ApiFormat::Google,
+        R"({"modelVersion":"gemini-2.5-pro-002","usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":30,"candidatesTokenCount":20,"thoughtsTokenCount":5,"totalTokenCount":125}})");
+    assert(google.has_value());
+    assert(google->model == "gemini-2.5-pro-002");
+    assert(google->usage.prompt_tokens == 100);
+    assert(google->usage.cache_read_tokens == 30);
+    assert(google->usage.cache_creation_tokens == 0);
+    assert(google->usage.completion_tokens == 25);
+    assert(google->usage.total_tokens == 125);
+    const auto google_projected = UsageAccounting::from_ir(
+        google->usage, ir::ApiFormat::Google, google->model);
+    // This wire's input is cache-inclusive, so no fold is applied.
+    assert(google_projected.prompt_tokens == 100);
+    assert(google_projected.total_tokens == 125);
+
     assert(!fmt::parse_usage_for_format(ir::ApiFormat::OpenAI,
                                         "not-json").has_value());
     return 0;

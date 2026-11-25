@@ -95,7 +95,8 @@ def main() -> None:
         "v1-admin-import")
     assert database.get_agent_software()[0]["id"] == software_id
     assert database.get_agent_subscriptions()[0]["id"] == subscription_id
-    assert len(database.get_timeout_config()) == 3
+    # One row per client wire format: chat / messages / responses / generate.
+    assert len(database.get_timeout_config()) == 4
     assert database.update_timeout_config("openai", {
         "streaming_first_byte_timeout": 15,
         "streaming_idle_timeout": 30,

@@ -147,13 +147,15 @@ struct UpstreamTarget {
 UpstreamTarget resolve_upstream_target(
     const EndpointPolicy &policy,
     const std::string &api_format, const std::string &base_url,
-    const std::string &endpoint_path, const std::string &auth_header,
+    const std::string &endpoint_path, const std::string &model,
+    bool streaming, const std::string &auth_header,
     const Database::TimeoutConfig &timeouts);
 UpstreamClient::ForwardResult forward_endpoint_attempt(
     UpstreamClient &upstream, const EndpointPolicy &policy,
-    const UpstreamCandidate &candidate, const std::string &body,
-    const std::string &content_type, int remaining_budget_ms,
-    const Database::TimeoutConfig &timeouts, int client_socket,
+    const UpstreamCandidate &candidate, bool streaming,
+    const std::string &body, const std::string &content_type,
+    int remaining_budget_ms, const Database::TimeoutConfig &timeouts,
+    int client_socket,
     const std::function<bool(const char *, size_t)> &on_chunk = nullptr,
     const std::function<void(ForwardOptions &)> &configure = nullptr);
 bool clamp_to_remaining_budget(

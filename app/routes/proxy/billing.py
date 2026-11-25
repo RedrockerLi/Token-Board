@@ -7,7 +7,7 @@ from app.routes.proxy.common import (
 
 
 # Client wire-format groups accepted by the timeout configuration API.
-_TIMEOUT_GROUPS = ("anthropic", "openai_responses", "openai")
+_TIMEOUT_GROUPS = ("anthropic", "openai_responses", "openai", "google")
 
 
 @bp_proxy.route("/pricing", methods=["GET"])

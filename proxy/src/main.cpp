@@ -78,6 +78,7 @@ int main(int argc, char *argv[]) {
     codecs.add(make_openai_codec());
     codecs.add(make_anthropic_codec());
     codecs.add(make_responses_codec());
+    codecs.add(make_google_codec());
     ProxyServer proxy_server(db, router, upstream, recorder, codecs);
 
     // ── Configure httplib server ──────────────────────────────────────

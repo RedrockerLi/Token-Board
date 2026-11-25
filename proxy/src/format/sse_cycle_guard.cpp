@@ -178,6 +178,27 @@ SseCycleGuard::FrameKind SseCycleGuard::classify(const std::string &frame) {
             }
             return FrameKind::kPass;
         }
+        case ir::ApiFormat::Google: {
+            if (!has_json) return FrameKind::kPass;
+            // A fresh responseId marks a new generation; the model reports one
+            // id per response.
+            const std::string id = parsed.value("responseId", "");
+            if (!id.empty()) {
+                if (first_id_.empty()) {
+                    first_id_ = id;
+                    saw_start_ = true;
+                } else if (id != first_id_) {
+                    return FrameKind::kSecondCycle;
+                }
+            }
+            if (parsed.contains("candidates") && parsed["candidates"].is_array()) {
+                for (const auto &candidate : parsed["candidates"])
+                    if (candidate.is_object() &&
+                        candidate.contains("finishReason"))
+                        return FrameKind::kTerminal;
+            }
+            return FrameKind::kPass;
+        }
     }
     return FrameKind::kPass;
 }

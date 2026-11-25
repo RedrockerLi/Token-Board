@@ -6,7 +6,7 @@
 ///   format_conv_test --response --from <f> --to <g> < body.json
 ///                                         convert one response body (f→g)
 ///
-/// Formats: openai | anthropic | responses.  Exit code 0 = all checks passed.
+/// Formats: openai | anthropic | responses | google.  Exit code 0 = all checks passed.
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -18,6 +18,7 @@
 #include "codec.h"
 #include "format_anthropic.h"
 #include "format_common.h"
+#include "format_google.h"
 #include "format_media.h"
 #include "format_openai.h"
 #include "format_responses.h"
@@ -95,6 +96,42 @@ static const char *kResponsesResponse = R"({
             "input_tokens_details": {"cached_tokens": 3}}
 })";
 
+// The model and the stream flag live in the URL on this wire, so the sample
+// intentionally carries neither: the HTTP layer supplies them.
+static const char *kGoogleRequest = R"({
+  "systemInstruction": {"parts": [{"text": "You are helpful."}]},
+  "contents": [
+    {"role": "user", "parts": [{"text": "Hi"}]},
+    {"role": "model", "parts": [
+      {"functionCall": {"id": "call_1", "name": "get_weather", "args": {"city": "SF"}},
+       "thoughtSignature": "c2ln"}]},
+    {"role": "user", "parts": [
+      {"functionResponse": {"id": "call_1", "name": "get_weather",
+                            "response": {"name": "get_weather", "content": "72F"}}}]}
+  ],
+  "tools": [{"functionDeclarations": [{"name": "get_weather", "description": "Get weather",
+    "parameters": {"type": "OBJECT", "properties": {"city": {"type": "STRING"}},
+                   "required": ["city"]}}]}],
+  "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+  "generationConfig": {"temperature": 0.5, "maxOutputTokens": 100, "topP": 0.9,
+    "thinkingConfig": {"thinkingBudget": 1024, "includeThoughts": true}}
+})";
+
+static const char *kGoogleResponse = R"({
+  "candidates": [{
+    "content": {"role": "model", "parts": [
+      {"text": "Let me check.", "thoughtSignature": "c2ln"},
+      {"functionCall": {"id": "call_1", "name": "get_weather", "args": {"city": "SF"}}}
+    ]},
+    "finishReason": "STOP",
+    "index": 0
+  }],
+  "usageMetadata": {"promptTokenCount": 100, "cachedContentTokenCount": 20,
+                    "candidatesTokenCount": 10, "totalTokenCount": 110},
+  "modelVersion": "gemini-2.5-pro-002",
+  "responseId": "resp-1"
+})";
+
 static int g_failures = 0;
 
 static void check(bool ok, const std::string &what) {
@@ -166,7 +203,14 @@ static void run_request_roundtrip(const CodecRegistry &reg, ApiFormat from,
         check(request_matches(a, b), label);
     } else {
         printf("  converted: %s [key fields checked below]\n", label.c_str());
-        check(b.model == a.model, "  model preserved");
+        if (to == ApiFormat::Google) {
+            // Gemini keeps the model in the URL path, never in the body; the
+            // HTTP layer restores it.  Assert the body stays model-free.
+            check(!converted.contains("model"),
+                  "  model kept out of the Gemini body");
+        } else {
+            check(b.model == a.model, "  model preserved");
+        }
         check(!b.system.empty() && b.system[0].text == a.system[0].text,
               "  system preserved");
     }
@@ -1504,11 +1548,342 @@ static void test_duplicate_cycle_suppression(const CodecRegistry &reg) {
     }
 }
 
+static void test_google_finish_reason_matrix(const CodecRegistry &reg) {
+    printf("--- Google finishReason mapping ---\n");
+    struct Case { const char *reason; StopReason want; };
+    const Case cases[] = {
+        {"STOP", StopReason::Stop},
+        {"MAX_TOKENS", StopReason::Length},
+        {"CONTINUATION", StopReason::Length},
+        {"SAFETY", StopReason::ContentFilter},
+        {"RECITATION", StopReason::ContentFilter},
+        {"BLOCKLIST", StopReason::ContentFilter},
+        {"PROHIBITED_CONTENT", StopReason::ContentFilter},
+        {"SPII", StopReason::ContentFilter},
+        {"IMAGE_SAFETY", StopReason::ContentFilter},
+        {"LANGUAGE", StopReason::Unknown},
+        {"MALFORMED_FUNCTION_CALL", StopReason::Unknown},
+        {"TOO_MANY_TOOL_CALLS", StopReason::Unknown},
+        {"FINISH_REASON_UNSPECIFIED", StopReason::Absent},
+    };
+    for (const auto &entry : cases) {
+        const json body = {{"candidates", json::array({{
+            {"content", {{"role", "model"},
+                         {"parts", json::array({{{"text", "x"}}})}}},
+            {"finishReason", entry.reason}, {"index", 0}}})}};
+        ChatResponse out;
+        std::string err;
+        const bool parsed = reg.get(ApiFormat::Google).parse_response(body, out, err);
+        check(parsed, std::string("google finishReason ") + entry.reason + " parses");
+        check(out.stop_reason == entry.want,
+              std::string("google finishReason ") + entry.reason + " maps");
+    }
+    // A tool-call response reports STOP but means a tool-use stop.
+    const json tool_body = {{"candidates", json::array({{
+        {"content", {{"role", "model"}, {"parts", json::array({{
+            {"functionCall", {{"id", "c1"}, {"name", "f"}, {"args", json::object()}}}}})}}},
+        {"finishReason", "STOP"}}})}};
+    ChatResponse tool_out;
+    std::string err;
+    check(reg.get(ApiFormat::Google).parse_response(tool_body, tool_out, err),
+          "google tool-call response parses");
+    check(tool_out.stop_reason == StopReason::ToolUse,
+          "google STOP with a function call maps to tool use");
+
+    struct Reverse { StopReason reason; const char *want; };
+    const Reverse reverse[] = {
+        {StopReason::Stop, "STOP"},
+        {StopReason::ToolUse, "STOP"},
+        {StopReason::Length, "MAX_TOKENS"},
+        {StopReason::ContentFilter, "SAFETY"},
+    };
+    for (const auto &entry : reverse) {
+        ChatResponse ir;
+        ir.stop_reason = entry.reason;
+        ir.content.push_back(ContentBlock{});
+        ir.content.back().kind = ContentKind::Text;
+        ir.content.back().text = "x";
+        const json wire = reg.get(ApiFormat::Google).serialize_response(ir);
+        check(wire["candidates"][0].value("finishReason", "") == entry.want,
+              std::string("IR stop reason serializes to ") + entry.want);
+    }
+    ChatResponse absent;
+    absent.content.push_back(ContentBlock{});
+    absent.content.back().kind = ContentKind::Text;
+    absent.content.back().text = "x";
+    const json absent_wire = reg.get(ApiFormat::Google).serialize_response(absent);
+    check(!absent_wire["candidates"][0].contains("finishReason"),
+          "an undefined stop reason is not fabricated");
+}
+
+static void test_google_usage_mapping(const CodecRegistry &reg) {
+    printf("--- Google usage mapping ---\n");
+    const json body = {{"usageMetadata", {
+        {"promptTokenCount", 100}, {"cachedContentTokenCount", 60},
+        {"candidatesTokenCount", 25}, {"thoughtsTokenCount", 128},
+        {"toolUsePromptTokenCount", 10}, {"totalTokenCount", 263}}}};
+    ChatResponse ir;
+    std::string err;
+    check(reg.get(ApiFormat::Google).parse_response(body, ir, err),
+          "google usage-only response parses");
+    check(ir.usage.prompt_tokens == 110, "prompt includes cache and tool-use tokens");
+    check(ir.usage.completion_tokens == 153, "completion includes thinking tokens");
+    check(ir.usage.cache_read_tokens == 60, "cache read becomes the cache bucket");
+    check(ir.usage.cache_creation_tokens == 0, "this wire has no cache-creation bucket");
+    check(ir.usage.total_tokens == 263, "reported total is preserved");
+    const json wire = reg.get(ApiFormat::Google).serialize_response(ir);
+    check(wire["usageMetadata"].value("promptTokenCount", 0) == 110,
+          "serialized prompt stays cache-inclusive");
+    check(wire["usageMetadata"].value("candidatesTokenCount", 0) == 25,
+          "serialized candidates exclude thinking tokens");
+    check(wire["usageMetadata"].value("thoughtsTokenCount", 0) == 128,
+          "serialized thoughts are reported separately");
+    check(wire["usageMetadata"].value("cachedContentTokenCount", 0) == 60,
+          "serialized cache read is a subset of prompt");
+}
+
+static void test_google_tool_id_and_result_name(const CodecRegistry &reg) {
+    printf("--- Google tool ids and result names ---\n");
+    const json response = {{"candidates", json::array({{
+        {"content", {{"role", "model"}, {"parts", json::array({{
+            {"functionCall", {{"name", "get_weather"},
+                              {"args", {{"city", "SF"}}}}}}})}}},
+        {"finishReason", "STOP"}}})}};
+    ChatResponse ir;
+    std::string err;
+    check(reg.get(ApiFormat::Google).parse_response(response, ir, err),
+          "google call without id parses");
+    std::string call_id;
+    for (const auto &block : ir.content)
+        if (block.kind == ContentKind::ToolUse) call_id = block.tool_call_id;
+    check(!call_id.empty(), "a missing functionCall id is synthesized");
+
+    // An OpenAI tool message names the call only by id; Gemini requires a name.
+    const json request = {
+        {"model", "m"},
+        {"messages", json::array({
+            {{"role", "user"}, {"content", "hi"}},
+            {{"role", "assistant"}, {"content", ""},
+             {"tool_calls", json::array({{{"id", call_id}, {"type", "function"},
+                {"function", {{"name", "get_weather"},
+                              {"arguments", "{\"city\":\"SF\"}"}}}}})}},
+            {{"role", "tool"}, {"tool_call_id", call_id}, {"content", "72F"}}})}};
+    ChatRequest chat;
+    check(reg.get(ApiFormat::OpenAI).parse_request(request, chat, err),
+          "openai tool request parses");
+    const json wire = reg.get(ApiFormat::Google).serialize_request(chat);
+    std::string result_name;
+    std::string result_id;
+    std::string result_text;
+    for (const auto &content : wire["contents"])
+        for (const auto &part : content["parts"])
+            if (part.contains("functionResponse")) {
+                result_name = part["functionResponse"].value("name", "");
+                result_id = part["functionResponse"].value("id", "");
+                result_text = part["functionResponse"]["response"].value("content", "");
+            }
+    check(result_name == "get_weather",
+          "the tool result is named from the matching call");
+    check(result_id == call_id, "the tool result keeps its call id");
+    check(result_text == "72F", "the tool result text is carried through");
+}
+
+static void test_google_thinking_signature(const CodecRegistry &reg) {
+    printf("--- Google thought signatures ---\n");
+    ChatRequest request;
+    request.model = "gemini-3-pro";
+    Message message;
+    message.role = "assistant";
+    ContentBlock call;
+    call.kind = ContentKind::ToolUse;
+    call.tool_name = "f";
+    call.tool_call_id = "c1";
+    call.tool_input = json{{"a", 1}};
+    message.content.push_back(call);
+    request.messages.push_back(message);
+    request.items = request.messages;
+    auto signature_of = [&reg](const ChatRequest &in) {
+        const json wire = reg.get(ApiFormat::Google).serialize_request(in);
+        for (const auto &content : wire["contents"])
+            for (const auto &part : content["parts"])
+                if (part.contains("functionCall"))
+                    return part.value("thoughtSignature", std::string());
+        return std::string();
+    };
+    check(signature_of(request) == "skip_thought_signature_validator",
+          "gemini 3 replay fills the documented signature sentinel");
+
+    ChatRequest signed_request = request;
+    signed_request.messages[0].content[0].extra["thoughtSignature"] = "c2ln";
+    signed_request.items = signed_request.messages;
+    check(signature_of(signed_request) == "c2ln",
+          "a stored signature is replayed verbatim");
+
+    ChatRequest older = request;
+    older.model = "gemini-2.5-pro";
+    check(signature_of(older).empty(),
+          "gemini 2.5 does not receive a synthetic signature");
+
+    // Thought parts round-trip as thinking blocks, not as answer text.
+    const json response = {{"candidates", json::array({{
+        {"content", {{"role", "model"}, {"parts", json::array({
+            {{"text", "pondering"}, {"thought", true}, {"thoughtSignature", "c2ln"}},
+            {{"text", "answer"}}})}}},
+        {"finishReason", "STOP"}}})}};
+    ChatResponse ir;
+    std::string err;
+    check(reg.get(ApiFormat::Google).parse_response(response, ir, err),
+          "google thinking response parses");
+    check(ir.content.size() == 2 && ir.content[0].kind == ContentKind::Thinking &&
+              ir.content[0].text == "pondering",
+          "thought parts become thinking blocks");
+    check(ir.content.size() == 2 && ir.content[1].kind == ContentKind::Text &&
+              ir.content[1].text == "answer",
+          "visible text stays visible");
+    check(ir.content[0].extra.value("thoughtSignature", "") == "c2ln",
+          "the per-part signature is retained");
+}
+
+static void test_google_blocked_prompt(const CodecRegistry &reg) {
+    printf("--- Google prompt blocking ---\n");
+    const json blocked = {{"promptFeedback", {{"blockReason", "SAFETY"}}},
+                          {"usageMetadata", {{"promptTokenCount", 3}}}};
+    ChatResponse ir;
+    std::string err;
+    check(reg.get(ApiFormat::Google).parse_response(blocked, ir, err),
+          "a blocked prompt response parses");
+    check(ir.stop_reason == StopReason::ContentFilter,
+          "a blocked prompt is a content-filter stop, not an empty answer");
+    check(ir.content.empty(), "a blocked prompt carries no content");
+    const json wire = reg.get(ApiFormat::Google).serialize_response(ir);
+    check(wire["candidates"][0].value("finishReason", "") == "SAFETY",
+          "a blocked prompt serializes as SAFETY");
+}
+
+static void test_google_error_envelope(const CodecRegistry &reg) {
+    printf("--- Google error envelope ---\n");
+    const json upstream = {{"error", {
+        {"code", 429}, {"message", "quota exceeded"},
+        {"status", "RESOURCE_EXHAUSTED"},
+        {"details", json::array({{{"@type", "type.googleapis.com/google.rpc.RetryInfo"},
+                                  {"retryDelay", "16s"}}})}}}};
+    const json normalized = reg.get(ApiFormat::Google).parse_error_body(upstream);
+    check(normalized.value("message", "") == "quota exceeded",
+          "the upstream message survives");
+    check(normalized.value("type", "") == "resource_exhausted",
+          "the google status becomes the normalized type");
+    check(normalized.value("retry_after_seconds", 0) == 16,
+          "RetryInfo becomes a retry hint");
+    const json wire = reg.get(ApiFormat::Google).serialize_error_body(
+        {{"message", "busy"}, {"type", "rate_limit_error"}, {"code", 429}});
+    check(wire["error"].value("status", "") == "RESOURCE_EXHAUSTED",
+          "429 serializes to RESOURCE_EXHAUSTED");
+    check(wire["error"].value("code", 0) == 8,
+          "429 serializes to the matching google.rpc code");
+}
+
+static void test_google_media_bridge(const CodecRegistry &reg) {
+    printf("--- Google inline media bridge ---\n");
+    const json request = {{"contents", json::array({{
+        {"role", "user"}, {"parts", json::array({
+            {{"text", "what is this"}},
+            {{"inlineData", {{"mimeType", "image/png"}, {"data", "aGVsbG8="}}}}})}}})}};
+    ChatRequest ir;
+    std::string err;
+    check(reg.get(ApiFormat::Google).parse_request(request, ir, err),
+          "google inline media request parses");
+    bool image = false;
+    for (const auto &message : ir.messages)
+        for (const auto &block : message.content)
+            if (block.kind == ContentKind::Image &&
+                block.image_data_b64 == "aGVsbG8=" &&
+                block.media_type == "image/png")
+                image = true;
+    check(image, "inlineData becomes an IR image block");
+    const json openai = reg.get(ApiFormat::OpenAI).serialize_request(ir);
+    bool data_uri = false;
+    for (const auto &message : openai["messages"])
+        if (message.contains("content") && message["content"].is_array())
+            for (const auto &part : message["content"])
+                if (part.value("type", "") == "image_url" &&
+                    part["image_url"].value("url", "").rfind(
+                        "data:image/png;base64,aGVsbG8=", 0) == 0)
+                    data_uri = true;
+    check(data_uri, "the IR image becomes an OpenAI data URI part");
+}
+
+static void test_google_stream_events(const CodecRegistry &reg) {
+    printf("--- Google stream parse/emit ---\n");
+    const std::string sse =
+        "data: {\"responseId\":\"r1\",\"modelVersion\":\"gemini-2.5-pro\","
+        "\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hel\"}]},"
+        "\"index\":0}]}\n\n"
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":["
+        "{\"text\":\"lo\"},{\"text\":\"why\",\"thought\":true}]},\"index\":0}]}\n\n"
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":["
+        "{\"functionCall\":{\"name\":\"f\",\"args\":{\"a\":1}}}]},\"index\":0}]}\n\n"
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},"
+        "\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":"
+        "{\"promptTokenCount\":5,\"candidatesTokenCount\":2,\"totalTokenCount\":7}}\n\n";
+
+    auto parser = reg.get(ApiFormat::Google).make_stream_parser();
+    std::vector<StreamEvent> events;
+    auto emit = [&events](const StreamEvent &event) {
+        events.push_back(event);
+        return true;
+    };
+    parser->feed(sse.data(), sse.size(), emit);
+    parser->finish(emit);
+    std::string text;
+    std::string thinking;
+    int tool_starts = 0;
+    bool finished = false;
+    bool tool_stop = false;
+    int total = 0;
+    for (const auto &event : events) {
+        if (event.type == StreamEventType::ContentTextDelta) text += event.text;
+        else if (event.type == StreamEventType::ContentThinkingDelta) thinking += event.text;
+        else if (event.type == StreamEventType::ToolCallStart) tool_starts++;
+        else if (event.type == StreamEventType::MessageFinish) {
+            finished = true;
+            tool_stop = event.stop_reason == StopReason::ToolUse;
+        } else if (event.type == StreamEventType::UsageEvent) {
+            total = event.usage.total_tokens;
+        }
+    }
+    check(text == "Hello", "stream text deltas concatenate");
+    check(thinking == "why", "thought deltas stay separate from text");
+    check(tool_starts == 1, "stream emits one tool call");
+    check(finished && tool_stop, "stream reports a tool-use stop");
+    check(total == 7, "stream reports usage");
+
+    const std::string reemitted =
+        convert_stream(reg, ApiFormat::Google, ApiFormat::Google, sse);
+    auto reparsed_parser = reg.get(ApiFormat::Google).make_stream_parser();
+    std::vector<StreamEvent> reparsed;
+    auto collect = [&reparsed](const StreamEvent &event) {
+        reparsed.push_back(event);
+        return true;
+    };
+    reparsed_parser->feed(reemitted.data(), reemitted.size(), collect);
+    reparsed_parser->finish(collect);
+    std::string reparsed_text;
+    int reparsed_tools = 0;
+    for (const auto &event : reparsed) {
+        if (event.type == StreamEventType::ContentTextDelta)
+            reparsed_text += event.text;
+        else if (event.type == StreamEventType::ToolCallStart) reparsed_tools++;
+    }
+    check(reparsed_text == "Hello", "google→google stream keeps the text");
+    check(reparsed_tools == 1, "google→google stream keeps the tool call");
+}
+
 static int self_test() {
     CodecRegistry reg;
     reg.add(make_openai_codec());
     reg.add(make_anthropic_codec());
     reg.add(make_responses_codec());
+    reg.add(make_google_codec());
 
     printf("=== Request round-trips ===\n");
     struct ReqSample {
@@ -1518,9 +1893,10 @@ static int self_test() {
         {ApiFormat::OpenAI, kOpenaiRequest},
         {ApiFormat::Anthropic, kAnthropicRequest},
         {ApiFormat::OpenAIResponses, kResponsesRequest},
+        {ApiFormat::Google, kGoogleRequest},
     };
     for (auto &r : reqs) {
-        for (int t = 0; t < 3; t++) {
+        for (int t = 0; t < 4; t++) {
             ApiFormat to = static_cast<ApiFormat>(t);
             run_request_roundtrip(reg, r.fmt, to, r.json);
         }
@@ -1534,9 +1910,10 @@ static int self_test() {
         {ApiFormat::OpenAI, kOpenaiResponse},
         {ApiFormat::Anthropic, kAnthropicResponse},
         {ApiFormat::OpenAIResponses, kResponsesResponse},
+        {ApiFormat::Google, kGoogleResponse},
     };
     for (auto &r : resps) {
-        for (int t = 0; t < 3; t++) {
+        for (int t = 0; t < 4; t++) {
             ApiFormat to = static_cast<ApiFormat>(t);
             run_response_roundtrip(reg, r.fmt, to, r.json);
         }
@@ -1571,6 +1948,14 @@ static int self_test() {
     test_responses_completed_after_items(reg);
     test_responses_tool_done_once(reg);
     test_duplicate_cycle_suppression(reg);
+    test_google_finish_reason_matrix(reg);
+    test_google_usage_mapping(reg);
+    test_google_tool_id_and_result_name(reg);
+    test_google_thinking_signature(reg);
+    test_google_blocked_prompt(reg);
+    test_google_error_envelope(reg);
+    test_google_media_bridge(reg);
+    test_google_stream_events(reg);
 
     printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL PASSED" : "FAILED",
            g_failures, g_failures == 1 ? "" : "s");
@@ -1582,6 +1967,7 @@ int main(int argc, char **argv) {
     reg.add(make_openai_codec());
     reg.add(make_anthropic_codec());
     reg.add(make_responses_codec());
+    reg.add(make_google_codec());
 
     bool self_test_mode = true;
     bool is_request = true;
@@ -1601,7 +1987,9 @@ int main(int argc, char **argv) {
     if (self_test_mode) return self_test();
 
     auto norm = [](const std::string &s) {
-        return s == "responses" ? std::string("openai_responses") : s;
+        if (s == "responses") return std::string("openai_responses");
+        if (s == "gemini") return std::string("google");
+        return s;
     };
     ApiFormat f = parse_api_format(norm(from));
     ApiFormat t = parse_api_format(norm(to));

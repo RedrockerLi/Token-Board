@@ -5,7 +5,7 @@ import math
 
 
 class ProxyPricingMixin:
-    _TIMEOUT_GROUPS = ("anthropic", "openai_responses", "openai")
+    _TIMEOUT_GROUPS = ("anthropic", "openai_responses", "openai", "google")
     _TIMEOUT_FIELDS = ("streaming_first_byte_timeout",
                        "streaming_idle_timeout",
                        "non_streaming_timeout")
@@ -244,9 +244,11 @@ class ProxyPricingMixin:
         try:
             rows = conn.execute(
                 "SELECT CASE endpoint_kind WHEN 'messages' THEN 'anthropic' "
-                "WHEN 'responses' THEN 'openai_responses' ELSE 'openai' END app_type,"
+                "WHEN 'responses' THEN 'openai_responses' "
+                "WHEN 'generate' THEN 'google' ELSE 'openai' END app_type,"
                 "streaming_first_byte_timeout,streaming_idle_timeout,non_streaming_timeout "
-                "FROM proxy_timeout_config WHERE endpoint_kind IN ('messages','responses','chat') "
+                "FROM proxy_timeout_config WHERE endpoint_kind IN "
+                "('messages','responses','chat','generate') "
                 "ORDER BY endpoint_kind"
             ).fetchall()
             return [dict(row) for row in rows]
@@ -289,7 +291,7 @@ class ProxyPricingMixin:
                 "streaming_idle_timeout=excluded.streaming_idle_timeout,"
                 "non_streaming_timeout=excluded.non_streaming_timeout",
                 ({"anthropic": "messages", "openai_responses": "responses",
-                  "openai": "chat"}[app_type], values["streaming_first_byte_timeout"],
+                  "openai": "chat", "google": "generate"}[app_type], values["streaming_first_byte_timeout"],
                  values["streaming_idle_timeout"], values["non_streaming_timeout"]),
             )
             conn.commit()

@@ -239,6 +239,13 @@ void collect_requirements(const std::vector<ir::ContentBlock> &blocks,
                                   b.file_data_b64.empty() && b.file_url.empty());
         r.file_url = r.file_url || (!b.file_url.empty() &&
                                    b.file_id.empty() && b.file_data_b64.empty());
+        r.image_url = r.image_url ||
+            (b.kind == ir::ContentKind::Image && !b.image_url.empty() &&
+             b.image_data_b64.empty());
+        if (!b.file_url.empty() &&
+            std::find(r.file_urls.begin(), r.file_urls.end(), b.file_url) ==
+                r.file_urls.end())
+            r.file_urls.push_back(b.file_url);
         r.file_unresolved = r.file_unresolved ||
             (b.kind == ir::ContentKind::File && b.file_id.empty() &&
              b.file_url.empty() && b.file_data_b64.empty());
@@ -438,8 +445,9 @@ bool target_supports_media(ir::ApiFormat target,
         reason = "audio input is missing data or format";
         return false;
     }
-    if (r.audio && target != ir::ApiFormat::OpenAI) {
-        reason = "audio input is supported only by the OpenAI Chat bridge";
+    if (r.audio && target != ir::ApiFormat::OpenAI &&
+        target != ir::ApiFormat::Google) {
+        reason = "audio input is supported only by the OpenAI Chat and Gemini bridges";
         return false;
     }
     if (r.file_id && target == ir::ApiFormat::Anthropic) {
@@ -449,6 +457,27 @@ bool target_supports_media(ir::ApiFormat target,
     if (r.file_url && target == ir::ApiFormat::OpenAI) {
         reason = "Chat file parts do not accept file URLs";
         return false;
+    }
+    if (target == ir::ApiFormat::Google) {
+        // Gemini fetches only Google-hosted references; arbitrary remote
+        // images must be supplied inline.
+        if (r.image_url) {
+            reason = "Gemini accepts images as inline data or Google-hosted "
+                     "file URIs, not as remote URLs";
+            return false;
+        }
+        if (r.file_id) {
+            reason = "provider-managed file_id cannot be sent to Gemini";
+            return false;
+        }
+        for (const auto &url : r.file_urls) {
+            if (url.rfind("gs://", 0) == 0) continue;
+            if (url.rfind("https://generativelanguage.googleapis.com/", 0) == 0)
+                continue;
+            reason = "Gemini accepts only gs:// or "
+                     "generativelanguage.googleapis.com file URIs";
+            return false;
+        }
     }
     return true;
 }

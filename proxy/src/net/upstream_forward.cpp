@@ -176,6 +176,11 @@ UpstreamClient::forward(const std::string &method,
             {"anthropic-version", "2023-06-01"},
             {"Content-Type", content_type},
         };
+    } else if (opts.auth_scheme == "x-goog-api-key") {
+        headers = {
+            {"x-goog-api-key", upstream_key},
+            {"Content-Type", content_type},
+        };
     } else {
         headers = {
             {"Authorization", "Bearer " + upstream_key},

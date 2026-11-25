@@ -96,6 +96,11 @@ class AppContractTest(AppDatabaseTestCase):
                 "streaming_idle_timeout": 122,
                 "non_streaming_timeout": 602,
             },
+            "google": {
+                "streaming_first_byte_timeout": 63,
+                "streaming_idle_timeout": 123,
+                "non_streaming_timeout": 603,
+            },
         }
 
         saved = client.put("/api/proxy/timeout-config", json=payload)

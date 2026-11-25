@@ -10,13 +10,14 @@ struct ErrorEnvelopeMapping {
     const char *root_key;
 };
 
-// The codec still owns serialization. This table freezes the three supported
-// wire roots in one place so a new endpoint cannot silently use the wrong
-// envelope while reusing the internal classification.
-constexpr std::array<ErrorEnvelopeMapping, 3> kErrorEnvelopeMappings{{
+// The codec still owns serialization. This table freezes the supported wire
+// roots in one place so a new endpoint cannot silently use the wrong envelope
+// while reusing the internal classification.
+constexpr std::array<ErrorEnvelopeMapping, 4> kErrorEnvelopeMappings{{
     {ir::ApiFormat::OpenAI, "error"},
     {ir::ApiFormat::OpenAIResponses, "error"},
     {ir::ApiFormat::Anthropic, "error"},
+    {ir::ApiFormat::Google, "error"},
 }};
 
 const ErrorEnvelopeMapping &error_envelope_mapping(ir::ApiFormat format) {
@@ -38,6 +39,13 @@ NormalizedError from_body(int status, const json &body,
         if (body.contains("message") && body["message"].is_string())
             result.message = body["message"].get<std::string>();
         if (body.contains("code")) result.code = body["code"];
+        // A codec may surface the provider's own retry hint (Gemini's
+        // google.rpc.RetryInfo, for example) alongside the normalized error.
+        if (body.contains("retry_after_seconds") &&
+            body["retry_after_seconds"].is_number_integer()) {
+            const int seconds = body["retry_after_seconds"].get<int>();
+            if (seconds > 0) result.retry_after_seconds = seconds;
+        }
     }
     if (result.code.is_null()) result.code = status;
     return result;
@@ -156,6 +164,10 @@ TerminalError render_terminal_error(
                                normalize_upstream_error(upstream_codec, fwd,
                                                         out.status));
     }
+    // A provider-supplied retry hint outranks the all-candidates default, but
+    // the cooldown ladder above already reported the authoritative wait.
+    if (normalized.retry_after_seconds > 0)
+        out.retry_after_seconds = normalized.retry_after_seconds;
     out.close_connection = normalized.close_connection;
     out.body = serialize_normalized_error(harness_codec, normalized).dump();
     return out;

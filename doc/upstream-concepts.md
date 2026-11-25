@@ -45,7 +45,7 @@
 
 - 计费与调用量解耦：**每把上游密钥**按 `valid_from`(订阅起始日) 锚定的**行政月周期**收一次月费；同一账户多把密钥 = 多个独立订阅。
 - 调用照常被代理转发、照常记 `request_log`，但 `api_cost` 记的是**虚拟消费**（不买套餐按量算要花多少钱），用于衡量套餐划不划算。
-- 429 冷却也是**按密钥**：一把 plan 密钥被限流只冷却它自己，同账户其他密钥立即接管（[proxy/src/core/account_gate.h:18-21](proxy/src/core/account_gate.h#L18-L21)）。冷却期的恢复观察分两条通道：带用量查询的子类型（opencode-go）每 5 分钟读一次用量快照，任一窗口未满即恢复（纯本地判断，不发请求）；其余 plan 密钥每 1 小时发一条最小的「你好」调用，2xx 提前解除冷却（没有目录模型名时退回 `GET {base}/models` 探测；auth scheme 按 `api_format` 推导：anthropic 用 x-api-key、其余 Bearer），见 [proxy-internals.md](proxy-internals.md)「冷却探测」。
+- 429 冷却也是**按密钥**：一把 plan 密钥被限流只冷却它自己，同账户其他密钥立即接管（[proxy/src/core/account_gate.h:18-21](proxy/src/core/account_gate.h#L18-L21)）。冷却期的恢复观察分两条通道：带用量查询的子类型（opencode-go）每 5 分钟读一次用量快照，任一窗口未满即恢复（纯本地判断，不发请求）；其余 plan 密钥每 1 小时发一条最小的「你好」调用，2xx 提前解除冷却（没有目录模型名时退回 `GET {base}/models` 探测；auth scheme 按 `api_format` 推导：anthropic 用 x-api-key、google 用 x-goog-api-key、其余 Bearer），见 [proxy-internals.md](proxy-internals.md)「冷却探测」。
 - 订阅周期、价格历史、删除默认操作见 [billing-pricing.md](billing-pricing.md)「plan 账户与虚拟消费」。
 
 ### 订阅计费与周期滚动（plan）
@@ -125,7 +125,7 @@
 1. **认证 + 一级路由**：`Authorization: Bearer` 或 `x-api-key` 取本地密钥 → `Router::route` 查出绑定账户（2s 缓存）。聚合账户只到这一步。
 2. **模型解析**：从请求体取模型名，剥掉 Claude Code 的 `[1m]`/`[1M]` 后缀 → `resolve_candidates_cached` 按账户形态展开候选链（普通账户=每把 Key 一个候选；聚合=匹配 entry × 每把 Key）。无候选返回 400「模型不可用」。
 3. **候选循环**：每个候选先过 `try_acquire_eligible`（冷却检查 + 并发槽），成功才占用槽位转发。
-4. **转发**：客户端线格式与账户 `api_format` 相同走直通(passthrough)，不同走 IR 转换；超时按客户端线格式分三档。
+4. **转发**：客户端线格式与账户 `api_format` 相同走直通(passthrough)，不同走 IR 转换；超时按客户端线格式分三档（四种线格式各一组）。
 5. **失败处理**：429/5xx/401/403/超时且未向客户端发数据 → 记一次 attempt，并按类落 Key 级状态（配额耗尽 → 冷却到可信重置/5 小时兜底；普通 429 → `Retry-After`/60 秒避让；401/403 → 15 分钟；5xx/超时 → 30 秒）→ 试下一个候选；请求内容错误不换 Key 重试。
 6. **成功绑定**：成功后会话亲和绑定到该 Key；记账线程把结果入队写 `request_log`。
 

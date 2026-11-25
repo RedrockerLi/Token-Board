@@ -12,6 +12,7 @@ ApiFormat parse_api_format(const std::string &s) {
     if (s == "openai" || s.empty()) return ApiFormat::OpenAI;
     if (s == "anthropic") return ApiFormat::Anthropic;
     if (s == "openai_responses") return ApiFormat::OpenAIResponses;
+    if (s == "google") return ApiFormat::Google;
     std::string normalized = s;
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                    [](unsigned char value) {
@@ -19,6 +20,10 @@ ApiFormat parse_api_format(const std::string &s) {
                    });
     if (normalized == "openai_responses") return ApiFormat::OpenAIResponses;
     if (normalized == "anthropic") return ApiFormat::Anthropic;
+    // "gemini" is the provider name clients use for the same wire format; both
+    // spellings select the Google Gemini GenerateContent codec.
+    if (normalized == "google" || normalized == "gemini")
+        return ApiFormat::Google;
     return ApiFormat::OpenAI;  // "openai" and any unknown value → OpenAI
 }
 
@@ -26,6 +31,7 @@ std::string to_string(ApiFormat f) {
     switch (f) {
         case ApiFormat::OpenAIResponses: return "openai_responses";
         case ApiFormat::Anthropic: return "anthropic";
+        case ApiFormat::Google: return "google";
         case ApiFormat::OpenAI: return "openai";
     }
     return "openai";

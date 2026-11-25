@@ -190,6 +190,26 @@ int main() {
         check(r.terminal, "responses: completed is terminal");
         check(r.suppressed, "responses: second response.created suppressed");
     }
+    // Gemini: finishReason is terminal; a new responseId is a new generation.
+    {
+        const std::string first =
+            "data: {\"responseId\":\"r1\",\"candidates\":[{\"content\":{\"role\":"
+            "\"model\",\"parts\":[{\"text\":\"hi\"}]},\"index\":0}]}\n\n"
+            "data: {\"responseId\":\"r1\",\"candidates\":[{\"content\":{\"role\":"
+            "\"model\",\"parts\":[]},\"finishReason\":\"STOP\",\"index\":0}]}\n\n";
+        const Result clean = run(ir::ApiFormat::Google, first, 1);
+        check(clean.out == first, "gemini: one cycle forwarded unchanged");
+        check(clean.terminal, "gemini: finishReason is terminal");
+        check(!clean.suppressed, "gemini: nothing suppressed");
+
+        const std::string second =
+            "data: {\"responseId\":\"r2\",\"candidates\":[{\"content\":{\"role\":"
+            "\"model\",\"parts\":[{\"text\":\"again\"}]},\"index\":0}]}\n\n";
+        const Result spliced = run(ir::ApiFormat::Google, first + second, 3);
+        check(spliced.out == first, "gemini: spliced second cycle dropped");
+        check(spliced.terminal, "gemini: first cycle stays terminal");
+        check(spliced.suppressed, "gemini: second responseId suppressed");
+    }
     // No terminal at all: the guard is transparent.
     {
         const std::string input = "event: ping\ndata: {}\n\n";

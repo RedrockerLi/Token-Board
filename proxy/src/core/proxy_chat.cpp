@@ -223,6 +223,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
         if (harness == ir::ApiFormat::OpenAIResponses)
             parsed_json = std::make_shared<const json>(context.parsed_json);
         for (const auto &candidate : cands) {
+            if (harness == ir::ApiFormat::Google) break;  // model is in the URL
             if (ir::parse_api_format(candidate.account().api_format) == harness &&
                 candidate.upstream_model() != context.model) {
                 parsed_json = std::make_shared<const json>(context.parsed_json);
@@ -361,14 +362,18 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 const std::string body = codecs_.get(upstream).serialize_request(
                     cReq, &same_context).dump();
                 result = forward_endpoint_attempt(
-                    upstream_, request_policy, c, body,
+                    upstream_, request_policy, c, false, body,
                     "application/json", attempt.remaining_budget_ms,
                     attempt_timeouts, req.client_socket, nullptr,
                     configure_forward);
             } else {
                 result = forward_endpoint_attempt(
-                    upstream_, request_policy, c,
-                    body_cache.for_candidate(c), content_type,
+                    upstream_, request_policy, c, false,
+                    // Gemini carries the model in the URL, so the body needs no
+                    // rewrite even when the route maps the model name.
+                    harness == ir::ApiFormat::Google
+                        ? *context.raw_body : body_cache.for_candidate(c),
+                    content_type,
                     attempt.remaining_budget_ms, attempt_timeouts,
                     req.client_socket, nullptr, configure_forward);
             }
@@ -390,7 +395,7 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                         cReq, &request_context).dump();
                 });
             result = forward_endpoint_attempt(
-                upstream_, request_policy, c, body,
+                upstream_, request_policy, c, false, body,
                 "application/json", attempt.remaining_budget_ms,
                 attempt_timeouts, req.client_socket, nullptr,
                 configure_forward);
@@ -574,6 +579,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 {.used = true, .passthrough = true});
             res.status = err.status;
             if (err.close_connection) res.set_header("Connection", "close");
+            if (err.retry_after_seconds > 0)
+                res.set_header("Retry-After",
+                               std::to_string(err.retry_after_seconds));
             res.set_content(err.body, "application/json");
         }
     } else {
@@ -640,6 +648,9 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 fwd, attempts, {.used = true, .used_failure_status = 502});
             res.status = err.status;
             if (err.close_connection) res.set_header("Connection", "close");
+            if (err.retry_after_seconds > 0)
+                res.set_header("Retry-After",
+                               std::to_string(err.retry_after_seconds));
             res.set_content(err.body, "application/json");
         }
     }

@@ -1,6 +1,7 @@
 #include "usage_parser.h"
 
 #include "format_common.h"
+#include "format_google_internal.h"
 #include "json.hpp"
 
 #include <limits>
@@ -138,6 +139,20 @@ std::optional<WireUsage> parse_responses_usage_json(const std::string &body) {
     }
 }
 
+std::optional<WireUsage> parse_google_usage_json(const std::string &body) {
+    try {
+        const json root = json::parse(body);
+        WireUsage result;
+        if (root.contains("modelVersion") && root["modelVersion"].is_string())
+            result.model = root["modelVersion"].get<std::string>();
+        if (root.contains("usageMetadata") && root["usageMetadata"].is_object())
+            gfmt::usage_from_wire(root["usageMetadata"], result.usage);
+        return result;
+    } catch (const json::exception &) {
+        return std::nullopt;
+    }
+}
+
 std::optional<WireUsage> parse_usage_for_format(ir::ApiFormat format,
                                                 const std::string &body) {
     switch (format) {
@@ -145,6 +160,8 @@ std::optional<WireUsage> parse_usage_for_format(ir::ApiFormat format,
         return parse_anthropic_usage_json(body);
     case ir::ApiFormat::OpenAIResponses:
         return parse_responses_usage_json(body);
+    case ir::ApiFormat::Google:
+        return parse_google_usage_json(body);
     case ir::ApiFormat::OpenAI:
         return parse_openai_usage_json(body);
     }

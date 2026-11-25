@@ -335,6 +335,8 @@ class Handler(BaseHTTPRequestHandler):
                 fmt = "anthropic"
             elif p.endswith("/responses"):
                 fmt = "responses"
+            elif ":streamGenerateContent" in p or ":generateContent" in p:
+                fmt = "google"
             else:
                 fmt = "openai"
         status = req.get("mock_status", 200)
@@ -403,8 +405,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
-        stream = bool(req.get("stream")) and status == 200
-        request_model = req.get("model", "mock-model")
+        stream = (bool(req.get("stream")) or
+                  ":streamGenerateContent" in self.path) and status == 200
+        if fmt == "google":
+            # This wire carries the model in the URL, never in the body.
+            resource = self.path.split("?", 1)[0].rsplit("/models/", 1)[-1]
+            request_model = resource.split(":", 1)[0] or "mock-model"
+        else:
+            request_model = req.get("model", "mock-model")
         response_model = (
             None if req.get("mock_omit_model")
             else req.get("mock_response_model", request_model)
@@ -486,6 +494,11 @@ class Handler(BaseHTTPRequestHandler):
                     "limitName": req.get("mock_limit_name", "5 hour"),
                 },
             }
+        if ":generateContent" in self.path or ":streamGenerateContent" in self.path:
+            return {"error": {
+                "code": status, "message": "mock error",
+                "status": "RESOURCE_EXHAUSTED" if status == 429
+                          else "INVALID_ARGUMENT"}}
         return {
             "error": {"message": "mock error", "type": "mock_error", "code": status},
         }
@@ -625,6 +638,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stream_chunks(self, fmt, model, req=None):
         req = req or {}
+        if fmt == "google":
+            response_model = "" if model is None else model
+            frames = [
+                {"responseId": "resp_mock", "modelVersion": response_model,
+                 "candidates": [{"content": {"role": "model",
+                                             "parts": [{"text": "Hel"}]},
+                                 "index": 0}]},
+                {"responseId": "resp_mock",
+                 "candidates": [{"content": {"role": "model",
+                                             "parts": [{"text": "lo"}]},
+                                 "index": 0}]},
+                {"responseId": "resp_mock",
+                 "candidates": [{"content": {"role": "model",
+                                             "parts": []},
+                                 "finishReason": "STOP", "index": 0}],
+                 "usageMetadata": {"promptTokenCount": 11,
+                                   "cachedContentTokenCount": 3,
+                                   "candidatesTokenCount": 7,
+                                   "totalTokenCount": 18}},
+            ]
+            return ["data: " + json.dumps(frame) + "\n\n" for frame in frames]
         if fmt == "anthropic":
             message = {
                 "id": "m1", "type": "message", "role": "assistant",
@@ -762,6 +796,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _nonstream_body(self, fmt, model, req):
         usage_extra = req.get("mock_usage_extra", {})
+        if fmt == "google":
+            body = {
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "Hello"}]},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 11, "cachedContentTokenCount": 3,
+                    "candidatesTokenCount": 7, "totalTokenCount": 18,
+                    **usage_extra,
+                },
+                "responseId": "resp_mock",
+            }
+            if model is not None:
+                body["modelVersion"] = model
+            return body
         if fmt == "anthropic":
             body = {
                 "id": "msg_1", "type": "message", "role": "assistant",

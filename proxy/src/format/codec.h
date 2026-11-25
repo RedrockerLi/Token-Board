@@ -75,7 +75,7 @@ private:
     ir::ApiFormat fmt_;
 };
 
-/// Registry of the three codecs, owned by ProxyServer.
+/// Registry of the format codecs, owned by ProxyServer.
 class CodecRegistry {
 public:
     void add(std::unique_ptr<FormatCodec> c);
@@ -88,3 +88,4 @@ private:
 std::unique_ptr<FormatCodec> make_openai_codec();
 std::unique_ptr<FormatCodec> make_anthropic_codec();
 std::unique_ptr<FormatCodec> make_responses_codec();
+std::unique_ptr<FormatCodec> make_google_codec();

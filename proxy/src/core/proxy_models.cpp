@@ -33,19 +33,38 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
         return;
     }
 
+    // Gemini clients read a different catalog shape, and identify themselves
+    // by the versioned path rather than a header.
+    const bool gemini_client = req.path.find("/v1beta") != std::string::npos;
+    auto respond = [&](const std::vector<std::string> &ids) {
+        json out = json::array();
+        if (gemini_client) {
+            for (const auto &id : ids) {
+                out.push_back(json{
+                    {"name", "models/" + id},
+                    {"baseModelId", id},
+                    {"displayName", id},
+                    {"supportedGenerationMethods",
+                     json::array({"generateContent", "streamGenerateContent"})}});
+            }
+            res.status = 200;
+            res.set_content(json{{"models", std::move(out)}}.dump(),
+                            "application/json");
+            return;
+        }
+        for (const auto &id : ids)
+            out.push_back(json{{"id", id}, {"object", "model"}, {"created", 1},
+                               {"owned_by", "token-board"}});
+        res.status = 200;
+        res.set_content(json{{"object", "list"}, {"data", std::move(out)}}.dump(),
+                        "application/json");
+    };
+
     // Aggregate accounts expose their entry patterns as the model catalog —
     // real names only, no `[1m]`/`[1M]` aliases (those are internal to cc).
     auto patterns = router_.model_patterns(ar.route);
     if (!patterns.empty()) {
-        json out = json::array();
-        for (const auto &p : patterns) {
-            json m = {{"id", p}, {"object", "model"}, {"created", 1},
-                      {"owned_by", "token-board"}};
-            out.push_back(m);
-        }
-        res.status = 200;
-        res.set_content(json{{"object", "list"}, {"data", std::move(out)}}.dump(),
-                        "application/json");
+        respond(patterns);
         return;
     }
 
@@ -55,12 +74,12 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
     // upstream request, no per-key gate, no failover: the stored list is the
     // authoritative answer for clients.  An account that was never refreshed
     // answers with an empty list.
-    json out = json::array();
+    std::vector<std::string> ids;
+    std::unordered_set<std::string> seen;
     if (ar.route.snapshot &&
         ar.route.route_set_index < ar.route.snapshot->route_sets.size()) {
         const auto &set =
             ar.route.snapshot->route_sets[ar.route.route_set_index];
-        std::unordered_set<std::string> seen;
         for (std::uint32_t i = set.rule_start;
              i < set.rule_start + set.rule_count; ++i) {
             const auto &rule = ar.route.snapshot->route_rules[i];
@@ -71,14 +90,11 @@ void ProxyServer::handle_list_models(const httplib::Request &req,
             if (!catalog) continue;
             for (const auto &model : *catalog) {
                 if (!seen.insert(model).second) continue;
-                out.push_back(json{{"id", model}, {"object", "model"},
-                                   {"created", 1}, {"owned_by", "token-board"}});
+                ids.push_back(model);
             }
         }
     }
-    res.status = 200;
-    res.set_content(json{{"object", "list"}, {"data", std::move(out)}}.dump(),
-                    "application/json");
+    respond(ids);
 }
 
 // ── handle_embeddings ────────────────────────────────────────────────────

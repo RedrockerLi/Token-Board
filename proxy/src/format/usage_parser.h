@@ -18,6 +18,7 @@ struct WireUsage {
 std::optional<WireUsage> parse_openai_usage_json(const std::string &body);
 std::optional<WireUsage> parse_anthropic_usage_json(const std::string &body);
 std::optional<WireUsage> parse_responses_usage_json(const std::string &body);
+std::optional<WireUsage> parse_google_usage_json(const std::string &body);
 
 /// Dispatch non-streaming usage extraction by upstream wire format.
 std::optional<WireUsage> parse_usage_for_format(ir::ApiFormat format,

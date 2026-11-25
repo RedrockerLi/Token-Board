@@ -25,6 +25,12 @@ void ProxyServer::setup_routes(httplib::Server &server) {
     server.Options("/v1/v1/messages", cors_handler);
     server.Options("/v1/v1/responses", cors_handler);
     server.Options("/v1/v1/responses/compact", cors_handler);
+    // Gemini keeps the model and the RPC in the path, so one pattern covers
+    // every API version and base-URL prefix combination.
+    // NOTE: the character class is written `[^:/]`, not `[^/:]` — httplib
+    // picks its path-parameter matcher whenever a pattern contains "/:".
+    const char *gemini_resource = R"(/(?:v1|v1beta)(?:/(?:v1|v1beta))?/models(?:/[^:/]+:(?:generateContent|streamGenerateContent))?)";
+    server.Options(gemini_resource, cors_handler);
 
     // Chat and Responses compaction endpoints share one format-agnostic
     // pipeline; the compact policy keeps its native upstream path.
@@ -39,6 +45,7 @@ void ProxyServer::setup_routes(httplib::Server &server) {
     server.Post("/v1/v1/messages", chat_handler);
     server.Post("/v1/v1/responses", chat_handler);
     server.Post("/v1/v1/responses/compact", chat_handler);
+    server.Post(gemini_resource, chat_handler);
 
     // Embedding endpoint
     server.Post("/v1/embeddings",
@@ -56,6 +63,11 @@ void ProxyServer::setup_routes(httplib::Server &server) {
                    handle_list_models(req, res);
                });
     server.Get("/v1/v1/models",
+               [this](const httplib::Request &req, httplib::Response &res) {
+                   handle_list_models(req, res);
+               });
+    // Gemini model listing (`GET /v1beta/models`).
+    server.Get(gemini_resource,
                [this](const httplib::Request &req, httplib::Response &res) {
                    handle_list_models(req, res);
                });
