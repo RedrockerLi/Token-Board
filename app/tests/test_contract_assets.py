@@ -37,15 +37,10 @@ class ContractAssetTest(unittest.TestCase):
         self.assertIn("request_log", RUNTIME_TABLE_DENYLIST)
         self.assertIn("agent_usage_receipts", RUNTIME_TABLE_DENYLIST)
         self.assertIn("billing_export_events", RUNTIME_TABLE_DENYLIST)
-        self.assertIn("agent_subscription_charge_allocations", RUNTIME_TABLE_DENYLIST)
         self.assertEqual(set(RUNTIME_TABLE_DELETE_ORDER), RUNTIME_TABLE_DENYLIST)
         self.assertLess(
             RUNTIME_TABLE_DELETE_ORDER.index("request_attempts"),
             RUNTIME_TABLE_DELETE_ORDER.index("request_log"),
-        )
-        self.assertLess(
-            RUNTIME_TABLE_DELETE_ORDER.index("agent_subscription_charge_allocations"),
-            RUNTIME_TABLE_DELETE_ORDER.index("agent_subscription_period_charges"),
         )
         self.assertTrue(is_config_sync_table("client_keys"))
         self.assertFalse(is_config_sync_table("request_log"))

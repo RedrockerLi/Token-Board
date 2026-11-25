@@ -167,10 +167,10 @@ def purge_agent_subscription(conn: sqlite3.Connection,
                               subscription_id: int) -> bool:
     """Remove an Agent subscription's live graph, retaining history.
 
-    The identity tables are intentionally not touched.  Frozen period charges,
-    charge allocations and immutable export events refer to those identities
-    and remain valid after the live subscription, instances, rates and
-    software bindings are physically removed.
+    The identity tables are intentionally not touched.  Frozen period charges
+    and immutable export events refer to those identities and remain valid
+    after the live subscription, instances, rates and software bindings are
+    physically removed.
     """
     row = conn.execute(
         "SELECT id FROM agent_subscriptions WHERE id=?",

@@ -23,8 +23,8 @@ def snapshot_config(db_path: str) -> None:
     try:
         # Delete generated children before their parent charge rows. These
         # tables are deliberately absent from a configuration rollback
-        # snapshot; leaving allocations behind creates orphan foreign keys
-        # when period charges are stripped.
+        # snapshot; leaving children behind creates orphan rows when period
+        # charges are stripped.
         for table in RUNTIME_TABLE_DELETE_ORDER:
             if table_exists(snapshot, table):
                 snapshot.execute(f"DELETE FROM {table}")

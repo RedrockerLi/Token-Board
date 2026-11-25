@@ -200,8 +200,7 @@ def rebuild_snapshot(proxy_path: Path,
                       "agent_usage_receipts",
                       "billing_period_charges",
                       "billing_export_events",
-                      "agent_subscription_period_charges",
-                      "agent_subscription_charge_allocations", "fx_rates"):
+                      "agent_subscription_period_charges", "fx_rates"):
             if table_exists(conn, table):
                 conn.execute(f"DELETE FROM {table}")
         conn.commit()

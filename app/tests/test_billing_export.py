@@ -208,8 +208,8 @@ class BillingExportTest(AppDatabaseTestCase):
                 "AND name='billing_export_receipts'"
             ).fetchone())
 
-    def test_direct_agent_event_remains_idempotent_by_source_key(self) -> None:
-        """A direct period-charge event stays idempotent after unit recovery."""
+    def test_agent_event_payload_mutation_is_rejected(self) -> None:
+        """An exported Agent event is immutable: payload mutation must fail."""
         from app.db.proxy.billing import materialize_agent_subscription_charges
         from app.db.proxy.billing_export import ensure_billing_export_events_conn
 
@@ -254,15 +254,8 @@ class BillingExportTest(AppDatabaseTestCase):
 
         with sqlite_connection(self.proxy_path) as conn:
             conn.row_factory = sqlite3.Row
-            created = ensure_billing_export_events_conn(conn)
-            self.assertEqual(created, 0)
-            self.assertEqual(
-                conn.execute(
-                    "SELECT billing_unit_id FROM billing_export_events WHERE id=?",
-                    (event["id"],),
-                ).fetchone()[0],
-                legacy_unit_id,
-            )
+            with self.assertRaises(ValueError):
+                ensure_billing_export_events_conn(conn)
 
 
     def _dashboard_usage_count(self) -> int:

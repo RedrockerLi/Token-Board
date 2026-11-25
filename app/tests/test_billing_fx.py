@@ -392,13 +392,6 @@ class BillingFxLockTest(AppDatabaseTestCase):
         self.assertEqual(row[1], 10.0)
         self.assertEqual(row[2], 1)
         self.assertIsNotNone(row[3])
-        with sqlite_connection(self.proxy_path) as conn:
-            self.assertEqual(conn.execute(
-                "SELECT count(*) FROM agent_subscription_charge_allocations "
-                "WHERE period_charge_id=(SELECT id FROM agent_subscription_period_charges "
-                "WHERE subscription_id=? AND period_start=?)",
-                (subscription_id, "2026-07-15T00:00:00Z"),
-            ).fetchone()[0], 0)
 
         self.assertTrue(db.update_agent_software(
             software_id, {"subscription_ids": []}))

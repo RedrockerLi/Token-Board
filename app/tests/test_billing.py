@@ -225,10 +225,6 @@ class BillingTest(AppDatabaseTestCase):
                 "WHERE subscription_id=? ORDER BY period_start",
                 (subscription_id,)).fetchall()]
             self.assertEqual(owners, [first_agent, second_agent])
-            self.assertEqual(conn.execute(
-                "SELECT count(*) FROM agent_subscription_charge_allocations "
-                "WHERE period_charge_id IN (SELECT id FROM agent_subscription_period_charges "
-                "WHERE subscription_id=?)", (subscription_id,)).fetchone()[0], 0)
 
     def test_agent_subscription_delete_keeps_history_and_allows_name_reuse(self) -> None:
         db = self.proxy_database()

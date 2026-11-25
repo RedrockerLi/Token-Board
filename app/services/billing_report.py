@@ -71,22 +71,6 @@ def _proxy_charge_sql() -> str:
     """
 
 
-def _agent_allocation_sql() -> str:
-    """Legacy V2.1 allocations attributed to the historical software id."""
-    return """
-        FROM agent_subscription_charge_allocations allocation
-        JOIN agent_subscription_period_charges charge
-          ON charge.id=allocation.period_charge_id
-        JOIN account_identities ai ON ai.id=allocation.software_id
-        WHERE allocation.is_finalized=1
-          AND allocation.normalized_recurring_cost IS NOT NULL
-          AND charge.is_finalized=1
-          AND charge.software_id IS NULL
-          AND ai.account_kind='agent'
-          AND charge.period_start>=:start AND charge.period_start<=:end
-    """
-
-
 def _agent_charge_sql() -> str:
     """Directly-owned Agent charges attributed by the frozen software id.
 
@@ -126,12 +110,7 @@ def actual_cost(conn, *, now: datetime | None = None, days: int = 30) -> dict:
         "SELECT COALESCE(SUM(charge.normalized_recurring_cost),0) "
         + _agent_charge_sql(), params,
     ).fetchone()[0]
-    legacy_agent = conn.execute(
-        "SELECT COALESCE(SUM(allocation.normalized_recurring_cost),0) "
-        + _agent_allocation_sql(), params,
-    ).fetchone()[0]
-    recurring = (float(proxy or 0) + float(agent or 0)
-                 + float(legacy_agent or 0))
+    recurring = float(proxy or 0) + float(agent or 0)
     return {
         "metered_cost": float(metered or 0),
         "recurring_cost": recurring,
@@ -155,13 +134,6 @@ def recurring_by_period_start(conn, *, now: datetime | None = None,
         "SELECT date(charge.period_start) period_start,"
         "COALESCE(SUM(charge.normalized_recurring_cost),0) cost "
         + _agent_charge_sql() + "GROUP BY date(charge.period_start)", params,
-    ):
-        period_start, cost = row[0], row[1]
-        result[period_start] = result.get(period_start, 0.0) + float(cost or 0)
-    for row in conn.execute(
-        "SELECT date(charge.period_start) period_start,"
-        "COALESCE(SUM(allocation.normalized_recurring_cost),0) cost "
-        + _agent_allocation_sql() + "GROUP BY date(charge.period_start)", params,
     ):
         period_start, cost = row[0], row[1]
         result[period_start] = result.get(period_start, 0.0) + float(cost or 0)
@@ -203,20 +175,11 @@ def actual_cost_by_day(conn, *, now: datetime | None = None,
         })
         item["recurring_cost"] += float(row[1] or 0)
 
-    for row in conn.execute(
-        "SELECT date(charge.period_start) day,"
-        "COALESCE(SUM(allocation.normalized_recurring_cost),0) cost "
-        + _agent_allocation_sql() + "GROUP BY date(charge.period_start)", params):
-        item = result.setdefault(str(row[0]), {
-            "metered_cost": 0.0, "recurring_cost": 0.0,
-        })
-        item["recurring_cost"] += float(row[1] or 0)
-
     for item in result.values():
         item["cost"] = item["metered_cost"] + item["recurring_cost"]
     return result
 
 
-__all__ = ["_agent_allocation_sql", "_agent_charge_sql", "_proxy_charge_sql",
-           "actual_cost", "actual_cost_by_day", "attributed_request_sql",
+__all__ = ["_agent_charge_sql", "_proxy_charge_sql", "actual_cost",
+           "actual_cost_by_day", "attributed_request_sql",
            "recurring_by_period_start"]

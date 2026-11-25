@@ -554,22 +554,12 @@ def materialize_all_period_charges(db_path: str,
 def _attach_agent_charge_owner(conn: sqlite3.Connection, instance_id: int,
                                software_id: int | None,
                                period_start: str) -> int:
-    """Attach the current binding to an existing unowned current charge.
-
-    V2.1 could create a finalized period charge before its allocation. Once a
-    billing run sees an effective binding, that charge can be assigned
-    directly unless a legacy allocation already owns it; the latter remains
-    historical and is intentionally left untouched.
-    """
+    """Attach the current binding to an existing unowned current charge."""
     if software_id is None:
         return 0
     cursor = conn.execute(
         "UPDATE agent_subscription_period_charges SET software_id=? "
-        "WHERE instance_id=? AND period_start=? AND software_id IS NULL "
-        "AND NOT EXISTS ("
-        "  SELECT 1 FROM agent_subscription_charge_allocations a "
-        "  WHERE a.period_charge_id=agent_subscription_period_charges.id"
-        ")",
+        "WHERE instance_id=? AND period_start=? AND software_id IS NULL",
         (software_id, instance_id, period_start),
     )
     return max(cursor.rowcount, 0)

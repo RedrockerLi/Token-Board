@@ -14,7 +14,13 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V2.8 当前增量
+## V2.9 当前增量
+
+V2.9 删除 V2.1 的 Agent 分摊表 `agent_subscription_charge_allocations`：Agent 周期费用只按
+`agent_subscription_period_charges.software_id` 归属。升级时遗留分摊按最大份额折算成该周期费用的
+直接归属，已冻结的导出事件改写为以周期费用主键为 `source_key`，因此历史金额和导出高水位不变。
+
+## V2.8 历史增量
 
 V2.8 为 Gemini GenerateContent 增加独立的超时分组：`proxy_timeout_config` 新增一行
 `endpoint_kind='generate'`，与 chat / messages / responses 三行并列，仪表盘「通用设置 → 设置」把它作为
@@ -91,7 +97,7 @@ V2.2 保留 V1/V2.1 的身份、请求和高水位结构，并将 Agent 计费�
 
 `billing_export_events` 以 `(source_table,source_key)` 唯一标识源事实；V2.2 Agent 直接账单的
 `source_key` 为 `agent_subscription_period_charges.id`，导出扫描所有已冻结周期费用并按源键补发，
-不依赖物化时间。V2.1 历史分摊仍使用 `period_charge_id:software_id` 旧源键兼容导出。源事实重新
+不依赖物化时间。导出事件统一以周期费用主键为源键。源事实重新
 比对载荷时 `account_name` 按展示属性跳过——账户改名不构成载荷变更，事件保留首次冻结时的名字。
 Dashboard 存档不保留周期费用明细,冻结费用导出后只累加进 `users.actual_cost_micro_cny`。
 

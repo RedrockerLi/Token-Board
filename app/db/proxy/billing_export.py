@@ -22,35 +22,6 @@ def _same_payload(existing: sqlite3.Row, row: dict) -> bool:
                if field not in _MUTABLE_PAYLOAD_FIELDS)
 
 
-def _same_payload_with_legacy_agent_unit(existing: sqlite3.Row,
-                                         row: dict) -> bool:
-    """Accept the V1 Agent unit label while recovering the same source fact.
-
-    V1 events used the subscription identity as their display unit, while
-    V2.1 derives the unit from the subscription-instance identity.  The
-    historical allocation source key is unchanged across that migration. Keep the
-    already-exported V1 payload authoritative, but continue to reject every
-    other payload mutation.
-    """
-    if _same_payload(existing, row):
-        return True
-    if not (
-        existing["event_kind"] == row["event_kind"] == "agent"
-        and str(existing["billing_unit_id"] or "").startswith(
-            "agent-subscription:"
-        )
-        and str(row["billing_unit_id"] or "").startswith(
-            "agent-subscription-instance:"
-        )
-    ):
-        return False
-    return all(
-        existing[field] == row[field]
-        for field in _PAYLOAD_FIELDS
-        if field != "billing_unit_id"
-    )
-
-
 def _insert_event(conn: sqlite3.Connection, row: dict) -> int:
     """Insert one event using ``(source_table, source_key)`` as its idempotency key.
 
@@ -64,7 +35,7 @@ def _insert_event(conn: sqlite3.Connection, row: dict) -> int:
         (row["source_table"], row["source_key"]),
     ).fetchone()
     if existing is not None:
-        if not _same_payload_with_legacy_agent_unit(existing, row):
+        if not _same_payload(existing, row):
             raise ValueError(
                 "billing export source payload changed: "
                 f"{row['source_table']}:{row['source_key']}"
@@ -121,38 +92,6 @@ def _proxy_event_row(row: sqlite3.Row) -> dict:
     }
 
 
-def _agent_event_row(row: sqlite3.Row) -> dict:
-    """Build an export event for a legacy allocation row."""
-    subscription_uuid = (row["subscription_uuid_snapshot"] or
-                         row["subscription_identity_uuid"] or
-                         row["subscription_uuid"] or
-                         f"subscription:{row['subscription_id']}")
-    instance_uuid = (row["instance_uuid_snapshot"] or
-                     row["instance_identity_uuid"] or row["instance_uuid"] or
-                     f"instance:{row['instance_id']}")
-    period_start = row["period_start"]
-    source_key = f"{row['period_charge_id']}:{row['software_id']}"
-    unit_id = f"agent-subscription-instance:{instance_uuid}"
-    return {
-        "event_key": (
-            f"agent:{subscription_uuid}:{instance_uuid}:"
-            f"{row['account_uuid'] or row['software_id']}:{period_start}"
-        ),
-        "event_kind": "agent",
-        "source_table": "agent_subscription_charge_allocations",
-        "source_key": source_key, "account_id": row["account_id"],
-        "account_uuid": row["account_uuid"], "account_name": row["account_name"],
-        "account_kind": row["account_kind"], "month": str(period_start)[:7],
-        "period_start": period_start, "billing_unit_id": unit_id,
-        "recurring_charge": float(row["recurring_charge"] or 0),
-        "normalized_recurring_cost": row["normalized_recurring_cost"],
-        "currency": row["currency"] or "CNY",
-        "base_currency": row["base_currency"] or "CNY",
-        "fx_rate_date": row["fx_rate_date"],
-        "frozen_on": _date_value(row["finalized_on"]),
-    }
-
-
 def _direct_agent_event_row(row: sqlite3.Row) -> dict:
     """Build an export event directly from one owned period charge."""
     subscription_uuid = (row["subscription_uuid_snapshot"] or
@@ -190,9 +129,7 @@ def _direct_agent_event_row(row: sqlite3.Row) -> dict:
 def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
     """Ensure every finalized billing fact has exactly one export event.
 
-    New Agent events use the period charge itself as the immutable source. The
-    allocation scan remains only for historical V2.1 rows and never receives
-    new records.
+    Every Agent event uses the period charge itself as the immutable source.
     """
     created = 0
     for row in conn.execute(
@@ -235,28 +172,4 @@ def ensure_billing_export_events_conn(conn: sqlite3.Connection) -> int:
     ):
         created += _insert_event(conn, _direct_agent_event_row(row))
 
-    for row in conn.execute(
-        """SELECT a.period_charge_id,a.software_id,a.recurring_charge,
-                      a.normalized_recurring_cost,a.currency,a.base_currency,
-                      a.fx_rate_date,a.finalized_on,
-                      c.period_start,c.instance_id,c.subscription_id,
-                      c.subscription_uuid_snapshot,c.instance_uuid_snapshot,
-                      si.uuid subscription_identity_uuid,
-                      ii.uuid instance_identity_uuid,
-                      s.uuid subscription_uuid,i.uuid instance_uuid,
-                      ai.id account_id,ai.uuid account_uuid,ai.name account_name,
-                      ai.account_kind
-               FROM agent_subscription_charge_allocations a
-               JOIN agent_subscription_period_charges c ON c.id=a.period_charge_id
-               LEFT JOIN agent_subscription_instances i ON i.id=c.instance_id
-               LEFT JOIN agent_subscriptions s ON s.id=COALESCE(c.subscription_id,i.subscription_id)
-               LEFT JOIN agent_subscription_instance_identities ii ON ii.id=c.instance_id
-               LEFT JOIN agent_subscription_identities si ON si.id=COALESCE(c.subscription_id,i.subscription_id)
-               JOIN account_identities ai ON ai.id=a.software_id
-               WHERE c.software_id IS NULL
-                 AND c.is_finalized=1 AND a.is_finalized=1
-                 AND ai.account_kind='agent'
-               ORDER BY a.period_charge_id,a.software_id"""
-    ):
-        created += _insert_event(conn, _agent_event_row(row))
     return created

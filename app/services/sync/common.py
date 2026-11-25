@@ -36,7 +36,6 @@ RUNTIME_TABLE_DELETE_ORDER = (
     "request_log",
     "agent_usage_receipts",
     "billing_export_events",
-    "agent_subscription_charge_allocations",
     "billing_period_charges",
     "agent_subscription_period_charges",
     "agent_software_runtime",

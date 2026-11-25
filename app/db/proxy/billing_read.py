@@ -4,7 +4,6 @@ from app.core.time import format_utc, utc_now
 from app.db.proxy.common import timedelta
 from app.services.billing_report import (
     _agent_charge_sql,
-    _agent_allocation_sql,
     _proxy_charge_sql,
     attributed_request_sql,
 )
@@ -204,12 +203,6 @@ class ProxyBillingReadMixin:
                           'agent' account_type
                 """ + _agent_charge_sql() + """
                    GROUP BY date(charge.period_start),ai.id""",
-                """SELECT date(charge.period_start) date,ai.id account_id,
-                          ai.name account_name,
-                          COALESCE(SUM(allocation.normalized_recurring_cost),0) recurring_cost,
-                          'agent' account_type
-                """ + _agent_allocation_sql() + """
-                   GROUP BY date(charge.period_start),ai.id""",
             )
             for sql in recurring_queries:
                 for row in conn.execute(sql, request_params):
@@ -258,9 +251,6 @@ class ProxyBillingReadMixin:
                 "SELECT date(charge.period_start) date,"
                 "COALESCE(SUM(charge.normalized_recurring_cost),0) recurring_cost "
                 + _agent_charge_sql() + "GROUP BY date(charge.period_start)",
-                "SELECT date(charge.period_start) date,"
-                "COALESCE(SUM(allocation.normalized_recurring_cost),0) recurring_cost "
-                + _agent_allocation_sql() + "GROUP BY date(charge.period_start)",
             )
             for sql in recurring_sql:
                 for row in conn.execute(sql, params):

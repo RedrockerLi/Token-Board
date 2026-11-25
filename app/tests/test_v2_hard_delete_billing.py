@@ -53,7 +53,6 @@ class V2MigrationTest(unittest.TestCase):
                     "agent_subscription_bindings": {"ends_at"},
                     "agent_subscription_rate_events": {"effective_at"},
                     "agent_subscription_period_charges": {"finalized_at"},
-                    "agent_subscription_charge_allocations": {"finalized_at"},
                     "billing_export_events": {"frozen_at"},
                 }.items():
                     current_columns = {

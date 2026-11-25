@@ -152,9 +152,9 @@ class ProxyLifecycleMixin:
             for row in pending:
                 purge_proxy_account(conn, int(row["id"]))
 
-            # Agent allocations use the final date interval. Reconcile ended
+            # Agent charges use the final date interval. Reconcile ended
             # instances before removing their live rows, otherwise a charge
-            # finalized earlier than its allocation could never be exported.
+            # finalized earlier than its period could never be exported.
             from app.db.proxy.billing import materialize_agent_subscription_charges_conn
             materialize_agent_subscription_charges_conn(
                 conn, now_dt, current_only=True, include_ended=True)

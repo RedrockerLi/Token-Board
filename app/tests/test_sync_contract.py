@@ -408,7 +408,7 @@ class SyncContractTest(unittest.TestCase):
             patch.stopall()
             shutil.rmtree(temp, ignore_errors=True)
 
-    def test_config_upload_with_frozen_agent_charge_allocations_succeeds(self) -> None:
+    def test_config_upload_with_frozen_agent_charge_succeeds(self) -> None:
         temp, proxy, _ = self._repo_layout()
         captured: dict[str, object] = {}
         try:
@@ -430,10 +430,6 @@ class SyncContractTest(unittest.TestCase):
                     "recurring_charge,currency,is_finalized,finalized_on) "
                     "VALUES(1,1,1,'2026-01-01','2026-02-01',1,'CNY',1,'2026-01-02')")
                 conn.execute(
-                    "INSERT INTO agent_subscription_charge_allocations "
-                    "(period_charge_id,software_id,is_finalized,finalized_on) "
-                    "VALUES(1,1,1,'2026-01-02')")
-                conn.execute(
                     "INSERT INTO billing_export_events"
                     "(event_key,event_kind,source_table,source_key,account_id,"
                     "account_name,account_kind,month,period_start,billing_unit_id,"
@@ -453,9 +449,6 @@ class SyncContractTest(unittest.TestCase):
                     captured["period_charges"] = uploaded.execute(
                         "SELECT count(*) FROM agent_subscription_period_charges"
                     ).fetchone()[0]
-                    captured["allocations"] = uploaded.execute(
-                        "SELECT count(*) FROM agent_subscription_charge_allocations"
-                    ).fetchone()[0]
                     captured["agent_receipts"] = uploaded.execute(
                         "SELECT count(*) FROM agent_usage_receipts"
                     ).fetchone()[0]
@@ -471,15 +464,11 @@ class SyncContractTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "ok", result)
             self.assertEqual(captured["period_charges"], 0)
-            self.assertEqual(captured["allocations"], 0)
             self.assertEqual(captured["agent_receipts"], 0)
             self.assertEqual(captured["foreign_key_check"], [])
             with sqlite_connection(proxy) as conn:
                 self.assertEqual(conn.execute(
                     "SELECT count(*) FROM agent_subscription_period_charges"
-                ).fetchone()[0], 1)
-                self.assertEqual(conn.execute(
-                    "SELECT count(*) FROM agent_subscription_charge_allocations"
                 ).fetchone()[0], 1)
                 self.assertEqual(conn.execute(
                     "SELECT count(*) FROM agent_usage_receipts"
@@ -527,9 +516,6 @@ class SyncContractTest(unittest.TestCase):
                     "INSERT INTO agent_subscription_period_charges "
                     "(id,instance_id,subscription_id,period_start,period_end,"
                     "recurring_charge,currency) VALUES(1,1,1,'2026-01-01','2026-02-01',1,'CNY')")
-                conn.execute(
-                    "INSERT INTO agent_subscription_charge_allocations "
-                    "(period_charge_id,software_id) VALUES(1,1)")
                 conn.commit()
             snapshot_config(proxy)
             with sqlite_connection(proxy) as conn:
@@ -538,9 +524,6 @@ class SyncContractTest(unittest.TestCase):
             with sqlite_connection(str(Path(temp) / "data/token-board_config_snapshot.db")) as conn:
                 self.assertEqual(conn.execute(
                     "PRAGMA foreign_key_check").fetchall(), [])
-                self.assertEqual(conn.execute(
-                    "SELECT count(*) FROM agent_subscription_charge_allocations"
-                ).fetchone()[0], 0)
                 self.assertEqual(conn.execute(
                     "SELECT count(*) FROM billing_export_events"
                 ).fetchone()[0], 0)

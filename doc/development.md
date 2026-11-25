@@ -133,6 +133,13 @@ Agent 订阅的实时配置（订阅、实例、价格事件、绑定）与历�
   在 shadow/事务中执行，业务 facade、
   reconcile 和 C++ 请求路径不补迁移逻辑。规则见
   [database-migrations.md](database-migrations.md)。
+- **已发布的升级代码不可修改。** `schema/<库>/v<major>/*.sql` 和
+  `schema/transitions/**` 一旦提交（发布）就冻结：任何字节变化——包括注释、空白和措辞——
+  都不能有。`schema_migrations` 为每个已应用文件保存 SHA-256，升级入口每次重算比对；
+  被改过的文件会让已升级的库在 `start.sh --all` 或同步升级时报
+  `checksum mismatch for recorded migration V<major>.<minor>`，升级卡住。修正只能追加新的
+  小版本迁移，不能靠"改旧文件 + 改本机库"消除旧语义：不同时间升级的库会停在不同的实际结构上，
+  版本号不再能标识 schema。新迁移在首次提交前可以修改，提交后同样冻结。
 - **C++ schema 版本必须同步。** 每次 Token Board V1 Minor tip 增加时，同时更新
   `proxy/src/store/database_lifecycle.cpp` 的
   `kRequiredRuntimeSchemaMinor`，重新编译代理并运行
