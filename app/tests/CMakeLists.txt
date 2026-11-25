@@ -23,6 +23,12 @@ add_test(
 )
 
 add_test(
+    NAME frontend_proxy_billing_stats_card
+    COMMAND ${NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_LIST_DIR}/test_proxy_billing_stats_card.js
+)
+
+add_test(
     NAME frontend_proxy_manager_key_order
     COMMAND ${NODE_EXECUTABLE}
             ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_key_order.js

@@ -13,9 +13,8 @@ async function loadBillingStats() {
         document.getElementById('billTotalRequests').textContent = fmtNum(stats.total_requests);
         document.getElementById('billTodayRequests').textContent = fmtNum(stats.today_requests);
         document.getElementById('billTotalCost').textContent = '¥' + (stats.total_cost || 0).toFixed(2);
-        document.getElementById('billTodayCost').textContent = '¥' + (stats.today_cost || 0).toFixed(2);
+        document.getElementById('billTheoreticalCost').textContent = '¥' + (stats.theoretical_cost || 0).toFixed(2);
         document.getElementById('billTotalTokens').textContent = fmtNum(stats.total_tokens);
-        document.getElementById('billActiveUpstreams').textContent = stats.active_upstreams;
     } catch (err) {
         console.error('Failed to load billing stats:', err);
     }
@@ -209,7 +208,7 @@ function initBillingPage() {
             <div class="stat-card stat-card--cost">
                 <div class="stat-card__label"><span class="icon-dot" style="background:#A75558;"></span><span class="stat-card__label-text">近30天消费（实际）</span></div>
                 <div class="stat-card__value number-lg" id="billTotalCost">--</div>
-                <div class="stat-card__sub">今日消费（理论）: <span id="billTodayCost">--</span> · <span id="billActiveUpstreams">0</span> 个活跃上游</div>
+                <div class="stat-card__sub">近30天消费（理论）: <span id="billTheoreticalCost">--</span></div>
             </div>
         </div>
 
