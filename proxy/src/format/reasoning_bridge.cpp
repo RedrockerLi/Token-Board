@@ -60,19 +60,22 @@ bool decode_reasoning_envelope(const std::string &value, const char *prefix,
 }
 
 json anthropic_block_from_responses_reasoning(const json &item) {
+    // An Anthropic thinking block's `signature` (and redacted_thinking's
+    // `data`) is verified by Anthropic against what Anthropic itself issued, so
+    // this service must never mint one: a self-made value is rejected as an
+    // invalid signature (audit 01-P-17).  The only honest carrier is the
+    // visible summary text.
     const std::string text = summary(item);
-    const std::string envelope = encode_reasoning_envelope(item, kOpenAI);
-    if (text.empty() && !item.value("encrypted_content", "").empty())
-        return json{{"type", "redacted_thinking"}, {"data", envelope}};
-    // Even summary-only Responses reasoning carries id/status/phase/extra in
-    // the envelope, so an Anthropic round-trip does not discard metadata.
-    return json{{"type", "thinking"}, {"thinking", text}, {"signature", envelope}};
+    if (text.empty()) return json();
+    return json{{"type", "thinking"}, {"thinking", text}};
 }
 
 json responses_reasoning_from_anthropic_block(const json &block) {
     json original;
     const std::string signed_value = block.value("type", "") == "redacted_thinking"
         ? block.value("data", "") : block.value("signature", "");
+    // Envelopes written by earlier releases stay readable so stored
+    // conversations still decode; nothing produces the OpenAI envelope now.
     if (decode_reasoning_envelope(signed_value, kOpenAI, original)) return original;
     json item{{"type", "reasoning"}, {"summary", json::array()}};
     const std::string text = block.value("thinking", "");

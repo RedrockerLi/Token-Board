@@ -4383,10 +4383,27 @@ bool read_content(Stream &strm, T &x, size_t payload_max_length, int &status,
         auto ret = true;
         auto exceed_payload_max_length = false;
 
+        // TB-PATCH: `payload_max_length` used to be compared on the
+        // Content-Length branch only, so a chunked or EOF-delimited body was
+        // read without any bound (unbounded memory growth).  Count the bytes
+        // actually handed to the receiver and stop reading as soon as the cap
+        // is exceeded; a body exactly at the cap still passes.
+        std::size_t received_body_bytes = 0;
+        auto limited_out = [&](const char *buf, size_t n, uint64_t off,
+                               uint64_t len) {
+          if (n > payload_max_length - received_body_bytes) {
+            exceed_payload_max_length = true;
+            return false;
+          }
+          received_body_bytes += n;
+          return out(buf, n, off, len);
+        };
+
+        // TB-PATCH: both uncapped branches below read through limited_out.
         if (is_chunked_transfer_encoding(x.headers)) {
-          ret = read_content_chunked(strm, x, out);
+          ret = read_content_chunked(strm, x, limited_out);
         } else if (!has_header(x.headers, "Content-Length")) {
-          ret = read_content_without_length(strm, out);
+          ret = read_content_without_length(strm, limited_out);
         } else {
           auto len = get_header_value_u64(x.headers, "Content-Length", 0, 0);
           if (len > payload_max_length) {

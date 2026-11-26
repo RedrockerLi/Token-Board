@@ -19,9 +19,13 @@ Codex logs carry no request-level timing of their own.
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import os
 import re
+import shutil
+import tempfile
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +52,7 @@ from app.services.codex_segments import (
     merge_codex_records,
     normalize_usage_record,
 )
+from . import zstd_reader
 
 KIND = "codex"
 LABEL = "Codex"
@@ -163,7 +168,7 @@ def _roots(software: dict) -> list[Path]:
 
 def _session_id_from_path(path: Path) -> str:
     name = path.name
-    for suffix in (".jsonl.gz", ".jsonl"):
+    for suffix in (".jsonl.gz", ".jsonl.zst", ".jsonl"):
         if name.endswith(suffix):
             name = name[:-len(suffix)]
             break
@@ -190,7 +195,10 @@ def _session_id_for_path(path: Path) -> str:
                     if isinstance(value, str) and value.strip():
                         return value.strip()
                 break
-    except (OSError, EOFError, gzip.BadGzipFile):
+    except (OSError, EOFError, gzip.BadGzipFile, UnicodeDecodeError,
+            zstd_reader.ZstdUnavailable, zstd_reader.ZstdDecodeError):
+        # 解不开的文件只影响它自己的会话身份:退回文件名,不能让一轮发现整体
+        # 失败(parse 会把它记成 skipped + warning)。
         return _session_id_from_path(path)
     return _session_id_from_path(path)
 
@@ -210,7 +218,7 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
             break
         if not root.is_dir():
             continue
-        for pattern in ("*.jsonl", "*.jsonl.gz"):
+        for pattern in ("*.jsonl", "*.jsonl.gz", "*.jsonl.zst"):
             if stop_event is not None and stop_event.is_set():
                 break
             try:
@@ -255,8 +263,43 @@ def discover(software: dict, stop_event=None) -> list[UsageSource]:
     return out
 
 
+ZSTD_SUFFIX = ".zst"
+
+
 def _open(path: Path):
+    """Open one rollout as text; a cold archive is decoded through a library."""
+    if path.name.endswith(ZSTD_SUFFIX):
+        text = zstd_reader.decode_bytes(path.read_bytes()).decode("utf-8")
+        return io.StringIO(text)
     return gzip.open(path, "rt", encoding="utf-8") if path.name.endswith(".gz") else path.open("r", encoding="utf-8")
+
+
+@contextmanager
+def _plaintext_paths(paths: tuple[Path, ...]):
+    """Map cold archives to decoded plaintext copies for the JSONL indexers.
+
+    Codex deletes the plaintext rollout once it writes ``<name>.jsonl.zst``,
+    while the shared record-merge and replay-prefix indexers open plain JSONL
+    text.  Decode those archives into a temporary directory so both indexers
+    see the same records as ``parse``, then remove the copies.
+    """
+    mapping = {}
+    temp_dir = None
+    try:
+        for path in paths:
+            if not path.name.endswith(ZSTD_SUFFIX):
+                mapping[path] = path
+                continue
+            if temp_dir is None:
+                temp_dir = Path(tempfile.mkdtemp(
+                    prefix="token-board-codex-archive-"))
+            decoded = temp_dir / path.name[:-len(ZSTD_SUFFIX)]
+            decoded.write_bytes(zstd_reader.decode_bytes(path.read_bytes()))
+            mapping[path] = decoded
+        yield mapping
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _records_for_item(item: UsageSource, stop_event=None):
@@ -265,9 +308,11 @@ def _records_for_item(item: UsageSource, stop_event=None):
         segments = (item.path,)
     paths = tuple(Path(path) for path in segments)
     if len(paths) > 1:
-        for index, (record, context) in enumerate(
-                merge_codex_records(paths, stop_event), 1):
-            yield record, context, index
+        with _plaintext_paths(paths) as readable:
+            for index, (record, context) in enumerate(
+                    merge_codex_records(
+                        tuple(readable[path] for path in paths), stop_event), 1):
+                yield record, context, index
         return
     with _open(paths[0]) as stream:
         for line_no, raw in enumerate(stream, 1):
@@ -696,6 +741,19 @@ def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_)
                 pending_usage_event, pending_usage_source_key, durable_seen))
             pending_usage_event = None
             pending_usage_source_key = None
+    except zstd_reader.ZstdUnavailable:
+        # 冷归档只有 .jsonl.zst 一份,解不开就不能装作没有用量:保留游标并把
+        # 原因写到适配器状态里,等环境补齐解码库后重试。
+        return batch(
+            [], line_count, skipped=True,
+            warnings=("codex: 缺少可用的 Zstandard 解码库，"
+                      ".jsonl.zst 冷归档未导入，已保留上次同步状态。",),
+        )
+    except zstd_reader.ZstdDecodeError:
+        return batch(
+            [], line_count, skipped=True,
+            warnings=("codex: .jsonl.zst 冷归档解码失败，已保留上次同步状态。",),
+        )
     except (CodexMergeCancelled, OSError, EOFError, gzip.BadGzipFile, ValueError):
         return batch(
             [], line_count, skipped=True,
@@ -707,24 +765,40 @@ def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_)
 def replay_skips(sources: list[UsageSource], stop_event=None) -> dict[str, int]:
     # Cindy ledger databases are merged into this adapter's source list, but
     # Codex lineage analysis only understands rollout JSONL files.
-    physical = [
-        item.context.get("segments") or item.path
-        for item in sources
-        if not item.context.get("cindy")
-        and not item.context.get("discovery_warnings")
-    ]
-    counts = replay_skip_counts(physical, stop_event)
-    result = {}
+    entries = []
     for item in sources:
         if item.context.get("cindy") or item.context.get("discovery_warnings"):
             continue
         segments = item.context.get("segments")
-        paths = tuple(segments) if isinstance(segments, (list, tuple)) else (item.path,)
+        paths = (tuple(Path(path) for path in segments)
+                 if isinstance(segments, (list, tuple)) and segments
+                 else (item.path,))
+        entries.append((item, paths))
+    groups = [paths for _, paths in entries]
+    mapping = {}
+    try:
+        with _plaintext_paths(
+                tuple(path for group in groups for path in group)) as mapping:
+            counts = replay_skip_counts(
+                [tuple(mapping[path] for path in group) for group in groups],
+                stop_event)
+    except (zstd_reader.ZstdUnavailable, zstd_reader.ZstdDecodeError):
+        # 归档解不开时只按明文文件建索引:parse 会对该归档给出 skipped +
+        # warning,不会静默丢掉它的重放前缀。
+        plain_groups = [
+            tuple(path for path in group if not path.name.endswith(ZSTD_SUFFIX))
+            for group in groups
+        ]
+        counts = replay_skip_counts(
+            [group for group in plain_groups if group], stop_event)
+    result = {}
+    for item, paths in entries:
         # replay_skip_counts indexes a multi-segment source by its first
         # physical path, while the importer keys the cursor by the selected
         # representative. Translate that internal key back to the source
         # identity used by parse().
-        skip = max((counts.get(str(path), 0) for path in paths), default=0)
+        skip = max((counts.get(str(mapping.get(path, path)), 0)
+                    for path in paths), default=0)
         if skip:
             result[str(item.path)] = skip
     return result

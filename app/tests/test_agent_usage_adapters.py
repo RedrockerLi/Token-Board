@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
 import json
 import os
 import shutil
@@ -4148,6 +4150,430 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual(ev.prompt_tokens, 115)
             self.assertEqual(ev.cache_read_tokens, 20)
             self.assertEqual(ev.completion_tokens, 30)
+
+
+def _zstd_reader():
+    """Import the Zstandard decoder lazily so the fixtures need no encoder."""
+    from app.services.agent_usage.adapters import zstd_reader
+    return zstd_reader
+
+
+class CodexZstdArchiveTestCase(unittest.TestCase):
+    """Codex 冷归档 ``.jsonl.zst``:发现、解码与无解码能力时的降级。
+
+    Codex 把 7 天前的 rollout 压成 ``<name>.jsonl.zst`` 并删掉明文,归档是唯一
+    剩下的副本。夹具是内嵌的 zstd 帧,生成测试时不需要本机装有编码器;解码能力
+    通过 ``zstd_reader`` 的模块级函数探测,测试可以 monkeypatch 掉。缺解码库时
+    需要真解码的用例显式失败(不 skip)并给出安装建议,无库降级路径则由
+    monkeypatch 用例无条件覆盖。
+    """
+
+    _ARCHIVE_NAME = ("rollout-20260920000000-"
+                     "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl.zst")
+    _PLAIN_NAME = ("rollout-20260919000000-"
+                   "11111111-2222-3333-4444-555555555555.jsonl")
+    # (prompt, completion, cache_read, total)
+    _ARCHIVE_TOKENS = ((100, 10, 20, 110), (200, 20, 40, 220))
+    # 内嵌 zstd 帧:整档一帧、同一档拆两帧再拼接、重放用例的子会话归档。
+    _ARCHIVE_FRAME_B64 = (
+        "KLUv/WAkAq0HAAKNKB5gZ9yAg42d9xa2UaKNbBEoDkEHlGdoOQPHpaGoYZ2E995LBEEQg0FVVd97qhTXXPuyo4rxYe06lv1+RMY/jcjIPFCC/jSusbL+qPddusC1dw8bNEFmFo4kcyA1CWQK0NSG2Xdm2ivOqHeM4ASzXgkgfaMszJr5BL/rpZzzPOE9TIxoh+VsYu8H2HCBEmTbi2IbRAbuM6NcN3d2RAlyo3hcBCIgsAKRObsBEvk7IYYotHHC/sTKdE3ViSQZDZaxNOJEcBPasLdhcNV/bhK8aRDUy5oY72C0ZnENrBoWGso2joDgBBLPwupQOrIJKVJdVn8C")
+    _SPLIT_FRAME_B64 = (
+        "KLUv/SCCBQMAkoUTGYC3bWDYNnC9tFBbhChbBkUJC+UFps4DQAem+0miIgMYr4CRqAcnyUpRoZABm+5bEpIAIWfIW3j6cojjqaHc+hl+nEehNO3m/hDPpfCXBQBsCDSgdIRNSJXqssoTKLUv/WCiAR0GAMLJHx1gNXawfDbtyrXrnQ/BESlOkgiOBpvzcYgIiAICB8T/v6aUEoLs7i7x//+7lsaag9wCu5QGSDg5GHbniQqPLlGheiCVML7G8lkYxuWQGXdozFt0yWod4BypVNgxDj+DqgoOpVrQNQhqDFb3NeywG+aJilxgs7z1QCdS2c/xfAIbACAR8B0AMSAKYCNIGPjEYLqo1gSFhZUkBg0gYykgTg1uEtqAvU0ZHOg/J0uOLQFq9FBHjFrfhEVMWaEzhbbmEw==")
+    _REPLAY_CHILD_FRAME_B64 = (
+        "KLUv/WCYAiUHAGLLJB5gR93I6mD6SLijt+JylNx3CDpAq0nNKREqCUQFdwJEjDEq5QBQlKKQBEkQtWo3xnX4/TMV+5BnKvRIS0LoOZZRgSG0HrLjjWPvICcs1wb/AVUdHIuqgK4RoEayuq/xw27sC7Ctd13QRIzv+uG3mj/NYtrweGMwDiMgJMsoLcmwOwd+mYrk77acMwgbZlqy3+EzCiIg0AIRwnppE5m+Qshj0GKnixLmMbQwhDyGFsPTuSIni1XUYiReiw/CSaksWi0BOlrFEUPrTYmg2FjIUL5xvMMhv8dZipOmAJZPc1nrCQ==")
+    # 解出来不是合法 UTF-8 的归档:解码本身成功,文本读取必须报错而不是崩掉发现。
+    _BAD_TEXT_FRAME_B64 = (
+        "KLUv/SBBCQIAeyJ0eXBlIjoic2Vzc2lvbl9tZXRhIiwicGF5bG9hZCI6eyJpZCI6ImJhZC11dGY4In19Cv/+IG5vdCB1dGYtOAo=")
+
+    @staticmethod
+    def _jsonl(records) -> str:
+        return "".join(json.dumps(record) + "\n" for record in records)
+
+    @staticmethod
+    def _token_record(at: str, input_tokens: int, output_tokens: int,
+                      *, cached: int = 0, reasoning: int = 0,
+                      total_in: int | None = None,
+                      total_out: int | None = None) -> dict:
+        last = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens}
+        if cached:
+            last["cached_input_tokens"] = cached
+        if reasoning:
+            last["reasoning_output_tokens"] = reasoning
+        cumulative = {
+            "input_tokens": input_tokens if total_in is None else total_in,
+            "output_tokens": output_tokens if total_out is None else total_out,
+        }
+        cumulative["total_tokens"] = (cumulative["input_tokens"]
+                                      + cumulative["output_tokens"])
+        return {"type": "event_msg", "timestamp": at,
+                "payload": {"type": "token_count",
+                            "info": {"last_token_usage": last,
+                                     "total_token_usage": cumulative}}}
+
+    @classmethod
+    def _archive_records(cls) -> list[dict]:
+        return [
+            {"type": "session_meta", "payload": {"id": "zstd-archive-session"}},
+            {"type": "turn_context", "payload": {"model": "gpt-5-codex"}},
+            cls._token_record("2026-09-20T00:00:01.000Z", 100, 10, cached=20,
+                              reasoning=2, total_in=100, total_out=10),
+            cls._token_record("2026-09-20T00:00:02.000Z", 200, 20, cached=40,
+                              reasoning=4, total_in=300, total_out=30),
+        ]
+
+    @classmethod
+    def _replay_records(cls) -> tuple[list[dict], list[dict]]:
+        usage = [
+            cls._token_record("2026-09-20T00:00:01.000Z", 10, 2,
+                              total_in=10, total_out=2),
+            cls._token_record("2026-09-20T00:00:02.000Z", 20, 4,
+                              total_in=30, total_out=6),
+        ]
+        parent = [{"type": "session_meta",
+                   "payload": {"id": "parent-session"}}] + usage
+        child = [
+            {"type": "session_meta", "payload": {
+                "id": "child-session", "forked_from_id": "parent-session"}},
+        ] + usage + [
+            cls._token_record("2026-09-20T00:00:03.000Z", 40, 8,
+                              total_in=70, total_out=14),
+        ]
+        return parent, child
+
+    def _codex_home(self, directory: str) -> Path:
+        home = Path(directory) / "codex-home"
+        (home / "sessions").mkdir(parents=True)
+        (home / "archived_sessions").mkdir()
+        return home
+
+    def _discover(self, home: Path) -> list[UsageSource]:
+        return codex.discover({"config": {"data_root": str(home)}})
+
+    def _source_for(self, sources, path: Path) -> UsageSource:
+        for item in sources:
+            if item.path == path:
+                return item
+        self.fail(f"codex did not discover the cold archive {path.name}")
+
+    def _require_decoder(self):
+        """Return the Zstandard decoder module, failing the test when absent.
+
+        这些用例是 02-F-02 的回归门禁:缺解码库时必须显式失败。静默 skip 会让
+        「冷归档能被解析」与「冷归档又被漏记」在 CI 里表现成同一个绿,而这正是
+        本审计要堵的静默漏记。
+        """
+        reader = _zstd_reader()
+        if not reader.available():
+            self.fail(
+                "需要 Zstandard 解码库才能验证 Codex .jsonl.zst 冷归档: "
+                "请安装 backports.zstd 或 zstandard(pip install zstandard),"
+                "或改用自带 compression.zstd 的 Python 3.14+。")
+        return reader
+
+    @staticmethod
+    def _tokens(parsed) -> list[tuple[int, int, int, int]]:
+        return [(event.prompt_tokens, event.completion_tokens,
+                 event.cache_read_tokens, event.total_tokens)
+                for event in parsed.events]
+
+    def test_discover_includes_zstd_cold_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            archive = home / "archived_sessions" / self._ARCHIVE_NAME
+            archive.write_bytes(base64.b64decode(self._ARCHIVE_FRAME_B64))
+
+            sources = self._discover(home)
+
+            # 发现这一步不依赖解码能力:归档文件必须出现在源列表里。
+            self.assertEqual(len(sources), 1)
+            item = sources[0]
+            self.assertEqual(item.path, archive)
+            self.assertEqual(item.context["segments"], (archive,))
+
+    def test_zstd_archive_identity_comes_from_its_header(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            archive = home / "archived_sessions" / self._ARCHIVE_NAME
+            archive.write_bytes(base64.b64decode(self._ARCHIVE_FRAME_B64))
+
+            sources = self._discover(home)
+            self._require_decoder()
+
+            self.assertEqual(len(sources), 1)
+            # 归档里的 session_meta 给出会话身份,与明文副本一致,不靠文件名猜。
+            self.assertEqual(sources[0].context["session_id"],
+                             "zstd-archive-session")
+
+    def test_zstd_archive_parses_like_plaintext(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            archive = home / "archived_sessions" / self._ARCHIVE_NAME
+            archive.write_bytes(base64.b64decode(self._ARCHIVE_FRAME_B64))
+            plain_records = json.loads(json.dumps(self._archive_records()))
+            plain_records[0]["payload"]["id"] = "plain-session"
+            plain = home / "sessions" / self._PLAIN_NAME
+            plain.write_text(self._jsonl(plain_records), encoding="utf-8")
+
+            sources = self._discover(home)
+            archive_source = self._source_for(sources, archive)
+            plain_source = self._source_for(sources, plain)
+            self._require_decoder()
+
+            archived = codex.parse(archive_source)
+            expected = codex.parse(plain_source)
+
+            self.assertFalse(archived.skipped)
+            self.assertEqual(archived.warnings, ())
+            self.assertEqual(self._tokens(archived), list(self._ARCHIVE_TOKENS))
+            self.assertEqual(self._tokens(archived), self._tokens(expected))
+            self.assertEqual([event.model for event in archived.events],
+                             [event.model for event in expected.events])
+            self.assertEqual([event.requested_at for event in archived.events],
+                             [event.requested_at for event in expected.events])
+            self.assertEqual([event.duration_ms for event in archived.events],
+                             [event.duration_ms for event in expected.events])
+
+    def test_zstd_archive_decodes_concatenated_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            archive = home / "archived_sessions" / self._ARCHIVE_NAME
+            archive.write_bytes(base64.b64decode(self._SPLIT_FRAME_B64))
+
+            sources = self._discover(home)
+            item = self._source_for(sources, archive)
+            self._require_decoder()
+
+            parsed = codex.parse(item)
+
+            self.assertFalse(parsed.skipped)
+            self.assertEqual(self._tokens(parsed), list(self._ARCHIVE_TOKENS))
+
+    def test_archive_without_decoder_is_skipped_with_warning(self) -> None:
+        reader = _zstd_reader()
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            archive = home / "archived_sessions" / self._ARCHIVE_NAME
+            archive.write_bytes(base64.b64decode(self._ARCHIVE_FRAME_B64))
+            plain_records = json.loads(json.dumps(self._archive_records()))
+            plain_records[0]["payload"]["id"] = "plain-session"
+            plain = home / "sessions" / self._PLAIN_NAME
+            plain.write_text(self._jsonl(plain_records), encoding="utf-8")
+
+            with patch.object(reader, "_backend", return_value=None), \
+                    patch.object(reader, "available", return_value=False):
+                self.assertFalse(reader.available())
+                sources = self._discover(home)
+                # 缺解码库也要发现归档,否则又会变回静默漏记。
+                archive_source = self._source_for(sources, archive)
+                self.assertEqual(
+                    archive_source.context["session_id"],
+                    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+                archived = codex.parse(archive_source)
+                # 明文会话不受影响:降级只针对归档。
+                plain_parsed = codex.parse(self._source_for(sources, plain))
+
+            self.assertTrue(archived.skipped)
+            self.assertEqual(archived.events, ())
+            self.assertGreaterEqual(len(archived.warnings), 1)
+            self.assertIn("Zstandard", archived.warnings[0])
+            self.assertFalse(plain_parsed.skipped)
+            self.assertEqual(self._tokens(plain_parsed),
+                             list(self._ARCHIVE_TOKENS))
+
+    def test_codex_merges_live_and_archived_zstd_copy(self) -> None:
+        # 合并要求先解出归档里的 session_meta,否则两边只能按文件名各成一条。
+        self._require_decoder()
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            live_records = self._archive_records()[:3]
+            live = home / "sessions" / (
+                "rollout-20260920000000-"
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl")
+            live.write_text(self._jsonl(live_records), encoding="utf-8")
+            archive = home / "archived_sessions" / self._ARCHIVE_NAME
+            archive.write_bytes(base64.b64decode(self._ARCHIVE_FRAME_B64))
+
+            sources = self._discover(home)
+            self.assertEqual(len(sources), 1)
+            item = sources[0]
+            # 明文副本 + 归档副本合并成一条逻辑会话,与 .jsonl/.jsonl.gz 同口径。
+            self.assertEqual(len(item.context["segments"]), 2)
+
+            parsed = codex.parse(item)
+
+            self.assertFalse(parsed.skipped)
+            self.assertEqual(self._tokens(parsed), list(self._ARCHIVE_TOKENS))
+
+    def test_replay_skips_read_zstd_archive(self) -> None:
+        parent_records, child_records = self._replay_records()
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            parent = home / "sessions" / (
+                "rollout-20260920000000-"
+                "11111111-2222-3333-4444-555555555555.jsonl")
+            parent.write_text(self._jsonl(parent_records), encoding="utf-8")
+            child = home / "archived_sessions" / (
+                "rollout-20260920000000-"
+                "99999999-8888-7777-6666-555555555555.jsonl.zst")
+            child.write_bytes(base64.b64decode(self._REPLAY_CHILD_FRAME_B64))
+
+            sources = self._discover(home)
+            child_source = self._source_for(sources, child)
+            parent_source = self._source_for(sources, parent)
+            self._require_decoder()
+
+            skips = codex.replay_skips(sources)
+            parsed = codex.parse(child_source, skip_token_count=skips[str(child)])
+
+            # 子会话前两条 token_count 是父会话的重放,只入账自己新增的一条。
+            self.assertEqual(skips, {str(child): 2})
+            self.assertNotIn(str(parent), skips)
+            self.assertEqual(self._tokens(parsed), [(40, 8, 0, 48)])
+            self.assertEqual(self._tokens(codex.parse(parent_source)),
+                             [(10, 2, 0, 12), (20, 4, 0, 24)])
+
+    def test_gzip_rollouts_are_still_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            path = home / "sessions" / (
+                "rollout-20260918000000-"
+                "77777777-6666-5555-4444-333333333333.jsonl.gz")
+            with gzip.open(path, "wt", encoding="utf-8") as stream:
+                stream.write(self._jsonl(self._archive_records()))
+
+            sources = self._discover(home)
+            item = self._source_for(sources, path)
+            parsed = codex.parse(item)
+
+            self.assertFalse(parsed.skipped)
+            self.assertEqual(self._tokens(parsed), list(self._ARCHIVE_TOKENS))
+
+    def test_decoder_priority_prefers_stdlib_then_backport_then_binding(self) -> None:
+        reader = _zstd_reader()
+        calls = []
+
+        class FakeBackend:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def decompress(self, raw: bytes) -> bytes:
+                return b"decoded:" + self.name.encode("ascii") + raw
+
+        def fake_import(name: str):
+            calls.append(name)
+            return FakeBackend(name) if name == "backports.zstd" else None
+
+        with patch.object(reader, "_import_backend", side_effect=fake_import):
+            self.assertTrue(reader.available())
+            probe = list(calls)
+            calls.clear()
+            self.assertEqual(reader.decode_bytes(b"payload"),
+                             b"decoded:backports.zstdpayload")
+            decode_probe = list(calls)
+
+        # 探测顺序固定,且命中后不再继续导入更低优先级的库。
+        self.assertEqual(probe, ["compression.zstd", "backports.zstd"])
+        self.assertEqual(decode_probe, ["compression.zstd", "backports.zstd"])
+
+    def test_no_decoder_library_reports_unavailable(self) -> None:
+        reader = _zstd_reader()
+        calls = []
+
+        def fake_import(name: str):
+            calls.append(name)
+            return None
+
+        with patch.object(reader, "_import_backend", side_effect=fake_import):
+            self.assertFalse(reader.available())
+            probe = list(calls)
+            calls.clear()
+            with self.assertRaises(reader.ZstdUnavailable):
+                reader.decode_bytes(b"payload")
+            decode_probe = list(calls)
+
+        self.assertEqual(probe, list(reader._BACKENDS))
+        self.assertEqual(decode_probe, list(reader._BACKENDS))
+
+    def test_zstd_reader_rejects_incomplete_archive(self) -> None:
+        reader = self._require_decoder()
+        archive_text = self._jsonl(self._archive_records()).encode("utf-8")
+        frame = base64.b64decode(self._ARCHIVE_FRAME_B64)
+
+        self.assertEqual(reader.decode_bytes(frame), archive_text)
+        self.assertEqual(
+            reader.decode_bytes(base64.b64decode(self._SPLIT_FRAME_B64)),
+            archive_text)
+        # 冷归档按完整文件处理:撕裂的帧、空文件、非 zstd 数据都要报错,不能
+        # 只返回解出来的那一段。
+        with self.assertRaises(reader.ZstdDecodeError):
+            reader.decode_bytes(frame[:-6])
+        with self.assertRaises(reader.ZstdDecodeError):
+            reader.decode_bytes(b"")
+        with self.assertRaises(reader.ZstdDecodeError):
+            reader.decode_bytes(b"not a zstandard stream")
+
+    def test_mixed_session_without_decoder_keeps_sync_alive(self) -> None:
+        reader = _zstd_reader()
+        with tempfile.TemporaryDirectory() as directory:
+            home = self._codex_home(directory)
+            live = home / "sessions" / (
+                "rollout-20260920000000-"
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl")
+            live.write_text(self._jsonl(self._archive_records()[:3]),
+                            encoding="utf-8")
+            archive = home / "archived_sessions" / self._ARCHIVE_NAME
+            archive.write_bytes(base64.b64decode(self._ARCHIVE_FRAME_B64))
+
+            with patch.object(reader, "_backend", return_value=None), \
+                    patch.object(reader, "available", return_value=False):
+                sources = self._discover(home)
+                # 归档读不出 header 时按文件名兜底成独立来源,明文副本照常导入。
+                self.assertEqual(len(sources), 2)
+                live_parsed = codex.parse(self._source_for(sources, live))
+                archive_parsed = codex.parse(self._source_for(sources, archive))
+                # 重放索引只能拿明文建索引:不能因为归档解不开就抛异常,把整轮
+                # 同步打断。
+                skips = codex.replay_skips(sources)
+
+            self.assertFalse(live_parsed.skipped)
+            self.assertEqual(self._tokens(live_parsed), [(100, 10, 20, 110)])
+            self.assertTrue(archive_parsed.skipped)
+            self.assertGreaterEqual(len(archive_parsed.warnings), 1)
+            self.assertEqual(skips, {})
+
+    def test_unreadable_archive_is_reported_not_dropped(self) -> None:
+        self._require_decoder()
+        cases = {
+            "corrupt stream": b"not a zstandard stream",
+            "invalid utf-8 text": base64.b64decode(self._BAD_TEXT_FRAME_B64),
+        }
+        for label, payload in cases.items():
+            with self.subTest(label=label), \
+                    tempfile.TemporaryDirectory() as directory:
+                home = self._codex_home(directory)
+                archive = home / "archived_sessions" / self._ARCHIVE_NAME
+                archive.write_bytes(payload)
+
+                # 单个坏归档不能让整轮发现失败。
+                sources = self._discover(home)
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(
+                    sources[0].context["session_id"],
+                    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+                parsed = codex.parse(sources[0])
+                self.assertTrue(parsed.skipped)
+                self.assertEqual(parsed.events, ())
+                self.assertGreaterEqual(len(parsed.warnings), 1)
+
+    def test_codex_zstd_path_does_not_shell_out(self) -> None:
+        reader = _zstd_reader()
+        sources = "".join(
+            Path(module.__file__).read_text(encoding="utf-8")
+            for module in (codex, reader)
+        )
+        for needle in ("subprocess", "shutil.which", "os.system"):
+            self.assertNotIn(needle, sources)
 
 
 if __name__ == "__main__":

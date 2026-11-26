@@ -162,10 +162,37 @@ json serialize_anthropic_blocks(const std::vector<ContentBlock> &blocks) {
                 break;
             }
             case ContentKind::Thinking: {
-                if (b.extra.contains("responses_reasoning_item") &&
+                // A signature/data value that came off an Anthropic block is
+                // the upstream vendor's own and is replayed verbatim.  Only a
+                // Responses reasoning item has to be adapted: this service
+                // cannot mint an Anthropic-verifiable signature for it
+                // (audit 01-P-17).
+                const bool has_vendor_signature =
+                    b.extra.contains("signature") || b.extra.contains("data");
+                if (!has_vendor_signature &&
+                    b.extra.contains("responses_reasoning_item") &&
                     b.extra["responses_reasoning_item"].is_object()) {
-                    arr.push_back(fmt::anthropic_block_from_responses_reasoning(
-                        b.extra["responses_reasoning_item"]));
+                    const json carrier =
+                        fmt::anthropic_block_from_responses_reasoning(
+                            b.extra["responses_reasoning_item"]);
+                    if (carrier.is_null() || carrier.empty()) {
+                        // Dropping the block loses no visible text: the item
+                        // only carried encrypted_content.  Counted and sampled
+                        // like the other informational conditions in this file.
+                        static std::atomic<std::uint64_t> dropped_reasoning{0};
+                        const std::uint64_t occurrence =
+                            dropped_reasoning.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (occurrence == 1 || occurrence % 1000 == 0)
+                            TB_LOG_WARN(
+                                "[Anthropic] dropped a Responses reasoning item: "
+                                "reasoning item has no text carrier (only "
+                                "encrypted_content, no summary text), and sending it "
+                                "would require a fabricated Anthropic signature "
+                                "(occurrence %llu)\n",
+                                static_cast<unsigned long long>(occurrence));
+                        break;
+                    }
+                    arr.push_back(carrier);
                     break;
                 }
                 json j;
@@ -294,6 +321,10 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in,
             has_tool_result = has_tool_result || b.kind == ContentKind::ToolResult;
         jm["role"] = has_tool_result ? "user" : m.role;
         jm["content"] = serialize_anthropic_blocks(m.content);
+        // An empty Anthropic content array is not a valid message; this only
+        // happens when every block was untranslatable (a reasoning item with
+        // no text carrier is the only such case today).
+        if (jm["content"].empty()) continue;
         msgs.push_back(std::move(jm));
     }
     body["messages"] = std::move(msgs);

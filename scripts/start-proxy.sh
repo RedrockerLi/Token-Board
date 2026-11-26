@@ -29,7 +29,9 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 if [ ! -f "$PROXY_BIN" ]; then
     echo "[INFO] 代理未编译，开始编译..."
     cd "$SCRIPT_DIR/proxy"
-    cmake -B build -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
+    # Production build only: the test suite (and its Python test-interpreter
+    # check) is not needed here, so keep tests out of this configure.
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF > /dev/null 2>&1
     cmake --build build -j$(nproc) > /dev/null 2>&1
     cd "$SCRIPT_DIR"
     echo "[INFO] 编译完成"

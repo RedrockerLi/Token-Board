@@ -274,6 +274,11 @@ tb_require_python_test_deps()
 # The interpreter is a test dependency of its own: a CTest entry keeps the
 # requirement visible when someone runs the suite with a different shell.
 add_test(NAME python_env COMMAND ${Python3_EXECUTABLE} -c "import flask, requests, jinja2")
+# Production start scripts must configure without the test suite, so a machine
+# whose default python3 lacks the test dependencies still builds the proxy.
+add_test(NAME start_scripts_configure COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/start_scripts_configure_test.py
+)
 add_test(NAME pricing_snapshot_equiv COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/run_prepared_cpp_db_test.py
     $<TARGET_FILE:pricing_snapshot_equiv_test>
@@ -645,7 +650,7 @@ set_tests_properties(
     PROPERTIES LABELS "schema;unit"
 )
 set_tests_properties(format_conversion session_affinity endpoint_policy source_size
-    refactor_boundaries ctest_registration_fresh python_env
+    refactor_boundaries ctest_registration_fresh python_env start_scripts_configure
     accounting_abort usage_accounting usage_parser semaphore_pool
     crash_hook_isolation
     PROPERTIES LABELS "unit")

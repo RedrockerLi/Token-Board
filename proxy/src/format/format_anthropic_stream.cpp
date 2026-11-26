@@ -1,6 +1,9 @@
 #include "format_anthropic_internal.h"
 #include "reasoning_bridge.h"
 
+#include <atomic>
+#include <cstdint>
+
 using namespace ir;
 
 namespace {
@@ -342,15 +345,35 @@ public:
                 const bool has_raw_reasoning = ev.item.extra.contains("raw_item") &&
                     ev.item.extra["raw_item"].is_object();
                 if (ev.text.empty() && !has_raw_reasoning) return true;
-                if (!started_ && !emit_message_start(sink)) return false;
                 json thinking_block{{"type", "thinking"}, {"thinking", ""}};
-                if (ev.item.extra.contains("raw_item") &&
-                    ev.item.extra["raw_item"].is_object()) {
-                    thinking_block = fmt::anthropic_block_from_responses_reasoning(
-                        ev.item.extra["raw_item"]);
-                    if (thinking_block.value("type", "") == "thinking")
-                        thinking_block["thinking"] = "";
+                if (has_raw_reasoning) {
+                    const json carrier =
+                        fmt::anthropic_block_from_responses_reasoning(
+                            ev.item.extra["raw_item"]);
+                    if (carrier.is_null() || carrier.empty()) {
+                        // The reasoning item carries no text, so there is no
+                        // Anthropic-verifiable signature and no visible summary
+                        // to send.  Drop the block; deltas (if any) still flow
+                        // through a plain unsigned thinking block.
+                        static std::atomic<std::uint64_t> dropped_reasoning{0};
+                        const std::uint64_t occurrence =
+                            dropped_reasoning.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (occurrence == 1 || occurrence % 1000 == 0)
+                            TB_LOG_WARN(
+                                "[Anthropic] dropped a Responses reasoning item in the "
+                                "stream: reasoning item has no text carrier (only "
+                                "encrypted_content, no summary text), and sending it "
+                                "would require a fabricated Anthropic signature "
+                                "(occurrence %llu)\n",
+                                static_cast<unsigned long long>(occurrence));
+                        if (ev.text.empty()) return true;
+                    } else {
+                        thinking_block = carrier;
+                        if (thinking_block.value("type", "") == "thinking")
+                            thinking_block["thinking"] = "";
+                    }
                 }
+                if (!started_ && !emit_message_start(sink)) return false;
                 if (!open_block(sink, ev.index, ContentKind::Thinking,
                                 thinking_block)) return false;
                 if (ev.text.empty()) return true;

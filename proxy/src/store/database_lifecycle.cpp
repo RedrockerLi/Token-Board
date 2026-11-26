@@ -2,10 +2,11 @@
 
 namespace {
 
-// Keep this reviewed with the newest proxy V2 SQL file.  The C++ runtime
-// serves one exact schema contract; Python owns all SQL migrations.
+// Keep this reviewed with the newest proxy V2 SQL file; the current tip is
+// V2.10 (2-10_pricing_slot_and_fx.sql).  The C++ runtime serves one exact
+// schema contract; Python owns all SQL migrations.
 constexpr int kRequiredRuntimeSchemaMajor = 2;
-constexpr int kRequiredRuntimeSchemaMinor = 9;
+constexpr int kRequiredRuntimeSchemaMinor = 10;
 
 bool validate_v2_schema(sqlite3 *db, const std::string &path,
                         int &major, int &minor) {

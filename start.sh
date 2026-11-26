@@ -331,8 +331,10 @@ echo ""
 if $START_ALL; then
     command -v cmake >/dev/null 2>&1 || { echo "[ERROR] cmake not found" >&2; exit 1; }
     echo "[proxy] 编译 C++ 代理..."
+    # Production build only: tests (and their Python test-interpreter check) are
+    # not part of --all, so keep them out of this configure entirely.
     cmake -S "$SCRIPT_DIR/proxy" -B "$SCRIPT_DIR/proxy/build" \
-        -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF >/dev/null 2>&1
     BUILD_JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
     cmake --build "$SCRIPT_DIR/proxy/build" -j"$BUILD_JOBS" >/dev/null 2>&1
     [ -x "$PROXY_BIN" ] || { echo "[ERROR] proxy binary not found: $PROXY_BIN" >&2; exit 1; }

@@ -19,6 +19,36 @@ from pathlib import Path
 
 from support import stop_process
 
+MINTED_ENVELOPE_PREFIXES = (
+    "token-board-openai-reasoning-v1:",
+    "token-board-anthropic-thinking-v1:",
+)
+
+
+def anthropic_blocks(body: dict) -> list[dict]:
+    """Every content block of an Anthropic Messages request body."""
+    blocks: list[dict] = []
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, list):
+            blocks.extend(part for part in content if isinstance(part, dict))
+    return blocks
+
+
+def fabricated_signature_field(body: dict) -> str | None:
+    """Name of the first Anthropic signature/data field this service minted.
+
+    Anthropic rejects thinking signatures it did not issue, so the mock
+    upstream mimics that check: any value carrying our own envelope prefix is
+    an automatic 400.
+    """
+    for index, block in enumerate(anthropic_blocks(body)):
+        for field in ("signature", "data"):
+            value = block.get(field)
+            if isinstance(value, str) and value.startswith(MINTED_ENVELOPE_PREFIXES):
+                return f"messages.{index}.{block.get('type', 'block')}.{field}"
+    return None
+
 
 class FakeResponsesUpstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -54,6 +84,70 @@ class FakeResponsesUpstream(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
         if self.path.endswith("/responses"):
+            if body.get("model") == "anthropic-reasoning-stream-text":
+                # A reasoning Item WITH visible summary text: the Anthropic
+                # emitter carries the text but must not attach a signature.
+                response = {"id": "resp-reasoning-text", "object": "response",
+                            "status": "completed",
+                            "model": body.get("model", "responses-model"),
+                            "output": []}
+                frames = [
+                    {"type": "response.created", "response": {
+                        "id": response["id"], "object": "response",
+                        "status": "in_progress", "model": response["model"]}},
+                    {"type": "response.output_item.added", "output_index": 0,
+                     "item": {"id": "rs-text", "type": "reasoning",
+                              "status": "completed",
+                              "summary": [{"type": "summary_text",
+                                            "text": "visible plan"}]}},
+                    {"type": "response.reasoning_summary_text.delta",
+                     "output_index": 0, "item_id": "rs-text",
+                     "summary_index": 0, "delta": "visible plan"},
+                    {"type": "response.output_item.added", "output_index": 1,
+                     "item": {"id": "msg-after", "type": "message",
+                              "status": "in_progress", "role": "assistant",
+                              "content": []}},
+                    {"type": "response.output_text.delta", "output_index": 1,
+                     "item_id": "msg-after", "content_index": 0,
+                     "delta": "after-reasoning"},
+                    {"type": "response.completed", "response": response},
+                ]
+                self._send_sse(("".join("data: " + json.dumps(frame) +
+                                        "\n\n" for frame in frames)).encode())
+                return
+            if body.get("model") == "anthropic-reasoning-stream":
+                # A reasoning Item with no summary text: the Anthropic stream
+                # emitter has nothing legitimate to open for it.
+                response = {"id": "resp-reasoning-stream", "object": "response",
+                            "status": "completed",
+                            "model": body.get("model", "responses-model"),
+                            "output": []}
+                frames = [
+                    {"type": "response.created", "response": {
+                        "id": response["id"], "object": "response",
+                        "status": "in_progress", "model": response["model"]}},
+                    {"type": "response.output_item.added", "output_index": 0,
+                     "item": {"id": "rs-stream", "type": "reasoning",
+                              "status": "completed", "summary": [],
+                              "encrypted_content": "cipher"}},
+                    {"type": "response.output_item.added", "output_index": 1,
+                     "item": {"id": "msg-stream", "type": "message",
+                              "status": "in_progress", "role": "assistant",
+                              "content": []}},
+                    {"type": "response.output_text.delta", "output_index": 1,
+                     "item_id": "msg-stream", "content_index": 0,
+                     "delta": "after-reasoning"},
+                    {"type": "response.output_item.done", "output_index": 1,
+                     "item": {"id": "msg-stream", "type": "message",
+                              "status": "completed", "role": "assistant",
+                              "content": [{"type": "output_text",
+                                            "text": "after-reasoning",
+                                            "annotations": []}]}},
+                    {"type": "response.completed", "response": response},
+                ]
+                self._send_sse(("".join("data: " + json.dumps(frame) +
+                                         "\n\n" for frame in frames)).encode())
+                return
             if body.get("stream"):
                 response = {
                     "id": "resp-stream",
@@ -136,6 +230,25 @@ class FakeResponsesUpstream(BaseHTTPRequestHandler):
             self._send_sse(data.encode())
             return
         if self.path.endswith("/messages"):
+            # P-17 regression guard: Anthropic validates thinking signatures,
+            # so a value this service minted itself must be rejected exactly
+            # like the real endpoint would (400 Invalid signature).  Nothing
+            # in these tests may legitimately carry such a value.
+            fabricated = fabricated_signature_field(body)
+            if fabricated:
+                self._send_json({
+                    "type": "error",
+                    "error": {"type": "invalid_request_error",
+                              "message": f"{fabricated}: Invalid signature"},
+                }, status=400)
+                return
+            if body.get("model") == "anthropic-upstream-error":
+                self._send_json({
+                    "type": "error",
+                    "error": {"type": "invalid_request_error",
+                              "message": "thinking.signature: Invalid signature"},
+                }, status=400)
+                return
             payload = {
                 "id": "msg-converted", "type": "message", "role": "assistant",
                 "model": body.get("model", "anthropic-model"),
@@ -150,9 +263,9 @@ class FakeResponsesUpstream(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
-    def _send_json(self, value):
+    def _send_json(self, value, status=200):
         data = json.dumps(value).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -249,10 +362,11 @@ def main() -> None:
         proxy = subprocess.Popen(
             [str(binary), "--db", str(db),
              "--host", "127.0.0.1", "--port", str(proxy_port),
-             "--log-level", "error"],
+             "--log-level", "warn"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             env=os.environ.copy(),
         )
+        diagnostics = ""
         try:
             wait_health(proxy_port)
             direct_body = {
@@ -489,6 +603,113 @@ def main() -> None:
             assert tool_content["type"] == "tool_result"
             assert tool_content["content"][0]["type"] == "image"
 
+            # P-17: replaying a Responses conversation that carries historical
+            # reasoning must reach Anthropic as an *unsigned* thinking block.
+            # The mock 400s any minted signature, so a 200 here also proves the
+            # request no longer fabricates one.
+            reasoning_replay = {
+                "model": "anthropic-reasoning-replay", "stream": False,
+                "input": [
+                    {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "plan"}]},
+                    {"type": "reasoning", "id": "rs-replay",
+                     "status": "completed", "encrypted_content": "cipher",
+                     "summary": [{"type": "summary_text",
+                                  "text": "visible plan"}]},
+                    {"type": "message", "id": "msg-replay", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "answer"}]},
+                ],
+            }
+            status, replay_result = post_path(proxy_port, "tb-anthropic",
+                                              "/v1/responses", reasoning_replay)
+            with FakeResponsesUpstream.lock:
+                replay_request = next(
+                    item for item in reversed(FakeResponsesUpstream.requests)
+                    if item["auth"] == "sk-anthropic" and
+                    item["body"].get("model") == "anthropic-reasoning-replay")
+            assert status == 200, (replay_result, replay_request["body"])
+            replay_blocks = anthropic_blocks(replay_request["body"])
+            replay_thinking = [block for block in replay_blocks
+                               if block.get("type") == "thinking"]
+            assert len(replay_thinking) == 1, replay_blocks
+            assert replay_thinking[0]["thinking"] == "visible plan", replay_thinking
+            assert "signature" not in replay_thinking[0], replay_thinking
+            assert not any(block.get("type") == "redacted_thinking"
+                           for block in replay_blocks), replay_blocks
+            assert "token-board" not in json.dumps(replay_request["body"])
+
+            # A reasoning item that only carries encrypted_content has no text
+            # carrier: the block is dropped (with a warning) instead of being
+            # re-labelled as redacted_thinking with a minted data value.
+            encrypted_only_replay = {
+                "model": "anthropic-reasoning-dropped", "stream": False,
+                "input": [
+                    {"type": "reasoning", "id": "rs-encrypted",
+                     "encrypted_content": "cipher"},
+                    {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "hi"}]},
+                ],
+            }
+            status, dropped_result = post_path(
+                proxy_port, "tb-anthropic", "/v1/responses", encrypted_only_replay)
+            with FakeResponsesUpstream.lock:
+                dropped_request = next(
+                    item for item in reversed(FakeResponsesUpstream.requests)
+                    if item["auth"] == "sk-anthropic" and
+                    item["body"].get("model") == "anthropic-reasoning-dropped")
+            assert status == 200, (dropped_result, dropped_request["body"])
+            assert "token-board" not in json.dumps(dropped_request["body"])
+            assert "redacted_thinking" not in json.dumps(dropped_request["body"])
+            for message in dropped_request["body"]["messages"]:
+                assert message["content"], dropped_request["body"]
+
+            # Streaming variant (Anthropic client, Responses upstream): the
+            # Anthropic emitter must not open a thinking block for a reasoning
+            # Item that has no text carrier, because the only thing it could
+            # put in `signature` would be a value this service invented.
+            reasoning_stream = {
+                "model": "anthropic-reasoning-stream", "max_tokens": 20,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            status, stream_reasoning_result = post_path(
+                proxy_port, "tb-responses", "/v1/messages", reasoning_stream)
+            assert status == 200, stream_reasoning_result
+            assert "after-reasoning" in stream_reasoning_result, \
+                stream_reasoning_result
+            assert "thinking" not in stream_reasoning_result, \
+                stream_reasoning_result
+            assert "token-board" not in stream_reasoning_result, \
+                stream_reasoning_result
+
+            # Streaming variant with visible summary text: the text survives,
+            # the block is still unsigned.
+            reasoning_stream_text = {
+                "model": "anthropic-reasoning-stream-text", "max_tokens": 20,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            status, stream_text_result = post_path(
+                proxy_port, "tb-responses", "/v1/messages", reasoning_stream_text)
+            assert status == 200, stream_text_result
+            assert "visible plan" in stream_text_result, stream_text_result
+            assert "thinking_delta" in stream_text_result, stream_text_result
+            assert "signature" not in stream_text_result, stream_text_result
+            assert "token-board" not in stream_text_result, stream_text_result
+
+            # An upstream 4xx must reach the client as a readable 4xx carrying
+            # the upstream message/type, never as an opaque 502.
+            upstream_error_body = {
+                "model": "anthropic-upstream-error", "stream": False,
+                "input": [{"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": "boom"}]}],
+            }
+            status, upstream_error_result = post_path(
+                proxy_port, "tb-anthropic", "/v1/responses", upstream_error_body)
+            assert status == 400, (status, upstream_error_result)
+            assert "Invalid signature" in upstream_error_result, upstream_error_result
+            assert "invalid_request_error" in upstream_error_result, upstream_error_result
+
             # An Anthropic client's non-streaming request routed to the OpenAI
             # upstream: the Anthropic wire reports input_tokens as the
             # exclusive net input (cache buckets are separate), so the
@@ -560,7 +781,11 @@ def main() -> None:
             assert status == 422, (status, file_url_result)
             assert len(FakeResponsesUpstream.requests) == before
         finally:
-            stop_process(proxy)
+            diagnostics = stop_process(proxy)
+        # Dropping a reasoning item is a lossy conversion, so it must be
+        # reported with its reason instead of failing silently.
+        assert "reasoning item has no text carrier" in diagnostics, \
+            diagnostics[-2000:]
     upstream.shutdown()
     upstream.server_close()
     thread.join(timeout=2)

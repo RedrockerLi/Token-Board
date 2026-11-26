@@ -8,7 +8,8 @@
 
 ```bash
 cd proxy
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+  -DPython3_EXECUTABLE=/home/redrocker/miniconda3/bin/python
 cmake --build build -j$(nproc)
 cd ..
 PYTHONPATH=. python3 -m app.db.schema_upgrade.cli \
@@ -19,6 +20,8 @@ PYTHONPATH=. python3 -m app.db.schema_upgrade.cli \
 cd proxy
 ./build/token_proxy --db ../data/token-board.db --port 8800
 ```
+
+`-DPython3_EXECUTABLE` 指定测试用的解释器（`BUILD_TESTING` 默认开启）。解析规则、`PY` 兜底与 configure 期依赖校验见「Python 解释器与测试环境」；只构建生产二进制时可用 `-DBUILD_TESTING=OFF` 跳过测试解释器的解析与校验。
 
 数据库升级只在 `bash start.sh --all` 中执行。代理的手动启动和
 `token-maintenance` 都只做 current schema 验证；`--schema-dir` 仅为旧启动命令
@@ -64,6 +67,102 @@ python3 scripts/mock_upstream.py --port 9100
 - **端到端**：Python 集成测试启动真实 `token_proxy` 二进制(CTest 传 `$<TARGET_FILE:token_proxy>`)，断言对外行为与落库结果。
 
 当前唯一的例外是崩溃注入点：`accounting_recovery` 需要在「spool 已 fdatasync、SQLite 尚未提交」的精确时刻终止进程，mock 与配置层表达不了，因此在构建层例外——`durable_spool.cpp` 中 `#ifdef TB_ENABLE_TEST_CRASH` 的注入点只随测试目标 `token_proxy_test` 存在(该目标在 `tests/` 下自行编译 store 源文件并定义宏)，生产库永不定义该宏。边界由 `crash_hook_isolation` 用例强制:生产二进制必须不含 `TB_TEST_CRASH_AFTER_SPOOL_SYNC` 标记，测试二进制必须含。
+
+## Python 解释器与测试环境
+
+`app_testbench`（`python -m unittest discover` 收集 `app/tests`）与 `proxy/tests` 的端到端脚本共用 configure 解析出的同一个 Python 解释器，并导入 `flask`、`requests`、`jinja2`（`jinja2` 由 Flask 带入）。解释器在 configure 阶段解析一次、写进构建树缓存；如果解析到缺依赖的解释器，失败会推迟到测试运行期、表现为 `ModuleNotFoundError`，所以 configure 先做一次导入自检，不通过就中止。
+
+### 解析到缺依赖解释器的原因
+
+未显式指定时，`find_package(Python3 COMPONENTS Interpreter REQUIRED)` 按 CMake 的搜索顺序挑一个 `python3`：PATH 上的系统解释器、`uv` 安装的解释器、激活的 venv（其 `bin` 在 PATH 最前）都是候选，而 conda base 不在 PATH 上。本机 PATH 上的 `python3` 是 `/usr/bin/python3`（3.13.5，缺 `flask`/`jinja2`），`~/.local/bin/python3.13` 是 uv 装的 3.13.15（`flask`/`requests`/`jinja2` 都缺）；没有激活 venv 时直接 configure 会选中后者，导入自检随即失败。带依赖的是 `/home/redrocker/miniconda3/bin/python`（conda base，3.13.11）。
+
+解析结果缓存在构建树的 `Python3_EXECUTABLE` 里：已有缓存的构建树继续用缓存值，新建构建目录（或清掉缓存）才会重新解析。因此同一个仓库里可能同时存在能跑和不能跑的构建树，取决于它是用哪个 PATH、哪个解释器 configure 出来的。
+
+### 显式指定解释器
+
+```bash
+cmake -S proxy -B proxy/build \
+  -DPython3_EXECUTABLE=/home/redrocker/miniconda3/bin/python
+```
+
+`/home/redrocker/miniconda3/bin/python` 可以换成任意带 `flask`、`requests`、`jinja2` 的解释器。需要复用时先存进变量：
+
+```bash
+PY=/home/redrocker/miniconda3/bin/python
+cmake -S proxy -B proxy/build -DPython3_EXECUTABLE="$PY"
+```
+
+`-DPython3_EXECUTABLE` 是 cache 条目，显式传入会覆盖构建树里已有的缓存值。
+
+### PY 环境变量兜底
+
+`proxy/tests/CMakeLists.txt` 的 `tb_prepare_python3_for_tests()` 在 `find_package` 之前读取环境变量 `PY`，把它作为 `Python3_EXECUTABLE` 的默认 cache 值：
+
+```bash
+export PY=/home/redrocker/miniconda3/bin/python
+cmake -S proxy -B proxy/build
+```
+
+优先级：显式 `-DPython3_EXECUTABLE` > 构建树已有缓存 > `PY` > `find_package` 自行搜索。`PY` 不覆盖已有缓存；三者都没有时由 `find_package` 自行搜索，搜索到的解释器仍要过导入自检。
+
+### configure 期依赖校验
+
+`proxy/tests/CMakeLists.txt` 与 `app/tests/CMakeLists.txt` 都调用 `tb_require_python_test_deps()`：用解析出的解释器执行 `import flask, requests, jinja2`，退出码非 0 就 `FATAL_ERROR`。报错给出实际解释器路径、缺失模块、必需模块、解释器的原始错误，以及一条带当前构建目录的修复命令：
+
+```text
+CMake Error at tests/CMakeLists.txt:43 (message):
+  The Python interpreter used by the test suite is missing dependencies.
+
+    interpreter:      /home/redrocker/.local/bin/python3.13
+    missing module:   flask
+    required modules: flask, requests, jinja2
+    interpreter says: Traceback (most recent call last):
+      ...
+    ModuleNotFoundError: No module named 'flask'
+
+    fix: re-run cmake with an interpreter that provides them, for example:
+      cmake -S proxy -B /home/redrocker/File/Token-Board/proxy/build -DPython3_EXECUTABLE=/home/redrocker/miniconda3/bin/python
+```
+
+含义是这次 configure 选中的解释器没有测试依赖，不是测试失败：按 `fix` 行对同一个构建目录重跑 configure 即可。无论解释器来自 `-D`、`PY` 还是 `find_package` 搜索，都走这项校验；`-DBUILD_TESTING=OFF` 的构建不解析测试解释器，也不做这项校验。
+
+### python_env 用例
+
+`python_env` 把「解释器带依赖」固化成一条 CTest 结果：命令是 `${Python3_EXECUTABLE} -c "import flask, requests, jinja2"`，标签 `unit`，超时 300 秒。它和 configure 期的导入检查是同一条命令，所以 configure 通过后它必然通过；作用是在直接跑 `ctest` 的 shell 或 CI 里把「环境不对」和「测试失败」分开：
+
+```bash
+ctest --test-dir proxy/build -R '^python_env$' --output-on-failure
+```
+
+### 改 tests/CMakeLists.txt 之后
+
+`Python3_EXECUTABLE` 缓存、导入自检和 `add_test` 清单都是 configure 产物。改动 `proxy/tests/CMakeLists.txt` 或 `app/tests/CMakeLists.txt` 后要重新 configure：同一构建目录重跑会保留已缓存的解释器，不需要重复 `-D`；新建构建目录则要重新指定解释器（`-DPython3_EXECUTABLE` 或 `PY`）。CTest 清单的新鲜度由 `ctest_registration_fresh` 校验，见下节。
+
+## CTest 注册
+
+`ctest` 的测试清单和测试属性都是 configure 产物：CMake 只在该步骤把 `add_test()` 与 `TIMEOUT` 写进构建树的 `CTestTestfile.cmake`。因此改动任意 `tests/CMakeLists.txt`（增删 `add_test`、改 `foreach` 的迭代列表）后必须重新 configure，否则构建树继续注册旧清单、静默少跑或多跑用例：
+
+```bash
+cmake -S proxy -B proxy/build -DPython3_EXECUTABLE=/home/redrocker/miniconda3/bin/python
+```
+
+门禁用例 `ctest_registration_fresh` 由 `scripts/check_ctest_registration.py` 实现，对**同一构建树**做两项检查：
+
+1. **清单一致**：动态计算源侧测试数（`proxy/tests/CMakeLists.txt` 的 `add_test` 声明数 + `app/tests/CMakeLists.txt` 的声明数按时区 `foreach` 迭代列表展开），与 `ctest --show-only=json-v1` 的注册结果比对；数量或名单不一致即失败，打印期望数、实测数、差额与缺失/多余用例名。
+2. **超时存在**：每个注册用例都必须有正的 `TIMEOUT`，缺失即失败并列出用例名。`tests/CMakeLists.txt` 按目录统一设置：普通用例 300 秒（含 `app/tests` 的 12 个用例），带 `performance` 或 `soak` 标签的用例 1800 秒。
+
+脚本的 `--build-dir` 由 CTest 传入 `CMAKE_BINARY_DIR`，所以任一构建目录（如 `proxy/build/<task>`）都校验自己的注册清单。手工等价命令：
+
+```bash
+/home/redrocker/miniconda3/bin/python scripts/check_ctest_registration.py --build-dir proxy/build --source-root .
+ctest --test-dir proxy/build -R '^ctest_registration_fresh$' --output-on-failure
+```
+
+只看注册数量和用例名（不做校验，也不检查 `TIMEOUT`）：
+
+```bash
+ctest --test-dir proxy/build -N
+```
 
 ## 脚本
 

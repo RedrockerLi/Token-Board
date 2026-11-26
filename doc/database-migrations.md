@@ -41,7 +41,7 @@ schema/
 ├── token-board/
 │   ├── v0/0-1_initial.sql … 0-19_drop_monthly_price.sql
 │   ├── v1/1-0_baseline.sql … 1-21_subscription_effective_dates.sql
-│   └── v2/2-1_agent_billing_dates_and_export_keys.sql … 2-9_retire_agent_allocation_ledger.sql
+│   └── v2/2-1_agent_billing_dates_and_export_keys.sql … 2-10_pricing_slot_and_fx.sql
 ├── dashboard/
 │   ├── v0/0-1_initial.sql … 0-6_drop_account_mirror_cols.sql
 │   ├── v1/1-0_baseline.sql … 1-6_remove_account_exclusions.sql
@@ -71,7 +71,7 @@ app/db/schema_upgrade/
 ```
 
 当前仓库的历史 V1 tip 是 Token Board V1.21、Dashboard V1.7；运行时当前 tip 是
-Token Board V2.9、Dashboard V2.2。V0/V1 文件保留用于历史库和转换测试；新安装只创建
+Token Board V2.10、Dashboard V2.2。V0/V1 文件保留用于历史库和转换测试；新安装只创建
 当前 baseline，不重放旧版本历史。
 
 ## 版本与元数据
@@ -83,12 +83,13 @@ Token Board V2.9、Dashboard V2.2。V0/V1 文件保留用于历史库和转换�
 - `schema_transitions` 保存数据 transition 的 ID、源码 checksum、配对
   `generation_id` 和应用时间。版本 route 决定 transition 是否适用；该表只记录
   已完成的 transition，避免重复执行并保证两个数据库使用同一个 generation。
-- 运行时要求数据库处于当前 V2.9/V2.2 tip（Token Board/Dashboard）。未知的更高版本不能当作已验证的运行时版本；
+- 运行时要求数据库处于当前 V2.10/V2.2 tip（Token Board/Dashboard）。未知的更高版本不能当作已验证的运行时版本；
   应使用匹配版本的 Python schema-upgrade 工具处理。
 
 ### C++ runtime schema contract
 
-Token Board 的 C++ runtime 只接受一个精确的 Proxy V2 Minor 版本。新增或修改
+Token Board 的 C++ runtime 只接受一个精确的 Proxy V2 Minor 版本：当前要求 Token Board
+V2.10（`kRequiredRuntimeSchemaMinor=10`，即 `PRAGMA user_version=20010`）。新增或修改
 `schema/token-board/v2/*.sql` 后，必须同步检查
 `proxy/src/store/database_lifecycle.cpp` 中的
 `kRequiredRuntimeSchemaMinor`，使它等于当前 Token Board V2 tip；否则 Python
@@ -168,6 +169,14 @@ Agent 周期费用只按 `agent_subscription_period_charges.software_id` 归属�
 `agent_subscription_charge_allocations` 已删除。升级 V2.9 时，V2.1 遗留的分摊按最大份额
 折算成该周期费用的直接归属（同一周期的多份分账合并为一笔），已冻结的导出事件改用周期费用
 主键作 `source_key`，保持载荷一致与高水位不重复导出。
+
+### V2.10 计价触发器的时段倍率与 FX 过滤
+
+`price_usage_event` 触发器在 V2.10 重建，V2 的计价口径与 V1.14 一致：时段倍率按写入时刻的
+UTC 当日分钟在 `[start_minute, end_minute)` 内选档（`start_minute > end_minute` 表示跨零点，
+同一规则命中多档时取 `id` 最小者，未命中任何档位为 1.0）；成本子查询与 `pricing_status`
+判定共用同一套规则可用性，非 CNY 规则要求写入当天存在 `<currency> → CNY` 汇率才参与报价。
+迁移只重建触发器，不改写任何既有 `request_log` 行。
 
 ## 同 Major 的 SQL 升级
 
@@ -259,7 +268,7 @@ python3 schema/transitions/V0-update-to-V1/migrate.py \
 
 云端没有远程 migration service。云端 artifact 被下载到本地临时文件后，才由
 Python runner 按版本 route 升级；原云端文件保持不变。配置 V0 artifact 合并后
-可以上传新的 V2.9 artifact，Dashboard artifact 则在导出事务中升级、导出并在
+可以上传新的 V2.10 artifact，Dashboard artifact 则在导出事务中升级、导出并在
 上传成功后提交本地状态。
 
 ## 新增升级的规则

@@ -154,13 +154,106 @@ int main() {
     ir::Tool collision; collision.name = tools.target_tools[0].name;
     ir::ToolContext ignored; assert(!fmt::build_tool_context({ns, collision}, ignored, error));
 
+    // P-17 contract (safe side): a Responses reasoning item becomes an
+    // *unsigned* Anthropic thinking block.  This service never mints the
+    // target vendor's signature/redacted payload — Anthropic only accepts
+    // signatures it issued itself, so a self-made value would be rejected.
     json reasoning{{"type", "reasoning"}, {"id", "rs"}, {"status", "completed"},
                    {"encrypted_content", "cipher"},
                    {"summary", json::array({json{{"type", "summary_text"}, {"text", "visible"}}})}};
     json block = fmt::anthropic_block_from_responses_reasoning(reasoning);
-    assert(block["type"] == "thinking" && block["signature"].get<std::string>().find("token-board-openai-reasoning-v1:") == 0);
+    assert(block["type"] == "thinking");
+    assert(block["thinking"] == "visible");
+    assert(!block.contains("signature"));
+    assert(block.dump().find("token-board") == std::string::npos);
+
+    // Responses -> Anthropic -> Responses degrades instead of fabricating:
+    // the visible summary survives, the unverifiable metadata does not.
     json restored = fmt::responses_reasoning_from_anthropic_block(block);
-    assert(restored == reasoning);
+    assert(restored["type"] == "reasoning");
+    assert(restored["summary"].size() == 1);
+    assert(restored["summary"][0]["text"] == "visible");
+    assert(!restored.contains("encrypted_content"));
+    assert(restored.dump().find("token-board") == std::string::npos);
+
+    // A reasoning item that only has encrypted_content has no text carrier:
+    // it cannot be represented on the Anthropic wire, so the bridge signals
+    // "drop" instead of re-labelling it as redacted_thinking with magic data.
+    json encrypted_only{{"type", "reasoning"}, {"id", "rs-enc"},
+                        {"encrypted_content", "cipher"}};
+    assert(fmt::anthropic_block_from_responses_reasoning(encrypted_only).is_null());
+
+    // Envelopes written by earlier releases stay decodable (read-only
+    // compatibility for conversations produced before this contract).
+    json legacy_block{{"type", "thinking"}, {"thinking", "visible"},
+                      {"signature", fmt::encode_reasoning_envelope(
+                           reasoning, "token-board-openai-reasoning-v1:")}};
+    json legacy_restored = fmt::responses_reasoning_from_anthropic_block(legacy_block);
+    assert(legacy_restored == reasoning);
+
+    // End-to-end: the Anthropic request built from a Responses reasoning item
+    // must not carry a signature for that block nor any token-board envelope.
+    auto anthropic_reasoning = make_anthropic_codec();
+    json p17_request{{"model", "gpt-test"},
+                           {"input", json::array({reasoning,
+                               json{{"type", "message"}, {"id", "msg-1"},
+                                    {"role", "assistant"},
+                                    {"content", json::array({json{
+                                        {"type", "output_text"}, {"text", "answer"}}})}}})}};
+    ir::ChatRequest p17_ir;
+    assert(responses->parse_request(p17_request, p17_ir, error));
+    json p17_anthropic = anthropic_reasoning->serialize_request(p17_ir);
+    int thinking_blocks = 0;
+    for (const auto &message : p17_anthropic["messages"]) {
+        for (const auto &part : message["content"]) {
+            if (part.value("type", "") == "thinking") {
+                ++thinking_blocks;
+                assert(part.value("thinking", "") == "visible");
+                assert(!part.contains("signature"));
+            }
+        }
+    }
+    assert(thinking_blocks == 1);
+    assert(p17_anthropic.dump().find("token-board") == std::string::npos);
+
+    // A thinking block that came off an Anthropic response keeps the
+    // signature that vendor issued: only the Responses-origin item is adapted,
+    // so same-vendor replay does not lose (or replace) a genuine signature.
+    ir::ChatRequest same_vendor;
+    same_vendor.model = "gpt-test";
+    ir::Message vendor_message;
+    vendor_message.role = "assistant";
+    ir::ContentBlock vendor_thinking;
+    vendor_thinking.kind = ir::ContentKind::Thinking;
+    vendor_thinking.text = "plan";
+    vendor_thinking.extra["signature"] = "vendor-sig";
+    vendor_thinking.extra["responses_reasoning_item"] =
+        json{{"type", "reasoning"},
+             {"summary", json::array({json{{"type", "summary_text"}, {"text", "plan"}}})}};
+    vendor_message.content.push_back(vendor_thinking);
+    same_vendor.messages.push_back(vendor_message);
+    json same_vendor_body = anthropic_reasoning->serialize_request(same_vendor);
+    assert(same_vendor_body["messages"][0]["content"][0]["signature"] == "vendor-sig");
+    assert(same_vendor_body.dump().find("token-board") == std::string::npos);
+
+    // The text-less item is dropped at the call site: no empty block, no
+    // redacted_thinking stand-in, and no empty Anthropic content array.
+    json encrypted_only_request{{"model", "gpt-test"},
+                                {"input", json::array({encrypted_only,
+                                    json{{"type", "message"}, {"id", "msg-2"},
+                                         {"role", "user"},
+                                         {"content", json::array({json{
+                                             {"type", "input_text"}, {"text", "hi"}}})}}})}};
+    ir::ChatRequest encrypted_only_ir;
+    assert(responses->parse_request(encrypted_only_request, encrypted_only_ir, error));
+    json encrypted_only_anthropic =
+        anthropic_reasoning->serialize_request(encrypted_only_ir);
+    assert(encrypted_only_anthropic.dump().find("redacted_thinking") == std::string::npos);
+    assert(encrypted_only_anthropic.dump().find("token-board") == std::string::npos);
+    for (const auto &message : encrypted_only_anthropic["messages"]) {
+        assert(!message["content"].empty());
+        for (const auto &part : message["content"]) assert(!part.empty());
+    }
 
     ir::ChatResponse response;
     response.model = "gpt-test";

@@ -14,7 +14,20 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V2.9 当前增量
+## V2.10 当前增量
+
+V2.10 重建计价触发器 `price_usage_event`，价格口径与 V1.14 对齐：
+
+- 时段倍率按写入时刻的 UTC 当日分钟选档：`start_minute <= end_minute` 命中
+  `[start_minute, end_minute)`，`start_minute > end_minute` 表示跨零点；同一规则命中多档时
+  取 `id` 最小的档位，未命中任何档位为 1.0。
+- 成本子查询与 `pricing_status` 判定共用同一套规则可用性：非 CNY 规则要求写入当天存在
+  `<currency> → CNY` 汇率，才参与报价。
+
+迁移只重建触发器，不改写 `request_log` 的既有行：已经固化的 `equivalent_cost` 与
+`billed_usage_cost` 保持写时值。
+
+## V2.9 历史增量
 
 V2.9 删除 V2.1 的 Agent 分摊表 `agent_subscription_charge_allocations`：Agent 周期费用只按
 `agent_subscription_period_charges.software_id` 归属。升级时遗留分摊按最大份额折算成该周期费用的
@@ -173,7 +186,7 @@ Dashboard 存档不保留周期费用明细,冻结费用导出后只累加进 `u
 
 索引:`idx_rl_account`、`idx_rl_time`、`idx_rl_key`(upstream_key_id)、`idx_rl_ttft_time`(requested_at, ttft_ms)、`idx_request_log_event_id`(event_id,唯一)。
 
-计费触发器 `price_usage_event`(V1.14)只处理 `pricing_status='pending'` 的新行,按"写入时当前定价 × 写入时段倍率 × 写入当天可用汇率"计算并固化 `equivalent_cost`。代理和 Agent 导入共用这一条数据库计价路径。公式:
+计费触发器 `price_usage_event`(当前定义见 V2.10)只处理 `pricing_status='pending'` 的新行,按"写入时当前定价 × 写入时段倍率 × 写入当天可用汇率"计算并固化 `equivalent_cost`。代理和 Agent 导入共用这一条数据库计价路径。公式:
 
 ```
 api_cost = (miss/1e6) × input_price
