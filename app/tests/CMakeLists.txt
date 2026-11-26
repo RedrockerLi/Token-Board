@@ -52,6 +52,12 @@ add_test(
             ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_usage_refresh.js
 )
 
+add_test(
+    NAME frontend_proxy_manager_accounts_actions
+    COMMAND ${NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_accounts_actions.js
+)
+
 foreach(FRONTEND_TZ Asia/Shanghai America/New_York UTC Pacific/Kiritimati)
     string(REPLACE "/" "_" FRONTEND_TZ_NAME "${FRONTEND_TZ}")
     add_test(

@@ -67,6 +67,21 @@ def create_account():
         "resource_create", {"status": "ok"})
 
 
+@bp_proxy.route("/accounts/<int:account_id>/duplicate", methods=["POST"])
+@require_config_writable
+def duplicate_account(account_id):
+    """复制账户：路由配置、本机明文密钥与已缓存模型目录复制成新账户。"""
+    try:
+        result = _proxy_db().duplicate_account(account_id)
+    except LookupError:
+        return api_error("Account not found", 404)
+    except ValueError as exc:
+        from app.db.proxy.common import ConflictError
+        return api_error(str(exc), 409 if isinstance(exc, ConflictError) else 400)
+    _trigger_usage_refresh_after_write(result["id"])
+    return jsonify(result), status_for("account_duplicate", {"status": "ok"})
+
+
 @bp_proxy.route("/accounts/<int:account_id>", methods=["PUT"])
 @require_config_writable
 def update_account(account_id):

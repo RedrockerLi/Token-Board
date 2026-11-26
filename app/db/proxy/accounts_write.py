@@ -194,6 +194,135 @@ class ProxyAccountWriteMixin:
         finally:
             conn.close()
 
+    @staticmethod
+    def _duplicate_name(conn: sqlite3.Connection, base_name: str) -> str:
+        """A display name for the copy: 「原名 副本」, numbered when taken.
+
+        Names are display attributes (no UNIQUE constraint), but a copy that
+        reuses its source's name would be indistinguishable in the accounts
+        table, so the copy gets a distinct default the user can rename.
+        """
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM accounts WHERE account_kind='proxy'")}
+        candidate = f"{base_name} 副本"
+        index = 2
+        while candidate in names:
+            candidate = f"{base_name} 副本 {index}"
+            index += 1
+        return candidate
+
+    def duplicate_account(self, account_id: int) -> dict:
+        """Create a second account carrying a copy of this account's config.
+
+        Copies the routing fields, the current subscription price and every
+        local (plaintext) upstream key with its display label, then reuses
+        :meth:`create_account` so the copy owns its own contract, route set
+        and credential rows.  A duplicate is a fresh account: the source's
+        billing dates, per-key start dates, usage snapshots and scheduled
+        deletion are deliberately not carried over.  The cached model catalog
+        is copied best-effort, so the copy answers ``/v1/models`` like its
+        source before the first 更新.
+
+        Raises ``LookupError`` for an unknown account, ``ConflictError`` when
+        the source's contract has already ended (the account is being purged)
+        and ``ValueError`` when it has no enabled upstream to copy.
+        """
+        now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn = self._connect()
+        try:
+            account = conn.execute(
+                "SELECT a.id,a.name,"
+                "(SELECT bc.id FROM billing_contracts bc "
+                "WHERE bc.account_id=a.id AND (bc.ends_at IS NULL OR bc.ends_at>?) "
+                "ORDER BY CASE WHEN bc.ends_at IS NULL THEN 0 ELSE 1 END,"
+                "bc.id DESC LIMIT 1) contract_id "
+                "FROM accounts a WHERE a.id=? AND a.account_kind='proxy'",
+                (now, account_id),
+            ).fetchone()
+            if account is None:
+                raise LookupError("账户不存在")
+            if account["contract_id"] is None:
+                raise ConflictError("账户已到期，等待清理")
+            contract = conn.execute(
+                "SELECT charge_type,currency,"
+                "(SELECT recurring_price FROM billing_rate_events "
+                "WHERE contract_id=billing_contracts.id "
+                "ORDER BY effective_at DESC,id DESC LIMIT 1) current_price "
+                "FROM billing_contracts WHERE id=?",
+                (account["contract_id"],),
+            ).fetchone()
+            if contract is None:
+                # 读到合同 id 后合同被清理任务删掉：与「已到期」同一语义。
+                raise ConflictError("账户已到期，等待清理")
+            upstream = conn.execute(
+                "SELECT id,base_url,api_format,auth_scheme,"
+                "COALESCE(endpoint_path,'') endpoint_path,max_concurrency,subtype "
+                "FROM upstreams WHERE account_id=? AND enabled=1 "
+                "ORDER BY id LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if upstream is None:
+                raise ValueError("账户没有可复制的上游配置")
+            key_rows = conn.execute(
+                "SELECT s.secret_value,c.label FROM upstream_credentials c "
+                "JOIN upstream_secrets s ON s.credential_uuid=c.uuid "
+                "WHERE c.upstream_id=? AND c.enabled=1 "
+                "AND (c.ends_at IS NULL OR c.ends_at>?) "
+                "ORDER BY c.position,c.runtime_id",
+                (upstream["id"], now),
+            ).fetchall()
+            new_name = self._duplicate_name(conn, account["name"])
+            source_upstream_id = int(upstream["id"])
+        finally:
+            conn.close()
+
+        # 同一明文只留一行（与 _set_upstream_keys 的 new_keys 去重一致），
+        # labels 与 upstream_keys 按下标对齐。
+        keys: list[str] = []
+        labels: list[object] = []
+        for row in key_rows:
+            if row["secret_value"] in keys:
+                continue
+            keys.append(row["secret_value"])
+            labels.append(row["label"])
+
+        new_id = self.create_account({
+            "name": new_name,
+            "account_type": ("plan" if contract["charge_type"] == "recurring"
+                             else "api"),
+            "subtype": upstream["subtype"],
+            "base_url": upstream["base_url"],
+            "api_format": upstream["api_format"],
+            "auth_header": upstream["auth_scheme"],
+            "endpoint_path": upstream["endpoint_path"],
+            "max_concurrency": upstream["max_concurrency"],
+            "monthly_price": float(contract["current_price"] or 0),
+            "currency": contract["currency"] or "CNY",
+            "upstream_keys": keys,
+            "new_labels": labels,
+        })
+
+        # 已缓存的模型目录属于账户当前可用的模型集合，随配置一起复制；best-effort：
+        # 账户已经建好，目录复制失败不该把成功的复制报成失败（首次「更新」可补）。
+        try:
+            conn = self._connect()
+            try:
+                target = self._v1_route_account(conn, new_id)
+                if target is not None and target["upstream_id"] is not None:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO upstream_model_catalog"
+                        "(upstream_id,model_id) SELECT ?,model_id "
+                        "FROM upstream_model_catalog WHERE upstream_id=?",
+                        (target["upstream_id"], source_upstream_id),
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+        return {"id": new_id, "name": new_name, "keys_copied": len(keys)}
+
     def update_account(self, account_id: int, data: dict) -> bool:
         conn = self._connect()
         try:

@@ -795,13 +795,12 @@ function renderAccountsTable() {
             const keyTitle = keyNames.length
                 ? ` title="${esc(`${keyCount} 把密钥：${keyNames.join('、')}`)}"`
                 : '';
-            const pendingDeletion = isPendingAccountDeletion(a);
             const usageAnchor = tracksKeyUsage(a)
                 ? `<span class="usage-anchor" data-account-id="${a.id}" title="点击立即刷新用量">${esc(a.name)}</span>`
                 : esc(a.name);
             return `
             <tr>
-                <td>${usageAnchor}${a.ends_at ? ` <span class="badge badge--warn" title="到期删除：${esc(fmtLocal(a.ends_at))}">到期 ${esc(fmtLocal(a.ends_at).slice(0, 10))}</span>` : ''}</td>
+                <td>${usageAnchor}${a.ends_at ? ` <span class="badge badge--warn" title="到期删除：${esc(fmtLocal(a.ends_at))}（在编辑弹窗中可取消删除）">到期 ${esc(fmtLocal(a.ends_at).slice(0, 10))}</span>` : ''}</td>
                 <td${keyTitle}><code>${esc(firstMask)}</code>${keyCount > 1 ? ` <span class="badge" title="${keyCount} 把密钥（同一配置的多个并发槽位）">×${keyCount}</span>` : ''}${!firstMask && !keyCount ? ' <span class="badge badge--warn" title="本机未配置上游 Key。云端同步来的账户需在本机填入 Key 才能转发请求">未配置 Key</span>' : ''}</td>
                 <td>${esc(a.base_url)}</td>
                 <td>${esc(({openai: 'OpenAI Chat Completions', openai_responses: 'OpenAI Responses', anthropic: 'Anthropic Messages', google: 'Google Gemini'})[a.api_format] || a.api_format)}</td>
@@ -812,13 +811,8 @@ function renderAccountsTable() {
                 <td>${a.max_concurrency ? a.max_concurrency + ' 并发' : '无限制'}</td>
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
-                    ${pendingDeletion ? `<button class="btn btn--sm" onclick="cancelAccountDeletion(${a.id})" title="恢复账户及尚未到期的上游密钥">取消删除</button>` : ''}
-                    <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${jsArg(a.name)}')">更新模型</button>
-                    ${typeSpec(a.account_type).holds_keys
-                        ? (a.max_concurrency
-                            ? `<button class="btn btn--sm" onclick="testConcurrency(${a.id}, '${jsArg(a.name)}')" title="按当前并发限额向真实上游并发测试">测试并发</button>`
-                            : `<button class="btn btn--sm" disabled title="该账户无并发限额（无限制），无需测试">测试并发</button>`)
-                        : `<button class="btn btn--sm" disabled title="该账户类型无直连上游密钥，不支持并发测试">测试并发</button>`}
+                    <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${jsArg(a.name)}')" title="从上游获取模型目录">更新</button>
+                    <button class="btn btn--sm" onclick="duplicateAccount(${a.id}, '${jsArg(a.name)}', this)" title="复制一份完全相同的配置（含本机上游密钥），生成新账户">复制</button>
                 </td>
             </tr>
         `;
@@ -999,7 +993,7 @@ async function editAccount(id) {
         document.getElementById('accountTestConcBtn').style.display = holdsKeys ? '' : 'none';
         document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name, acc.account_type); };
         document.getElementById('accountModelBtn').onclick = () => updateAccountModels(id, acc.name);
-        document.getElementById('accountTestConcBtn').onclick = () => testConcurrency(id, acc.name, true);
+        document.getElementById('accountTestConcBtn').onclick = () => testConcurrency(id);
         openModal('accountModal');
     } catch (err) {
         showToast(err.message, 'error');
@@ -1074,8 +1068,11 @@ function deleteAccountDetach() {
 }
 
 async function updateAccountModels(id, name) {
-    const btns = document.querySelectorAll('#accountModelBtn, [onclick*="updateAccountModels"]');
-    btns.forEach(b => { b.disabled = true; b.textContent = '获取中...'; });
+    // 列表行与编辑弹窗的文案不同（「更新」/「更新模型」）：逐个记住原文案，
+    // 请求结束后各自还原，不能统一写成一个文案。
+    const btns = [...document.querySelectorAll('#accountModelBtn, [onclick*="updateAccountModels"]')];
+    const labels = btns.map((b) => b.textContent);
+    btns.forEach((b) => { b.disabled = true; b.textContent = '获取中...'; });
     try {
         const result = await proxyApi(`/api/proxy/accounts/${id}/models`, { method: 'POST', body: '{}' });
         showToast(`${name}: 获取到 ${result.count} 个模型`);
@@ -1083,31 +1080,53 @@ async function updateAccountModels(id, name) {
     } catch (err) {
         showToast(`获取失败: ${err.message}`, 'error');
     }
-    btns.forEach(b => { b.disabled = false; b.textContent = '更新模型'; });
+    btns.forEach((b, index) => { b.disabled = false; b.textContent = labels[index]; });
 }
 
-async function testConcurrency(id, name, useFormValue) {
-    // useFormValue=true 时来自编辑弹窗：测「尚未保存」的输入值，否则用已保存的限额。
-    const btns = document.querySelectorAll('[onclick*="testConcurrency"], #accountTestConcBtn');
-    btns.forEach(b => { b.disabled = true; b.textContent = '测试中...'; });
-    let body = '{}';
-    if (useFormValue) {
-        const input = document.querySelector('#accountForm [name="max_concurrency"]');
-        const val = parseInt(input && input.value, 10);
-        if (!val || val < 1) {
-            showToast('请先填写有效的并发限额数值', 'error');
-            btns.forEach(b => { b.disabled = false; b.textContent = '测试并发'; });
-            return;
-        }
-        body = JSON.stringify({ concurrency: val });
+async function testConcurrency(id) {
+    // 唯一入口是编辑弹窗：测「尚未保存」的输入值，无需先保存。
+    const input = document.querySelector('#accountForm [name="max_concurrency"]');
+    const value = parseInt(input && input.value, 10);
+    if (!value || value < 1) {
+        showToast('请先填写有效的并发限额数值', 'error');
+        return;
     }
+    const btn = document.getElementById('accountTestConcBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '测试中...'; }
     try {
-        const result = await proxyApi(`/api/proxy/accounts/${id}/test-concurrency`, { method: 'POST', body });
+        const result = await proxyApi(`/api/proxy/accounts/${id}/test-concurrency`, {
+            method: 'POST', body: JSON.stringify({ concurrency: value }),
+        });
         showToast(result.message, result.succeeded === result.concurrency ? 'success' : 'error');
     } catch (err) {
         showToast(err.message, 'error');
     }
-    btns.forEach(b => { b.disabled = false; b.textContent = '测试并发'; });
+    if (btn) { btn.disabled = false; btn.textContent = '测试并发'; }
+}
+
+let _accountDuplicatePending = false;
+
+/** 复制账户：后端把配置、本机明文密钥与已缓存模型目录复制成新账户，
+ *  随后直接打开新账户的编辑弹窗——只需改一个参数即可保存。 */
+async function duplicateAccount(id, name, btn) {
+    if (_accountDuplicatePending) return;
+    if (!confirm(`复制账户「${name}」？\n\n将创建一个配置完全相同的新账户（含本机上游密钥）；订阅账户会作为独立账户计入费用。`)) return;
+    _accountDuplicatePending = true;
+    if (btn) { btn.disabled = true; btn.textContent = '复制中...'; }
+    try {
+        const result = await proxyApi(`/api/proxy/accounts/${id}/duplicate`, { method: 'POST' });
+        ConfigSync.markDirty();
+        await loadAccountsTable();
+        showToast(result.keys_copied
+            ? `已复制为「${result.name}」`
+            : `已复制为「${result.name}」：该账户没有本机明文密钥，请在新账户中填写`);
+        await editAccount(result.id);
+    } catch (err) {
+        showToast(`复制失败: ${err.message}`, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = '复制'; }
+    } finally {
+        _accountDuplicatePending = false;
+    }
 }
 
 async function openAddAccountModal() {
@@ -1221,7 +1240,7 @@ function initAccountsPage() {
                                 <button type="submit" class="btn btn--primary">添加账户</button>
                                 <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
                                 <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
-                                <button type="button" class="btn btn--sm" id="accountCancelDeleteBtn" style="display:none">取消删除</button>
+                                <button type="button" class="btn btn--sm" id="accountCancelDeleteBtn" style="display:none" title="恢复账户及尚未到期的上游密钥">取消删除</button>
                                 <button type="button" class="btn btn--sm" id="accountDeleteBtn" style="display:none; color:var(--color-danger);">删除账户</button>
                             </div>
                         </div>

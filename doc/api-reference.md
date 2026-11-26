@@ -64,6 +64,7 @@
 | `/api/proxy/accounts/<id>` | PUT | 更新账户字段 |
 | `/api/proxy/accounts/<id>` | DELETE | 删除账户:立即模式物理删除实时账户与密钥图,`end_of_period` 模式到期后由延迟清理任务删除;历史日志(解绑到身份)与冻结账目保留,消费报表不受影响 |
 | `/api/proxy/accounts/<id>/cancel-deletion` | POST | 取消尚未到期的订阅账户删除 |
+| `/api/proxy/accounts/<id>/duplicate` | POST | 复制账户:把类型/子类型、Base URL/API 格式/认证方式/上游路径/并发限额、当前月费与币种、本机明文上游密钥(含名称)与已缓存模型目录复制成新账户(名称「原名 副本」,重名追加序号);新账户的计费周期从当前开始,用量快照与到期删除安排不复制;源账户合同已过期返回 409 |
 | `/api/proxy/accounts/<id>/models` | GET | 账户模型目录 |
 | `/api/proxy/accounts/<id>/models` | POST | 从上游模型目录端点拉取(默认 `{base}/models`,opencode-go 为 `{base}/v1/models`)并整体替换模型目录 |
 | `/api/proxy/accounts/<id>/test-concurrency` | POST | 并发测试:不经本机代理、直连上游并行发 N 个极小请求(body 可传 `concurrency` 覆盖已保存限额,上限 50),自动挑选定价最便宜的可用模型,返回各档成功的统计与失败原因 |

@@ -76,6 +76,14 @@ ROUTE_CONTRACTS = {
         {"ok": 201, "error": 400},
         response_shapes={"ok": ("id",), "error": ("error",)},
         json_mode="force"),
+    "account_duplicate": RouteContract(
+        "account_duplicate", "/api/proxy/accounts/<int:account_id>/duplicate",
+        ("POST",),
+        {"ok": 201, "not_found": 404, "error": 400, "conflict": 409},
+        response_shapes={
+            "ok": ("id", "name", "keys_copied"),
+            "not_found": ("error",), "error": ("error",), "conflict": ("error",),
+        }),
 }
 
 
