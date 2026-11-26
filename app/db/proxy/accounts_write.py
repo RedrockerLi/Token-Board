@@ -34,6 +34,66 @@ def _carried_subtype(stored: object, type_spec) -> str | None:
     return subtype if subtype in type_spec.subtypes else None
 
 
+# Upstream wire fields the proxy understands.  Both the C++ runtime and the
+# dashboard probe helpers degrade an unknown value to a default
+# (`parse_api_format` → openai, `resolve_auth_scheme` → bearer), which made a
+# typo look like a working configuration.  The write path is therefore strict:
+# only these spellings are stored, normalized to their canonical form.
+API_FORMATS = ("openai", "openai_responses", "anthropic", "google")
+API_FORMAT_ALIASES = {"gemini": "google"}
+AUTH_SCHEMES = ("auto", "bearer", "x-api-key", "x-goog-api-key")
+
+
+def _validated_api_format(value: object, default: str | None) -> str | None:
+    """Normalize a requested wire format; empty keeps *default*.
+
+    ``gemini`` is the provider name for the same wire format the codec calls
+    ``google``, so it is stored canonically rather than rejected.
+    """
+    if value in (None, ""):
+        return default
+    fmt = str(value).strip().lower()
+    if not fmt:
+        return default
+    fmt = API_FORMAT_ALIASES.get(fmt, fmt)
+    if fmt not in API_FORMATS:
+        raise ValueError("API 格式必须是 " + " / ".join(API_FORMATS))
+    return fmt
+
+
+def _validated_auth_scheme(value: object, default: str | None) -> str | None:
+    """Normalize a requested auth scheme; empty keeps *default*."""
+    if value in (None, ""):
+        return default
+    scheme = str(value).strip().lower()
+    if not scheme:
+        return default
+    if scheme not in AUTH_SCHEMES:
+        raise ValueError("认证方式必须是 " + " / ".join(AUTH_SCHEMES))
+    return scheme
+
+
+def _validated_max_concurrency(value: object, default: int | None) -> int | None:
+    """Normalize a requested concurrency limit; empty keeps *default*.
+
+    The column carries a ``>= 0`` CHECK, so a negative or non-numeric value
+    used to surface as an IntegrityError (500) or as text stored in an INTEGER
+    column that the proxy then read as 0.  Both are refused here instead.
+    """
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool) or (
+            isinstance(value, float) and not value.is_integer()):
+        raise ValueError("并发限额必须是非负整数")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("并发限额必须是非负整数") from None
+    if limit < 0:
+        raise ValueError("并发限额必须是非负整数")
+    return limit
+
+
 class ProxyAccountWriteMixin:
     def create_account(self, data: dict) -> int:
         account_type = data.get("account_type", "api")
@@ -45,6 +105,10 @@ class ProxyAccountWriteMixin:
         keys, new_labels = self._normalize_keys_and_labels(data)
         type_spec = spec(account_type)
         subtype = _validated_subtype(data.get("subtype"), type_spec)
+        api_format = _validated_api_format(data.get("api_format"), "openai")
+        auth_scheme = _validated_auth_scheme(data.get("auth_header"), "bearer")
+        max_concurrency = _validated_max_concurrency(
+            data.get("max_concurrency"), 0)
         raw_valid_from = data.get("valid_from")
         valid_from = (_parse_iso_date(_subscription_date(raw_valid_from))
                       if raw_valid_from not in (None, "") else None)
@@ -97,8 +161,8 @@ class ProxyAccountWriteMixin:
                 "max_concurrency,subtype) "
                 "VALUES(?,?,?,?,?,?,?,?)",
                 (shared_id, data["name"], data.get("base_url", ""),
-                 data.get("api_format", "openai"), data.get("auth_header", "bearer"),
-                 data.get("endpoint_path", ""), int(data.get("max_concurrency") or 0),
+                 api_format, auth_scheme,
+                 data.get("endpoint_path", ""), max_concurrency,
                  subtype),
             ).lastrowid
             conn.execute(
@@ -175,6 +239,13 @@ class ProxyAccountWriteMixin:
             # account behind.  Cancel the deletion first.
             raise ConflictError("账户已进入结束流程，请先撤销结束")
         final_spec = spec(final_type)
+        # Absent/empty keeps the stored wire settings: the update below feeds
+        # these through COALESCE, and the insert branch (an account whose
+        # upstream row is missing) falls back to the creation defaults.
+        api_format = _validated_api_format(data.get("api_format"), None)
+        auth_scheme = _validated_auth_scheme(data.get("auth_header"), None)
+        max_concurrency = _validated_max_concurrency(
+            data.get("max_concurrency"), None)
         upstream = conn.execute(
             "SELECT id,subtype FROM upstreams WHERE account_id=? ORDER BY id LIMIT 1",
             (real_id,)
@@ -236,9 +307,10 @@ class ProxyAccountWriteMixin:
                     "(account_id,name,base_url,api_format,auth_scheme,endpoint_path,"
                     "max_concurrency,subtype) "
                     "VALUES(?,?,?,?,?,?,?,?)",
-                    (real_id, name, data.get("base_url", ""), data.get("api_format", "openai"),
-                     data.get("auth_header", "bearer"), data.get("endpoint_path", ""),
-                     int(data.get("max_concurrency") or 0), final_subtype),
+                    (real_id, name, data.get("base_url", ""),
+                     api_format or "openai", auth_scheme or "bearer",
+                     data.get("endpoint_path", ""),
+                     max_concurrency or 0, final_subtype),
                 ).lastrowid
             else:
                 upstream_id = upstream["id"]
@@ -247,9 +319,9 @@ class ProxyAccountWriteMixin:
                     "api_format=COALESCE(?,api_format),auth_scheme=COALESCE(?,auth_scheme),"
                     "endpoint_path=COALESCE(?,endpoint_path),max_concurrency=COALESCE(?,max_concurrency),"
                     "subtype=?,enabled=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
-                    (name, data.get("base_url"), data.get("api_format"),
-                     data.get("auth_header"), data.get("endpoint_path"),
-                     data.get("max_concurrency"), final_subtype, upstream_id),
+                    (name, data.get("base_url"), api_format,
+                     auth_scheme, data.get("endpoint_path"),
+                     max_concurrency, final_subtype, upstream_id),
                 )
             route_row = conn.execute("SELECT id FROM route_sets WHERE id=?", (external_id,)).fetchone()
             if route_row is None:
