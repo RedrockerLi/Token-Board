@@ -79,7 +79,8 @@ function buildDailySeries(data, days) {
         var d = map[key];
         out.push(d || {
             date: key, input_tokens: 0, output_tokens: 0,
-            cache_hit_tokens: 0, cache_miss_tokens: 0, requests: 0, cost: 0
+            cache_hit_tokens: 0, cache_miss_tokens: 0, requests: 0,
+            equivalent_cost: 0
         });
     }
     return out;
@@ -99,7 +100,7 @@ async function loadDailyBillingChart() {
         const dates = data.map(d => d.date);
         const inputTokens = data.map(d => d.input_tokens);
         const outputTokens = data.map(d => d.output_tokens);
-        const costs = data.map(d => d.cost);
+        const equivalentCosts = data.map(d => d.equivalent_cost || 0);
 
         if (typeof echarts !== 'undefined') {
             if (billingChart) billingChart.dispose();
@@ -120,11 +121,11 @@ async function loadDailyBillingChart() {
                         html += '输出Token: <b>' + fmtNum(d.output_tokens || 0) + '</b> (' + pct(d.output_tokens || 0) + '%)<br/>';
                         html += '输入缓存命中: <b>' + fmtNum(hit) + '</b> (' + pct(hit) + '%)<br/>';
                         html += '输入缓存未命中: <b>' + fmtNum(miss) + '</b> (' + pct(miss) + '%)<br/>';
-                        html += '消费: <b>¥' + (d.cost || 0).toFixed(2) + '</b>';
+                        html += 'API 等值消费: <b>¥' + (d.equivalent_cost || 0).toFixed(2) + '</b>';
                         return html;
                     }
                 }, (typeof TOOLTIP_STYLE !== 'undefined' ? TOOLTIP_STYLE : {})),
-                legend: { data: ['输入Token', '输出Token', '消费'], bottom: 0, textStyle: { fontSize: 11, color: '#6E6E73' } },
+                legend: { data: ['输入Token', '输出Token', 'API 等值消费'], bottom: 0, textStyle: { fontSize: 11, color: '#6E6E73' } },
                 grid: { left: 70, right: 70, top: 20, bottom: 50 },
                 xAxis: { type: 'category', data: dates, axisLabel: { rotate: 30, fontSize: 10 } },
                 yAxis: [
@@ -143,8 +144,8 @@ async function loadDailyBillingChart() {
                         itemStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('#A8BF92', '#6E8B77') : '#6E8B77', borderRadius: [4, 4, 0, 0] },
                     },
                     {
-                        name: '消费', type: 'line', yAxisIndex: 1,
-                        data: costs,
+                        name: 'API 等值消费', type: 'line', yAxisIndex: 1,
+                        data: equivalentCosts,
                         lineStyle: { color: '#927CA6', width: 2.25 },
                         itemStyle: { color: '#927CA6', borderColor: '#fffdf9', borderWidth: 1.5 },
                         areaStyle: { color: typeof _vGrad !== 'undefined' ? _vGrad('rgba(146,124,166,0.16)', 'rgba(146,124,166,0)') : 'rgba(146,124,166,0.08)' },
