@@ -16,6 +16,8 @@
 ```
 
 - **账户(account)** 是唯一身份，`id` 永不复用。实时配置没有 tombstone：`immediate` 删除直接物理清理整张 live 图；`end_of_period` 只把结束时刻写进 `billing_contracts.ends_at`（各把密钥的 `upstream_credentials.ends_at` 是各自的本期期末），到期前仍可路由，到期后由删除 finalizer 物理清理，历史身份和冻结账目继续留在 `account_identities` 与计费事实表中。
+- **`billing_contracts.ends_at` 是合同的结束边界，不是"合同已关闭"**：在该时刻之前这张合同仍是账户的**当前合同**——可路由、按订阅计费（`request_log` 的 `billing_unit_id` 与 `billing_contract_uuid` 仍归属它、每请求 `billed_usage_cost` 仍为 0）、429 配额冷却仍取它的 `cooldown_policy_json`。因此"取当前合同"的查询一律写成 `ends_at IS NULL OR ends_at > now`，只有"合同已彻底失效"才用 `ends_at IS NULL`。
+- **到期删除中的账户**：仍可编辑名称与上游配置（Base URL / 线格式 / 认证 / 路径 / 并发 / 子分类）；但**不能改 `account_type`**（409「账户已进入结束流程，请先撤销结束」）、**不能编辑密钥**（409「账户已进入结束流程，不能编辑密钥」，新增与删除都算），合同已过 `ends_at` 而未及清理时返回 409「账户已到期，等待清理」。想改类型或改密钥，先撤销删除再操作。
 - **账户类型 `account_type`**：`api`(按量)或 `plan`(订阅套餐)。它决定**怎么计费**和**能不能路由**；类型下还可以有**子分类 `subtype`**（如 plan 的 `opencode-go`），只影响新建预设与少量类型内特殊行为。Codex 等智能体不再是上游账户。
 - **单上游多密钥(`upstream_keys`)**：一个真实上游账户名下可以挂多把上游 Key，每把 Key 是独立的并发槽位、独立的冷却单元、独立的订阅周期。管理页在三处列出同一账户的多把 Key——账户表的密钥列（打码值、×N 提示与名称清单）、名称悬浮的用量卡、编辑弹窗的既有密钥行——一律按密钥名称的字典序排序，无名称的密钥以打码值为名参与同一排序；排序只发生在渲染层，存储的 `position`（入库/调度基序）不因此改变，编辑弹窗保存时 `keep_key_ids` 按存储下标提交。
 - **聚合账户(`is_aggregate=1`)**：不是真实上游，只是**按模型名的路由分组**。它把多个真实账户合并成一个模型目录暴露给客户端，同一个模型可以配多个账户自动回退。
@@ -38,6 +40,7 @@
 ### api 账户（按量计费）
 
 - 常规形态：`base_url` + `api_format` + 一把或多把上游密钥，`max_concurrency` 控制并发。
+- 这三个上游字段**写入口校验并归一化**（[app/db/proxy/accounts_write.py](app/db/proxy/accounts_write.py)）：`api_format` 只接受 `openai` / `openai_responses` / `anthropic` / `google`（`gemini` 归一化为 `google`），`auth_header` 只接受 `auto` / `bearer` / `x-api-key` / `x-goog-api-key`，`max_concurrency` 必须是非负整数；未知值返回 400。读取路径仍保留兜底（未知 `api_format` 按 OpenAI、未知认证按 Bearer），那只服务本次校验之前写入的老数据。
 - 每一笔请求按写时固化的单价算出 `api_cost`，这是**真实账单**。
 - 消费报告与导出按**按量计费类型**（`account_type` 属于 `usage_billed_types()`，目前仅 `api`）的 `api_cost` 统计真实消费（[app/db/proxy_db.py:183](app/db/proxy_db.py#L183)）。
 
@@ -45,7 +48,7 @@
 
 - 计费与调用量解耦：**每把上游密钥**按 `valid_from`(订阅起始日) 锚定的**行政月周期**收一次月费；同一账户多把密钥 = 多个独立订阅。
 - 调用照常被代理转发、照常记 `request_log`，但 `api_cost` 记的是**虚拟消费**（不买套餐按量算要花多少钱），用于衡量套餐划不划算。
-- 429 冷却也是**按密钥**：一把 plan 密钥被限流只冷却它自己，同账户其他密钥立即接管（[proxy/src/core/account_gate.h:18-21](proxy/src/core/account_gate.h#L18-L21)）。冷却期的恢复观察分两条通道：带用量查询的子类型（opencode-go）每 5 分钟读一次用量快照，任一窗口未满即恢复（纯本地判断，不发请求）；其余 plan 密钥每 1 小时发一条最小的「你好」调用，2xx 提前解除冷却（没有目录模型名时退回 `GET {base}/models` 探测；auth scheme 按 `api_format` 推导：anthropic 用 x-api-key、google 用 x-goog-api-key、其余 Bearer），见 [proxy-internals.md](proxy-internals.md)「冷却探测」。
+- 429 冷却也是**按密钥**：一把 plan 密钥被限流只冷却它自己，同账户其他密钥立即接管（[proxy/src/core/account_gate.h:18-21](proxy/src/core/account_gate.h#L18-L21)）。冷却期的恢复观察分两条通道：带用量查询的子类型（opencode-go）每 5 分钟读一次用量快照，纯本地判断、不发请求；**解除需要重置证据**——标记时记录的窗口在快照里的重置时刻已经改变，或标记之后完成的观测里已无耗尽窗口；快照不新鲜（10 分钟外）或仍存在 `percent ≥ 100` 且重置未到的窗口时维持冷却（否则会重蹈"百分比恰好读到 99% 就解除"的 429 循环）。其余 plan 密钥每 1 小时发一条最小的「你好」调用，2xx 提前解除冷却（没有目录模型名时退回 `GET {base}/models` 探测；auth scheme 按 `api_format` 推导：anthropic 用 x-api-key、google 用 x-goog-api-key、其余 Bearer），见 [proxy-internals.md](proxy-internals.md)「冷却探测」。
 - 订阅周期、价格历史、删除默认操作见 [billing-pricing.md](billing-pricing.md)「plan 账户与虚拟消费」。
 
 ### 订阅计费与周期滚动（plan）
@@ -233,7 +236,7 @@
 ### 添加步骤（三步 + 两个按需）
 
 1. **`ACCOUNT_TYPES` 加一行**：把上面 7 个属性取值填好；`label`（形如 `<type> — <说明>`，破折号后的说明进左栏卡片正文）是账户弹窗左栏类型选择卡文案、`short_label` 是类型徽章文案（账户列表与左栏卡片共用）。
-2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、仪表盘"更新模型"和用量轮询都从它派生。代理侧对应一张 `UpstreamProfile` 表（[proxy/src/core/upstream_profile.h](proxy/src/core/upstream_profile.h)）：SQL 只读 `upstreams.subtype` 原文，路由快照与冷却探测目标各解析一次指针，运行时按 `needs_session`、`cooldown_recovery` 与头部装饰函数分派，不再比较子类型字符串。新增需要代理行为的子分类 = 该表加一行 + 这里的 spec 一行；声明侧 `session_header=true` 与表里 `needs_session` 必须一致，`usage_path` 非空时才应选择 `kUsageSnapshot` 冷却恢复通道。类型层的派生量另只有合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
+2. **需要子分类就加一个 `subtypes` 条目**：预设、`session_header`、`usage_path`、`models_path` 填进 `AccountSubtypeSpec`；左栏子卡片、仪表盘"更新模型"和用量轮询都从它派生。代理侧对应一张 `UpstreamProfile` 表（[proxy/src/core/upstream_profile.h](proxy/src/core/upstream_profile.h)）：SQL 只读 `upstreams.subtype` 原文，路由快照与冷却探测目标各解析一次指针，运行时按 `needs_session`、`cooldown_recovery` 与头部装饰函数分派，不再比较子类型字符串。新增需要代理行为的子分类 = 该表加一行 + 这里的 spec 一行；声明侧 `session_header=true` 与表里 `needs_session` 必须一致，`usage_path` 非空时才应选择 `kUsageSnapshot` 冷却恢复通道——这两条由 `app/tests/test_account_type_parity.py` 直接读取该头文件校验，任一侧新增或删除子分类都会让测试失败。类型层的派生量另只有合同里的 `cooldown_policy_json`（`subscription_5h` → `extended_usage_limit_cooldown`），建账户时按规格自动写入。
 3. **智能体扩展另走智能体管理**：在 `agent_software` 增加 `agent_kind`，为该类型注册一个返回统一 UsageEvent 的解析器；订阅继续保存在独立的 `agent_subscriptions`，通过绑定表连接到软件，不把订阅误当成代理上游。
 
 两个按需的 if：
