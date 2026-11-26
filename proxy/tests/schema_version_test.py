@@ -14,31 +14,35 @@ from pathlib import Path
 from support import sqlite_connection
 
 
-schema_root = Path(sys.argv[1]).resolve()
-project_root = Path(sys.argv[2]).resolve()
-migrations_path = project_root / "app" / "db" / "migrations.py"
-spec = importlib.util.spec_from_file_location("token_board_migrations", migrations_path)
-assert spec is not None and spec.loader is not None
-migrations = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = migrations
-spec.loader.exec_module(migrations)
-MigrationError = migrations.MigrationError
-SchemaVersion = migrations.SchemaVersion
-_sql_steps = migrations._sql_steps
-migrate = migrations.migrate
-from app.db.schema_upgrade import ensure_local_databases
+def load_migrations(project_root: Path):
+    migrations_path = project_root / "app" / "db" / "migrations.py"
+    spec = importlib.util.spec_from_file_location("token_board_migrations", migrations_path)
+    assert spec is not None and spec.loader is not None
+    migrations = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = migrations
+    spec.loader.exec_module(migrations)
+    return migrations
 
 
-def expect_error(fn, text: str) -> None:
+def expect_error(fn, text: str, error_cls) -> None:
     try:
         fn()
-    except MigrationError as exc:
+    except error_cls as exc:
         assert text in str(exc), (text, str(exc))
     else:
         raise AssertionError(f"expected MigrationError containing {text!r}")
 
 
 def main() -> None:
+    schema_root = Path(sys.argv[1]).resolve()
+    project_root = Path(sys.argv[2]).resolve()
+    migrations = load_migrations(project_root)
+    MigrationError = migrations.MigrationError
+    SchemaVersion = migrations.SchemaVersion
+    _sql_steps = migrations._sql_steps
+    migrate = migrations.migrate
+    from app.db.schema_upgrade import ensure_local_databases
+
     assert SchemaVersion.from_user_version(19) == SchemaVersion(0, 19)
     assert SchemaVersion.from_user_version(10000) == SchemaVersion(1, 0)
     assert SchemaVersion(1, 10).user_version == 10010
@@ -107,10 +111,10 @@ def main() -> None:
     duplicate = Path(tempfile.mkdtemp())
     (duplicate / "1-1_one.sql").write_text("SELECT 1;", encoding="utf-8")
     (duplicate / "1-01_same.sql").write_text("SELECT 1;", encoding="utf-8")
-    expect_error(lambda: _sql_steps(duplicate), "duplicate")
+    expect_error(lambda: _sql_steps(duplicate), "duplicate", MigrationError)
     invalid = Path(tempfile.mkdtemp())
     (invalid / "0010_old.sql").write_text("SELECT 1;", encoding="utf-8")
-    expect_error(lambda: _sql_steps(invalid), "bad migration filename")
+    expect_error(lambda: _sql_steps(invalid), "bad migration filename", MigrationError)
 
     checksum_dir = Path(tempfile.mkdtemp())
     shutil.copy2(schema_root / "token-board" / "v1" / "1-0_baseline.sql",
@@ -120,7 +124,7 @@ def main() -> None:
     with (checksum_dir / "1-0_baseline.sql").open("a", encoding="utf-8") as handle:
         handle.write("\n-- forbidden edit\n")
     expect_error(lambda: migrate(str(checksum_db), str(checksum_dir), "token-board"),
-                 "checksum mismatch")
+                 "checksum mismatch", MigrationError)
 
     v0 = Path(tempfile.mkdtemp()) / "token-board.db"
     migrate(str(v0), str(schema_root / "token-board" / "v0"), "token-board")

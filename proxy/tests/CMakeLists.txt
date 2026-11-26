@@ -3,6 +3,54 @@
 # CMakeLists.txt). Every target here is a test executable; none of them link
 # into the production token_proxy binary.
 
+# ── Python test interpreter ──────────────────────────────────────────────
+# The Python-backed tests import flask, requests and jinja2. Discovery can land
+# on a bare python3, which then fails inside a test with an opaque
+# ModuleNotFoundError far from the configure step that picked it. Resolve the
+# default once (PY), find the interpreter once, and validate it immediately so
+# a wrong interpreter fails configure with the command that fixes it.
+#
+# These helpers are reused by app/tests/CMakeLists.txt, which the proxy project
+# adds after this directory.
+#
+# An explicit -DPython3_EXECUTABLE=... always wins: it is already a cache entry,
+# so the PY default below cannot override it.
+function(tb_prepare_python3_for_tests)
+    if(DEFINED ENV{PY} AND NOT "$ENV{PY}" STREQUAL "")
+        set(Python3_EXECUTABLE "$ENV{PY}" CACHE FILEPATH
+            "Python interpreter for tests")
+    endif()
+endfunction()
+
+function(tb_require_python_test_deps)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import flask, requests, jinja2"
+        RESULT_VARIABLE tb_python_deps_status
+        ERROR_VARIABLE tb_python_deps_error
+        OUTPUT_QUIET
+    )
+    if("${tb_python_deps_status}" STREQUAL "0")
+        return()
+    endif()
+    string(REGEX MATCH "No module named '([^']+)'" tb_python_deps_match
+        "${tb_python_deps_error}")
+    if(tb_python_deps_match)
+        set(tb_python_deps_missing "${CMAKE_MATCH_1}")
+    else()
+        set(tb_python_deps_missing "<unknown, see interpreter error>")
+    endif()
+    string(STRIP "${tb_python_deps_error}" tb_python_deps_error)
+    message(FATAL_ERROR
+        "The Python interpreter used by the test suite is missing dependencies.\n"
+        "  interpreter:      ${Python3_EXECUTABLE}\n"
+        "  missing module:   ${tb_python_deps_missing}\n"
+        "  required modules: flask, requests, jinja2\n"
+        "  interpreter says: ${tb_python_deps_error}\n"
+        "  fix: re-run cmake with an interpreter that provides them, for example:\n"
+        "    cmake -S proxy -B ${CMAKE_BINARY_DIR} -DPython3_EXECUTABLE=/home/redrocker/miniconda3/bin/python"
+    )
+endfunction()
+
 # Tests must actually assert: the parent Release build adds -DNDEBUG, which
 # compiles assert() out and silently disables every check in this suite.
 # -UNDEBUG here re-enables assertions for the test executables regardless of
@@ -220,7 +268,12 @@ target_link_libraries(pricing_snapshot_equiv_test PRIVATE
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
+tb_prepare_python3_for_tests()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+tb_require_python_test_deps()
+# The interpreter is a test dependency of its own: a CTest entry keeps the
+# requirement visible when someone runs the suite with a different shell.
+add_test(NAME python_env COMMAND ${Python3_EXECUTABLE} -c "import flask, requests, jinja2")
 add_test(NAME pricing_snapshot_equiv COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/run_prepared_cpp_db_test.py
     $<TARGET_FILE:pricing_snapshot_equiv_test>
@@ -342,6 +395,18 @@ add_test(
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_SOURCE_DIR}/../scripts/check_refactor_boundaries.py
             ${CMAKE_SOURCE_DIR}/..
+)
+# Registration freshness gate: add_test() lines only reach a build tree at
+# configure time (CTestTestfile.cmake), so an edited tests/CMakeLists.txt in an
+# already-configured tree would keep running the old list. The script compares
+# the source-side expansion with `ctest -N` for this very build directory.
+add_test(
+    NAME ctest_registration_fresh
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/../scripts/check_ctest_registration.py
+            --build-dir ${CMAKE_BINARY_DIR}
+            --source-root ${CMAKE_SOURCE_DIR}/..
+            --ctest ${CMAKE_CTEST_COMMAND}
 )
 add_test(NAME upstream_client COMMAND upstream_client_test)
 add_test(NAME http_debug_log COMMAND http_debug_log_test)
@@ -580,7 +645,7 @@ set_tests_properties(
     PROPERTIES LABELS "schema;unit"
 )
 set_tests_properties(format_conversion session_affinity endpoint_policy source_size
-    refactor_boundaries
+    refactor_boundaries ctest_registration_fresh python_env
     accounting_abort usage_accounting usage_parser semaphore_pool
     crash_hook_isolation
     PROPERTIES LABELS "unit")
@@ -609,3 +674,17 @@ set_tests_properties(
     accounting_soak_60s perf_stress perf_gate_1000_64 cooldown_discrimination
     fallback_matrix cooldown_probe ending_contract error_shape opencode_session
     PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/..")
+
+# Every registered test gets a timeout so a hung test cannot occupy CI forever.
+# add_test() has no TIMEOUT argument; set it once for the directory instead of
+# repeating it per test, then lengthen it for the measured performance/soak
+# runs. Both lists come from the directory itself, so tests added later inherit
+# the default without touching this block.
+get_property(TB_DIRECTORY_TESTS DIRECTORY PROPERTY TESTS)
+set_tests_properties(${TB_DIRECTORY_TESTS} PROPERTIES TIMEOUT 300)
+foreach(TB_TEST IN LISTS TB_DIRECTORY_TESTS)
+    get_property(TB_TEST_LABELS TEST ${TB_TEST} PROPERTY LABELS)
+    if("performance" IN_LIST TB_TEST_LABELS OR "soak" IN_LIST TB_TEST_LABELS)
+        set_tests_properties(${TB_TEST} PROPERTIES TIMEOUT 1800)
+    endif()
+endforeach()
