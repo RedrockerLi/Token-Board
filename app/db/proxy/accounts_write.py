@@ -2,8 +2,8 @@
 
 from app.core.time import utc_now
 from app.db.proxy.common import (
-    ACCOUNT_TYPES, _parse_iso_date, _subscription_date, is_subscription, json,
-    spec, sqlite3, uuid,
+    ACCOUNT_TYPES, ConflictError, _parse_iso_date, _subscription_date,
+    is_subscription, json, spec, sqlite3, uuid,
 )
 
 
@@ -145,20 +145,35 @@ class ProxyAccountWriteMixin:
         real_id = route["account_id"] if route and route["account_id"] is not None else external_id
         original = conn.execute(
             "SELECT a.*,bc.id contract_id,bc.charge_type,bc.billing_scope,bc.currency,"
-            "bc.cooldown_policy_json,"
+            "bc.cooldown_policy_json,bc.ends_at contract_ends_at,"
             "bc.valid_from contract_valid_from,"
             "(SELECT recurring_price FROM billing_rate_events WHERE contract_id=bc.id "
             "ORDER BY effective_at DESC,id DESC LIMIT 1) current_price FROM accounts a "
-            "LEFT JOIN billing_contracts bc ON bc.account_id=a.id AND bc.ends_at IS NULL "
-            "WHERE a.id=? AND a.account_kind='proxy'",
+            "LEFT JOIN billing_contracts bc ON bc.account_id=a.id "
+            "AND (bc.ends_at IS NULL "
+            "OR bc.ends_at>strftime('%Y-%m-%dT%H:%M:%SZ','now')) "
+            "WHERE a.id=? AND a.account_kind='proxy' "
+            "ORDER BY CASE WHEN bc.ends_at IS NULL THEN 0 ELSE 1 END,bc.id DESC LIMIT 1",
             (real_id,),
         ).fetchone()
         if original is None:
             return False
+        if original["contract_id"] is None:
+            # The account exists but its contract is already past its end
+            # boundary; the deletion finalizer is about to purge it.  Refuse
+            # instead of falling through to a NULL contract_id write.
+            raise ConflictError("账户已到期，等待清理")
         original_type = ("plan" if original["charge_type"] == "recurring" else "api")
         final_type = data.get("account_type", original_type)
         if final_type not in ACCOUNT_TYPES:
             raise ValueError("账户类型必须是 " + " / ".join(ACCOUNT_TYPES))
+        if original["contract_ends_at"] is not None and final_type != original_type:
+            # A pending deletion keeps its contract live only until the end
+            # boundary.  Retyping mid-way would either strand the current
+            # period charge (a metered contract is not a billing unit) or
+            # disable the "cannot add keys" guard and leave an unpurgeable
+            # account behind.  Cancel the deletion first.
+            raise ConflictError("账户已进入结束流程，请先撤销结束")
         final_spec = spec(final_type)
         upstream = conn.execute(
             "SELECT id,subtype FROM upstreams WHERE account_id=? ORDER BY id LIMIT 1",

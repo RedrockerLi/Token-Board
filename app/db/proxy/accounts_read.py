@@ -228,7 +228,7 @@ class ProxyAccountReadMixin:
                 (account_id, utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")),
             ).fetchone()
             if ending is not None:
-                raise ConflictError("账户已进入结束流程，不能新增 Key")
+                raise ConflictError("账户已进入结束流程，不能编辑密钥")
         upstream_id = int(route["upstream_id"])
         active = {
             row["runtime_id"]: row for row in conn.execute(
