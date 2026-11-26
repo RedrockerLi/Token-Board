@@ -57,14 +57,16 @@ const apiAccount = {
     cloud_keys: [],
 };
 
-// ── 行内操作：编辑 / 更新 / 复制，没有测试并发与取消删除 ────────────────
+// ── 行内操作：只有编辑 / 更新（复制、测试并发与取消删除都在编辑弹窗） ────
 
 vm.runInContext(`_accountsCache = ${JSON.stringify([apiAccount])}`, context);
 context.renderAccountsTable();
 assert.ok(tbody.innerHTML.includes('>编辑</button>'), tbody.innerHTML);
 assert.ok(tbody.innerHTML.includes('>更新</button>'), tbody.innerHTML);
-assert.ok(tbody.innerHTML.includes('>复制</button>'), tbody.innerHTML);
-assert.ok(tbody.innerHTML.includes('duplicateAccount(1,'), tbody.innerHTML);
+assert.strictEqual((tbody.innerHTML.match(/<button/g) || []).length, 2,
+                   tbody.innerHTML);
+assert.ok(!tbody.innerHTML.includes('复制'), tbody.innerHTML);
+assert.ok(!tbody.innerHTML.includes('duplicateAccount'), tbody.innerHTML);
 assert.ok(!tbody.innerHTML.includes('测试并发'), tbody.innerHTML);
 assert.ok(!tbody.innerHTML.includes('取消删除'), tbody.innerHTML);
 
@@ -77,7 +79,7 @@ assert.ok(tbody.innerHTML.includes('到期'), tbody.innerHTML);
 assert.ok(tbody.innerHTML.includes('在编辑弹窗中可取消删除'), tbody.innerHTML);
 assert.ok(!tbody.innerHTML.includes('>取消删除</button>'), tbody.innerHTML);
 
-// ── 编辑弹窗：保留 更新模型 / 测试并发 / 取消删除 ───────────────────────
+// ── 编辑弹窗：保留 复制 / 更新模型 / 测试并发 / 取消删除 ────────────────
 
 context.initAccountsPage();
 const pageHtml = pageEl.innerHTML;
@@ -85,9 +87,11 @@ const occurrences = (needle) => pageHtml.split(needle).length - 1;
 assert.strictEqual(occurrences('测试并发'), 1, pageHtml);
 assert.strictEqual(occurrences('取消删除'), 1, pageHtml);
 assert.strictEqual(occurrences('更新模型'), 1, pageHtml);
+assert.strictEqual(occurrences('>复制</button>'), 1, pageHtml);
 assert.ok(pageHtml.includes('id="accountTestConcBtn"'), pageHtml);
 assert.ok(pageHtml.includes('id="accountCancelDeleteBtn"'), pageHtml);
 assert.ok(pageHtml.includes('id="accountModelBtn"'), pageHtml);
+assert.ok(pageHtml.includes('id="accountDuplicateBtn"'), pageHtml);
 assert.ok(pageHtml.includes('恢复账户及尚未到期的上游密钥'), pageHtml);
 
 async function main() {
@@ -150,6 +154,9 @@ async function main() {
     assert.ok(confirmText.includes('OpenAI'), confirmText);
     assert.ok(String(toastText).includes('OpenAI 副本'), String(toastText));
     assert.ok(context.__dirty, 'config sync marked dirty');
+    // 弹窗是常驻节点：复制完成后按钮必须恢复，不能停在「复制中...」。
+    assert.deepStrictEqual([copyBtn.disabled, copyBtn.textContent],
+                           [false, '复制']);
 
     // ── 复制：没有本机明文密钥时提示手填 ────────────────────────────────
 

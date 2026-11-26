@@ -812,7 +812,6 @@ function renderAccountsTable() {
                 <td>
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
                     <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${jsArg(a.name)}')" title="从上游获取模型目录">更新</button>
-                    <button class="btn btn--sm" onclick="duplicateAccount(${a.id}, '${jsArg(a.name)}', this)" title="复制一份完全相同的配置（含本机上游密钥），生成新账户">复制</button>
                 </td>
             </tr>
         `;
@@ -933,6 +932,7 @@ async function saveAccount(e) {
         if (cancelDelBtn) cancelDelBtn.style.display = 'none';
         document.getElementById('accountModelBtn').style.display = 'none';
         document.getElementById('accountTestConcBtn').style.display = 'none';
+        document.getElementById('accountDuplicateBtn').style.display = 'none';
         form.querySelector('[type=submit]').textContent = '添加账户';
         closeModal('accountModal');
         loadAccountsTable();
@@ -994,6 +994,10 @@ async function editAccount(id) {
         document.getElementById('accountDeleteBtn').onclick = () => { closeModal('accountModal'); deleteAccount(id, acc.name, acc.account_type); };
         document.getElementById('accountModelBtn').onclick = () => updateAccountModels(id, acc.name);
         document.getElementById('accountTestConcBtn').onclick = () => testConcurrency(id);
+        // 复制入口只在编辑已有账户时出现：按已保存的配置复制成另一个账户。
+        const duplicateBtn = document.getElementById('accountDuplicateBtn');
+        duplicateBtn.style.display = '';
+        duplicateBtn.onclick = () => duplicateAccount(id, acc.name, duplicateBtn);
         openModal('accountModal');
     } catch (err) {
         showToast(err.message, 'error');
@@ -1110,7 +1114,7 @@ let _accountDuplicatePending = false;
  *  随后直接打开新账户的编辑弹窗——只需改一个参数即可保存。 */
 async function duplicateAccount(id, name, btn) {
     if (_accountDuplicatePending) return;
-    if (!confirm(`复制账户「${name}」？\n\n将创建一个配置完全相同的新账户（含本机上游密钥）；订阅账户会作为独立账户计入费用。`)) return;
+    if (!confirm(`复制账户「${name}」？\n\n将按已保存的配置创建一个新账户（含本机上游密钥）；订阅账户会作为独立账户计入费用。`)) return;
     _accountDuplicatePending = true;
     if (btn) { btn.disabled = true; btn.textContent = '复制中...'; }
     try {
@@ -1123,9 +1127,11 @@ async function duplicateAccount(id, name, btn) {
         await editAccount(result.id);
     } catch (err) {
         showToast(`复制失败: ${err.message}`, 'error');
-        if (btn) { btn.disabled = false; btn.textContent = '复制'; }
     } finally {
         _accountDuplicatePending = false;
+        // 编辑弹窗是常驻节点（不像列表行会被重渲染替换）：成功后也必须把按钮
+        // 从「复制中...」恢复，否则会一直停在禁用态。
+        if (btn) { btn.disabled = false; btn.textContent = '复制'; }
     }
 }
 
@@ -1150,10 +1156,12 @@ async function openAddAccountModal() {
     const cancelDelBtn = document.getElementById('accountCancelDeleteBtn');
     const modelBtn = document.getElementById('accountModelBtn');
     const testConcBtn = document.getElementById('accountTestConcBtn');
+    const duplicateBtn = document.getElementById('accountDuplicateBtn');
     if (delBtn) delBtn.style.display = 'none';
     if (cancelDelBtn) cancelDelBtn.style.display = 'none';
     if (modelBtn) modelBtn.style.display = 'none';
     if (testConcBtn) testConcBtn.style.display = 'none';
+    if (duplicateBtn) duplicateBtn.style.display = 'none';
     const submit = form && form.querySelector('[type=submit]');
     if (submit) submit.textContent = '添加账户';
     openModal('accountModal');
@@ -1238,6 +1246,7 @@ function initAccountsPage() {
                             </label>
                             <div style="display:flex; gap:8px;">
                                 <button type="submit" class="btn btn--primary">添加账户</button>
+                                <button type="button" class="btn btn--sm" id="accountDuplicateBtn" style="display:none" title="复制一份完全相同的配置（含本机上游密钥），生成新账户">复制</button>
                                 <button type="button" class="btn btn--sm" id="accountModelBtn" style="display:none">更新模型</button>
                                 <button type="button" class="btn btn--sm" id="accountTestConcBtn" style="display:none" title="按当前输入的并发限额测试（无需先保存）">测试并发</button>
                                 <button type="button" class="btn btn--sm" id="accountCancelDeleteBtn" style="display:none" title="恢复账户及尚未到期的上游密钥">取消删除</button>
