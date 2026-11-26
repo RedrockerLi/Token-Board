@@ -1254,6 +1254,13 @@ textarea:focus-visible {
     vertical-align: middle;
 }
 
+/* 操作列：行内按钮必须排成一行。单元格默认允许在按钮之间换行，表格列宽被
+   其它列挤压时两个按钮就会叠成两行；nowrap 让该列的 min-content 等于按钮
+   总宽，列宽随之撑开（表格超宽时由 .table-scroll 横向滚动）。 */
+.mgmt-table td.td-actions {
+    white-space: nowrap;
+}
+
 .mgmt-table tbody tr {
     transition: background var(--transition);
 }

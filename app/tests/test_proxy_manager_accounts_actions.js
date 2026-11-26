@@ -61,6 +61,7 @@ const apiAccount = {
 
 vm.runInContext(`_accountsCache = ${JSON.stringify([apiAccount])}`, context);
 context.renderAccountsTable();
+assert.ok(tbody.innerHTML.includes('<td class="td-actions">'), tbody.innerHTML);
 assert.ok(tbody.innerHTML.includes('>编辑</button>'), tbody.innerHTML);
 assert.ok(tbody.innerHTML.includes('>更新</button>'), tbody.innerHTML);
 assert.strictEqual((tbody.innerHTML.match(/<button/g) || []).length, 2,

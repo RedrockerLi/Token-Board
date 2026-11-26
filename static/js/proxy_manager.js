@@ -809,7 +809,7 @@ function renderAccountsTable() {
                     ? currencySymbol(a.currency) + (+(a.monthly_price || 0)).toFixed(2) + (typeSpec(a.account_type).subscription_unit === 'per_key' ? '/密钥·周期' : '/周期')
                     : '-'}</td>
                 <td>${a.max_concurrency ? a.max_concurrency + ' 并发' : '无限制'}</td>
-                <td>
+                <td class="td-actions">
                     <button class="btn btn--sm" onclick="editAccount(${a.id})">编辑</button>
                     <button class="btn btn--sm" onclick="updateAccountModels(${a.id}, '${jsArg(a.name)}')" title="从上游获取模型目录">更新</button>
                 </td>
