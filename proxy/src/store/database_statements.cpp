@@ -27,19 +27,27 @@ bool Database::prepare_statements() {
             "(SELECT id FROM client_keys WHERE id=?2),?12,"
             "(SELECT uuid FROM upstream_credentials WHERE runtime_id=?12),"
             "?3,?4,?5,?6,?7,?8,CASE WHEN EXISTS(SELECT 1 FROM billing_contracts "
-            "WHERE account_id=?1 AND charge_type='recurring' AND ends_at IS NULL) "
+            "WHERE account_id=?1 AND charge_type='recurring' AND "
+            "(ends_at IS NULL OR ends_at>strftime('%Y-%m-%dT%H:%M:%fZ',?20,'unixepoch'))) "
             "THEN 0 ELSE ?8 END,?9,?10,?11,COALESCE(?13,0),COALESCE(?14,0),"
             "COALESCE(?15,0),COALESCE(?16,0),COALESCE(?17,0),?18,?19,"
             "strftime('%Y-%m-%dT%H:%M:%fZ',?20,'unixepoch'),?22,?23,'pending',?1,"
             "CASE WHEN EXISTS(SELECT 1 FROM billing_contracts WHERE account_id=?1 "
-            "AND charge_type='recurring' AND ends_at IS NULL) THEN COALESCE("
+            "AND charge_type='recurring' AND "
+            "(ends_at IS NULL OR ends_at>strftime('%Y-%m-%dT%H:%M:%fZ',?20,'unixepoch'))) "
+            "THEN COALESCE("
             "(SELECT uuid FROM upstream_credentials WHERE runtime_id=?12),"
             "(SELECT 'contract:' || uuid FROM billing_contracts WHERE account_id=?1 "
-            "AND charge_type='recurring' AND ends_at IS NULL ORDER BY id DESC LIMIT 1)) END,"
+            "AND charge_type='recurring' AND "
+            "(ends_at IS NULL OR ends_at>strftime('%Y-%m-%dT%H:%M:%fZ',?20,'unixepoch')) "
+            "ORDER BY id DESC LIMIT 1)) END,"
             "(SELECT uuid FROM billing_contracts WHERE account_id=?1 AND charge_type='recurring' "
-            "AND ends_at IS NULL ORDER BY id DESC LIMIT 1),"
+            "AND (ends_at IS NULL OR ends_at>strftime('%Y-%m-%dT%H:%M:%fZ',?20,'unixepoch')) "
+            "ORDER BY id DESC LIMIT 1),"
             "(SELECT billing_anchor_day FROM billing_contracts WHERE account_id=?1 "
-            "AND charge_type='recurring' AND ends_at IS NULL ORDER BY id DESC LIMIT 1))",
+            "AND charge_type='recurring' AND "
+            "(ends_at IS NULL OR ends_at>strftime('%Y-%m-%dT%H:%M:%fZ',?20,'unixepoch')) "
+            "ORDER BY id DESC LIMIT 1))",
             stmt_insert_log_);
         PREPARE_ON(write_db_, "SELECT id FROM request_log WHERE event_id=?1",
                    stmt_find_log_event_);

@@ -516,6 +516,17 @@ add_test(
             ${CMAKE_SOURCE_DIR}/../schema
             ${CMAKE_SOURCE_DIR}/..
 )
+# An ending plan contract (a future `billing_contracts.ends_at`) is still the
+# account's live contract: its requests bill as a subscription and its quota
+# 429 keeps the subscription cooldown window.
+add_test(
+    NAME ending_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/ending_contract_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
 # Fallback-matrix experiments A3/A4/B1/B2/B3 (provider cooldown, ordinary
 # fallback retry, non-streaming 5xx, streaming pre-commit 429, and the
 # commit-then-stall #5 baseline).
@@ -576,7 +587,7 @@ set_tests_properties(format_conversion session_affinity endpoint_policy source_s
 set_tests_properties(upstream_client PROPERTIES LABELS "integration")
 set_tests_properties(
     proxy_forwarding v1_routing model_accounting responses_forwarding google_forwarding v1_admin cooldown_discrimination
-    fallback_matrix cooldown_probe error_shape opencode_session
+    fallback_matrix cooldown_probe ending_contract error_shape opencode_session
     PROPERTIES LABELS "integration"
 )
 set_tests_properties(v1_sync transition_recovery
@@ -596,5 +607,5 @@ set_tests_properties(
     proxy_forwarding v1_routing model_accounting responses_forwarding v1_admin v1_sync
     transition_recovery queue_saturation accounting_recovery stream_rss_100
     accounting_soak_60s perf_stress perf_gate_1000_64 cooldown_discrimination
-    fallback_matrix cooldown_probe error_shape opencode_session
+    fallback_matrix cooldown_probe ending_contract error_shape opencode_session
     PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/..")
