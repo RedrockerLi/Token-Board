@@ -296,6 +296,13 @@ function _calendarFormatNumber(value) {
     return _calendarNumber(value).toLocaleString('en-US');
 }
 
+/** API-equivalent cost for one token figure, rendered as " (¥1.23)". */
+function _calendarCostSuffix(value) {
+    var cost = _calendarNumber(value);
+    if (typeof fmtCost === 'function') return ' (' + fmtCost(cost) + ')';
+    return ' (¥' + cost.toFixed(2) + ')';
+}
+
 function _calendarDateParts(value) {
     var match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
     if (!match) return null;
@@ -487,7 +494,8 @@ function _calendarModelTokens(day, entry) {
 
 function _calendarTooltip(day, modelEntries) {
     var html = '<b>' + _calendarEscape(day.date) + '</b><br/>' +
-        '总 Token: <b>' + _calendarFormatNumber(day.total_tokens) + '</b><br/>' +
+        '总 Token: <b>' + _calendarFormatNumber(day.total_tokens) + '</b>' +
+        _calendarCostSuffix(day.api_equivalent_cost) + '<br/>' +
         '请求数: <b>' + _calendarFormatNumber(day.requests) + '</b>';
     var rows = [];
     (modelEntries || []).forEach(function (entry) {
@@ -497,7 +505,8 @@ function _calendarTooltip(day, modelEntries) {
             var tokens = _calendarNumber(model && model.total_tokens);
             if (tokens <= 0) return;
             rows.push('<span style="color:' + entry.color + '">●</span> ' +
-                _calendarEscape(modelName) + ': <b>' + _calendarFormatNumber(tokens) + '</b>');
+                _calendarEscape(modelName) + ': <b>' + _calendarFormatNumber(tokens) + '</b>' +
+                _calendarCostSuffix(model && model.api_equivalent_cost));
         });
     });
     if (rows.length) html += '<br/>' + rows.join('<br/>');

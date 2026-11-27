@@ -39,6 +39,12 @@ add_test(
 )
 
 add_test(
+    NAME frontend_dashboard_calendar_tooltip
+    COMMAND ${NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_LIST_DIR}/test_dashboard_calendar_tooltip.js
+)
+
+add_test(
     NAME frontend_proxy_manager_key_order
     COMMAND ${NODE_EXECUTABLE}
             ${CMAKE_CURRENT_LIST_DIR}/test_proxy_manager_key_order.js

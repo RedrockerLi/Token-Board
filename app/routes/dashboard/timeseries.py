@@ -30,6 +30,8 @@ def api_daily():
             "output": 0, "input_hit": 0, "input_miss": 0, "requests": 0,
         }),
     })
+    daily_cost = defaultdict(float)
+    model_cost = defaultdict(lambda: defaultdict(float))
     for usage in _store().token_usages:
         if usage["_year"] != year or usage["_month"] != month:
             continue
@@ -60,9 +62,23 @@ def api_daily():
         day["requests"] += usage["count"]
         day["by_model"][usage["model"]]["requests"] += usage["count"]
 
+    # API-equivalent cost comes from the daily projection, where every row
+    # already carries the virtual amount that the 30-day card sums.
+    for entry in _store().cost_entries:
+        if entry["_year"] != year or entry["_month"] != month:
+            continue
+        if user_id is not None and entry["user_id"] != user_id:
+            continue
+        if model_filter and entry["model"] != model_filter:
+            continue
+        value = float(entry.get("api_equivalent_cost", 0) or 0)
+        daily_cost[entry["date"]] += value
+        model_cost[entry["date"]][entry["model"]] += value
+
     result = []
     for day_name in sorted(daily):
         day = daily[day_name]
+        day_model_cost = model_cost.get(day_name, {})
         result.append({
             "date": day_name,
             "output_tokens": day["output_tokens"],
@@ -71,6 +87,7 @@ def api_daily():
             "input_tokens": day["input_cache_hit"] + day["input_cache_miss"],
             "total_tokens": day["output_tokens"] + day["input_cache_hit"] + day["input_cache_miss"],
             "requests": day["requests"],
+            "api_equivalent_cost": round(daily_cost.get(day_name, 0.0), 6),
             "by_model": {
                 model: {
                     "output_tokens": values["output"],
@@ -78,6 +95,8 @@ def api_daily():
                     "input_cache_miss_tokens": values["input_miss"],
                     "total_tokens": values["output"] + values["input_hit"] + values["input_miss"],
                     "requests": values["requests"],
+                    "api_equivalent_cost": round(
+                        day_model_cost.get(model, 0.0), 6),
                 }
                 for model, values in sorted(day["by_model"].items())
             },

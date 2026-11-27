@@ -209,6 +209,32 @@ class DashboardReportsTest(AppDatabaseTestCase):
         self.assertEqual(row["total_tokens"], 10)
         self.assertEqual(row["requests"], 1)
 
+    def test_daily_reports_api_equivalent_cost_per_day_and_model(self) -> None:
+        daily = self.client.get("/api/daily?year=2026&month=8").get_json()
+        days = {row["date"]: row for row in daily["days"]}
+        self.assertAlmostEqual(days["2026-08-09"]["api_equivalent_cost"], 7.0)
+        self.assertAlmostEqual(days["2026-08-10"]["api_equivalent_cost"], 4.0)
+        self.assertAlmostEqual(days["2026-08-11"]["api_equivalent_cost"], 9.0)
+        self.assertAlmostEqual(
+            days["2026-08-09"]["by_model"]["model-a"]["api_equivalent_cost"],
+            7.0)
+        self.assertAlmostEqual(
+            days["2026-08-11"]["by_model"]["plan-model"]["api_equivalent_cost"],
+            9.0)
+        self.assertAlmostEqual(
+            sum(row["api_equivalent_cost"] for row in daily["days"]), 20.0)
+
+        model_a = self.client.get(
+            "/api/daily?year=2026&month=8&model=model-a").get_json()
+        self.assertAlmostEqual(
+            sum(row["api_equivalent_cost"] for row in model_a["days"]), 7.0)
+
+        plan_only = self.client.get(
+            f"/api/daily?year=2026&month=8&user_id={self.plan_account_id}"
+        ).get_json()
+        self.assertAlmostEqual(
+            sum(row["api_equivalent_cost"] for row in plan_only["days"]), 9.0)
+
     def test_frozen_dashboard_cost_does_not_change_after_live_delete(self) -> None:
         before = self.client.get("/api/summary").get_json()
 

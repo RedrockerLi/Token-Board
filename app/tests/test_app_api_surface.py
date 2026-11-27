@@ -421,12 +421,14 @@ class AppApiSurfaceTest(AppDatabaseTestCase):
              day["input_cache_miss_tokens"], day["input_tokens"],
              day["total_tokens"], day["requests"]),
             (20, 10, 90, 100, 120, 1))
+        self.assertAlmostEqual(day["api_equivalent_cost"], 0.001)
         self.assertEqual(day["by_model"]["surface-model"], {
             "output_tokens": 20,
             "input_cache_hit_tokens": 10,
             "input_cache_miss_tokens": 90,
             "total_tokens": 120,
             "requests": 1,
+            "api_equivalent_cost": 0.001,
         })
 
         token_types = self.client.get("/api/token_types").get_json()
