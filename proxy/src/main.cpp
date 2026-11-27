@@ -35,6 +35,10 @@
 // Signal-safe flag for graceful shutdown
 static volatile sig_atomic_t g_shutdown = 0;
 
+/// Exit status used when the worker pool did not drain inside its shutdown
+/// budget: the process stops waiting instead of hanging, and says so.
+constexpr int kExitShutdownTimedOut = 3;
+
 extern "C" void signal_handler(int /*signum*/) {
     g_shutdown = 1;
 }
@@ -231,13 +235,33 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    printf("Proxy listening on http://%s:%d\n", cfg.host.c_str(), cfg.port);
-    printf("Press Ctrl+C to stop.\n\n");
-
-    // Start server in a separate thread so we can poll for shutdown
+    // Start server in a separate thread so we can poll for shutdown.
     auto server_thread = std::thread([&]() {
         server.listen(cfg.host.c_str(), cfg.port);
     });
+
+    // Announce "listening" only once the socket is really bound and accepting.
+    // A failed bind (EADDRINUSE, permission) must end the process with a
+    // non-zero status instead of leaving a "started" server that serves
+    // nothing; wait_until_ready() returns on either outcome.
+    server.wait_until_ready();
+    if (!server.is_running()) {
+        TB_LOG_ERROR(
+                "FATAL: cannot listen on %s:%d (address already in use, or a "
+                "bind/permission error); refusing to run without a listening "
+                "socket\n",
+                cfg.host.c_str(), cfg.port);
+        server_thread.join();
+        // Same teardown order as the ordinary shutdown path: stop the threads
+        // that read the database before closing it.
+        proxy_server.shutdown();
+        router.shutdown();
+        db.close();
+        return 1;
+    }
+
+    printf("Proxy listening on http://%s:%d\n", cfg.host.c_str(), cfg.port);
+    printf("Press Ctrl+C to stop.\n\n");
 
     // Wait for signal while the server runs.
     while (!g_shutdown) {
@@ -245,14 +269,40 @@ int main(int argc, char *argv[]) {
     }
 
     printf("\nShutting down...\n");
+    const auto shutdown_started = std::chrono::steady_clock::now();
     server.stop();
+    // listen_internal() calls task_queue->shutdown() before it returns, so this
+    // join carries the worker drain; the pool bounds that wait internally.
     server_thread.join();
     pool.shutdown();
+    if (pool.abandoned()) {
+        // Workers did not drain inside the pool's budget.  They keep running
+        // and still reference the pool and the database, so the process must
+        // not unwind (closing the database or destroying the pool under them
+        // would be a use-after-free).  Exit with a distinct status instead of
+        // waiting forever; nothing was killed.
+        TB_LOG_ERROR(
+                "[Shutdown] request workers did not finish within the pool's "
+                "drain budget; exiting with status %d after %lld ms without "
+                "closing the database (in-flight requests keep running)\n",
+                kExitShutdownTimedOut,
+                static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - shutdown_started)
+                        .count()));
+        std::_Exit(kExitShutdownTimedOut);
+    }
 
     // Drain and join the accounting thread before closing the DB it writes to.
     proxy_server.shutdown();
     router.shutdown();
     db.close();
+    TB_LOG_INFO(
+            "[Shutdown] graceful stop finished in %lld ms\n",
+            static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - shutdown_started)
+                    .count()));
     printf("Goodbye.\n");
     return 0;
 }

@@ -1,5 +1,8 @@
 #include "format_responses_internal.h"
 #include "context_management.h"
+
+#include <cctype>
+
 using namespace ir;
 bool ResponsesCodec::parse_request(const json &in, ir::ChatRequest &out,
                                    std::string &err) const {
@@ -443,8 +446,16 @@ json ResponsesCodec::serialize_request(const ir::ChatRequest &in,
         std::string sys_text;
         bool all_text = true;
         for (const auto &b : in.system) {
-            if (b.kind == ContentKind::Text) sys_text += b.text;
-            else all_text = false;
+            if (b.kind != ContentKind::Text) { all_text = false; continue; }
+            // Audit 01-P-01: the Responses target folds the IR system blocks
+            // into one `instructions` string, so they have to stay separated by
+            // a blank line instead of being glued together.  The separator is
+            // skipped while nothing has been written yet or the text already
+            // ends in whitespace.
+            if (!sys_text.empty() &&
+                !std::isspace(static_cast<unsigned char>(sys_text.back())))
+                sys_text += "\n\n";
+            sys_text += b.text;
         }
         if (all_text)
             body["instructions"] = sys_text;

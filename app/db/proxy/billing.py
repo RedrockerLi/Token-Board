@@ -6,9 +6,11 @@ determined: a USD row is locked as soon as fx_rates has an exact row for
 that date (fx_rate_date == period_start afterwards), and the rate is read
 from that row forever — price changes re-multiply the same rate, and later
 daily rate movements never touch it.  Missing historical rates are fetched
-on demand via fx.ensure_rate(?date=period_start); on failure the nearest
-stored rate is frozen as the permanent fallback.  Recurring rows are finalized
-as soon as their period-start amount is known.
+on demand via fx.ensure_rate(?date=period_start); a charge is finalized only
+once that exact period-start rate exists.  A provisional (nearest-earlier)
+rate is never frozen: the row stays pending, keeps being retried by later
+materializations, and is reported through a warning plus the incomplete-charge
+counters.
 
 Which period is "current" is decided by one resolver
 (:func:`resolve_unit_period`): the recorded ledger wins while it still covers
@@ -24,6 +26,7 @@ instead of billing the anchor immediately.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from datetime import date, datetime
@@ -37,6 +40,8 @@ from app.db.proxy.billing_export import ensure_billing_export_events_conn
 from app.services import fx
 from app.services.billing_units import BillingUnit, BillingUnitResolver
 
+
+log = logging.getLogger(__name__)
 
 # A freshly added usage-tracked key waits this long for its first usage
 # observation before the anchor calendar may bill it: the account save
@@ -208,17 +213,24 @@ def _normalized_charge(conn: sqlite3.Connection, price: float,
                        ) -> tuple[float | None, str | None, bool]:
     """Convert ``price`` to CNY at the rate locked on the period start date.
 
-    A USD row is locked using the exact period-start rate when available. FX
-    prewarming happens before the caller's write transaction; this function is
-    deliberately read-only so it can never perform network I/O while SQLite
-    writes are locked. A currency with no stored rate remains pending.
+    A foreign-currency row is finalized only with the exact period-start rate;
+    a provisional resolution (a nearest-earlier fallback) is reported and left
+    pending instead of being frozen as a financial fact. FX prewarming happens
+    before the caller's write transaction; this function is deliberately
+    read-only so it can never perform network I/O while SQLite writes are
+    locked. A currency with no stored rate remains pending as before.
     """
     if currency == "CNY":
         return price, None, True
     resolution = fx.FxRateResolver.resolve(conn, currency, "CNY", start_date)
-    if resolution.source_date is None:
+    if not resolution.locked:
+        log.warning(
+            "period start %s has no exact %s->CNY rate (provisional "
+            "source_date=%s); charge stays pending",
+            start_date, currency, resolution.source_date)
         return None, None, False
-    return price * resolution.rate, resolution.source_date, True
+    return (price * fx.FxRateResolver.finalize(resolution),
+            resolution.source_date, True)
 
 
 def prewarm_period_fx_rates_conn(conn: sqlite3.Connection,

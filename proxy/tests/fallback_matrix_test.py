@@ -321,8 +321,14 @@ def main() -> None:
             rid, _, st = latest_attempts(db_path, "b2-model")
             assert st == [429, 429, 200], f"B2 chain {st}"
             rows = attempt_rows(db_path, rid)
-            assert rows[0][1] == "Upstream returned 429", (
+            # 04-C-19: the HTTP-status reason stays the prefix, and the attempt
+            # now also carries an excerpt of the upstream body.
+            error = rows[0][1]
+            assert error.strip(), f"B2 attempt error must not be empty: {rows[0]}"
+            assert error.startswith("Upstream returned 429"), (
                 f"B2 attempt error must keep the HTTP-status reason: {rows[0]}")
+            assert error != "Upstream returned 429", (
+                f"B2 attempt error must carry the upstream excerpt: {rows[0]}")
             print(f"B2 OK: streaming 429 pre-commit buffered -> fallback ({st}), "
                   f"error kept as HTTP status")
 

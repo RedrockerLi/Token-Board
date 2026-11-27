@@ -1,8 +1,7 @@
 """ProxyDatabase methods for ProxyBillingLedgerMixin."""
 
 from app.core.time import format_utc, utc_now
-from app.db.proxy.common import sqlite3, timedelta
-from app.services.billing_units import BillingUnitResolver
+from app.db.proxy.common import timedelta
 from app.services.billing_report import attributed_request_sql
 
 
@@ -48,27 +47,3 @@ class ProxyBillingLedgerMixin:
             return [dict(r) for r in rows]
         finally:
             conn.close()
-
-    @staticmethod
-    def _plan_key_billing_meta(conn: sqlite3.Connection) -> list[dict]:
-        """Build plan key lifecycles from synchronized credential metadata.
-
-        A plan is priced by its configured key slots, not by whether this
-        machine has filled in the local plaintext key.  Cloud-only rows are
-        therefore billable metadata; they still cannot route until a local
-        secret is entered. Duplicate local+cloud rows with the same masked
-        identity are collapsed to the local slot.
-        """
-        now = utc_now()
-        return [{
-            "account_id": unit.account_id,
-            "contract_id": unit.contract_id,
-            "credential_uuid": unit.credential_uuid,
-            "key_id": unit.credential_runtime_id,
-            "key_masked": unit.key_masked or "subscription",
-            "billing_unit_id": unit.billing_unit_id.removeprefix("credential:"),
-            "anchor": unit.valid_from,
-            "end": unit.ends_at,
-            "now": now,
-            "currency": unit.currency,
-        } for unit in BillingUnitResolver.proxy_units(conn, at=now)]

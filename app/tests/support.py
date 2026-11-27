@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import shutil
 import tempfile
@@ -10,6 +11,23 @@ from typing import Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def short_temp_root() -> tempfile.TemporaryDirectory:
+    """Temporary root on a short base directory.
+
+    AF_UNIX ``sun_path`` is 108 bytes, so the maintenance socket — which stays
+    at the production location ``<root>/data/token-maintenance.sock`` — cannot
+    be bound when ``TMPDIR`` is deep.  The databases and the socket layout keep
+    their normal shape; only the base of the temporary tree is short.
+    """
+    for base in ("/tmp", "/var/tmp"):
+        try:
+            if os.path.isdir(base) and os.access(base, os.W_OK | os.X_OK):
+                return tempfile.TemporaryDirectory(dir=base)
+        except OSError:
+            continue
+    return tempfile.TemporaryDirectory()
 
 
 @contextmanager
@@ -28,7 +46,7 @@ def sqlite_connection(path: str | Path) -> Iterator[sqlite3.Connection]:
 
 class AppDatabaseTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._temporary = tempfile.TemporaryDirectory()
+        self._temporary = short_temp_root()
         self.root = Path(self._temporary.name)
         shutil.copytree(PROJECT_ROOT / "schema", self.root / "schema")
         (self.root / "data").mkdir()

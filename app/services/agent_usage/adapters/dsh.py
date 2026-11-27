@@ -10,13 +10,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import struct
-import subprocess
 from pathlib import Path
 
 from ..common import batch, config_value, make_event, project_name, source, timestamp, walk_files
 from ..ir import ParseBatch, UsageSource
+from . import zstd_reader
 
 KIND = "dsh"
 LABEL = "DeepSeek Harness"
@@ -110,7 +109,7 @@ def _logical_session_key(path: Path) -> str:
     """Read the header id when possible; fall back to the directory name."""
     try:
         text = _text(path)
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError, zstd_reader.ZstdUnavailable):
         return path.parent.name
     for raw in text.splitlines():
         try:
@@ -139,8 +138,13 @@ _SKIPPABLE_MAGIC_MIN = 0x184D2A50
 _SKIPPABLE_MAGIC_MAX = 0x184D2A5F
 
 
-def _split_zstd_frames(buffer: bytes) -> list[tuple[int, int]]:
-    """Return complete standard-frame ranges, ignoring an incomplete tail."""
+def _split_zstd_frames(buffer: bytes) -> list[tuple[int, int, int | None]]:
+    """Return complete standard-frame ranges with their declared content size.
+
+    Each entry is ``(start, end, content_size)``; ``content_size`` is ``None``
+    when the frame header does not declare one.  An incomplete trailing frame
+    is ignored: DSH appends frames to a live log and may leave a torn one.
+    """
     frames = []
     position = 0
     length = len(buffer)
@@ -181,6 +185,13 @@ def _split_zstd_frames(buffer: bytes) -> list[tuple[int, int]]:
                      + content_size_bytes)
         if position + remaining > length:
             break
+        content_size = None
+        if content_size_bytes:
+            offset = position + (0 if single_segment else 1) + dictionary_bytes
+            declared = int.from_bytes(
+                buffer[offset:offset + content_size_bytes], "little")
+            # RFC 8878: a two-byte field stores Frame_Content_Size - 256.
+            content_size = declared + 256 if content_size_bytes == 2 else declared
         position += remaining
 
         while True:
@@ -203,7 +214,7 @@ def _split_zstd_frames(buffer: bytes) -> list[tuple[int, int]]:
             if position + 4 > length:
                 return frames
             position += 4
-        frames.append((start, position))
+        frames.append((start, position, content_size))
     return frames
 
 
@@ -214,24 +225,27 @@ def _text(path: Path) -> str:
             f"session log too large ({len(raw)} bytes)")
     if not path.name.endswith(".zstd"):
         return raw.decode("utf-8", errors="replace")
-    zstd = shutil.which("zstd")
-    if not zstd:
-        raise OSError("zstd CLI is required to read DeepSeek Harness logs")
     frames = _split_zstd_frames(raw)
     if not frames:
         raise ValueError("no complete zstd frames found")
     # DSH appends frames and may leave a torn final frame while the session is
-    # still live. Decode all complete frames only; zstd CLI otherwise rejects
-    # the entire concatenated stream and silently loses the earlier usage.
-    complete = b"".join(raw[start:end] for start, end in frames)
-    result = subprocess.run(
-        [zstd, "-d", "-c"], input=complete, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, check=True, timeout=30,
-    )
-    if len(result.stdout) > MAX_DECOMPRESSED_SESSION_BYTES:
-        raise _DshParseError(
-            f"decompressed session log too large ({len(result.stdout)} bytes)")
-    return result.stdout.decode("utf-8", errors="replace")
+    # still live. Decode the complete frames one by one: a decoder library
+    # would also decode the concatenation, but only per-frame decoding can hold
+    # each frame to the decompressed size its header declares.
+    chunks = []
+    total = 0
+    for start, end, content_size in frames:
+        decoded = zstd_reader.decode_bytes(raw[start:end])
+        if content_size is not None and len(decoded) != content_size:
+            raise _DshParseError(
+                f"frame at byte {start} decoded to {len(decoded)} bytes, "
+                f"header says {content_size}")
+        total += len(decoded)
+        if total > MAX_DECOMPRESSED_SESSION_BYTES:
+            raise _DshParseError(
+                f"decompressed session log too large ({total} bytes)")
+        chunks.append(decoded)
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 def _seq(value):
@@ -366,14 +380,21 @@ def _load_model(item: UsageSource, *, strict: bool = False) -> dict | None:
         file_version = (_session_file_version(item.path)
                         if configured_version is None else int(configured_version))
         return _build_model(text, file_version)
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError, zstd_reader.ZstdUnavailable):
         if strict:
             raise
         return None
 
 
 def _replay_skip_count(child: dict, parent: dict | None) -> int:
-    if parent is None or child["seed_length"] <= 0:
+    # A v2+ fork that was not seeded (``isSeeded`` false, no inherited
+    # end-seed marker) declares no provable inherited prefix, and the header
+    # validation accepts that as ``seed_length = None``; treat it as zero
+    # rather than comparing None.  Before this, any forked session without a
+    # marker raised TypeError out of ``replay_skips``, which the importer calls
+    # before its own try block — the whole import pass failed and every kind
+    # went unimported.
+    if parent is None or (child["seed_length"] or 0) <= 0:
         return 0
     parent_index = 0
     previous = -1
@@ -434,7 +455,16 @@ def replay_skips(sources: list[UsageSource], stop_event=None) -> dict[str, int]:
 def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_) -> ParseBatch:
     try:
         model = _load_model(item, strict=True)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+    except zstd_reader.ZstdUnavailable as exc:
+        # A compressed session log has no plaintext copy here, so a missing
+        # decoder must not look like "no usage": keep the sync state and say
+        # why, so the log imports once a decoder library is installed.
+        return batch(
+            [], 0, skipped=True,
+            warnings=(f"dsh: 缺少可用的 Zstandard 解码库，{item.path} 未导入，"
+                      f"已保留上次同步状态。({exc})",),
+        )
+    except (OSError, ValueError) as exc:
         return batch(
             [], 0, skipped=True,
             warnings=(f"dsh: skipping {item.path} ({exc})",),
@@ -461,8 +491,12 @@ def parse(item: UsageSource, stop_event=None, *, skip_token_count: int = 0, **_)
         usage = message["usage"]
         event = make_event(
             kind=KIND, source_key=f"session:{session_id}",
-            ordinal=(message.get("message_id") or message["seq"]
-                     if message["seq"] is not None else index),
+            # A message id is the stable identity; only a record without one
+            # falls back to its seq, and only a record without either falls
+            # back to the enumeration index. (The old expression dropped the
+            # message id whenever seq was absent, e.g. in format v0 logs.)
+            ordinal=(message.get("message_id")
+                     or (message["seq"] if message["seq"] is not None else index)),
             model=message["model"], requested_at=message["time"],
             input_tokens=usage["input"], output_tokens=usage["output"],
             cached_input_tokens=usage["cache"],

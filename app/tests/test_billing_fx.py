@@ -1,11 +1,18 @@
 """Subscription (plan/agent) FX locking at the billing period start date.
 
-Covers the period_start-lock contract:
-  * a USD row locks as soon as fx_rates has an exact row for period_start
-    (fx_rate_date == period_start afterwards; rate never re-fetched, even
-    when later daily rates arrive or prices change);
-  * missing historical rates are fetched on demand via ?date=period_start;
-  * fetch failure uses the nearest stored rate as a permanent fallback;
+Covers the period_start-lock contract (04-C-06 policy change: a provisional
+rate is never frozen as a financial fact):
+
+  * a foreign-currency row is finalized only when fx_rates has an exact row for
+    period_start (fx_rate_date == period_start afterwards; the rate is never
+    re-fetched, even when later daily rates arrive or prices change);
+  * a provisional resolution (nearest-earlier, or the earliest stored row when
+    none precedes the period start) leaves the row pending: the native amount
+    is kept, normalized_recurring_cost/fx_rate_date/finalized_at stay NULL, a
+    warning says the charge stays pending, the incomplete-charge counter grows,
+    and later materializations retry it until the exact rate exists;
+  * missing historical rates are fetched on demand via ?date=period_start and
+    pre-1999 dates never reach the network;
   * CNY rows pass through untouched; frozen rows are never touched.
 """
 
@@ -22,7 +29,6 @@ from app.db.proxy.billing import (
     materialize_period_charges,
 )
 from app.core import sqlite_runtime
-from app.db.dashboard_db import DashboardDatabase
 from app.db.proxy_db import ProxyDatabase
 from app.services import fx
 
@@ -178,34 +184,47 @@ class BillingFxLockTest(AppDatabaseTestCase):
         finally:
             conn.close()
 
-    def test_fetch_failure_freezes_nearest_fallback(self) -> None:
+    def test_fetch_failure_keeps_provisional_rate_pending(self) -> None:
+        """04-C-06 policy change: a provisional rate is never frozen."""
         db = self.proxy_database()
         self._usd_plan(db, valid_from="2026-06-15")
-        self._seed_rate("2026-07-01", 6.5)  # fallback when start-day FX is absent
+        self._seed_rate("2026-07-01", 6.5)  # nearest earlier, not the start day
+        before_incomplete = db.get_perf_realtime()["billing_incomplete"]
         with mock.patch("app.services.fx.requests.get",
                         side_effect=RuntimeError("offline")):
-            materialize_period_charges(str(self.proxy_path),
-                                       datetime(2026, 7, 20, tzinfo=timezone.utc))
-            with sqlite_connection(self.proxy_path) as conn:
-                # Runtime materializes only the period containing the
-                # recovery timestamp. A missing exact rate uses the nearest
-                # stored rate and is frozen permanently.
-                row = _rates(conn, "2026-07-15T00:00:00Z")
-                self.assertEqual(row[:3], (10.0, "USD", 65.0))
-                self.assertNotEqual(row[3], "2026-06-15")
-                self.assertIsNotNone(row[4])
-        # A later exact rate must not rewrite the frozen fallback.
-        with mock.patch("app.services.fx.requests.get",
-                        return_value=_FakeResponse(
-                            {"date": "2026-06-15", "rate": 6.9})) as get:
-            materialize_period_charges(str(self.proxy_path),
-                                       datetime(2026, 7, 20, tzinfo=timezone.utc))
+            with self.assertLogs("app.db.proxy.billing",
+                                 level="WARNING") as captured:
+                materialize_period_charges(
+                    str(self.proxy_path),
+                    datetime(2026, 7, 20, tzinfo=timezone.utc))
             with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-15T00:00:00Z")
-                self.assertEqual(row[:3], (10.0, "USD", 65.0))
-                self.assertNotEqual(row[3], "2026-06-15")
+                # The native amount is kept; the conversion is not a fact yet.
+                self.assertEqual(row[:2], (10.0, "USD"))
+                self.assertIsNone(row[2])
+                self.assertIsNone(row[3])
+                self.assertIsNone(row[4])
+        self.assertIn("charge stays pending",
+                      " ".join(record.getMessage()
+                               for record in captured.records))
+        self.assertEqual(db.get_perf_realtime()["billing_incomplete"],
+                         before_incomplete + 1)
+
+        # The pending charge is retried: once the exact period-start rate
+        # exists, the same row finalizes without being re-created.
+        self._seed_rate("2026-07-15", 7.0)
+        with mock.patch("app.services.fx.requests.get") as get:
+            materialize_period_charges(
+                str(self.proxy_path),
+                datetime(2026, 7, 20, tzinfo=timezone.utc))
+            with sqlite_connection(self.proxy_path) as conn:
+                row = _rates(conn, "2026-07-15T00:00:00Z")
+                self.assertEqual(row[:3], (10.0, "USD", 70.0))
+                self.assertEqual(row[3], "2026-07-15")
                 self.assertIsNotNone(row[4])
             get.assert_not_called()
+        self.assertEqual(db.get_perf_realtime()["billing_incomplete"],
+                         before_incomplete)
 
     def test_existing_unfrozen_rows_are_corrected_and_frozen_rows_untouched(
             self) -> None:
@@ -283,36 +302,49 @@ class BillingFxLockTest(AppDatabaseTestCase):
                 self.assertEqual(row[:3], (10.0, "USD", 71.0))
                 self.assertEqual(row[3], "2026-07-18")
 
-    def test_pre_1999_period_start_never_hits_the_api(self) -> None:
+    def test_pre_1999_period_start_never_fetches_and_stays_pending(self) -> None:
         db = self.proxy_database()
         self._usd_plan(db, valid_from="1998-12-15")
-        self._seed_rate("1999-01-01", 6.5)
+        self._seed_rate("1999-01-01", 6.5)  # provisional for the 1999-02-15 start
         with mock.patch("app.services.fx.requests.get",
                         side_effect=RuntimeError("offline")) as get:
-            materialize_period_charges(
-                str(self.proxy_path),
-                datetime(1999, 2, 20, tzinfo=timezone.utc))
+            with self.assertLogs("app.db.proxy.billing",
+                                 level="WARNING") as captured:
+                materialize_period_charges(
+                    str(self.proxy_path),
+                    datetime(1999, 2, 20, tzinfo=timezone.utc))
             requested = [c.kwargs["params"]["date"] for c in get.call_args_list]
             self.assertTrue(requested)  # 1999-01-15 period did try
             self.assertTrue(all(d >= "1999-01-01" for d in requested))
             with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "1999-02-15T00:00:00Z")
-                self.assertIsNotNone(row[4])
-                self.assertNotEqual(row[3], "1998-12-15")
+                self.assertEqual(row[:2], (10.0, "USD"))
+                self.assertIsNone(row[2])
+                self.assertIsNone(row[3])
+                self.assertIsNone(row[4])
+        self.assertIn("charge stays pending",
+                      " ".join(record.getMessage()
+                               for record in captured.records))
 
-    def test_period_start_before_earliest_stored_rate_uses_earliest(self) -> None:
+    def test_rate_only_after_period_start_keeps_the_period_pending(self) -> None:
         db = self.proxy_database()
         self._usd_plan(db)
-        self._seed_rate("2026-08-01", 6.8)
+        self._seed_rate("2026-08-01", 6.8)  # after the 2026-07-15 period start
         with mock.patch("app.services.fx.requests.get",
                         side_effect=RuntimeError("offline")):
-            materialize_period_charges(str(self.proxy_path), _at())
+            with self.assertLogs("app.db.proxy.billing",
+                                 level="WARNING") as captured:
+                materialize_period_charges(str(self.proxy_path), _at())
             with sqlite_connection(self.proxy_path) as conn:
                 row = _rates(conn, "2026-07-15T00:00:00Z")
-                # 6.8 from the earliest stored row, never 1.0, and frozen.
-                self.assertEqual(row[:3], (10.0, "USD", 68.0))
-                self.assertEqual(row[3], "2026-08-01")
-                self.assertIsNotNone(row[4])
+                # The later row is a fallback, never a period-start fact.
+                self.assertEqual(row[:2], (10.0, "USD"))
+                self.assertIsNone(row[2])
+                self.assertIsNone(row[3])
+                self.assertIsNone(row[4])
+        self.assertIn("charge stays pending",
+                      " ".join(record.getMessage()
+                               for record in captured.records))
 
     def test_no_stored_fx_rate_keeps_native_price_pending(self) -> None:
         db = self.proxy_database()

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <list>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -50,14 +51,35 @@ public:
         const auto started = std::chrono::steady_clock::now();
         const auto deadline = started + std::chrono::milliseconds(timeout_ms);
         std::unique_lock<std::mutex> lock(mutex_);
-        const auto available = [&] {
-            const auto found = active_.find(origin);
-            const std::size_t active = found == active_.end() ? 0 : found->second;
-            return total_active_ < total_limit_ && active < origin_limit_;
-        };
-        if (!cv_.wait_until(lock, deadline, available)) return {};
-        ++total_active_;
-        ++active_[origin];
+        if (!available_locked(origin)) {
+            // Park as an explicit waiter instead of sleeping on a broadcast:
+            // a release hands the freed slot to exactly one waiting request,
+            // so a saturated origin does not turn every completion into a
+            // wake-up of the whole queue (C-10).
+            Waiter waiter;
+            waiter.origin = &origin;
+            waiters_.push_back(&waiter);
+            // Keeps the queue consistent if the wait throws; a grant already
+            // erased this entry, which makes the removal a no-op.
+            struct QueueEntry {
+                std::list<Waiter *> *queue;
+                Waiter *waiter;
+                ~QueueEntry() { queue->remove(waiter); }
+            } entry{&waiters_, &waiter};
+            while (!waiter.granted) {
+                if (waiter.cv.wait_until(lock, deadline) ==
+                        std::cv_status::timeout &&
+                    !waiter.granted) {
+                    // Timed out before a grant: leave the queue.  grant_one()
+                    // erases the waiter before granting, and both sides run
+                    // under mutex_, so a grant cannot be lost here.
+                    return {};
+                }
+            }
+            // The grantor already reserved this request's slot.
+        } else {
+            reserve_locked(origin);
+        }
         ++lease_count_;
         const int waited = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -80,19 +102,54 @@ public:
     }
 
 private:
+    /// One parked acquire.  Each waiter owns its condition variable so a
+    /// release can grant the slot to exactly this request.
+    struct Waiter {
+        const std::string *origin = nullptr;
+        std::condition_variable cv;
+        bool granted = false;
+    };
+
+    bool available_locked(const std::string &origin) const {
+        const auto found = active_.find(origin);
+        const std::size_t active = found == active_.end() ? 0 : found->second;
+        return total_active_ < total_limit_ && active < origin_limit_;
+    }
+
+    void reserve_locked(const std::string &origin) {
+        ++total_active_;
+        ++active_[origin];
+    }
+
+    /// Hand the single slot freed by one release to the first waiter that can
+    /// use it; the other waiters stay parked instead of re-checking.
+    void grant_one_locked() {
+        for (auto it = waiters_.begin(); it != waiters_.end(); ++it) {
+            Waiter *waiter = *it;
+            if (!available_locked(*waiter->origin)) continue;
+            waiters_.erase(it);
+            reserve_locked(*waiter->origin);
+            waiter->granted = true;
+            // Notify under the lock: a waiter that timed out concurrently has
+            // already removed itself, so this grant cannot be consumed by
+            // anyone else.
+            waiter->cv.notify_one();
+            return;
+        }
+    }
+
     void release(const std::string &origin) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto found = active_.find(origin);
-        if (found != active_.end() && found->second != 0) {
-            --found->second;
-            --total_active_;
-            if (found->second == 0) active_.erase(found);
-        }
-        cv_.notify_all();
+        if (found == active_.end() || found->second == 0) return;
+        --found->second;
+        --total_active_;
+        if (found->second == 0) active_.erase(found);
+        grant_one_locked();
     }
 
     mutable std::mutex mutex_;
-    std::condition_variable cv_;
+    std::list<Waiter *> waiters_;
     std::unordered_map<std::string, std::size_t> active_;
     std::size_t total_active_ = 0;
     std::uint64_t lease_count_ = 0;

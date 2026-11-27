@@ -512,10 +512,30 @@ int main() {
     gate2.note_success(101);
     assert(gate2.try_acquire_eligible(101, 1) ==
            AccountGate::KeyAcquireResult::kSubscriptionCooldown);
-    gate2.clear_cooldown(101);
+    // A clear is only honoured for the cooldown the evidence observed: the
+    // recorded mark (999) is at or before the observation, so it lifts.
+    assert(gate2.clear_cooldown_if_current(101, 999) ==
+           AccountGate::CooldownClearResult::kCleared);
     assert(gate2.try_acquire_eligible(101, 1) ==
            AccountGate::KeyAcquireResult::kAcquired);
     gate2.release(101);
+
+    // A newer cooldown outlives an older observation, and the dropped clear is
+    // reported instead of vanishing.
+    gate2.mark_subscription_cooldown(
+        101, std::chrono::seconds(42),
+        AccountGate::CooldownEvidence{"5h", 12345, 1000});
+    assert(gate2.clear_cooldown_if_current(101, 999) ==
+           AccountGate::CooldownClearResult::kSuperseded);
+    assert(gate2.try_acquire_eligible(101, 1) ==
+           AccountGate::KeyAcquireResult::kSubscriptionCooldown);
+    assert(gate2.clear_cooldown_if_current(101, 1000) ==
+           AccountGate::CooldownClearResult::kCleared);
+    assert(gate2.try_acquire_eligible(101, 1) ==
+           AccountGate::KeyAcquireResult::kAcquired);
+    gate2.release(101);
+    assert(gate2.clear_cooldown_if_current(101, 1000) ==
+           AccountGate::CooldownClearResult::kNotCooling);
 
     gate2.mark_rate_limited(101, std::chrono::seconds(60));
     assert(gate2.try_acquire_eligible(101, 1) ==
@@ -582,6 +602,99 @@ int main() {
     quota_cand.usage_ref = nullptr;
     plan = quota_cooldown_plan(quota_cand, "", now);
     assert(plan.window.empty() && plan.evidence_resets_at == 0);
+
+    // ── 03-F-14 guard: candidate_exhausted_reset ──────────────────────────
+    // t6 collapsed the two-branch veto test into `resets_at <= now` and
+    // dropped the snapshot-freshness input.  These are semantics-preserving
+    // guards, not red→green tests: the old and the current implementation
+    // agree over 128304 brute-forced inputs (ref/audit/fragments/w9.md §F-14).
+    {
+        // A reset still ahead of `now` is reported as the recovery deadline.
+        UpstreamCandidate future_reset;
+        future_reset.key_slot_id = 20;
+        future_reset.usage_ref = fresh({win("month", 100, now + 30 * day)});
+        assert(candidate_exhausted_reset(future_reset, now) == now + 30 * day);
+
+        // An unknown reset stamp is not a deadline: 0 means "no schedule".
+        UpstreamCandidate unknown_reset;
+        unknown_reset.key_slot_id = 21;
+        unknown_reset.usage_ref = fresh({win("month", 100, 0)});
+        assert(candidate_exhausted_reset(unknown_reset, now) == 0);
+
+        // A stale snapshot still reports a future reset.  This is the branch
+        // the removed `fresh` local used to decide ("a reset ahead of now
+        // wins regardless of snapshot age"), so a regression that re-couples
+        // freshness to the reset stamp fails here.
+        UpstreamCandidate stale_future;
+        stale_future.key_slot_id = 22;
+        stale_future.usage_ref = usage_of(now - kUsageFreshSeconds - 1,
+                                          {win("month", 100, now + 100)});
+        assert(candidate_exhausted_reset(stale_future, now) == now + 100);
+
+        // Several exhausted windows: the earliest future reset wins, because
+        // the ordering key is "recovers soonest".
+        UpstreamCandidate two_windows;
+        two_windows.key_slot_id = 23;
+        two_windows.usage_ref = fresh({win("month", 100, now + 50 * hour),
+                                       win("5h", 100, now + 5 * hour)});
+        assert(candidate_exhausted_reset(two_windows, now) == now + 5 * hour);
+    }
+
+    // ── 03-F-13 guard: window_pressure ────────────────────────────────────
+    // The invariant (remaining >= 1) lives in the assert; the bool answers
+    // "this window supplies a pressure signal".  These cases pin both halves.
+    {
+        // kExhaustedPercent - 1 is the tightest positive case: remaining == 1,
+        // exactly the value the assert checks, and seconds must be positive.
+        UpstreamCandidate almost_spent;
+        almost_spent.key_slot_id = 24;
+        almost_spent.usage_ref = fresh(
+            {win("month", kExhaustedPercent - 1, now + 30 * day)});
+        WindowPressure pressure{};
+        assert(window_pressure(almost_spent, UsageWindowKind::kMonthly, now,
+                               &pressure));
+        assert(pressure.remaining == 1);
+        assert(pressure.seconds == 30 * day);
+
+        // An exhausted window supplies no pressure at all.
+        UpstreamCandidate spent;
+        spent.key_slot_id = 25;
+        spent.usage_ref = fresh({win("month", kExhaustedPercent,
+                                     now + 30 * day)});
+        WindowPressure rejected{};
+        assert(!window_pressure(spent, UsageWindowKind::kMonthly, now,
+                                &rejected));
+    }
+
+    // ── 04-C-01 guard: the hashed key keeps its scope separator ───────────
+    // The digest is fed scope, a 0x1f separator and the session in three
+    // incremental chunks; a separator-free implementation would give the same
+    // key for ("ab","c") and ("a","bc").
+    {
+        SessionAffinity affinity;
+        affinity.bind("ab", "c", 7);
+        const std::vector<int> slots{7};
+        assert(affinity.bound_index("ab", "c", slots) == 0);
+        assert(!affinity.bound_index("a", "bc", slots).has_value());
+        assert(!affinity.bound_index("abc", "", slots).has_value());
+        assert(!affinity.bound_index("", "abc", slots).has_value());
+
+        // 2000 distinct pairs must all resolve to their own binding: a hash
+        // collision here would silently route a session to another key.
+        SessionAffinity many;
+        for (int i = 0; i < 2000; ++i)
+            many.bind("scope-" + std::to_string(i),
+                      "session-" + std::to_string(i), 100 + i % 50);
+        int resolved = 0;
+        for (int i = 0; i < 2000; ++i) {
+            const std::vector<int> own{100 + i % 50};
+            const auto bound = many.bound_index("scope-" + std::to_string(i),
+                                                "session-" + std::to_string(i),
+                                                own);
+            if (bound && *bound == 0) ++resolved;
+        }
+        assert(resolved == 2000);
+    }
 
     std::cout << "session affinity tests passed\n";
 }

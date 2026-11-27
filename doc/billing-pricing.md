@@ -1,6 +1,6 @@
 # 计费与定价
 
-V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库在写入 `request_log` 时读取当前模型定价并固化 `equivalent_cost`；metered 合同同时写 `billed_usage_cost=equivalent_cost`，recurring 合同写 0，真实周期费用来自 `billing_period_charges` 或独立的智能体订阅周期表。上游 API 只展示 api/plan 两种类型，智能体配置走独立管理页。
+proxy/import 用量都写同一种 `UsageEvent`。数据库在写入 `request_log` 时读取当前模型定价并固化 `equivalent_cost`；metered 合同同时写 `billed_usage_cost=equivalent_cost`，recurring 合同写 0，真实周期费用来自 `billing_period_charges` 或独立的智能体订阅周期表。上游 API 只展示 api/plan 两种类型，智能体配置走独立管理页。
 
 ## 定价模型
 
@@ -32,7 +32,7 @@ V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库在写入 `req
 | `start_minute` / `end_minute` | 当日分钟,按 UTC+0 存,范围 `[0,1439]`,`end` 独占 |
 | `multiplier` | 该时段倍率,默认 1.0 |
 
-请求写入时取当前 UTC 时间换算成当日分钟 `M = CAST(strftime('%s', 'now') AS INTEGER) % 86400 / 60`,落在档位区间即命中,倍率乘到三档基础价上。`start > end` 表示跨午夜档(如 22:00–06:00),命中条件是 `M >= start OR M < end`。同一 pricing 有多档命中时取 `id` 最小的一档。
+按该行的 `requested_at` 换算成 UTC 当日分钟 `M = CAST(strftime('%s', requested_at) AS INTEGER) % 86400 / 60`,落在档位区间即命中,倍率乘到三档基础价上。`start > end` 表示跨午夜档(如 22:00–06:00),命中条件是 `M >= start OR M < end`。同一 pricing 有多档命中时取 `id` 最小的一档。
 
 界面按浏览器所在时区输入和显示,存入库的仍是 UTC+0 当日分钟。换算使用浏览器当前的 `getTimezoneOffset()`:
 
@@ -45,7 +45,7 @@ V1 的 proxy/import 用量都写同一种 `UsageEvent`。数据库在写入 `req
 
 计费载体是 `request_log` 的**单列 `api_cost`**(0007 起 `cost` + `virtual_cost` 合并——api 账户记真实账单,plan 记虚拟口径,统一落这一列)。智能体用量同样进入 request log 以便导出，但订阅实际费用单独记录。
 
-- **所有新写入**(`pricing_status='pending'`):由 SQLite 触发器在 INSERT 时按当前规则、当前档位和写入当天汇率计算并固化 `equivalent_cost`。
+- **所有新写入**(`pricing_status='pending'`):由 SQLite 触发器在 INSERT 时按该行 `requested_at` 当天的规则、该时刻命中的档位和该天可用汇率计算并固化 `equivalent_cost`；收据修复改写 token 的行由 `reprice_usage_event` 按同一口径重算那一行。
 - 代理、Agent 导入和 spool 重放都走同一触发器；`event_id` 只负责导入/重放幂等。
 
 V1.14 删除了模型定价历史和改价回溯路径,所以:
@@ -76,7 +76,7 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 - **今日消费**:今日全部 `SUM(api_cost)`(api 真实账单 + plan 虚拟口径,`get_stats` 限今日)。
 - **API 等值消费**:api 按量 + plan 虚拟消费,即完全不买 plan、全部按 api 计价应花的金额；智能体按 API 计价折算的用量可在独立软件用量存档查看。主仪表盘展示存档全量口径,代理账单页展示**近 30 天滚动**口径。
 
-`proxy_plan_summary` 已不再参与当前存档(dashboard 的 `accumulate_plan_summary` 是兼容空操作):plan 的虚拟金额随请求行一并汇入 `daily_model_usage.api_equivalent_cost_micro_cny`,订阅月费由冻结的账单导出事件累加进 `users.actual_cost_micro_cny`。`/api/summary` 返回 `actual_cost` 与 `api_equivalent_total_cost`,前端把前者作为总消费、后者显示为"API 等值消费"。日志导出 30 天后清理,历史金额以存档为准。
+存档只有 `users` 与 `daily_model_usage` 两张表,没有独立的 plan-summary 账本:plan 的虚拟金额随请求行一并汇入 `daily_model_usage.api_equivalent_cost_micro_cny`,订阅月费由冻结的账单导出事件累加进 `users.actual_cost_micro_cny`,两条路径各记一处,plan 成本不会重复计入。`/api/summary` 返回 `actual_cost` 与 `api_equivalent_total_cost`,前端把前者作为总消费、后者显示为"API 等值消费"。日志导出 30 天后清理,历史金额以存档为准。
 
 ## 智能体订阅与软件用量
 
@@ -89,7 +89,7 @@ plan 账户的 `api_cost`(虚拟口径)的意义是衡量套餐划不划算:实�
 ## 币种与汇率(CNY / USD)
 
 - 模型定价与 plan/智能体订阅价都可选币种,默认 CNY,可选 USD。输入的单价/月费是**原生币种**金额。
-- 模型 USD 计费在写时按**写入当天的 USD→CNY 汇率**换算成 CNY 后再进 `request_log.api_cost`；订阅周期费用仍按其独立的周期锁定规则处理。
+- 模型 USD 计费按**该行 `requested_at` 当天（UTC 日）的 USD→CNY 汇率**换算成 CNY 后再进 `request_log.api_cost`；订阅周期费用仍按其独立的周期锁定规则处理。
 - 订阅费换算到 CNY 按**计费周期开始日(period_start,UTC)汇率**,首次确定后**永久锁定**:USD 行一旦 `fx_rate_date == date(period_start)` 即锁定,汇率只从 `fx_rates` 的该日精确行读取,永不重新拉取、不随当天汇率漂移;`immediate` 改价时金额按「新价 × 锁定汇率」重算,汇率本身不变。已冻结(finalized)周期金额永远不变,改价也不生效。
 - 周期开始日无精确汇率时,按 `?date=period_start` 从 frankfurter **历史接口**拉取并落库后锁定(1999-01-04 起支持,早于此日期不发请求);拉取失败则用最近一条已存汇率作**临时值(provisional,不锁定)**,每轮物化重试;未锁定的 USD 行在周期结束后也**不会冻结**,直到锁定成功(网络恢复后同一次物化内完成锁定并冻结)。
 - 汇率来源 `GET https://api.frankfurter.dev/v2/rate/USD/CNY`(带 `?date=` 支持历史日期;v2 对周末请求回显请求日期、汇率为最近交易日值)。仪表盘启动与首次使用时按 UTC 日拉取一次并存入本机 `fx_rate` 表;当天已有则直接用;拉取失败(或仍为旧数据)则用最近一条已存汇率。请求日期早于所有已存记录(如过去月份早于首次拉取)时用**最早一条已存汇率**,避免 USD 订阅被按 1.0 低估;只有该币种对从未存储过任何记录才按 1.0(等价不换算)。

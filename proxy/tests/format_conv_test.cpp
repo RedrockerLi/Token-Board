@@ -22,6 +22,7 @@
 #include "format_media.h"
 #include "format_openai.h"
 #include "format_responses.h"
+#include "reasoning_bridge.h"
 
 using namespace ir;
 
@@ -1878,6 +1879,616 @@ static void test_google_stream_events(const CodecRegistry &reg) {
     check(reparsed_tools == 1, "google→google stream keeps the tool call");
 }
 
+// ── Audit 01 (protocol alignment) regression cases ───────────────────────
+// Each case names the audit id it pins and asserts the contract that audit
+// section 6 asks for, so it stays red until the matching fix lands.
+
+/// Null-safe string member read: a JSON null (not a missing key) is the easy
+/// way to abort the whole suite through nlohmann's value() type_error.
+static std::string json_string_at(const json &object, const char *key) {
+    if (!object.is_object() || !object.contains(key)) return std::string();
+    const json &value = object[key];
+    return value.is_string() ? value.get<std::string>() : std::string();
+}
+
+/// Null-safe object/number read for the same reason.
+static json json_object_at(const json &object, const char *key) {
+    if (!object.is_object() || !object.contains(key)) return json::object();
+    const json &value = object[key];
+    return value.is_object() ? value : json::object();
+}
+
+/// Null-safe array member read (a JSON null must not abort the suite).
+static json json_array_at(const json &object, const char *key) {
+    if (!object.is_object() || !object.contains(key)) return json::array();
+    const json &value = object[key];
+    return value.is_array() ? value : json::array();
+}
+
+/// Text of the first `role:"system"` message, joined when it is a block array.
+static std::string first_system_message(const json &body) {
+    for (const auto &m : json_array_at(body, "messages")) {
+        if (json_string_at(m, "role") != "system") continue;
+        const json &content = m["content"];
+        if (content.is_string()) return content.get<std::string>();
+        if (content.is_array()) {
+            std::string joined;
+            for (const auto &part : content) joined += part.value("text", "");
+            return joined;
+        }
+    }
+    return std::string();
+}
+
+/// Thinking budget the Anthropic target derives from one effort tier.
+static int anthropic_budget_for_effort(const CodecRegistry &reg,
+                                       const std::string &effort) {
+    const FormatCodec &openai = reg.get(ApiFormat::OpenAI);
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    ir::ChatRequest req;
+    std::string err;
+    json body = json::parse(R"({"model":"m","stream":false,"max_tokens":10,
+        "messages":[{"role":"user","content":"hi"}]})");
+    body["reasoning_effort"] = effort;
+    if (!openai.parse_request(body, req, err)) return -1;
+    const json out = anthropic.serialize_request(req);
+    if (!out.contains("thinking") || !out["thinking"].contains("budget_tokens"))
+        return -1;
+    return out["thinking"]["budget_tokens"].get<int>();
+}
+
+// 01-P-01: folding several system blocks into one field must not glue them.
+static void test_audit_p01_system_fold_separator(const CodecRegistry &reg) {
+    printf("--- 01-P-01 folded system blocks keep a blank line ---\n");
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    const FormatCodec &openai = reg.get(ApiFormat::OpenAI);
+    const FormatCodec &responses = reg.get(ApiFormat::OpenAIResponses);
+    std::string err;
+
+    // Anthropic source, two-block system array.
+    {
+        ir::ChatRequest req;
+        json body = json::parse(R"({"model":"m","max_tokens":10,
+            "system":[{"type":"text","text":"AAA"},{"type":"text","text":"BBB"}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]})");
+        const bool parsed = anthropic.parse_request(body, req, err);
+        check(parsed, "P-01: anthropic multi-block system parses");
+        if (parsed) {
+            check(first_system_message(openai.serialize_request(req)) ==
+                      "AAA\n\nBBB",
+                  "P-01: OpenAI target separates folded system blocks");
+            check(json_string_at(responses.serialize_request(req),
+                                 "instructions") == "AAA\n\nBBB",
+                  "P-01: Responses target separates folded system blocks");
+            check(json_string_at(anthropic.serialize_request(req), "system") ==
+                      "AAA\n\nBBB",
+                  "P-01: Anthropic target separates folded system blocks");
+        }
+    }
+    // OpenAI source, two system messages.
+    {
+        ir::ChatRequest req;
+        json body = json::parse(R"({"model":"m","stream":false,"max_tokens":10,
+            "messages":[{"role":"system","content":"AAA"},
+                        {"role":"system","content":"BBB"},
+                        {"role":"user","content":"hi"}]})");
+        const bool parsed = openai.parse_request(body, req, err);
+        check(parsed, "P-01: openai two-system request parses");
+        if (parsed) {
+            check(json_string_at(anthropic.serialize_request(req), "system") ==
+                      "AAA\n\nBBB",
+                  "P-01: Anthropic target separates OpenAI system messages");
+            check(json_string_at(responses.serialize_request(req),
+                                 "instructions") == "AAA\n\nBBB",
+                  "P-01: Responses target separates OpenAI system messages");
+        }
+    }
+}
+
+// 01-P-02: an explicit Anthropic thinking budget must reach an OpenAI target.
+static void test_audit_p02_budget_to_effort(const CodecRegistry &reg) {
+    printf("--- 01-P-02 Anthropic budget_tokens reaches reasoning_effort ---\n");
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    const FormatCodec &openai = reg.get(ApiFormat::OpenAI);
+    struct Case {
+        int budget;
+        const char *effort;
+    } cases[] = {{32000, "high"}, {8192, "high"}, {2048, "medium"},
+                 {1024, "low"}};
+    for (const auto &item : cases) {
+        ir::ChatRequest req;
+        std::string err;
+        json body = json::parse(R"({"model":"m","max_tokens":10,
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]})");
+        body["thinking"] = json{{"type", "enabled"},
+                                {"budget_tokens", item.budget}};
+        if (!anthropic.parse_request(body, req, err)) {
+            check(false, "P-02: anthropic thinking request parses");
+            continue;
+        }
+        const json out = openai.serialize_request(req);
+        check(json_string_at(out, "reasoning_effort") == item.effort,
+              std::string("P-02: budget ") + std::to_string(item.budget) +
+                  " maps to reasoning_effort " + item.effort);
+    }
+}
+
+// 01-P-03: the thinking budget must grow with the effort tier.
+static void test_audit_p03_effort_budget_ladder(const CodecRegistry &reg) {
+    printf("--- 01-P-03 thinking budget grows with effort ---\n");
+    const int minimal = anthropic_budget_for_effort(reg, "minimal");
+    const int low = anthropic_budget_for_effort(reg, "low");
+    const int medium = anthropic_budget_for_effort(reg, "medium");
+    const int high = anthropic_budget_for_effort(reg, "high");
+    const int xhigh = anthropic_budget_for_effort(reg, "xhigh");
+    const int unknown = anthropic_budget_for_effort(reg, "not-a-tier");
+    check(minimal > 0 && low > minimal,
+          "P-03: the minimal tier buys less thinking than low");
+    check(low < medium && medium < high && high < xhigh,
+          "P-03: the budget is monotonic across the effort tiers");
+    check(unknown == medium,
+          "P-03: an unknown tier falls back to the medium budget");
+}
+
+// 01-P-04: `developer` / `system` turns must reach the Anthropic system field.
+static void test_audit_p04_developer_role_system(const CodecRegistry &reg) {
+    printf("--- 01-P-04 developer/system turns fold into system ---\n");
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    const FormatCodec &responses = reg.get(ApiFormat::OpenAIResponses);
+    const FormatCodec &openai = reg.get(ApiFormat::OpenAI);
+    std::string err;
+
+    {
+        ir::ChatRequest req;
+        json body = json::parse(R"({"model":"m","max_tokens":10,
+            "instructions":"base","input":[
+            {"type":"message","role":"developer","content":[{"type":"input_text","text":"dev rule"}]},
+            {"type":"message","role":"system","content":[{"type":"input_text","text":"sys rule"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]})");
+        const bool parsed = responses.parse_request(body, req, err);
+        check(parsed, "P-04: responses developer/system request parses");
+        if (parsed) {
+            const json out = anthropic.serialize_request(req);
+            check(json_string_at(out, "system") ==
+                      "base\n\ndev rule\n\nsys rule",
+                  "P-04: developer and system items reach the system field");
+            bool leaked = false;
+            for (const auto &m : json_array_at(out, "messages")) {
+                const std::string role = json_string_at(m, "role");
+                if (role == "developer" || role == "system") leaked = true;
+            }
+            check(!leaked,
+                  "P-04: no developer/system role reaches the Anthropic wire");
+        }
+    }
+    {
+        ir::ChatRequest req;
+        json body = json::parse(R"({"model":"m","stream":false,"max_tokens":10,
+            "messages":[{"role":"developer","content":"dev rule"},
+                        {"role":"user","content":"hi"}]})");
+        const bool parsed = openai.parse_request(body, req, err);
+        check(parsed, "P-04: openai developer request parses");
+        if (parsed)
+            check(json_string_at(anthropic.serialize_request(req), "system")
+                      .find("dev rule") != std::string::npos,
+                  "P-04: an OpenAI developer turn reaches the system field");
+    }
+}
+
+// 01-P-05: malformed role / tool_result combinations are rejected, not guessed.
+static void test_audit_p05_malformed_tool_result(const CodecRegistry &reg) {
+    printf("--- 01-P-05 malformed Anthropic role/block combinations ---\n");
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    std::string err;
+    {
+        ir::ChatRequest req;
+        json body = json::parse(R"({"model":"m","max_tokens":10,"messages":[
+            {"role":"user","content":[{"type":"text","text":"hi"}]},
+            {"role":"assistant","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"r"}]}]})");
+        err.clear();
+        const bool parsed = anthropic.parse_request(body, req, err);
+        check(!parsed, "P-05: tool_result in an assistant message is rejected");
+        check(err == "tool_result blocks are only valid in user messages",
+              "P-05: the rejection names the tool_result rule");
+    }
+    {
+        ir::ChatRequest req;
+        json body = json::parse(R"({"model":"m","max_tokens":10,"messages":[
+            {"role":"tool","content":[{"type":"text","text":"r"}]}]})");
+        err.clear();
+        const bool parsed = anthropic.parse_request(body, req, err);
+        check(!parsed, "P-05: an unknown Anthropic role is rejected");
+        check(err ==
+                  "Anthropic message role must be user or assistant, got \"tool\"",
+              "P-05: the rejection names the offending role");
+    }
+}
+
+// 01-P-07: media from different tool results must not merge into one message.
+static void test_audit_p07_tool_media_keeps_id(const CodecRegistry &reg) {
+    printf("--- 01-P-07 multimodal tool results keep their tool_call_id ---\n");
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    const FormatCodec &openai = reg.get(ApiFormat::OpenAI);
+    ir::ChatRequest req;
+    std::string err;
+    json body = json::parse(R"({"model":"claude-test","max_tokens":100,
+        "stream":false,"messages":[
+        {"role":"user","content":[{"type":"text","text":"go"}]},
+        {"role":"assistant","content":[
+            {"type":"tool_use","id":"tu_1","name":"a","input":{}},
+            {"type":"tool_use","id":"tu_2","name":"b","input":{}}]},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"tu_1","content":[
+                {"type":"text","text":"r1"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png",
+                                          "data":"iVBORw0KGgo="}}]},
+            {"type":"tool_result","tool_use_id":"tu_2","content":[
+                {"type":"text","text":"r2"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png",
+                                          "data":"iVBORw0KGgo="}}]}]}]})");
+    if (!anthropic.parse_request(body, req, err)) {
+        check(false, "P-07: anthropic multimodal tool_result parses");
+        return;
+    }
+    const json out = openai.serialize_request(req);
+    int media_messages = 0;
+    bool names_first = false, names_second = false, mixed = false;
+    bool tool_media_leak = false;
+    for (const auto &m : json_array_at(out, "messages")) {
+        const std::string role = json_string_at(m, "role");
+        const json content = json_array_at(m, "content");
+        if (!content.is_array()) continue;
+        bool has_image = false;
+        std::string text;
+        for (const auto &part : content) {
+            if (part.value("type", "") == "image_url") has_image = true;
+            if (part.value("type", "") == "text" && text.empty())
+                text = part.value("text", "");
+        }
+        if (role == "tool" && has_image) tool_media_leak = true;
+        if (role != "user" || !has_image) continue;
+        media_messages++;
+        const bool first = text.find("tu_1") != std::string::npos;
+        const bool second = text.find("tu_2") != std::string::npos;
+        if (first && second) mixed = true;
+        names_first = names_first || first;
+        names_second = names_second || second;
+    }
+    check(media_messages == 2, "P-07: one media message per tool call");
+    check(!mixed, "P-07: media from different tool calls is not merged");
+    check(names_first && names_second,
+          "P-07: each media message names its tool_call_id");
+    check(!tool_media_leak, "P-07: role:tool messages stay text-only");
+}
+
+// 01-P-08: the output-ceiling field follows the target upstream model.
+static void test_audit_p08_max_tokens_field(const CodecRegistry &reg) {
+    printf("--- 01-P-08 output-token field follows the upstream model ---\n");
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    const FormatCodec &openai = reg.get(ApiFormat::OpenAI);
+    struct Case {
+        const char *model;
+        bool completion;
+    } cases[] = {{"deepseek-v4", false}, {"gpt-4o", false},
+                 {"o3-mini", true},     {"openai/gpt-5", true}};
+    for (const auto &item : cases) {
+        ir::ChatRequest req;
+        std::string err;
+        json body = json::parse(R"({"model":"x","max_tokens":100,
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]})");
+        body["model"] = item.model;
+        if (!anthropic.parse_request(body, req, err)) {
+            check(false, "P-08: anthropic request parses");
+            continue;
+        }
+        const json out = openai.serialize_request(req);
+        const bool has_completion = out.contains("max_completion_tokens");
+        const bool has_plain = out.contains("max_tokens");
+        check(has_completion == item.completion &&
+                  has_plain == !item.completion,
+              std::string("P-08: ") + item.model +
+                  (item.completion ? " uses max_completion_tokens only"
+                                   : " uses max_tokens only"));
+    }
+}
+
+// 01-P-09: the Anthropic target normalizes the tool schema like OpenAI does.
+static void test_audit_p09_anthropic_input_schema(const CodecRegistry &reg) {
+    printf("--- 01-P-09 Anthropic input_schema is normalized ---\n");
+    const FormatCodec &openai = reg.get(ApiFormat::OpenAI);
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    const char *bodies[] = {
+        R"({"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"t","parameters":null}}]})",
+        R"({"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"t","parameters":{}}}]})",
+    };
+    for (const char *text : bodies) {
+        ir::ChatRequest req;
+        std::string err;
+        if (!openai.parse_request(json::parse(text), req, err)) {
+            check(false, "P-09: openai tool request parses");
+            continue;
+        }
+        const json out = anthropic.serialize_request(req);
+        if (!out.contains("tools") || !out["tools"].is_array() ||
+            out["tools"].empty()) {
+            check(false, "P-09: the anthropic target emits the tool");
+            continue;
+        }
+        const json schema = json_object_at(out["tools"][0], "input_schema");
+        check(json_string_at(schema, "type") == "object" &&
+                  schema.contains("properties") &&
+                  schema["properties"].is_object(),
+              "P-09: input_schema carries type:object and properties");
+    }
+}
+
+// 01-P-10: schema normalization recurses into nested objects and array items.
+static void test_audit_p10_recursive_normalize(const CodecRegistry &reg) {
+    printf("--- 01-P-10 nested tool schemas are normalized ---\n");
+    const FormatCodec &openai = reg.get(ApiFormat::OpenAI);
+    ir::ChatRequest req;
+    std::string err;
+    json body = json::parse(R"({"model":"m","stream":false,
+        "messages":[{"role":"user","content":"hi"}],
+        "tools":[{"type":"function","function":{"name":"t","parameters":{
+            "type":"object","properties":{
+                "cfg":{"properties":{"x":{"type":"string"}}},
+                "list":{"type":"array","items":{"properties":{
+                    "y":{"type":"number"}}}}}}}}]})");
+    if (!openai.parse_request(body, req, err)) {
+        check(false, "P-10: nested-schema tool request parses");
+        return;
+    }
+    const json out = openai.serialize_request(req);
+    if (!out.contains("tools") || !out["tools"].is_array() ||
+        out["tools"].empty()) {
+        check(false, "P-10: the openai target emits the tool");
+        return;
+    }
+    const json params = json_object_at(
+        json_object_at(out["tools"][0], "function"), "parameters");
+    const json properties = json_object_at(params, "properties");
+    check(json_string_at(json_object_at(properties, "cfg"), "type") == "object",
+          "P-10: a nested object property gains type:object");
+    check(json_string_at(json_object_at(json_object_at(properties, "list"),
+                                        "items"),
+                         "type") == "object",
+          "P-10: an array item object gains type:object");
+}
+
+// 01-P-12: content filtering must survive the Responses hop.
+static void test_audit_p12_stop_reason_roundtrip(const CodecRegistry &reg) {
+    printf("--- 01-P-12 content_filter survives the Responses hop ---\n");
+    const FormatCodec &responses = reg.get(ApiFormat::OpenAIResponses);
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    {
+        ir::ChatResponse response;
+        std::string err;
+        json body = json::parse(R"({"id":"r1","object":"response","created_at":1,
+            "model":"m","status":"incomplete",
+            "incomplete_details":{"reason":"content_filter"},"output":[],
+            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}})");
+        if (!responses.parse_response(body, response, err)) {
+            check(false, "P-12: responses incomplete response parses");
+        } else {
+            check(json_string_at(anthropic.serialize_response(response),
+                                 "stop_reason") == "refusal",
+                  "P-12: Responses content_filter becomes Anthropic refusal");
+        }
+    }
+    {
+        ir::ChatResponse response;
+        std::string err;
+        json body = json::parse(R"({"id":"msg_1","type":"message",
+            "role":"assistant","model":"m",
+            "content":[{"type":"text","text":"no"}],"stop_reason":"refusal",
+            "stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}})");
+        if (!anthropic.parse_response(body, response, err)) {
+            check(false, "P-12: anthropic refusal response parses");
+        } else {
+            const json out = responses.serialize_response(response);
+            check(json_string_at(out, "status") == "incomplete",
+                  "P-12: Anthropic refusal becomes an incomplete response");
+            check(json_string_at(json_object_at(out, "incomplete_details"),
+                                 "reason") == "content_filter",
+                  "P-12: the Responses reason names content_filter");
+        }
+    }
+}
+
+// 01-P-13: enabled thinking must always carry a budget on the wire.
+static void test_audit_p13_thinking_budget_fallback(const CodecRegistry &reg) {
+    printf("--- 01-P-13 enabled thinking always carries a budget ---\n");
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    ir::ChatRequest req;
+    req.model = "m";
+    req.max_tokens = 10;
+    req.reasoning.enabled = true;  // no budget_tokens and no effort
+    ir::Message user;
+    user.role = "user";
+    ir::ContentBlock text;
+    text.kind = ir::ContentKind::Text;
+    text.text = "hi";
+    user.content.push_back(text);
+    req.messages.push_back(user);
+
+    const json thinking =
+        json_object_at(anthropic.serialize_request(req), "thinking");
+    const int medium = anthropic_budget_for_effort(reg, "medium");
+    check(json_string_at(thinking, "type") == "enabled",
+          "P-13: thinking keeps its enabled type");
+    check(thinking.contains("budget_tokens"),
+          "P-13: a missing budget_tokens is filled in");
+    check(thinking.value("budget_tokens", 0) == medium,
+          "P-13: the fallback is the medium thinking budget");
+}
+
+// 01-P-17: the reasoning replay envelope carries a whitelisted payload under
+// this service's own prefix, and never invents a vendor signature.
+static void test_audit_p17_reasoning_envelope(const CodecRegistry & /*reg*/) {
+    printf("--- 01-P-17 reasoning replay envelopes ---\n");
+    const std::string openai_prefix = "token-board-openai-reasoning-v1:";
+    const std::string anthropic_prefix = "token-board-anthropic-thinking-v1:";
+
+    {  // encrypted_content only → empty thinking block carried by the envelope.
+        json item = {{"type", "reasoning"},
+                     {"id", "r1"},
+                     {"encrypted_content", "cipher"},
+                     {"status", "completed"}};
+        const json block = fmt::anthropic_block_from_responses_reasoning(item);
+        check(block.is_object() && json_string_at(block, "type") == "thinking",
+              "P-17: encrypted-only reasoning becomes a thinking block");
+        check(json_string_at(block, "thinking").empty(),
+              "P-17: the carried thinking text is empty");
+        const std::string signature = json_string_at(block, "signature");
+        check(signature.rfind(openai_prefix, 0) == 0,
+              "P-17: the signature is this service's own envelope");
+        json decoded;
+        check(fmt::decode_reasoning_envelope(signature, openai_prefix.c_str(),
+                                             decoded),
+              "P-17: the envelope decodes with the matching prefix");
+        check(json_string_at(decoded, "encrypted_content") == "cipher",
+              "P-17: the encrypted payload survives the envelope");
+        check(!decoded.contains("status"),
+              "P-17: fields outside the whitelist are not carried");
+    }
+    {  // summary only → unsigned thinking block.
+        json item = {{"type", "reasoning"},
+                     {"id", "r2"},
+                     {"summary", json::array({json{{"type", "summary_text"},
+                                                   {"text", "why"}}})}};
+        const json block = fmt::anthropic_block_from_responses_reasoning(item);
+        check(block.is_object() && json_string_at(block, "type") == "thinking",
+              "P-17: summary-only reasoning becomes a thinking block");
+        check(json_string_at(block, "thinking") == "why",
+              "P-17: the summary text is carried");
+        check(!block.contains("signature"),
+              "P-17: no envelope without encrypted content");
+    }
+    {  // nothing to carry → dropped.
+        json item = {{"type", "reasoning"}, {"id", "r3"}};
+        check(fmt::anthropic_block_from_responses_reasoning(item).is_null(),
+              "P-17: reasoning with neither text nor ciphertext is dropped");
+    }
+    {  // signed Anthropic thinking → Responses encrypted_content.
+        const json block = {
+            {"type", "thinking"}, {"thinking", "t"}, {"signature", "sig"}};
+        const json item = fmt::responses_reasoning_from_anthropic_block(block);
+        const std::string encrypted = json_string_at(item, "encrypted_content");
+        check(encrypted.rfind(anthropic_prefix, 0) == 0,
+              "P-17: a signed thinking block is re-wrapped for Responses");
+        json decoded;
+        check(fmt::decode_reasoning_envelope(encrypted, anthropic_prefix.c_str(),
+                                             decoded),
+              "P-17: the Anthropic envelope decodes");
+        check(json_string_at(decoded, "signature") == "sig",
+              "P-17: the original signature survives the round trip");
+    }
+    {  // unsigned thinking → no envelope is invented.
+        const json block = {{"type", "thinking"}, {"thinking", "t"}};
+        check(!fmt::responses_reasoning_from_anthropic_block(block).contains(
+                  "encrypted_content"),
+              "P-17: an unsigned thinking block stays unsigned");
+    }
+}
+
+// 01-P-16: a `data` line without a colon is an empty data field, and the
+// `id:`/`retry:` fields are deliberately not propagated (t3 took the
+// documented branch: the conversion path rebuilds the event stream).
+static void test_audit_p16_sse_bare_data_and_id() {
+    printf("--- 01-P-16 bare `data` line and id:/retry: fields ---\n");
+    std::string event_name;
+    std::string data;
+    const bool bare = fmt::parse_sse_frame("data\n\n", &event_name, &data);
+    check(bare, "P-16: a bare `data` line still counts as a data field");
+    check(data.empty(), "P-16: the bare `data` field is empty");
+
+    // A bare `data` followed by a normal one must not swallow the payload.
+    event_name.clear();
+    data.clear();
+    check(fmt::parse_sse_frame("data\ndata: hello\n\n", &event_name, &data),
+          "P-16: a keepalive followed by a payload parses");
+    check(data == "hello", "P-16: the payload after a bare `data` survives");
+
+    // id:/retry: are documented as not propagated: they must not be mistaken
+    // for an event name nor leak into the data field.
+    event_name.clear();
+    data.clear();
+    check(fmt::parse_sse_frame("id: 42\nretry: 1000\ndata: payload\n\n",
+                               &event_name, &data),
+          "P-16: a frame carrying id:/retry: still parses");
+    check(event_name.empty(), "P-16: id:/retry: are not read as an event name");
+    check(data == "payload", "P-16: id:/retry: leave the data field alone");
+}
+
+// 01-P-17 ⑤: the replay envelope is this service's own carrier, so it must be
+// stripped before a signature-verifying Anthropic upstream sees it — and kept
+// for every other upstream, where it carries cross-vendor replays.
+static void test_audit_p17_strip_envelopes(const CodecRegistry &reg) {
+    printf("--- 01-P-17⑤ signature-verifying target strips the carrier ---\n");
+    const std::string openai_prefix = "token-board-openai-reasoning-v1:";
+    const std::string anthropic_prefix = "token-board-anthropic-thinking-v1:";
+
+    // Both carrier shapes are stripped, visible text stays, and a genuine
+    // vendor signature is never touched.
+    {
+        json body = {{"messages", json::array({json{
+            {"role", "assistant"},
+            {"content", json::array({
+                json{{"type", "thinking"}, {"thinking", "why"},
+                     {"signature", openai_prefix + "AAA"}},
+                json{{"type", "redacted_thinking"},
+                     {"data", anthropic_prefix + "BBB"}},
+                json{{"type", "thinking"}, {"thinking", "vendor"},
+                     {"signature", "vendor-sig"}}})}}})}};
+        fmt::strip_reasoning_envelopes(body);
+        const json &blocks = body["messages"][0]["content"];
+        check(!blocks[0].contains("signature"),
+              "P-17⑤: the envelope signature is stripped");
+        check(json_string_at(blocks[0], "thinking") == "why",
+              "P-17⑤: the visible thinking text survives the strip");
+        check(json_string_at(blocks[1], "type") == "thinking" &&
+                  json_string_at(blocks[1], "thinking").empty() &&
+                  !blocks[1].contains("data"),
+              "P-17⑤: a carrier redacted block degrades to an empty thinking "
+              "block");
+        check(json_string_at(blocks[2], "signature") == "vendor-sig",
+              "P-17⑤: a genuine vendor signature is left untouched");
+        check(body.dump().find("token-board-") == std::string::npos,
+              "P-17⑤: no carrier survives anywhere in the body");
+    }
+
+    // Wiring: the serializer strips only when the target was judged to verify
+    // signatures; every other upstream keeps the envelope for replay.
+    const FormatCodec &anthropic = reg.get(ApiFormat::Anthropic);
+    ir::ChatRequest req;
+    req.model = "m";
+    req.max_tokens = 10;
+    ir::Message assistant;
+    assistant.role = "assistant";
+    ir::ContentBlock thinking;
+    thinking.kind = ir::ContentKind::Thinking;
+    thinking.text = "carried";
+    thinking.extra["signature"] = openai_prefix + "CCC";
+    assistant.content.push_back(thinking);
+    req.messages.push_back(assistant);
+
+    ir::ConversionContext verifying;
+    verifying.target_verifies_thinking_signature = true;
+    const json stripped = anthropic.serialize_request(req, &verifying);
+    check(stripped.dump().find("token-board-") == std::string::npos,
+          "P-17⑤: a verifying target receives no carrier");
+
+    ir::ConversionContext replaying;  // default: not a verifying upstream
+    const json kept = anthropic.serialize_request(req, &replaying);
+    check(kept.dump().find(openai_prefix) != std::string::npos,
+          "P-17⑤: any other upstream keeps the envelope for cross-vendor "
+          "replay");
+}
+
 static int self_test() {
     CodecRegistry reg;
     reg.add(make_openai_codec());
@@ -1921,6 +2532,20 @@ static int self_test() {
 
     printf("=== Cross-format regression tests ===\n");
     test_sse_multiline_data();
+    test_audit_p01_system_fold_separator(reg);
+    test_audit_p02_budget_to_effort(reg);
+    test_audit_p03_effort_budget_ladder(reg);
+    test_audit_p04_developer_role_system(reg);
+    test_audit_p05_malformed_tool_result(reg);
+    test_audit_p07_tool_media_keeps_id(reg);
+    test_audit_p08_max_tokens_field(reg);
+    test_audit_p09_anthropic_input_schema(reg);
+    test_audit_p10_recursive_normalize(reg);
+    test_audit_p12_stop_reason_roundtrip(reg);
+    test_audit_p13_thinking_budget_fallback(reg);
+    test_audit_p17_reasoning_envelope(reg);
+    test_audit_p16_sse_bare_data_and_id();
+    test_audit_p17_strip_envelopes(reg);
     test_openai_to_anthropic_stream_tool_calls(reg);
     test_openai_to_anthropic_stream_reasoning_then_text(reg);
     test_anthropic_to_openai_request_tool_result(reg);

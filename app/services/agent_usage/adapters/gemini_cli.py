@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ..common import batch, configured_root, iter_jsonl, make_event, project_name, read_json, source, timestamp, walk_files
 from ..ir import ParseBatch, UsageSource
+from .record_identity import assign_ordinals
 
 KIND = "gemini-cli"
 LABEL = "Gemini CLI"
@@ -33,8 +34,10 @@ def _records(path: Path):
 def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
     records, directories = _records(item.path)
     project = project_name((directories or [None])[0]) if directories else "unknown"
-    events = []
-    for index, (obj, _) in enumerate(records):
+    # Session logs are appended to and may be rewritten (rewind, compaction), so
+    # the record index is not its identity; the record content is.
+    payloads = []
+    for obj, _ in records:
         role = obj.get("type") or obj.get("role")
         if role not in {"gemini", "model", "assistant"}:
             continue
@@ -51,13 +54,18 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             reasoning = usage.get("thoughtsTokenCount", 0)
             input_tokens = max(0, float(usage.get("promptTokenCount", usage.get("input_tokens", 0)) or 0) - float(cached or 0))
             output_tokens = max(0, float(usage.get("candidatesTokenCount", usage.get("output_tokens", 0)) or 0) - float(reasoning or 0))
-        event = make_event(
-            kind=KIND, source_key=item.state_key, ordinal=index, model=obj.get("model", "unknown"),
+        payloads.append(dict(
+            kind=KIND, source_key=item.state_key, model=obj.get("model", "unknown"),
             requested_at=timestamp(obj.get("timestamp") or obj.get("createTime")),
             input_tokens=input_tokens, output_tokens=output_tokens,
             cached_input_tokens=cached, reasoning_output_tokens=reasoning,
             project=project, session_id=item.path.stem,
-        )
+        ))
+    events = []
+    for payload, ordinal in zip(payloads, assign_ordinals(payloads)):
+        if ordinal is None:
+            continue
+        event = make_event(**payload, ordinal=ordinal)
         if event:
             events.append(event)
     return batch(events, len(records))

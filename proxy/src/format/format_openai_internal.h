@@ -3,6 +3,7 @@
 #include "format_openai.h"
 #include "format_common.h"
 #include "format_media.h"
+#include "core/logging.h"
 
 class OpenAICodec final : public FormatCodec {
 public:
@@ -24,6 +25,8 @@ public:
 };
 
 bool openai_request_key_consumed(const std::string &key);
+std::string openai_effort_from_budget(int budget_tokens);
+bool openai_uses_max_completion_tokens(const std::string &model);
 void collapse_openai_system_messages(json &messages);
 void parse_openai_namespace_children(const json &tool_json, ir::Tool &tool);
 void append_openai_content_part(json &parts, json &tool_calls, bool &has_tools,

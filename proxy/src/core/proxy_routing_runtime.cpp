@@ -134,8 +134,7 @@ std::uint64_t ProxyServer::request_started(std::uint64_t request_id,
     const std::uint64_t id = request_id == 0 ? allocate_request_id() : request_id;
     {
         std::lock_guard<std::mutex> lock(live_requests_mutex_);
-        live_requests_.emplace(id, LiveRequest{
-            model, streaming, std::chrono::steady_clock::now()});
+        live_requests_.emplace(id, LiveRequest{model, streaming});
     }
     in_flight_count_.fetch_add(1, std::memory_order_relaxed);
     return id;

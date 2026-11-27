@@ -168,6 +168,106 @@ target_include_directories(semaphore_pool_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_compile_features(semaphore_pool_test PRIVATE cxx_std_17)
 target_link_libraries(semaphore_pool_test PRIVATE Threads::Threads)
 
+# 04-C-04 / 04-C-05: a double shutdown (shutdown() racing the destructor) must
+# join instead of tearing the workers down, and a parked request must not pin
+# the drain past its grace budget.  Separate target: the C-04 case aborts the
+# process when the guard is missing, which must not take the pool suite with it.
+# 04-C-01: a warm affinity bind/resolve must not allocate.  Overriding the
+# global allocator is scoped to this target so no other case is affected.
+add_executable(session_affinity_alloc_test session_affinity_alloc_test.cpp)
+target_include_directories(session_affinity_alloc_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(session_affinity_alloc_test PRIVATE cxx_std_17)
+
+# 04-C-08: one candidate_order() must read each candidate's ordering cost once
+# before sorting.  The comparator used to call cost_of() twice per comparison,
+# which measured 128 lock acquisitions in the all-cost fixture below and
+# 192-256 in the w9 fixture for 20 candidates.  The snapshot makes it exactly
+# 2N (gate mutex + ledger rwlock per candidate).  --wrap counts acquisitions
+# while the real pthread functions still run.
+add_executable(candidate_order_lock_test candidate_order_lock_test.cpp)
+target_include_directories(candidate_order_lock_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(candidate_order_lock_test PRIVATE cxx_std_17)
+target_link_libraries(candidate_order_lock_test PRIVATE Threads::Threads)
+target_link_options(candidate_order_lock_test PRIVATE
+    -Wl,--wrap=pthread_mutex_lock
+    -Wl,--wrap=pthread_rwlock_rdlock
+)
+
+# 04-C-11: the watchdog's per-round scan follows the number of active watches,
+# not the number of committed downstream streams, and a zero-watch round never
+# calls expire_if_due().  The counters are production-observable metrics; a
+# deadline far in the future keeps time out of the assertion.
+add_executable(watchdog_scan_test watchdog_scan_test.cpp)
+target_include_directories(watchdog_scan_test PRIVATE
+    ${TEST_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
+)
+target_compile_features(watchdog_scan_test PRIVATE cxx_std_17)
+target_link_libraries(watchdog_scan_test PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+)
+
+# 04-C-12: the thread_local accounting reservation is a hand-off carrier, so a
+# second adopt on the same thread must trip the proxy_server.h assert.  The
+# abort runs in a child process; the CTest process itself stays healthy and
+# inspects exit 134 plus the assertion text on stderr.
+add_executable(accounting_adopt_test accounting_adopt_test.cpp)
+target_include_directories(accounting_adopt_test PRIVATE
+    ${TEST_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
+)
+target_compile_features(accounting_adopt_test PRIVATE cxx_std_17)
+target_link_libraries(accounting_adopt_test PRIVATE
+    token_proxy_runtime
+    token_proxy_format
+    token_proxy_net
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+)
+
+# 04-C-17: PooledLease reports an empty lease as empty and keeps its client
+# across a self-move-assignment.  The header is a fragment included inside
+# namespace tb_transport; this target supplies only the declarations it needs.
+add_executable(pooled_lease_test pooled_lease_test.cpp)
+target_include_directories(pooled_lease_test PRIVATE
+    ${TEST_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
+)
+target_compile_features(pooled_lease_test PRIVATE cxx_std_17)
+target_link_libraries(pooled_lease_test PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Threads::Threads
+)
+
+# 04-C-10: releasing one limiter slot must wake one waiter, not the herd.
+# The counter is voluntary context switches (getrusage), a structural metric
+# rather than a timing one.
+add_executable(origin_limiter_herd_test origin_limiter_herd_test.cpp)
+target_include_directories(origin_limiter_herd_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(origin_limiter_herd_test PRIVATE cxx_std_17)
+target_link_libraries(origin_limiter_herd_test PRIVATE Threads::Threads)
+
+add_executable(semaphore_shutdown_test semaphore_shutdown_test.cpp)
+target_include_directories(semaphore_shutdown_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(semaphore_shutdown_test PRIVATE cxx_std_17)
+target_link_libraries(semaphore_shutdown_test PRIVATE Threads::Threads)
+
+# The same source under AddressSanitizer: the pre-fix double shutdown was a
+# use-after-free that only ASAN reports reliably.  ASAN stays on this dedicated
+# target so the Release binaries are unaffected.
+add_executable(semaphore_shutdown_asan_test semaphore_shutdown_test.cpp)
+target_include_directories(semaphore_shutdown_asan_test PRIVATE ${TEST_INCLUDE_DIRS})
+target_compile_features(semaphore_shutdown_asan_test PRIVATE cxx_std_17)
+target_compile_options(semaphore_shutdown_asan_test PRIVATE
+    -fsanitize=address -fno-omit-frame-pointer -g)
+target_link_options(semaphore_shutdown_asan_test PRIVATE -fsanitize=address)
+target_link_libraries(semaphore_shutdown_asan_test PRIVATE Threads::Threads)
+
 # Upstream forwarding regression: fast responses must not wait for a watchdog
 # polling interval, and invalid targets must normalize to a retryable 502.
 add_executable(upstream_client_test
@@ -278,6 +378,29 @@ add_test(NAME python_env COMMAND ${Python3_EXECUTABLE} -c "import flask, request
 # whose default python3 lacks the test dependencies still builds the proxy.
 add_test(NAME start_scripts_configure COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/start_scripts_configure_test.py
+)
+# The deploy entry point must refuse a binary that carries the test crash
+# marker (05-TB05-F12); the check is driven without starting a proxy.
+add_test(NAME start_proxy_binary_guard COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/start_proxy_binary_guard_test.py
+    ${CMAKE_SOURCE_DIR}/..
+    $<TARGET_FILE:token_proxy>
+)
+# Source-shape assertions for the dead-code / hygiene audit rows a compile
+# cannot see (03 proxy items plus 01-P-06/P-14/P-15), and the codec warnings.
+add_test(NAME static_source COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/static_source_test.py
+    ${CMAKE_SOURCE_DIR}/..
+    $<TARGET_FILE:format_conv_test>
+)
+# Concurrency/robustness rows from audit 04: terminal provider quota (C-18),
+# upstream error visibility (C-19), listen failure (C-07) and clean-FIN
+# detection over TCP plus the transport semantics it depends on (C-16).
+add_test(NAME concurrency_regression COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/concurrency_regression_test.py
+    $<TARGET_FILE:token_proxy>
+    ${CMAKE_SOURCE_DIR}/../schema
+    ${CMAKE_SOURCE_DIR}/..
 )
 add_test(NAME pricing_snapshot_equiv COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/run_prepared_cpp_db_test.py
@@ -413,6 +536,51 @@ add_test(
             --source-root ${CMAKE_SOURCE_DIR}/..
             --ctest ${CMAKE_CTEST_COMMAND}
 )
+# Repository environment gates. Each one pins a contract that neither configure
+# nor a test suite can express on its own; see doc/development.md
+# 「测试环境与门禁契约」.
+add_test(
+    NAME python_env_contract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/../scripts/check_python_env.py
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME readonly_pytest_tree
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/../scripts/check_readonly_pytest_tree.py
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME ctest_readonly_recovery
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/../scripts/check_ctest_readonly_recovery.py
+)
+add_test(
+    NAME sqlite_leak_audit
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/../scripts/check_sqlite_leaks.py
+            ${CMAKE_SOURCE_DIR}/..
+)
+add_test(
+    NAME maintenance_socket_path
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/../scripts/check_maintenance_socket_path.py
+            ${CMAKE_SOURCE_DIR}/..
+)
+set_tests_properties(
+    python_env_contract readonly_pytest_tree ctest_readonly_recovery
+    sqlite_leak_audit maintenance_socket_path
+    PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+add_test(NAME session_affinity_alloc COMMAND session_affinity_alloc_test)
+add_test(NAME origin_limiter_herd COMMAND origin_limiter_herd_test)
+add_test(NAME semaphore_shutdown COMMAND semaphore_shutdown_test)
+add_test(NAME semaphore_shutdown_asan COMMAND semaphore_shutdown_asan_test)
+add_test(NAME candidate_order_locks COMMAND candidate_order_lock_test)
+add_test(NAME watchdog_scan_cost COMMAND watchdog_scan_test)
+add_test(NAME accounting_double_adopt COMMAND accounting_adopt_test)
+add_test(NAME pooled_lease_guard COMMAND pooled_lease_test)
 add_test(NAME upstream_client COMMAND upstream_client_test)
 add_test(NAME http_debug_log COMMAND http_debug_log_test)
 add_test(NAME upstream_debug_exchange COMMAND upstream_debug_exchange_test)
@@ -437,6 +605,16 @@ add_test(
     NAME stream_cycle_guard
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/stream_cycle_guard_test.py
+            $<TARGET_FILE:token_proxy>
+            ${CMAKE_SOURCE_DIR}/../schema
+            ${CMAKE_SOURCE_DIR}/..
+)
+# The two production gray switches (PROXY_STRICT_TERMINAL, PROXY_STREAM_CYCLE_GUARD)
+# default to ON; this pins their OFF branches against the ON controls.
+add_test(
+    NAME gray_switch
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/gray_switch_test.py
             $<TARGET_FILE:token_proxy>
             ${CMAKE_SOURCE_DIR}/../schema
             ${CMAKE_SOURCE_DIR}/..
@@ -652,7 +830,10 @@ set_tests_properties(
 set_tests_properties(format_conversion session_affinity endpoint_policy source_size
     refactor_boundaries ctest_registration_fresh python_env start_scripts_configure
     accounting_abort usage_accounting usage_parser semaphore_pool
-    crash_hook_isolation
+    crash_hook_isolation semaphore_shutdown semaphore_shutdown_asan
+    origin_limiter_herd session_affinity_alloc
+    candidate_order_locks watchdog_scan_cost accounting_double_adopt
+    pooled_lease_guard
     PROPERTIES LABELS "unit")
 set_tests_properties(upstream_client PROPERTIES LABELS "integration")
 set_tests_properties(
@@ -693,3 +874,7 @@ foreach(TB_TEST IN LISTS TB_DIRECTORY_TESTS)
         set_tests_properties(${TB_TEST} PROPERTIES TIMEOUT 1800)
     endif()
 endforeach()
+
+# The leak audit re-runs the app suite under instrumentation, so it needs more
+# than the default 300s on a slow runner.
+set_tests_properties(sqlite_leak_audit PROPERTIES TIMEOUT 900)

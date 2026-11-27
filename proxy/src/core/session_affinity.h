@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <list>
 #include <mutex>
@@ -26,7 +27,7 @@ public:
                                       const std::string &session_id,
                                       const std::vector<int> &key_slot_ids) {
         if (session_id.empty() || key_slot_ids.empty()) return std::nullopt;
-        const std::string key = digest(scope, session_id);
+        const std::string &key = digest_key(digest(scope, session_id));
         std::lock_guard<std::mutex> lock(mutex_);
         auto now = std::chrono::steady_clock::now();
         auto it = bindings_.find(key);
@@ -46,7 +47,7 @@ public:
     void bind(const std::string &scope, const std::string &session_id,
               int key_slot_id) {
         if (session_id.empty()) return;
-        const std::string key = digest(scope, session_id);
+        const std::string &key = digest_key(digest(scope, session_id));
         std::lock_guard<std::mutex> lock(mutex_);
         auto now = std::chrono::steady_clock::now();
         auto it = bindings_.find(key);
@@ -65,17 +66,42 @@ public:
     }
 
 private:
-    static uint64_t hash64(const std::string &value) {
-        uint64_t h = 1469598103934665603ULL;
+    /// FNV-1a over one string's bytes, continuing from `h`.
+    static uint64_t hash_step(uint64_t h, const std::string &value) {
         for (unsigned char c : value) {
             h ^= c;
             h *= 1099511628211ULL;
         }
         return h;
     }
-    static std::string digest(const std::string &scope,
-                              const std::string &session_id) {
-        return std::to_string(hash64(scope + "\x1f" + session_id));
+    /// Incremental FNV-1a over scope, the 0x1f separator and the session id.
+    /// Feeding the parts in order yields the same 64-bit value as hashing
+    /// `scope + "\x1f" + session_id`, without building that temporary string
+    /// (which used to cost two allocations per call).
+    static uint64_t digest(const std::string &scope,
+                           const std::string &session_id) {
+        uint64_t h = hash_step(1469598103934665603ULL, scope);
+        h ^= 0x1f;
+        h *= 1099511628211ULL;
+        return hash_step(h, session_id);
+    }
+    /// Decimal key for `value`, rendered into a per-thread buffer.  The map is
+    /// keyed by that string, so a warmed buffer makes the per-request lookup
+    /// allocation-free; std::to_string allocated on every call because a
+    /// 20-digit hash never fits libstdc++'s 15-byte small-string buffer.  The
+    /// returned reference stays valid until the next call on this thread.
+    static const std::string &digest_key(uint64_t value) {
+        static thread_local std::string buffer;
+        char digits[20];
+        std::size_t count = 0;
+        do {
+            digits[count++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        buffer.clear();
+        if (buffer.capacity() < count) buffer.reserve(count);
+        while (count > 0) buffer.push_back(digits[--count]);
+        return buffer;
     }
     struct Entry {
         int key_slot_id;

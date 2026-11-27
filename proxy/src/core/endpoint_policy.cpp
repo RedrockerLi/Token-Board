@@ -1,6 +1,7 @@
 #include "endpoint_policy.h"
 
 #include <array>
+#include <cctype>
 
 namespace {
 
@@ -56,35 +57,28 @@ bool base_path_has_version(const std::string &base_path) {
 
 constexpr std::array<EndpointPolicy, 7> policies{{
     {EndpointKind::Chat, "chat", "POST", "/chat/completions",
-     ir::ApiFormat::OpenAI, true, true, HttpMethod::Post, BodyMode::Json,
-     ResponseMode::Codec, UsageMode::Json, LocalResponseMode::None,
-     TimeoutClass::Streaming},
+     ir::ApiFormat::OpenAI, true, true, HttpMethod::Post,
+     LocalResponseMode::None, TimeoutClass::Streaming},
     {EndpointKind::Messages, "messages", "POST", "/messages",
-     ir::ApiFormat::Anthropic, true, true, HttpMethod::Post, BodyMode::Json,
-     ResponseMode::Codec, UsageMode::Json, LocalResponseMode::None,
-     TimeoutClass::Streaming},
+     ir::ApiFormat::Anthropic, true, true, HttpMethod::Post,
+     LocalResponseMode::None, TimeoutClass::Streaming},
     {EndpointKind::Responses, "responses", "POST", "/responses",
-     ir::ApiFormat::OpenAIResponses, true, true, HttpMethod::Post, BodyMode::Json,
-     ResponseMode::Codec, UsageMode::Json, LocalResponseMode::None,
-     TimeoutClass::Streaming},
+     ir::ApiFormat::OpenAIResponses, true, true, HttpMethod::Post,
+     LocalResponseMode::None, TimeoutClass::Streaming},
     {EndpointKind::ResponsesCompact, "responses_compact", "POST",
      "/responses/compact", ir::ApiFormat::OpenAIResponses, true, true,
-     HttpMethod::Post, BodyMode::Json, ResponseMode::Codec, UsageMode::Json,
-     LocalResponseMode::None, TimeoutClass::Streaming},
+     HttpMethod::Post, LocalResponseMode::None, TimeoutClass::Streaming},
     {EndpointKind::Embeddings, "embeddings", "POST", "/embeddings",
-     ir::ApiFormat::OpenAI, false, true, HttpMethod::Post, BodyMode::Json,
-     ResponseMode::Codec, UsageMode::Json, LocalResponseMode::None,
-     TimeoutClass::NonStreaming},
+     ir::ApiFormat::OpenAI, false, true, HttpMethod::Post,
+     LocalResponseMode::None, TimeoutClass::NonStreaming},
     {EndpointKind::Models, "models", "GET", "/models",
-     ir::ApiFormat::OpenAI, false, false, HttpMethod::Get, BodyMode::Empty,
-     ResponseMode::Raw, UsageMode::None, LocalResponseMode::Catalog,
-     TimeoutClass::Catalog},
+     ir::ApiFormat::OpenAI, false, false, HttpMethod::Get,
+     LocalResponseMode::Catalog, TimeoutClass::Catalog},
     // Gemini's endpoint path is built per request from the model and the RPC,
     // so this policy carries no static default_path.
     {EndpointKind::GenerateContent, "generate", "POST", "",
-     ir::ApiFormat::Google, true, true, HttpMethod::Post, BodyMode::Json,
-     ResponseMode::Codec, UsageMode::Json, LocalResponseMode::None,
-     TimeoutClass::Streaming},
+     ir::ApiFormat::Google, true, true, HttpMethod::Post,
+     LocalResponseMode::None, TimeoutClass::Streaming},
 }};
 
 }  // namespace
@@ -100,6 +94,31 @@ std::string google_model_from_path(const std::string &path) {
 
 bool google_stream_from_path(const std::string &path) {
     return method_token(path) == "streamGenerateContent";
+}
+
+bool upstream_verifies_anthropic_signatures(const std::string &base_url) {
+    // Host of the URL: skip the scheme, drop any userinfo, the port and the
+    // path, then match Anthropic's own domain (audit 01-P-17 ⑤).
+    size_t start = 0;
+    const size_t scheme = base_url.find("://");
+    if (scheme != std::string::npos) start = scheme + 3;
+    size_t end = base_url.find('/', start);
+    if (end == std::string::npos) end = base_url.size();
+    std::string authority = base_url.substr(start, end - start);
+    const size_t at = authority.rfind('@');
+    if (at != std::string::npos) authority.erase(0, at + 1);
+    if (!authority.empty() && authority[0] == '[') return false;  // IPv6 literal
+    const size_t colon = authority.find(':');
+    if (colon != std::string::npos) authority.erase(colon);
+    std::string host = authority;
+    for (char &c : host)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    static const std::string kDomain = "anthropic.com";
+    static const std::string kSuffix = ".anthropic.com";
+    return host == kDomain ||
+           (host.size() > kSuffix.size() &&
+            host.compare(host.size() - kSuffix.size(), kSuffix.size(),
+                         kSuffix) == 0);
 }
 
 const EndpointPolicy &endpoint_policy_for_path(const std::string &path) {
@@ -178,12 +197,18 @@ void resolve_upstream_path(const EndpointPolicy &policy,
                     base_path.compare(base_path.size() - 3, 3, "/v1") == 0)
             ? "/messages" : "/v1/messages";
     } else if (format == ir::ApiFormat::OpenAIResponses) {
-        out_path = policy.kind == EndpointKind::ResponsesCompact
+        // A base URL without a version segment needs one, exactly like the
+        // Anthropic and Gemini branches: `https://api.example.com` must become
+        // `/v1/responses`, not `/responses` (audit 01-P-18).
+        out_path = base_path_has_version(base_path) ? "" : "/v1";
+        out_path += policy.kind == EndpointKind::ResponsesCompact
             ? "/responses/compact" : "/responses";
     } else {
         // The path is selected by the target upstream format, not by the
         // client's endpoint policy. This matters for cross-format chat and
         // messages forwarding (e.g. Anthropic client -> OpenAI upstream).
-        out_path = "/chat/completions";
+        // Same version rule as above (audit 01-P-18).
+        out_path = base_path_has_version(base_path) ? "/chat/completions"
+                                                   : "/v1/chat/completions";
     }
 }

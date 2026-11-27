@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -154,6 +155,15 @@ public:
     }
     void adopt_accounting_reservation(
         const std::shared_ptr<UsageReservation> &reservation) noexcept {
+        // The thread_local is a hand-off carrier, never a second slot: the
+        // streaming path detaches on the handler's thread and re-installs here
+        // when cpp-httplib invokes the deferred provider, which SemaphorePool
+        // runs synchronously inside the same worker.  Adopting onto a thread
+        // that still holds a reservation would make the next enqueue_log
+        // account against the wrong request (or release a foreign slot), so
+        // make the premise loud in debug/test builds instead of silent.
+        assert(!accounting_reservation_);
+        assert(reservation != nullptr);
         accounting_reservation_ = reservation;
     }
     /// Record the account/key/model context on the current reservation and mark
@@ -251,7 +261,6 @@ private:
     struct LiveRequest {
         std::string model;
         bool streaming = false;
-        std::chrono::steady_clock::time_point started_at;
     };
     std::atomic<std::uint64_t> next_request_id_{1};
     std::atomic<int> in_flight_count_{0};

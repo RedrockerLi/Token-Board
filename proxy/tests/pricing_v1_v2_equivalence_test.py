@@ -5,8 +5,8 @@ The old pricing gate compared two historical V0 trigger revisions.  That did
 not exercise the schema which the proxy runs today.  These checks build the
 published V1.14 pricing baseline and the V1 tip, clone the same priced
 configuration, and compare new usage events against V2 upgrades.  The current
-V2 tip must reproduce the V1.14 answers: the slot multiplier is selected by the
-wall-clock minute and the FX filter is applied inside the cost subquery.  The
+V2 tip must reproduce the V1.14 answers: the slot multiplier is selected by the minute of
+the usage instant (the write clock and requested_at agree) and the FX filter is applied inside the cost subquery.  The
 V2.9 trigger definition stays frozen for the rows it already priced, so the
 snapshot check also proves that replacing the trigger rewrites no history.  The
 recovery case deliberately stops at V2.0, then resumes through V2.7 and repeats
@@ -118,21 +118,35 @@ def _seed_current_pricing(db_path: Path) -> None:
         conn.commit()
 
 
-def _current_utc_minute() -> int:
-    now = datetime.now(timezone.utc)
+def _fixture_clock() -> datetime:
+    """One clock reading shared by the slot window and the priced rows.
+
+    V1.14 selects the slot from the write clock, while the V2.11 trigger prices
+    on ``requested_at``.  Reading the instant once keeps both clocks on the same
+    minute (the equivalence under test) and keeps the pair from straddling a
+    minute boundary while the fixture is built.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _utc_minute(now: datetime) -> int:
     return now.hour * 60 + now.minute
 
 
-def _seed_slot_window(db_path: Path) -> None:
-    """Add the two slot rows against the minute that is current right now.
+def _current_utc_minute() -> int:
+    return _utc_minute(datetime.now(timezone.utc))
 
-    The lower id never covers the insert minute while the higher id covers it,
+
+def _seed_slot_window(db_path: Path, now: datetime) -> None:
+    """Add the two slot rows against the minute of the shared clock reading.
+
+    The lower id never covers the fixture minute while the higher id covers it,
     so the V2.9 trigger (lowest slot id) and the V1.14 / current V2 trigger
-    (wall-clock minute) must disagree.  The minute is read immediately before
-    the insert so the fixture cannot straddle a minute boundary while the
-    databases are built.
+    (the same minute, read from either the write clock or ``requested_at``)
+    must disagree.  ``now`` is the same reading the rows are stamped with, so
+    the window cannot drift away from ``requested_at``.
     """
-    minute = _current_utc_minute()
+    minute = _utc_minute(now)
     outside = (minute + SLOT_WINDOW_OFFSET) % 1440
     end = min(minute + 1, 1440)
     with sqlite_connection(db_path) as conn:
@@ -152,8 +166,10 @@ def _seed_slot_window(db_path: Path) -> None:
     )
 
 
-def _insert_cases(db_path: Path, prefix: str) -> None:
-    today = datetime.now(timezone.utc).date().isoformat()
+def _insert_cases(db_path: Path, prefix: str, now: datetime) -> None:
+    # The schema writes requested_at as ...T%H:%M:%fZ; the fixture uses the same
+    # shape so both trigger generations read one unambiguous instant.
+    requested_at = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     with sqlite_connection(db_path) as conn:
         for index, (label, model, prompt, cache, completion, _expected) in enumerate(
             CASES, start=1
@@ -173,7 +189,7 @@ def _insert_cases(db_path: Path, prefix: str) -> None:
                     completion,
                     cache,
                     prompt + completion,
-                    f"{today}T12:00:00Z",
+                    requested_at,
                 ),
             )
         conn.commit()
@@ -228,8 +244,9 @@ def run_equivalence(schema_root: Path) -> None:
         # slot window and the FX filter inside the cost subquery.
         _migrate_v1(baseline, schema_root, SchemaVersion(1, 14))
         _seed_current_pricing(baseline)
-        _seed_slot_window(baseline)
-        _insert_cases(baseline, "v114")
+        now = _fixture_clock()
+        _seed_slot_window(baseline, now)
+        _insert_cases(baseline, "v114", now)
 
         # V2 is a transformation of the V1 tip, so both V2 copies start from
         # the same seeded tip database.
@@ -240,8 +257,9 @@ def run_equivalence(schema_root: Path) -> None:
         _upgrade(current, schema_root, latest)
         _upgrade(frozen, schema_root, 9)
         for db_path, prefix in ((current, "v2"), (frozen, "v29")):
-            _seed_slot_window(db_path)
-            _insert_cases(db_path, prefix)
+            now = _fixture_clock()
+            _seed_slot_window(db_path, now)
+            _insert_cases(db_path, prefix, now)
 
         rows_baseline = _usage_rows(baseline)
         rows_current = _usage_rows(current)
@@ -272,8 +290,9 @@ def run_recovery(schema_root: Path) -> None:
         db_path = Path(directory) / "token-board.db"
         _migrate_v1(db_path, schema_root)
         _seed_current_pricing(db_path)
-        _seed_slot_window(db_path)
-        _insert_cases(db_path, "recovery")
+        now = _fixture_clock()
+        _seed_slot_window(db_path, now)
+        _insert_cases(db_path, "recovery", now)
         before = _usage_rows(db_path)
         _assert_expected(before)
 

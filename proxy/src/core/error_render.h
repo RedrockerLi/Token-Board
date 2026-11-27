@@ -5,8 +5,45 @@
 #include "db.h"
 #include "upstream_client.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
+
+// ── Upstream error observability (04-C-19) ────────────────────────────────
+// The diagnostic excerpt kept from an upstream error body.  The attempt record
+// and the client-facing "last upstream ..." annotation share this limit so one
+// pathological body can neither bloat the journal nor a response.
+inline constexpr std::size_t kUpstreamExcerptBytes = 512;
+
+// Escape control characters (a quoted body stays one line) and truncate to
+// `limit` bytes, marking a cut with "…(+N bytes)" so a truncated excerpt can
+// never read as the complete upstream text.
+std::string upstream_text_excerpt(const std::string &raw,
+                                  std::size_t limit = kUpstreamExcerptBytes);
+
+// The last upstream error the proxy observed, with the wall-clock stamp of the
+// observation.  AttemptExecutor records it for every failed attempt; it lets a
+// response that never reached the upstream quote what the upstream actually
+// said last instead of only reporting the proxy's own classification.
+struct UpstreamErrorSnapshot {
+    int status_code = 0;
+    std::string excerpt;
+    std::int64_t wall_ms = 0;
+};
+
+void record_upstream_error(int status_code, const std::string &raw);
+bool last_upstream_error(UpstreamErrorSnapshot *out);
+
+// The "what the upstream said" sentence a proxy-authored terminal message
+// carries.  `attempts` decides the wording: a request that already contacted
+// the upstream quotes that attempt's error, while one that skipped every
+// candidate quotes the process-wide last observation with its timestamp.
+// Returns `message` unchanged when there is nothing truthful to add.
+std::string with_upstream_context(
+    const std::string &message,
+    const std::vector<Database::AttemptInfo> &attempts,
+    const UpstreamClient::ForwardResult &fwd);
 
 // Terminal status when no candidate could be used by a non-streaming request:
 // 504 on timeout, 429 for an explicit provider quota cooldown or an all-keys

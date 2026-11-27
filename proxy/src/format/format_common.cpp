@@ -237,7 +237,20 @@ const char *stop_reason_to_anthropic(ir::StopReason r) {
 }
 
 const char *stop_reason_to_responses(ir::StopReason r) {
-    return r == ir::StopReason::Length ? "incomplete" : "completed";
+    // A filtered answer is NOT a completed one; the Responses wire reports both
+    // Length and ContentFilter as `incomplete` and distinguishes them in
+    // `incomplete_details.reason` (audit 01-P-12).
+    return (r == ir::StopReason::Length || r == ir::StopReason::ContentFilter)
+               ? "incomplete"
+               : "completed";
+}
+
+const char *responses_incomplete_reason(ir::StopReason r) {
+    switch (r) {
+        case ir::StopReason::Length: return "max_output_tokens";
+        case ir::StopReason::ContentFilter: return "content_filter";
+        default: return nullptr;
+    }
 }
 
 ir::StopReason openai_finish_reason_to_stop(const std::string &fr) {
@@ -259,9 +272,20 @@ ir::StopReason anthropic_stop_reason_to_stop(const std::string &sr) {
     return ir::StopReason::Unknown;
 }
 
-ir::StopReason responses_status_to_stop(const std::string &st) {
+ir::StopReason responses_status_to_stop(const std::string &st,
+                                        const json &incomplete_details) {
     if (st == "completed") return ir::StopReason::Stop;
-    if (st == "incomplete") return ir::StopReason::Length;
+    if (st == "incomplete") {
+        // `incomplete` alone does not say why: without the detail object the
+        // historical reading (Length) is kept, but an explicit
+        // `reason: "content_filter"` must survive as ContentFilter so the value
+        // is reversible (audit 01-P-12).
+        const std::string reason = incomplete_details.is_object()
+            ? incomplete_details.value("reason", "")
+            : std::string();
+        if (reason == "content_filter") return ir::StopReason::ContentFilter;
+        return ir::StopReason::Length;
+    }
     if (st == "failed") return ir::StopReason::Unknown;
     return ir::StopReason::Unknown;
 }
@@ -398,17 +422,66 @@ json filter_keys(const json &src, std::initializer_list<const char *> keep) {
 /// some Responses tools carry `parameters: null` or an empty object, which
 /// strict-compatible upstreams (opencode.ai Console Go) reject with 400
 /// (mirror cc-switch `normalize_function_parameters`).
-json normalize_function_parameters(const json &params) {
-    if (params.is_object() && params.value("type", "") == "object")
-        return params;
-    json out = json::object();
-    out["type"] = "object";
-    if (params.is_object()) {
-        for (auto it = params.begin(); it != params.end(); ++it) {
-            if (it.key() != "type") out[it.key()] = it.value();
-        }
+namespace {
+
+/// Keywords whose value is a map of `name -> subschema`.
+constexpr const char *kNestedSchemaMaps[] = {"properties", "patternProperties",
+                                             "$defs", "definitions"};
+/// Keywords whose value is one subschema or an array of subschemas
+/// (`items`/`anyOf`/`prefixItems` accept either shape).
+constexpr const char *kNestedSchemas[] = {
+    "items",        "prefixItems", "additionalProperties", "not",
+    "contains",     "propertyNames", "if",                 "then",
+    "else",         "anyOf",       "oneOf",                "allOf"};
+
+/// Fill `"type": "object"` into a nested node that already declares
+/// `properties`, then descend into every subschema keyword.  Only that
+/// unambiguous case is inferred — a node carrying `properties` is an object, so
+/// the missing `type` is exactly what strict upstreams reject (audit 01-P-10).
+/// Nothing is guessed otherwise: a bare `{"description": …}` sub-schema has no
+/// knowable type, and inventing one would reject valid client schemas.
+void normalize_nested_schema(json &node) {
+    if (node.is_array()) {
+        for (auto &child : node) normalize_nested_schema(child);
+        return;
     }
-    if (!out.contains("properties")) out["properties"] = json::object();
+    if (!node.is_object()) return;
+    if (!node.contains("type") && node.contains("properties") &&
+        node["properties"].is_object())
+        node["type"] = "object";
+    for (const char *key : kNestedSchemaMaps) {
+        auto it = node.find(key);
+        if (it == node.end() || !it->is_object()) continue;
+        for (auto child = it->begin(); child != it->end(); ++child)
+            normalize_nested_schema(child.value());
+    }
+    for (const char *key : kNestedSchemas) {
+        auto it = node.find(key);
+        if (it != node.end()) normalize_nested_schema(*it);
+    }
+}
+
+}  // namespace
+
+json normalize_function_parameters(const json &params) {
+    json out;
+    if (params.is_object() && params.value("type", "") == "object") {
+        out = params;
+    } else {
+        out = json::object();
+        out["type"] = "object";
+        if (params.is_object()) {
+            for (auto it = params.begin(); it != params.end(); ++it) {
+                if (it.key() != "type") out[it.key()] = it.value();
+            }
+        }
+        if (!out.contains("properties")) out["properties"] = json::object();
+    }
+    // The top-level fill above is not enough: Responses/OpenAI tools routinely
+    // nest object sub-schemas that omit `"type"`, which is what strict upstreams
+    // reject (audit 01-P-10).  Both targets that call this helper (Chat, and
+    // since 01-P-09 the Anthropic serializer) get the same recursive shape.
+    normalize_nested_schema(out);
     return out;
 }
 
@@ -437,8 +510,20 @@ bool parse_sse_frame(const std::string &frame, std::string *event_name,
                 if (!data->empty()) data->push_back('\n');
                 *data += val;
             }
+        } else if (line == "data") {
+            // The SSE grammar allows `data` without a colon, meaning an empty
+            // data field.  Upstreams send it as a keepalive; treating the line
+            // as "no data at all" dropped that field and with it the frame
+            // (audit 01-P-16).
+            has_data = true;
+            if (data && !data->empty()) data->push_back('\n');
         }
-        // lines starting with ':' are SSE comments — ignored
+        // `id:` and `retry:` are deliberately not propagated.  The conversion
+        // path re-synthesizes the event stream, so an upstream's SSE id has no
+        // meaning on the client's wire, and the same-format passthrough path
+        // never parses frames — it forwards the raw bytes, ids included
+        // (audit 01-P-16 takes the documented branch for those two fields).
+        // Lines starting with ':' are SSE comments — ignored.
         if (nl == std::string::npos) break;
         start = nl + 1;
     }

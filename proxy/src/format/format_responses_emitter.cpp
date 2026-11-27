@@ -255,6 +255,7 @@ bool ResponsesStreamEmitter::emit(const StreamEvent &ev, const Sink &sink) {
             if (!close_open_items(sink)) return false;
             if (ev.extra.is_object()) terminal_extras_ = ev.extra;
             deferred_status_ = fmt::stop_reason_to_responses(ev.stop_reason);
+            deferred_stop_reason_ = ev.stop_reason;
             return true;
         case StreamEventType::UsageEvent:
             last_usage_ = ev.usage;
@@ -536,6 +537,12 @@ bool ResponsesStreamEmitter::emit_completed(const Sink &sink) {
                   {"model", model_}, {"output", build_output()},
                   {"usage", std::move(usage)},
                   {"error", nullptr}, {"incomplete_details", nullptr}};
+    // `incomplete` alone loses why the answer stopped: publish the reason so a
+    // ContentFilter survives the round trip instead of reading back as Length
+    // (audit 01-P-12).
+    if (const char *incomplete_reason =
+            fmt::responses_incomplete_reason(deferred_stop_reason_))
+        response["incomplete_details"] = json{{"reason", incomplete_reason}};
     if (terminal_extras_.contains("object"))
         response["object"] = terminal_extras_["object"];
     if (terminal_extras_.contains("context_management"))

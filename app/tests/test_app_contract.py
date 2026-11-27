@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import sqlite3
 import threading
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 from app import create_app
 from app.db.dashboard_db import DashboardDatabase
-from app.db.proxy_db import ProxyDatabase
 from app.db.schema_upgrade.engine_core import latest_version
 from app.core.time import parse_runtime_timestamp
 
@@ -440,7 +438,6 @@ class AppContractTest(AppDatabaseTestCase):
             conn.commit()
         rows = db.get_perf_throughput(60)
         self.assertTrue(rows)
-        import re
         self.assertRegex(rows[0]["bucket"],
                          r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00Z$")
 

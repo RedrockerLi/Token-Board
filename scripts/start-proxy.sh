@@ -7,6 +7,7 @@
 #   bash scripts/start-proxy.sh --daemon     # 后台启动
 #   bash scripts/start-proxy.sh --install    # 安装为 systemd 用户服务（开机自启）
 #   bash scripts/start-proxy.sh --uninstall  # 移除 systemd 服务
+#   bash scripts/start-proxy.sh --verify-binary <path>  # 只校验产物不含崩溃标记后退出
 # ==============================================================================
 set -e
 
@@ -25,6 +26,39 @@ DEBUG_SERVICE_WAS_ACTIVE=false
 # ── Colors ──
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 
+# ── Artifact guard ──
+# Only the test target (token_proxy_test) defines TB_ENABLE_TEST_CRASH, so a
+# production artifact must never carry the injected marker. Every mode that
+# executes or installs $PROXY_BIN runs this check first; --verify-binary exposes
+# the same check as a standalone entry point (CTest case start_proxy_binary_guard).
+CRASH_MARKER="TB_TEST_CRASH_AFTER_SPOOL_SYNC"
+
+verify_binary() {
+    local binary="$1"
+    if [ ! -f "$binary" ]; then
+        echo "[ERROR] 代理产物不存在: $binary" >&2
+        return 1
+    fi
+    if ! command -v grep > /dev/null 2>&1; then
+        echo "[ERROR] 未找到 grep，无法校验崩溃标记: $binary" >&2
+        return 1
+    fi
+    if grep -q --binary-files=text "$CRASH_MARKER" "$binary"; then
+        echo "[ERROR] $binary contains $CRASH_MARKER; refusing to start" >&2
+        return 1
+    fi
+    return 0
+}
+
+if [ "${1:-}" = "--verify-binary" ]; then
+    if [ -z "${2:-}" ]; then
+        echo "Usage: bash scripts/start-proxy.sh --verify-binary <path>" >&2
+        exit 2
+    fi
+    verify_binary "$2" || exit 1
+    exit 0
+fi
+
 # ── Build if needed ──
 if [ ! -f "$PROXY_BIN" ]; then
     echo "[INFO] 代理未编译，开始编译..."
@@ -35,6 +69,13 @@ if [ ! -f "$PROXY_BIN" ]; then
     cmake --build build -j$(nproc) > /dev/null 2>&1
     cd "$SCRIPT_DIR"
     echo "[INFO] 编译完成"
+fi
+
+# ── Artifact guard ──
+# --uninstall only removes the unit file and never touches $PROXY_BIN, so it is
+# the one mode that keeps running without an artifact check.
+if [ "${1:-}" != "--uninstall" ]; then
+    verify_binary "$PROXY_BIN" || exit 1
 fi
 
 # ── Functions ──
@@ -180,6 +221,7 @@ case "${1:-}" in
         echo "  --daemon      后台启动"
         echo "  --install     安装为 systemd 用户服务，开机自启"
         echo "  --uninstall   移除 systemd 服务"
+        echo "  --verify-binary <path>  只校验产物不含崩溃标记后退出（干净=0，含标记=1）"
         echo ""
         # Default: foreground
         do_start

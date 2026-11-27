@@ -1,3 +1,16 @@
+// Production-observable metrics, no behaviour branch: each counter is a
+// function-local atomic that the watchdog loop updates and that tests and
+// diagnostics read.  Nothing in production consults them.
+inline std::atomic<std::uint64_t> &watchdog_scanned_watches() {
+    static std::atomic<std::uint64_t> scanned{0};
+    return scanned;
+}
+
+inline std::atomic<std::uint64_t> &watchdog_expire_calls() {
+    static std::atomic<std::uint64_t> calls{0};
+    return calls;
+}
+
 struct ForwardWatch {
     std::atomic<bool> running{true};
     std::mutex state_mutex;
@@ -14,6 +27,27 @@ struct ForwardWatch {
     // 1 = first byte / total, 2 = first semantic event, 3 = stream idle.
     std::atomic<int> expired_reason{0};
     std::atomic<bool> client_disconnected{false};
+    // Streaming only: set by the forwarding thread once at least one response
+    // byte reached the downstream sink, i.e. the response is committed.  The
+    // watchdog reads a clean FIN as "the client is gone" only from that point
+    // on: before commit a client may legitimately shutdown(SHUT_WR) and keep
+    // reading the response, so only hard socket errors count there, and the
+    // non-streaming path never sets this (04-C-16 scope ruling).
+    std::atomic<bool> downstream_started{false};
+    // Latched once the downstream read half reported EOF (or a hard error).
+    // A closed read half stays level-readable forever, so the watchdog must
+    // stop polling that fd instead of spinning on it; the separate
+    // downstream_started bit decides whether that EOF means "gone".
+    std::atomic<bool> downstream_read_closed{false};
+    // One watchdog pass of grace for a body callback that is publishing
+    // semantic_seen at the exact deadline.
+    static constexpr long long kSemanticGraceMs = 5;
+    // Set when refresh_semantic_progress_locked() arms the idle deadline from
+    // "not armed".  Arming introduces a deadline the event-driven waiter cannot
+    // have seen (it computed its poll timeout before the first semantic chunk),
+    // so the forwarding thread consumes this and wakes the watchdog; extending
+    // an armed deadline needs no wake-up (an early wake recomputes it).
+    std::atomic<bool> idle_deadline_armed{false};
     std::shared_ptr<std::atomic<bool>> semantic_seen;
     std::shared_ptr<std::atomic<uint64_t>> semantic_progress;
     int downstream_socket = -1;
@@ -145,6 +179,50 @@ struct ForwardWatch {
         return true;
     }
 
+    /// Publish that the response is committed downstream (first body byte
+    /// written).  From here on a clean FIN means the reader went away.
+    void mark_downstream_started() {
+        downstream_started.store(true, std::memory_order_release);
+    }
+
+    /// Consume the "idle deadline was just armed" notice (forwarding thread
+    /// only): the caller then wakes the watchdog so it re-derives its wait
+    /// instead of sleeping on the deadline it saw when the watch was added.
+    bool take_idle_deadline_armed() {
+        return idle_deadline_armed.exchange(false, std::memory_order_acq_rel);
+    }
+
+    /// Latch the downstream read half as closed (EOF or a hard error).  The
+    /// watchdog calls this once per watch so the level-triggered fd is dropped
+    /// from the poll set and cannot spin the loop.
+    void latch_downstream_read_closed() {
+        downstream_read_closed.store(true, std::memory_order_release);
+    }
+
+    /// Earliest absolute time (ms) at which this watch can expire, or 0 when
+    /// nothing can expire any more (deadline disabled, finished, already
+    /// expired, or the client is gone).  The watchdog sleeps until the
+    /// earliest deadline instead of scanning on a fixed 5ms tick, which is
+    /// what turns an idle long stream into zero wake-ups (04-C-11).
+    long long next_deadline_ms() {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        if (!running.load(std::memory_order_acquire) ||
+            expired.load(std::memory_order_acquire) ||
+            client_disconnected.load(std::memory_order_acquire))
+            return 0;
+        const bool got_semantic =
+            semantic_seen && semantic_seen->load(std::memory_order_acquire);
+        long long next = 0;
+        auto arm = [&next](long long deadline_ms) {
+            if (deadline_ms > 0 && (next == 0 || deadline_ms < next))
+                next = deadline_ms;
+        };
+        if (!got_first) arm(first_byte_deadline_ms);
+        if (!got_semantic) arm(semantic_deadline_ms);
+        else arm(idle_deadline_ms);
+        return next;
+    }
+
     int expire_if_due(long long at_ms) {
         std::lock_guard<std::mutex> lock(state_mutex);
         if (!running.load(std::memory_order_acquire) ||
@@ -163,11 +241,14 @@ struct ForwardWatch {
                             at_ms >= idle_deadline_ms;
 
         // A body callback that crossed the exact semantic boundary may be in
-        // the act of publishing semantic_seen.  Defer one watchdog tick; this
+        // the act of publishing semantic_seen.  Defer one watchdog pass; this
         // remains bounded because the next pass no longer gets this grace.
+        // The deadline moves with it so an event-driven wait recomputes a
+        // future wake-up instead of spinning on an already-due deadline.
         if (semantic_expired && receiver_active && !semantic_grace_used) {
             semantic_expired = false;
             semantic_grace_used = true;
+            semantic_deadline_ms = at_ms + kSemanticGraceMs;
         }
 
         // Re-read the externally published semantic state/counter at the
@@ -221,8 +302,12 @@ private:
         if (idle_timeout_secs <= 0 || !semantic_seen ||
             !semantic_seen->load(std::memory_order_acquire))
             return;
-        if (idle_deadline_ms == 0 || advanced)
+        if (idle_deadline_ms == 0 || advanced) {
+            const bool newly_armed = idle_deadline_ms == 0;
             idle_deadline_ms = at_ms +
                 static_cast<long long>(idle_timeout_secs) * 1000;
+            if (newly_armed)
+                idle_deadline_armed.store(true, std::memory_order_release);
+        }
     }
 };

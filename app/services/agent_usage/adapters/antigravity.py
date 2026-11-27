@@ -22,6 +22,7 @@ from ..common import (
     walk_files,
 )
 from ..ir import ParseBatch, UsageSource
+from .record_identity import assign_ordinals
 
 KIND = "antigravity"
 LABEL = "Antigravity"
@@ -775,13 +776,15 @@ def _parse_legacy(item: UsageSource, stop_event=None) -> ParseBatch:
         else:
             project = project_name(workspace.get("workspaceFolderAbsoluteUri"))
 
-    events = []
+    entries = []
     metadata = trajectory.get("generatorMetadata")
     if not isinstance(metadata, list):
         metadata = []
+    stopped = False
     for entry in metadata:
         if stop_event is not None and stop_event.is_set():
-            return batch(events, len(metadata), skipped=True)
+            stopped = True
+            break
         chat_model = entry.get("chatModel") if isinstance(entry, dict) else None
         if not isinstance(chat_model, dict):
             continue
@@ -804,10 +807,9 @@ def _parse_legacy(item: UsageSource, stop_event=None) -> ParseBatch:
             total_output = safe_float(usage.get("outputTokens"))
             thinking = safe_float(usage.get("thinkingOutputTokens"))
             output_tokens = max(0, total_output - thinking)
-            event = make_event(
+            entries.append((response_id, dict(
                 kind=KIND,
                 source_key="response" if response_id else item.state_key,
-                ordinal=response_id or len(events),
                 model=_legacy_model(chat_model),
                 requested_at=requested_at,
                 # request_log 没有 cache-creation 列,按本仓库惯例折入 input,
@@ -819,10 +821,20 @@ def _parse_legacy(item: UsageSource, stop_event=None) -> ParseBatch:
                 reasoning_output_tokens=max(thinking, total_output - output_tokens),
                 project=project,
                 session_id=item.path.stem,
-            )
-            if event:
-                events.append(event)
-    return batch(events, len(metadata))
+            )))
+    # 响应 id 是上游给的稳定身份;没有响应 id 的条目以前用"已产出事件数"当
+    # 序号,前面任意一条变化就会整体移位。改用内容身份。
+    fallback_ordinals = iter(assign_ordinals(
+        [payload for response_id, payload in entries if not response_id]))
+    events = []
+    for response_id, payload in entries:
+        ordinal = response_id or next(fallback_ordinals, None)
+        if ordinal is None:
+            continue
+        event = make_event(**payload, ordinal=ordinal)
+        if event:
+            events.append(event)
+    return batch(events, len(metadata), skipped=stopped)
 
 
 def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:

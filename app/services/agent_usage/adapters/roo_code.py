@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ..common import batch, config_value, make_event, project_name, read_json, source, timestamp
 from ..ir import ParseBatch, UsageSource
+from .record_identity import assign_ordinals
 
 KIND = "roo-code"
 LABEL = "Roo Code"
@@ -61,8 +62,10 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
     task = item.context.get("task") or {}
     project = project_name(task.get("workspace"))
     fallback = str(task.get("apiConfigName") or "roo-unknown")
-    events = []
-    for index, msg in enumerate(messages):
+    # A task's ui_messages array can be rewritten (resume, truncate), so the
+    # array index is not the record's identity; its own fields are.
+    payloads = []
+    for msg in messages:
         if not isinstance(msg, dict):
             continue
         if msg.get("type") != "say" or msg.get("say") != "api_req_started":
@@ -73,12 +76,17 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             continue
         if not isinstance(info, dict):
             continue
-        event = make_event(
-            kind=KIND, source_key=item.state_key, ordinal=index, model=info.get("model") or fallback,
+        payloads.append(dict(
+            kind=KIND, source_key=item.state_key, model=info.get("model") or fallback,
             requested_at=timestamp(msg.get("ts")),
             input_tokens=info.get("tokensIn", 0) + info.get("cacheWrites", 0), output_tokens=info.get("tokensOut", 0),
             cached_input_tokens=info.get("cacheReads", 0), project=project, session_id=item.context.get("task_id"),
-        )
+        ))
+    events = []
+    for payload, ordinal in zip(payloads, assign_ordinals(payloads)):
+        if ordinal is None:
+            continue
+        event = make_event(**payload, ordinal=ordinal)
         if event:
             events.append(event)
     return batch(events, len(messages))

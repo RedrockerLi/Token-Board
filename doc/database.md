@@ -14,18 +14,20 @@ Dashboard 的 V1 基础结构统一使用历史身份、`daily_usage` 和 `month
 
 以下章节记录 V0.19/V0.6 的旧表，供 transition 审计；新装不会创建这些实体表。
 
-## V2.10 当前增量
+## V2.12 当前增量
 
-V2.10 重建计价触发器 `price_usage_event`，价格口径与 V1.14 对齐：
+V2.11 重建 `price_usage_event`，把计价时钟取为该行的 `requested_at`（代理行为请求时刻，智能体导入为事件发生时刻）；V2.12 新增 `reprice_usage_event`，供收据修复后按同一口径重算。价格口径与 V1.14 对齐：
 
-- 时段倍率按写入时刻的 UTC 当日分钟选档：`start_minute <= end_minute` 命中
+- 时段倍率按 `requested_at` 的 UTC 当日分钟选档：`start_minute <= end_minute` 命中
   `[start_minute, end_minute)`，`start_minute > end_minute` 表示跨零点；同一规则命中多档时
   取 `id` 最小的档位，未命中任何档位为 1.0。
-- 成本子查询与 `pricing_status` 判定共用同一套规则可用性：非 CNY 规则要求写入当天存在
+- 成本子查询与 `pricing_status` 判定共用同一套规则可用性：非 CNY 规则要求 `requested_at` 当天存在
   `<currency> → CNY` 汇率，才参与报价。
 
-迁移只重建触发器，不改写 `request_log` 的既有行：已经固化的 `equivalent_cost` 与
-`billed_usage_cost` 保持写时值。
+两个迁移都只重建触发器、只计价触发它的那一行，不改写历史行：已经固化的 `equivalent_cost` 与
+`billed_usage_cost` 保持原值；`reprice_usage_event` 只重算收据修复改写了 token 的那一行（`event_id`
+唯一，单行 UPDATE），未被修复的历史行不重算。V1 线保持冻结：V1.14 的写时钟触发器在 V1→V2
+转换（V2.0）时被 `DROP`，运行期只由这两个 V2 触发器计价。
 
 ## V2.9 历史增量
 
@@ -186,14 +188,14 @@ Dashboard 存档不保留周期费用明细,冻结费用导出后只累加进 `u
 
 索引:`idx_rl_account`、`idx_rl_time`、`idx_rl_key`(upstream_key_id)、`idx_rl_ttft_time`(requested_at, ttft_ms)、`idx_request_log_event_id`(event_id,唯一)。
 
-计费触发器 `price_usage_event`(当前定义见 V2.10)只处理 `pricing_status='pending'` 的新行,按"写入时当前定价 × 写入时段倍率 × 写入当天可用汇率"计算并固化 `equivalent_cost`。代理和 Agent 导入共用这一条数据库计价路径。公式:
+计费触发器 `price_usage_event`(当前定义见 V2.11)与重算触发器 `reprice_usage_event`(V2.12)只处理 `pricing_status='pending'` 的行,按"`requested_at` 当天的当前定价 × 该时刻命中档位的倍率 × 该天可用汇率"计算并固化 `equivalent_cost`。代理和 Agent 导入共用这一条数据库计价路径；后者只对收据修复改回 pending 的那一行重算。公式:
 
 ```
 api_cost = (miss/1e6) × input_price
          + (cache_read/1e6) × COALESCE(cache_read_price, input_price)
          + (completion/1e6) × output_price
-         ,再乘以写入时刻命中 pricing_slots 档位的 multiplier(无命中=1.0)
-         ;若当前定价的 currency='USD',再乘以写入当天最近一条 USD→CNY 汇率(缺失则 unrated)
+         ,再乘以 `requested_at` 所在 UTC 分钟命中 pricing_slots 档位的 multiplier(无命中=1.0)
+         ;若当前定价的 currency='USD',再乘以 `requested_at` 当天最近一条 USD→CNY 汇率(缺失则 unrated)
 ```
 
 模型匹配是 `LOWER(model) GLOB LOWER(model_pattern) ORDER BY priority,id`,即第一条匹配生效,`reorder_pricing` 修改 `priority` 来改变匹配优先级。所有账户统一记 `equivalent_cost`(api = 真实账单,plan/agent = 虚拟口径)。`prompt_tokens + completion_tokens = 0` 的行只记日志、不计价。写时固化的含义与改价行为见 [billing-pricing.md](billing-pricing.md)。
@@ -240,7 +242,7 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 
 ### fx_rates 与 account_importers — 仅本机的运行时数据
 
-`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,写入触发器按写入当天取最近一条;没有可用汇率时该行标记 `unrated`。`agent_software_runtime.cursor_json` 是统一 agent adapter 用量导入的增量游标,保证幂等续传。请求日志、导入游标和汇率缓存都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
+`fx_rates` 按 `(base, quote, date)` 存 USD→CNY 当日汇率(0013),Python 侧 `app/fx.py` 按 UTC 日拉取一次并落库,写入触发器按该行 `requested_at` 当天取最近一条;没有可用汇率时该行标记 `unrated`。`agent_software_runtime.cursor_json` 是统一 agent adapter 用量导入的增量游标,保证幂等续传。请求日志、导入游标和汇率缓存都**仅存本机**,配置上传时被剔除(见 [sync.md](sync.md))。
 
 ## dashboard.db
 
@@ -273,5 +275,5 @@ key/value 表,存同步服务器 `url` / `folder` / `username` / `password`。`u
 - C++ 用预编译语句 + 内部 mutex 串行写;Python 每方法独立连接(SQLite 支持多读单写)。
 - 数据库升级只在 Python `app.db.schema_upgrade` 边界执行：本地双库先获取
   `schema-upgrade.lock`，单库 SQL 再使用 `<库>.migrate.lock`。C++ 不参与迁移，
-  只校验已准备好的 Proxy V1 schema；详见
+  只校验已准备好的 Proxy V2 schema；详见
   [database-migrations.md](database-migrations.md)。

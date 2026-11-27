@@ -22,7 +22,7 @@ from app.services.agent_usage.adapters import (
 )
 from app.services.agent_usage import cindy_ledger
 from app.services.agent_usage.ir import UsageEvent, UsageSource
-from app.services.agent_usage.registry import ADAPTERS
+from app.services.agent_usage.registry import ADAPTERS, ADAPTER_SPECS, AGENT_TYPES
 from app.tests.support import PROJECT_ROOT, sqlite_connection
 
 
@@ -45,17 +45,30 @@ class AgentUsageAdapterTestCase(unittest.TestCase):
             self.assertEqual(event.session_id, session_id)
         self.assertTrue(event.event_id)
 
+    # 02-F-01: the local registry must be one-to-one with the upstream
+    # registry at its current reference revision (ref/vibe-usage HEAD
+    # 3f4695e, src/parsers/index.js: 36 keys, including kiki and kilo).
+    # A missing or extra kind is a data-coverage defect, not a cosmetic one.
+    UPSTREAM_HEAD_AGENT_KINDS = {
+        "claude-code", "codex", "grok", "copilot-cli", "craft-agent",
+        "cursor", "dimagent", "gemini-cli", "opencode", "openclaw",
+        "omp", "pi-coding-agent", "qwen-code", "kimi-code", "amp",
+        "alma", "droid", "dsh", "antigravity", "trae-cli", "hermes",
+        "kiro", "mimocode", "cline", "roo-code", "workbuddy", "zcode",
+        "mcode", "cola", "qoder", "qoder-cn", "devin", "codebuddy",
+        "codearts-agent", "kiki", "kilo",
+    }
+
     def test_registry_matches_reference_agent_set(self) -> None:
-        self.assertEqual(len(ADAPTERS), 34)
-        self.assertEqual(set(ADAPTERS), {
-            "claude-code", "codex", "grok", "copilot-cli", "craft-agent",
-            "cursor", "dimagent", "gemini-cli", "opencode", "openclaw",
-            "omp", "pi-coding-agent", "qwen-code", "kimi-code", "amp",
-            "alma", "droid", "dsh", "antigravity", "trae-cli", "hermes",
-            "kiro", "mimocode", "cline", "roo-code", "workbuddy", "zcode",
-            "mcode", "cola", "qoder", "qoder-cn", "devin", "codebuddy",
-            "codearts-agent",
-        })
+        self.assertEqual(len(self.UPSTREAM_HEAD_AGENT_KINDS), 36)
+        self.assertEqual(len(ADAPTERS), 36)
+        self.assertEqual(set(ADAPTERS), self.UPSTREAM_HEAD_AGENT_KINDS)
+        # The explicit manifest must stay in lockstep with the mapping: a
+        # module registered in only one of them is invisible or unloadable.
+        self.assertEqual(set(ADAPTER_SPECS), self.UPSTREAM_HEAD_AGENT_KINDS)
+        self.assertEqual(set(AGENT_TYPES), self.UPSTREAM_HEAD_AGENT_KINDS)
+        for kind, module in ADAPTERS.items():
+            self.assertEqual(module.KIND, kind)
 
     def test_copilot_cli_parses_shutdown_model_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

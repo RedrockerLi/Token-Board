@@ -1,5 +1,7 @@
 #include "attempt_executor.h"
 
+#include "error_render.h"
+#include "logging.h"
 #include "upstream_error_body.h"
 
 #include <algorithm>
@@ -19,6 +21,26 @@ std::int64_t remaining_budget_ms(
                deadline - std::chrono::steady_clock::now()).count();
 }
 
+// Persisted attempt reason (04-C-19②): the classification text plus the
+// upstream's own words, so request_attempts.error is not one fixed string per
+// status.  The excerpt is bounded here and again by the journal writer.
+std::string attempt_error_text(const UpstreamClient::ForwardResult &result) {
+    if (result.success || result.body.empty()) return result.error;
+    const std::string excerpt = upstream_text_excerpt(result.body);
+    if (excerpt.empty()) return result.error;
+    if (result.error.empty()) return excerpt;
+    return result.error + ": " + excerpt;
+}
+
+// Remember the last failed exchange the proxy actually saw, so a request that
+// has to skip every candidate can still quote the upstream (04-C-19).  An
+// aborted exchange is not a usable answer, so client disconnects are ignored.
+void record_attempt_observation(const UpstreamClient::ForwardResult &result) {
+    if (result.success || result.client_disconnected) return;
+    record_upstream_error(result.status_code,
+                          result.body.empty() ? result.error : result.body);
+}
+
 Database::AttemptInfo to_attempt(const UpstreamCandidate &candidate,
                                  const UpstreamClient::ForwardResult &result) {
     Database::AttemptInfo out;
@@ -29,13 +51,14 @@ Database::AttemptInfo to_attempt(const UpstreamCandidate &candidate,
     out.duration_ms = result.duration_ms;
     out.ttft_ms = result.ttft_ms;
     out.is_timeout = result.is_timeout;
-    out.error = result.error;
+    out.error = attempt_error_text(result);
     out.dns_ms = result.dns_ms;
     out.connect_ms = result.connect_ms;
     out.tls_ms = result.tls_ms;
     out.lease_wait_ms = result.lease_wait_ms;
     out.first_byte_ms = result.first_byte_ms;
     out.connection_reused = result.connection_reused;
+    record_attempt_observation(result);
     return out;
 }
 }  // namespace
@@ -64,18 +87,35 @@ void AttemptExecutor::complete(
         // evidence (a slot inside the cooldown is skipped and cannot
         // succeed here).
         gate_.note_success(slot);
-    } else if (result.status_code == 429 && result.usage_limit &&
-               candidate.account().extended_usage_limit_cooldown) {
-        // Explicit subscription quota exhaustion: prefer the trusted window
-        // reset over the fixed fallback and record the evidence.
+    } else if (result.status_code == 429 &&
+               (result.usage_limit_terminal ||
+                (result.usage_limit &&
+                 candidate.account().extended_usage_limit_cooldown))) {
+        // Explicit quota exhaustion: either the usage-limit envelope a plan
+        // account opted into, or terminal billing/quota text that holds for
+        // every account kind (04-C-18: Google's monthly spending cap,
+        // insufficient_quota, "exceeded your current quota").  Prefer the
+        // trusted window reset over the fixed fallback and record the
+        // evidence; the ordinary 60s rate-limit cycle would just burn one
+        // upstream call per minute until the quota is restored by hand.
         const auto plan = quota_cooldown_plan(candidate, result.limit_window,
                                               now);
+        const auto cooldown = std::chrono::seconds(
+            std::max<std::int64_t>(1, plan.until_wall - now));
         gate_.mark_subscription_cooldown(
-            slot,
-            std::chrono::seconds(std::max<std::int64_t>(
-                1, plan.until_wall - now)),
+            slot, cooldown,
             AccountGate::CooldownEvidence{plan.window, plan.evidence_resets_at,
                                           now});
+        // Never silent: the terminal classification and the hold it produced
+        // are logged, so an operator can see why a key stopped serving.
+        TB_LOG_WARN(
+            "[Quota] terminal quota 429 held: key_slot=%d account=%d "
+            "classification=%s cooldown_s=%lld window=%s resets_at=%lld\n",
+            slot, candidate.account().id,
+            result.usage_limit_terminal ? "billing_quota_text"
+                                        : "usage_limit_envelope",
+            static_cast<long long>(cooldown.count()), plan.window.c_str(),
+            static_cast<long long>(plan.evidence_resets_at));
     } else if (result.status_code == 429) {
         // An ordinary 429 is rate limiting, not a subscription quota: a short
         // avoid honoring the upstream's Retry-After, never the retained

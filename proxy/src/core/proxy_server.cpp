@@ -1,13 +1,8 @@
 #include "proxy_server_internal.h"
-#include "endpoint_policy.h"
-#include "db.h"
 #include "format_common.h"
 #include "logging.h"
-#include "request_context.h"
 #include "router.h"
 #include "think_filter.h"
-#include "upstream_client.h"
-#include "usage_recorder.h"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
@@ -57,8 +52,12 @@ std::optional<size_t> affinity_bound_index(
     // candidate_order maps it to its own group's start while still trying
     // higher-priority groups first.
     if (cands.empty()) return std::nullopt;
-    std::vector<int> slots;
-    slots.reserve(cands.size());
+    // Reuse one scratch buffer per worker thread: bound_index() only scans the
+    // slot list, so a warmed vector keeps affinity lookup allocation-free
+    // instead of building a fresh vector on every request.
+    static thread_local std::vector<int> slots;
+    slots.clear();
+    if (slots.capacity() < cands.size()) slots.reserve(cands.size());
     for (const auto &cand : cands) slots.push_back(cand.key_slot_id);
     return affinity.bound_index(scope, session_id, slots);
 }

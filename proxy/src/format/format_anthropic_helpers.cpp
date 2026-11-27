@@ -2,6 +2,8 @@
 #include "reasoning_bridge.h"
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 
 using namespace ir;
 
@@ -17,9 +19,29 @@ bool anthropic_request_key_consumed(const std::string &key) {
 }
 
 int anthropic_effort_budget(const std::string &effort) {
-    if (effort == "low") return 1024;
-    if (effort == "high") return 4096;
-    return 2048;
+    // The budget must grow with the effort tier, so that a weaker tier can
+    // never buy more thinking than a stronger one (audit 01-P-03: `minimal`
+    // used to fall through to 2048, i.e. twice `low`).  1024 is Anthropic's
+    // documented floor for `thinking.budget_tokens`, so `minimal` sits on that
+    // floor instead of going below it and being rejected.
+    if (effort == "minimal") return 1024;
+    if (effort == "low") return 2048;
+    if (effort == "medium" || effort.empty()) return 4096;
+    if (effort == "high") return 8192;
+    if (effort == "xhigh") return 16384;
+    // An unknown tier is not guessed from its spelling: fall back to `medium`
+    // (the historical default) and say so, first occurrence and every
+    // thousandth after it — the same sampling the other informational paths in
+    // this file use.
+    static std::atomic<std::uint64_t> unknown_effort{0};
+    const std::uint64_t occurrence =
+        unknown_effort.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (occurrence == 1 || occurrence % 1000 == 0)
+        TB_LOG_WARN("[Anthropic] unknown reasoning effort \"%s\", using the "
+                    "medium thinking budget (occurrence %llu)\n",
+                    effort.c_str(),
+                    static_cast<unsigned long long>(occurrence));
+    return 4096;
 }
 
 void parse_anthropic_blocks(const json &value,

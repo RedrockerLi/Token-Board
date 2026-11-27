@@ -31,7 +31,7 @@ Token Board 由三个进程边界组成，共享同一份版本化数据库 sche
 
 schema 的单一来源是 `schema/` 目录下的版本化 SQL 与 transition，见
 [database-migrations.md](database-migrations.md)。历史 V1 tip 是 Token Board V1.21、
-Dashboard V1.7；当前运行 tip 是 Token Board V2.10、Dashboard V2.2，baseline 位于各自
+Dashboard V1.7；当前运行 tip 是 Token Board V2.12、Dashboard V2.2，baseline 位于各自
 `v1/1-0_baseline.sql`，V0 文件按原内容归档在各自 `v0/`。所有生产升级由 Python 的
 `app.db.schema_upgrade` 负责；C++ 只校验已准备好的 Proxy V2 数据库，不读取 SQL、不执行迁移。
 
@@ -56,8 +56,8 @@ Dashboard V1.7；当前运行 tip 是 Token Board V2.10、Dashboard V2.2，basel
 │   ├── services/agent_usage/     Usage IR、通用游标导入器与逐 agent adapter
 │   └── services/sync/       配置与 dashboard WebDAV 同步
 ├── proxy/                  C++17 代理 CMake 工程
-├── schema/token-board/v0,v1/     Token Board 历史迁移与当前 V1
-├── schema/dashboard/v0,v1/ Dashboard 历史迁移与当前 V1
+├── schema/token-board/v0,v1,v2/     Token Board 历史迁移与当前 V2
+├── schema/dashboard/v0,v1,v2/ Dashboard 历史迁移与当前 V2
 ├── schema/transitions/     版本 route 驱动的 V0/V1 数据 transition 插件
 ├── static/                 CSS 与 SPA JavaScript
 ├── templates/index.html    SPA 页面
@@ -76,7 +76,7 @@ Dashboard V1.7；当前运行 tip 是 Token Board V2.10、Dashboard V2.2，basel
 
 Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查。C++ 代理打开
 数据库时只验证 `schema_version` 与 `PRAGMA user_version` 一致，并要求 Proxy
-运行时使用的精确 schema 为当前 Token Board V2.10；不满足时直接退出并提示先运行匹配版本的 Python
+运行时使用的精确 schema 为当前 Token Board V2.12；不满足时直接退出并提示先运行匹配版本的 Python
 升级边界。C++ 的 `--schema-dir` 仅为旧启动器保留，不参与升级。
 
 ## 数据流
@@ -91,7 +91,7 @@ Python 运行时 facade 和 Dashboard writer 只做只读的当前版本检查�
 
 ## 关键设计决策
 
-**数据库是唯一事实来源。** V2.1 在请求写入时按当前 `pricing_rules → pricing_slots → fx_rates` 计算并固化 `equivalent_cost` 与 `billed_usage_cost`；周期费用来自 Proxy/Agent 的周期费用事实，冻结后生成不可变的 `billing_export_events`。Agent 绑定只保存 UTC 日期状态，账单物化时读取有效 Agent 并把 owner 快照写入周期费用；解绑或改绑不改写已生成账单，事件按周期费用主键补发；仪表盘直接归档这两个口径与 recurring charge，改价不回溯。
+**数据库是唯一事实来源。** 计价由 SQLite 触发器按该行 `requested_at` 当天的 `pricing_rules → pricing_slots → fx_rates` 计算并在写入时固化 `equivalent_cost` 与 `billed_usage_cost`（收据修复改写 token 的行按同一口径重算那一行）；周期费用来自 Proxy/Agent 的周期费用事实，冻结后生成不可变的 `billing_export_events`。Agent 绑定只保存 UTC 日期状态，账单物化时读取有效 Agent 并把 owner 快照写入周期费用；解绑或改绑不改写已生成账单，事件按周期费用主键补发；仪表盘直接归档这两个口径与 recurring charge，改价不回溯。
 
 **格式转换收敛到 IR。** 四种线格式的编解码统一到 `ir.h` 的中间表示：`parse → IR → serialize`。同格式走透传快速路径，不经过 IR。
 

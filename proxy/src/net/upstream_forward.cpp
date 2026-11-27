@@ -251,12 +251,19 @@ UpstreamClient::forward(const std::string &method,
     // A pooled keep-alive socket the provider closed while idle fails the next
     // request with Read/Write before any response byte arrives (a response
     // status of 0 means no response line was parsed).  Only that reused-socket
-    // window earns the one-shot fresh-connection retry; once a response head
-    // arrived the faithful 502/truncation classification stays.
+    // window earns the one-shot fresh-connection retry.
+    //
+    // A non-streaming call additionally qualifies after the response head
+    // arrived: it buffers the whole body before answering, so a provider that
+    // dies mid-body (04-C-15) has still handed the client nothing and the same
+    // one-shot retry is safe.  A streaming call keeps the strict
+    // response_status == 0 gate because it forwards bytes as they arrive.
     auto is_stale_reused_error = [](bool reused, int response_status,
-                                    bool timed_out, httplib::Error e) {
-        return reused && response_status == 0 && !timed_out &&
-               (e == httplib::Error::Read || e == httplib::Error::Write);
+                                    bool timed_out, httplib::Error e,
+                                    bool response_buffered) {
+        return reused && !timed_out &&
+               (e == httplib::Error::Read || e == httplib::Error::Write) &&
+               (response_status == 0 || response_buffered);
     };
 
     // Set by acquire() below on every attempt: whether this request is riding
@@ -286,6 +293,12 @@ UpstreamClient::forward(const std::string &method,
                 ? false : progress_fallback.feed(data, len);
             if (!watch->begin_chunk(received_ms, fallback_progress))
                 return false;
+            // A chunk can arm the semantic idle deadline, which the event-driven
+            // watchdog may already be sleeping past (it derived its poll timeout
+            // when the watch was added).  Wake it so the wait is re-derived;
+            // extending an armed deadline needs no wake-up.
+            if (watch->take_idle_deadline_armed())
+                ForwardWatchdog::instance().changed();
             if (first_chunk) {
                 t_first = received_at;
                 first_chunk = false;
@@ -297,8 +310,15 @@ UpstreamClient::forward(const std::string &method,
             if (!successful_status) accumulated.append(data, len);
             if (client_connected && successful_status) {
                 client_connected = on_chunk(data, len);
+                // The response is now committed downstream: from here on the
+                // watchdog may read a clean FIN from the client as "gone"
+                // (04-C-16).  A failed write is handled by the existing
+                // cancellation path, so only a successful hand-off counts.
+                if (client_connected) watch->mark_downstream_started();
             }
             watch->end_chunk(now_ms(), fallback_progress);
+            if (watch->take_idle_deadline_armed())
+                ForwardWatchdog::instance().changed();
             return client_connected;
         };
 
@@ -366,6 +386,8 @@ UpstreamClient::forward(const std::string &method,
                     : "Upstream returned " + std::to_string(upstream_res.status);
             if (upstream_res.status >= 400) {
                 result.usage_limit = is_usage_limit_error(result.body);
+                result.usage_limit_terminal =
+                    is_terminal_quota_error(result.body);
                 result.limit_window = usage_limit_window(result.body);
                 result.retry_after_seconds = parse_retry_after_seconds(
                     upstream_res.get_header_value("Retry-After"));
@@ -430,7 +452,8 @@ UpstreamClient::forward(const std::string &method,
                    !watch->client_disconnected.load(std::memory_order_acquire) &&
                    (is_connect_error(err) ||
                     is_stale_reused_error(connection_reused, upstream_status,
-                                          result.is_timeout, err));
+                                          result.is_timeout, err,
+                                          /*response_buffered=*/false));
         }
     } else {
         int upstream_status = 0;
@@ -498,6 +521,8 @@ UpstreamClient::forward(const std::string &method,
                 result.failure_kind = UpstreamFailureKind::HttpStatus;
             if (result.status_code >= 400) {
                 result.usage_limit = is_usage_limit_error(result.body);
+                result.usage_limit_terminal =
+                    is_terminal_quota_error(result.body);
                 result.limit_window = usage_limit_window(result.body);
                 result.retry_after_seconds = parse_retry_after_seconds(
                     upstream_res.get_header_value("Retry-After"));
@@ -545,7 +570,8 @@ UpstreamClient::forward(const std::string &method,
                    !watch->client_disconnected.load(std::memory_order_acquire) &&
                    (is_connect_error(request_err) ||
                     is_stale_reused_error(connection_reused, upstream_status,
-                                          result.is_timeout, request_err));
+                                          result.is_timeout, request_err,
+                                          /*response_buffered=*/true));
         }
     }
         return false;
@@ -606,6 +632,13 @@ UpstreamClient::forward(const std::string &method,
                 // An idle pooled socket can be closed by the provider between
                 // requests.  Replace only that socket and retry the exact
                 // resolver-selected address before affecting DNS health.
+                // Observable: a retry that used to be skipped (response head
+                // already parsed on a buffered call) is now visible.
+                TB_LOG_DEBUG(
+                    "[Upstream] retrying once on a fresh connection "
+                    "(reused=%d status=%d error=%s)\n",
+                    connection_reused ? 1 : 0, result.status_code,
+                    result.error.empty() ? "-" : result.error.c_str());
                 retried_reused_connection = true;
                 ClientPool::instance().invalidate(origin_parts.origin,
                                                   failed_address);

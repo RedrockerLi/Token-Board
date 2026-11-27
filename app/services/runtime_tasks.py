@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 
 from app.core.time import format_utc, utc_now
+from app.services.agent_usage.common import sqlite_read_failure_count
 
 log = logging.getLogger(__name__)
 
@@ -81,19 +82,30 @@ class AgentUsageImportWorker:
         self._wake.set()
 
     def _run_once(self) -> None:
+        read_failures_before = sqlite_read_failure_count()
         try:
             inserted = self._action()
-            _set_health(
-                self._health, self._health_lock,
-                "agent-usage-importer", "ok")
-            with self._health_lock:
-                self._health["agent-usage-importer"]["last_inserted"] = inserted
         except Exception as exc:
             log.exception("background task failed: agent-usage-importer")
             _set_health(
                 self._health, self._health_lock,
                 "agent-usage-importer", "degraded",
                 f"{type(exc).__name__}: {exc}")
+            return
+        # External agent databases can fail to read (a lock, a malformed file)
+        # and then yield no rows, which looks exactly like "no usage".  Report
+        # that on the same health record the dashboard already reads, so the
+        # incomplete pass is visible instead of silent.
+        read_failures = sqlite_read_failure_count() - read_failures_before
+        _set_health(
+            self._health, self._health_lock,
+            "agent-usage-importer", "degraded" if read_failures else "ok",
+            (f"{read_failures} external sqlite read(s) failed; "
+             f"those sources were not counted this pass"
+             if read_failures else None))
+        with self._health_lock:
+            self._health["agent-usage-importer"]["last_inserted"] = inserted
+            self._health["agent-usage-importer"]["sqlite_read_failures"] = read_failures
 
     def _run(self) -> None:
         # Anchor the automatic cadence to worker startup.  Browser wake-ups add

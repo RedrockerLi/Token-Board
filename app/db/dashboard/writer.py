@@ -76,6 +76,9 @@ class DashboardWriterMixin:
         """Merge ordinary users into id=0 and remove their source identity."""
         raw_ids = {int(value) for value in (user_ids or [])}
         if 0 in raw_ids:
+            # id=0 is the archive target itself, never a source: this guard is
+            # the single defense for the merge below, so the per-id existence
+            # check needs no extra non-zero predicate of its own.
             raise ValueError("archive user_id=0 cannot be archived")
         ids = sorted(raw_ids)
         if any(value < 0 for value in ids):
@@ -88,7 +91,7 @@ class DashboardWriterMixin:
             archived_rows = 0
             for user_id in ids:
                 exists = conn.execute(
-                    "SELECT 1 FROM users WHERE id=? AND id<>0", (user_id,)
+                    "SELECT 1 FROM users WHERE id=?", (user_id,)
                 ).fetchone()
                 if exists is None:
                     continue
@@ -258,10 +261,6 @@ class DashboardWriterMixin:
             return cursor.rowcount
         finally:
             conn.close()
-
-    def accumulate_plan_summary(self, **kwargs):
-        """Compatibility no-op: plan/agent cost is already in daily usage."""
-        return 0
 
     def record_billing_export_event(self, event: dict, payload_hash: str) -> int:
         if event.get("normalized_recurring_cost") is None:

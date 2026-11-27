@@ -7,7 +7,7 @@ from pathlib import Path
 from .adapters import alma, amp, antigravity, claude_code, cline, codex
 from .adapters import codearts_agent, codebuddy, cola
 from .adapters import copilot_cli, craft_agent, cursor, devin, dimagent, droid, dsh
-from .adapters import gemini_cli, grok, hermes, kimi_code, kiro, mimocode
+from .adapters import gemini_cli, grok, hermes, kiki, kilo, kimi_code, kiro, mimocode
 from .adapters import mcode
 from .adapters import omp, openclaw, opencode, pi_coding_agent, qoder, qoder_cn, qwen_code
 from .adapters import roo_code, trae_cli, workbuddy, zcode
@@ -17,8 +17,8 @@ ADAPTERS = {
     module.KIND: module for module in (
         claude_code, codex, grok, copilot_cli, craft_agent, cursor, dimagent,
         gemini_cli, opencode, openclaw, omp, pi_coding_agent, qwen_code,
-        kimi_code, amp, alma, droid, dsh, antigravity, trae_cli, hermes,
-        kiro, mimocode, cline, roo_code, workbuddy, zcode,
+        kiki, kimi_code, kilo, amp, alma, droid, dsh, antigravity, trae_cli,
+        hermes, kiro, mimocode, cline, roo_code, workbuddy, zcode,
         mcode, cola, qoder, qoder_cn, devin, codebuddy, codearts_agent,
     )
 }

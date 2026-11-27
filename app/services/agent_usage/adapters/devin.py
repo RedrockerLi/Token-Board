@@ -21,6 +21,10 @@ KIND = "devin"
 LABEL = "Devin"
 DESCRIPTION = "Devin 本地用量"
 ALWAYS_SCAN = True
+# ``parse`` reads nothing but this source file (and its SQLite
+# sidecars), so an unchanged fingerprint reproduces the batch exactly:
+# the importer may replay it instead of re-reading the store.
+PARSE_CACHE = True
 DEFAULT_PATH = Path.home() / ".local" / "share" / "devin" / "cli" / "sessions.db"
 
 NODE_COLUMNS = {"session_id", "node_id", "chat_message", "created_at"}
@@ -106,8 +110,12 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
 
     seen = set()
     events = []
+    # An interrupted scan is incomplete: mark it skipped so the caller neither
+    # advances the cursor nor caches the partial batch.
+    stopped = False
     for row in rows:
         if stop_event is not None and stop_event.is_set():
+            stopped = True
             break
 
         session_id = str(row["sessionId"] or "").strip()
@@ -152,4 +160,4 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         if event:
             events.append(event)
 
-    return batch(events, len(rows))
+    return batch(events, len(rows), skipped=stopped)

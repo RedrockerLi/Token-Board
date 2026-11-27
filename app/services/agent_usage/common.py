@@ -5,10 +5,12 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -16,6 +18,43 @@ from typing import Any, Iterable, Iterator
 from .ir import ParseBatch, UsageEvent, UsageSource
 from app.core import sqlite_runtime
 from app.core.time import format_utc, parse_external_timestamp
+
+log = logging.getLogger(__name__)
+
+_read_failure_lock = threading.Lock()
+_read_failures = 0
+
+
+def sqlite_read_failure_count() -> int:
+    """Number of external SQLite reads that failed and therefore returned no rows.
+
+    External agent databases are read opportunistically: a missing table or a
+    write lock must never abort an import.  Returning no rows is still a
+    failure that has to be visible, so every failed read also increments this
+    counter and logs a warning.  Callers that can attribute a counter delta to
+    one source (the importer does) can report it where a user will see it.
+    """
+    with _read_failure_lock:
+        return _read_failures
+
+
+def reset_sqlite_read_failures() -> int:
+    """Reset the read-failure counter and return its previous value."""
+    global _read_failures
+    with _read_failure_lock:
+        previous, _read_failures = _read_failures, 0
+        return previous
+
+
+def _record_sqlite_read_failure(path: Path, sql: str, exc: BaseException) -> None:
+    global _read_failures
+    with _read_failure_lock:
+        _read_failures += 1
+    log.warning(
+        "agent external sqlite read failed, returning no rows "
+        "(path=%s sql=%s): %s: %s",
+        path, " ".join(str(sql).split())[:200], type(exc).__name__, exc,
+    )
 
 
 def event_id_for(kind: str, source_identity: str, record_identity: object) -> str:
@@ -166,14 +205,42 @@ def source(path: Path, *, key: str | None = None, **context: Any) -> UsageSource
     return UsageSource(path=path, key=key, context=context)
 
 
+IDENTITY_FIELDS = ("dev", "ino", "size", "mtime_ns", "ctime_ns")
+
+
+def stat_identity(stat) -> dict[str, int]:
+    """Content identity of one file: device, inode, size and timestamps.
+
+    The importer cursor and the parse cache share this definition so that
+    "this source is unchanged" means exactly one thing.  ``ino`` is what makes
+    log rotation visible: a rotated file can keep the old size and, on a
+    coarse filesystem, the old mtime.
+    """
+    return {
+        "dev": int(getattr(stat, "st_dev", 0) or 0),
+        "ino": int(getattr(stat, "st_ino", 0) or 0),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "ctime_ns": int(stat.st_ctime_ns),
+    }
+
+
 def sqlite_rows(path: Path, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+    """Read rows from an external agent database without ever raising.
+
+    A missing database file is a normal "this agent is not installed" answer.
+    A lock or a malformed file is not: it is counted and logged so that the
+    caller can distinguish "no rows" from "could not read", and the caller's
+    cursor must not advance past it.
+    """
     if not path.is_file():
         return []
     conn = None
     try:
         conn = sqlite_runtime.read_only(path)
         return conn.execute(sql, params).fetchall()
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error) as exc:
+        _record_sqlite_read_failure(path, sql, exc)
         return []
     finally:
         if conn is not None:
@@ -225,7 +292,12 @@ def sqlite_rows_snapshot(
         )
         conn.execute("PRAGMA query_only=ON")
         return conn.execute(sql, params).fetchall()
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error) as exc:
+        # A snapshot read is the fallback for a database that another process
+        # keeps locked.  Swallowing its failure would hide both the lock and
+        # the failed fallback, so the failure is always counted and logged;
+        # only whether it propagates is the caller's choice.
+        _record_sqlite_read_failure(path, sql, exc)
         if raise_on_error:
             raise
         return []

@@ -10,6 +10,10 @@ from ..ir import ParseBatch, UsageSource
 KIND = "alma"
 LABEL = "Alma"
 ALWAYS_SCAN = True
+# ``parse`` reads nothing but this source file (and its SQLite
+# sidecars), so an unchanged fingerprint reproduces the batch exactly:
+# the importer may replay it instead of re-reading the store.
+PARSE_CACHE = True
 DEFAULT_PATH = Path.home() / ".config" / "alma" / "chat_threads.db"
 
 
@@ -41,9 +45,13 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         LEFT JOIN workspaces ON workspaces.id = chat_threads.workspace_id
         ORDER BY usage_records.rowid""")
     events = []
+    # An interrupted scan is incomplete: mark it skipped so the caller neither
+    # advances the cursor nor caches the partial batch.
+    stopped = False
     for row in rows:
         if stop_event is not None and stop_event.is_set():
-            return batch(events, len(rows))
+            stopped = True
+            break
         model = str(row["model"] or "unknown").strip() or "unknown"
         if ":" in model:
             model = model.rsplit(":", 1)[-1].strip() or "unknown"
@@ -57,4 +65,4 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         )
         if event:
             events.append(event)
-    return batch(events, len(rows))
+    return batch(events, len(rows), skipped=stopped)

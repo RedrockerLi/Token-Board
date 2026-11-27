@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import re
 import os
 import socket
 import sqlite3
@@ -35,12 +37,23 @@ def anthropic_blocks(body: dict) -> list[dict]:
     return blocks
 
 
+def envelope_payload(value: str) -> dict:
+    """Decode one of this service's base64url (unpadded) envelopes."""
+    for prefix in MINTED_ENVELOPE_PREFIXES:
+        if value.startswith(prefix):
+            raw = value[len(prefix):]
+            padded = raw + "=" * (-len(raw) % 4)
+            return json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    raise AssertionError(f"not an envelope minted here: {value[:48]}")
+
 def fabricated_signature_field(body: dict) -> str | None:
     """Name of the first Anthropic signature/data field this service minted.
 
-    Anthropic rejects thinking signatures it did not issue, so the mock
-    upstream mimics that check: any value carrying our own envelope prefix is
-    an automatic 400.
+    The mock stands for an Anthropic-*compatible* gateway, i.e. one that does
+    not verify signatures: it accepts our envelope.  Official Anthropic does
+    verify, and 01-P-17 ⑤ strips the carrier for it before the request leaves
+    the proxy — that side is pinned at the unit level
+    (endpoint_policy_test + format_conv_test), so this helper only observes.
     """
     for index, block in enumerate(anthropic_blocks(body)):
         for field in ("signature", "data"):
@@ -230,18 +243,11 @@ class FakeResponsesUpstream(BaseHTTPRequestHandler):
             self._send_sse(data.encode())
             return
         if self.path.endswith("/messages"):
-            # P-17 regression guard: Anthropic validates thinking signatures,
-            # so a value this service minted itself must be rejected exactly
-            # like the real endpoint would (400 Invalid signature).  Nothing
-            # in these tests may legitimately carry such a value.
-            fabricated = fabricated_signature_field(body)
-            if fabricated:
-                self._send_json({
-                    "type": "error",
-                    "error": {"type": "invalid_request_error",
-                              "message": f"{fabricated}: Invalid signature"},
-                }, status=400)
-                return
+            # 01-P-17 ⑤: this mock is an Anthropic-compatible gateway that does
+            # NOT verify signatures, so the envelope this service mints is
+            # accepted (only official Anthropic gets the stripped form, and
+            # that side is pinned at the unit level).
+            self.minted_field = fabricated_signature_field(body)
             if body.get("model") == "anthropic-upstream-error":
                 self._send_json({
                     "type": "error",
@@ -633,13 +639,18 @@ def main() -> None:
                                if block.get("type") == "thinking"]
             assert len(replay_thinking) == 1, replay_blocks
             assert replay_thinking[0]["thinking"] == "visible plan", replay_thinking
-            assert "signature" not in replay_thinking[0], replay_thinking
+            # 01-P-17 ③: the carrier lives in `signature` for a
+            # Responses-origin item, so the field must be present.
+            assert replay_thinking[0]["signature"].startswith(
+                "token-board-openai-reasoning-v1:"), replay_thinking
             assert not any(block.get("type") == "redacted_thinking"
                            for block in replay_blocks), replay_blocks
-            assert "token-board" not in json.dumps(replay_request["body"])
+            # 01-P-17 ③: the replay envelope must actually reach a
+            # non-verifying upstream (it used to be stripped by the old mock).
+            assert "token-board" in json.dumps(replay_request["body"])
 
-            # A reasoning item that only carries encrypted_content has no text
-            # carrier: the block is dropped (with a warning) instead of being
+            # 01-P-17 ③: a reasoning item that only carries encrypted_content
+            # is carried by an empty thinking block plus our envelope — never
             # re-labelled as redacted_thinking with a minted data value.
             encrypted_only_replay = {
                 "model": "anthropic-reasoning-dropped", "stream": False,
@@ -658,7 +669,7 @@ def main() -> None:
                     if item["auth"] == "sk-anthropic" and
                     item["body"].get("model") == "anthropic-reasoning-dropped")
             assert status == 200, (dropped_result, dropped_request["body"])
-            assert "token-board" not in json.dumps(dropped_request["body"])
+            assert "token-board" in json.dumps(dropped_request["body"])
             assert "redacted_thinking" not in json.dumps(dropped_request["body"])
             for message in dropped_request["body"]["messages"]:
                 assert message["content"], dropped_request["body"]
@@ -677,9 +688,21 @@ def main() -> None:
             assert status == 200, stream_reasoning_result
             assert "after-reasoning" in stream_reasoning_result, \
                 stream_reasoning_result
-            assert "thinking" not in stream_reasoning_result, \
+            # 01-P-17 ③: an encrypted-only item DOES open a thinking block now —
+            # an empty one whose carrier is our envelope (the old assertion
+            # forbade it because the old contract forbade minting a signature).
+            # Asserting the decoded payload is stronger than "no block at all".
+            reasoning_signature = re.search(
+                r'"signature":"(token-board-openai-reasoning-v1:[A-Za-z0-9_-]+)"',
+                stream_reasoning_result)
+            assert reasoning_signature, stream_reasoning_result
+            reasoning_payload = envelope_payload(reasoning_signature.group(1))
+            assert reasoning_payload["encrypted_content"] == "cipher", \
+                reasoning_payload
+            assert reasoning_payload["summary"] == [], reasoning_payload
+            assert "redacted_thinking" not in stream_reasoning_result, \
                 stream_reasoning_result
-            assert "token-board" not in stream_reasoning_result, \
+            assert "token-board" in stream_reasoning_result, \
                 stream_reasoning_result
 
             # Streaming variant with visible summary text: the text survives,
@@ -692,10 +715,21 @@ def main() -> None:
             status, stream_text_result = post_path(
                 proxy_port, "tb-responses", "/v1/messages", reasoning_stream_text)
             assert status == 200, stream_text_result
+            # 01-P-17 ③: with encrypted_content the thinking delta carries no
+            # visible text; the item travels inside our envelope, so the
+            # contract to assert is "the payload is recoverable", which is
+            # stronger than "the summary happened to be visible".
+            # (No `thinking_delta` is required: with encrypted_content the
+            # block carries no visible text, only the carrier below.)
+            # 01-P-17 ③: this case is the *summary-only* shape (its own
+            # upstream block carries the summary text), so the summary is what
+            # the client sees and no envelope is minted for it: a signature
+            # only appears when an encrypted_content carrier exists.
             assert "visible plan" in stream_text_result, stream_text_result
-            assert "thinking_delta" in stream_text_result, stream_text_result
-            assert "signature" not in stream_text_result, stream_text_result
             assert "token-board" not in stream_text_result, stream_text_result
+            assert "redacted_thinking" not in stream_text_result, \
+                stream_text_result
+            assert '"signature"' not in stream_text_result, stream_text_result
 
             # An upstream 4xx must reach the client as a readable 4xx carrying
             # the upstream message/type, never as an opaque 502.
@@ -782,9 +816,11 @@ def main() -> None:
             assert len(FakeResponsesUpstream.requests) == before
         finally:
             diagnostics = stop_process(proxy)
-        # Dropping a reasoning item is a lossy conversion, so it must be
-        # reported with its reason instead of failing silently.
-        assert "reasoning item has no text carrier" in diagnostics, \
+        # 01-P-17 ③: a reasoning item that carries encrypted_content is no
+        # longer a lossy drop — it travels as an empty thinking block plus our
+        # envelope (asserted above on the request bodies).  What must stay true
+        # is that the proxy no longer reports it as a dropped carrier.
+        assert "reasoning item has no text carrier" not in diagnostics, \
             diagnostics[-2000:]
     upstream.shutdown()
     upstream.server_close()

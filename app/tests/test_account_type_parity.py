@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import unittest
-from pathlib import Path
 
 from app.domain.account_types import ACCOUNT_TYPES
 from app.tests.support import PROJECT_ROOT

@@ -5,13 +5,15 @@ from __future__ import annotations
 import shutil
 import json
 import struct
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from app.db.migrations import SchemaVersion, apply_sql_migrations, migrate
+from app.db.migrations import (
+    MigrationError, SchemaVersion, apply_sql_migrations, migrate,
+)
 from app.db.schema_upgrade import ensure_local_databases
+from app.db.schema_upgrade.coordinator import verify_current_database
 from app.db.schema_upgrade import upgrade_shadow
 from app.tests.support import sqlite_connection
 
@@ -599,3 +601,111 @@ class LocalSchemaUpgradeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SchemaVersionGuardTest(unittest.TestCase):
+    """TB05-F03: version guards and the runtime V2 precondition.
+
+    ``migrations._run_locked`` rejects a downgrade, a target newer than the
+    known files, and a database newer than the available files.  The suite
+    never drove those branches, so a refactor of their order would regress
+    silently.  ``coordinator.verify_current_database`` is the runtime gate the
+    App and the C++ process rely on: it must reject a V1 database, a V2
+    database that is not the published tip, and a missing one.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        shutil.copytree(Path(__file__).resolve().parents[2] / "schema",
+                        self.root / "schema")
+        (self.root / "data").mkdir()
+        self.schema = self.root / "schema"
+        self.proxy = self.root / "data/token-board.db"
+        self.dashboard = self.root / "data/dashboard.db"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _versions(self, database: str = "token-board") -> list[tuple[int, int]]:
+        versions = []
+        for path in (self.schema / database).glob("v*/*.sql"):
+            major, minor = (int(part) for part
+                            in path.name.split("_", 1)[0].split("-"))
+            versions.append((major, minor))
+        return sorted(versions)
+
+    def _latest(self, database: str = "token-board") -> tuple[int, int]:
+        return self._versions(database)[-1]
+
+    def _migrate(self, target: SchemaVersion | None = None,
+                 schema_dir: Path | None = None) -> None:
+        apply_sql_migrations(str(self.proxy), str(schema_dir or self.schema),
+                             "token-board", target)
+
+    def _version(self) -> tuple[int, int]:
+        with sqlite_connection(self.proxy) as conn:
+            value = conn.execute("PRAGMA user_version").fetchone()[0]
+        return divmod(int(value), 10_000)
+
+    def _current_pair(self) -> tuple[int, int]:
+        ensure_local_databases(str(self.proxy), str(self.dashboard),
+                               self.schema)
+        return self._latest()
+
+    def test_target_below_current_is_rejected(self) -> None:
+        tip = self._current_pair()
+        self.assertEqual(self._version(), tip)
+        with self.assertRaises(MigrationError) as raised:
+            self._migrate(SchemaVersion(tip[0], 0))
+        self.assertIn("cannot move backwards", str(raised.exception))
+        # A rejected target must not partially apply or rewrite the version.
+        self.assertEqual(self._version(), tip)
+
+    def test_target_newer_than_known_files_is_rejected(self) -> None:
+        tip = self._current_pair()
+        with self.assertRaises(MigrationError) as raised:
+            self._migrate(SchemaVersion(tip[0], tip[1] + 1))
+        self.assertIn("is newer than known", str(raised.exception))
+        self.assertEqual(self._version(), tip)
+
+    def test_database_newer_than_available_files_is_rejected(self) -> None:
+        tip = self._current_pair()
+        previous = self._versions()[-2]
+        truncated = self.root / "truncated-schema"
+        shutil.copytree(self.schema, truncated)
+        truncate_migrations(truncated, *previous)
+        # The database is V2.<tip> while the shipped files stop at
+        # V2.<previous>; the guard must refuse to run "backwards" instead of
+        # silently accepting an older file set.  (The same-major "newer than
+        # known" warning branch below that check is unreachable for this
+        # shape, which is why the observable contract is the error.)
+        with self.assertRaises(MigrationError) as raised:
+            self._migrate(schema_dir=truncated)
+        self.assertIn("cannot move backwards", str(raised.exception))
+        self.assertEqual(self._version(), tip)
+
+    def test_runtime_rejects_a_v1_database(self) -> None:
+        self._migrate()  # fresh database stops at the V1 tip
+        self.assertEqual(self._version()[0], 1)
+        with self.assertRaises(MigrationError) as raised:
+            verify_current_database(self.proxy, "token-board", self.schema)
+        self.assertIn("runtime accepts only current V2",
+                      str(raised.exception))
+
+    def test_runtime_rejects_a_v2_database_that_is_not_the_tip(self) -> None:
+        self._migrate()
+        self._migrate(SchemaVersion(2, 9))
+        tip = self._latest()
+        self.assertGreater(tip[1], 9)
+        with self.assertRaises(MigrationError) as raised:
+            verify_current_database(self.proxy, "token-board", self.schema)
+        message = str(raised.exception)
+        self.assertIn("is V2.9", message)
+        self.assertIn(f"expected V2.{tip[1]}", message)
+
+    def test_runtime_rejects_a_missing_database(self) -> None:
+        absent = self.root / "data" / "absent.db"
+        with self.assertRaises(MigrationError) as raised:
+            verify_current_database(absent, "token-board", self.schema)
+        self.assertIn("missing or empty", str(raised.exception))

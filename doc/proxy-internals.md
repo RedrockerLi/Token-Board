@@ -1,14 +1,14 @@
 # 代理内部机制
 
-代理是 C++17 单进程,入口 `proxy/src/main.cpp`,基于 httplib 提供 HTTP 服务。源码按职责分目录:`core/`(路由、网关、会话亲和、服务端)、`net/`(上游转发、线程池)、`format/`(IR 与三格式 codec、think 过滤)、`store/`(SQLite 访问、usage 解析)。本文按一条请求的旅程讲内部组件:生命周期、线程池、路由与认证、候选选择与回退、会话亲和、并发闸门、超时与断连、记账与性能事件。
+代理是 C++17 单进程,入口 `proxy/src/main.cpp`,基于 httplib 提供 HTTP 服务。源码按职责分目录:`core/`(路由、网关、会话亲和、服务端)、`net/`(上游转发、线程池)、`format/`(IR 与四格式 codec、think 过滤)、`store/`(SQLite 访问、usage 解析)。本文按一条请求的旅程讲内部组件:生命周期、线程池、路由与认证、候选选择与回退、会话亲和、并发闸门、超时与断连、记账与性能事件。
 
 ## 生命周期
 
 启动流程:服务脚本先调用 Python `app.db.schema_upgrade` 完成本地数据库升级与
-transition→解析 C++ CLI 参数→打开并校验已准备好的 V1 schema→构建首个
+transition→解析 C++ CLI 参数→打开并校验已准备好的 V2 schema→构建首个
 `RoutingSnapshot`→组装转发/codec/记账组件→建线程池并监听。C++ 不读取
 `schema/` 中的 SQL，也不执行迁移；数据库版本不满足校验时直接退出并提示先
-运行 Python 升级边界。收到 SIGINT/SIGTERM 后停止刷新、探测和记账线程，排空后退出。
+运行 Python 升级边界。收到 SIGINT/SIGTERM 后停止接收新请求，并对已接收任务做**有界排空**：线程池先把已接收的任务排空，再最多等 `shutdown_grace`（默认 30 秒，构造参数可覆盖，没有环境变量开关）让在途请求结束。超时**不取消、不 kill** 在途请求，也不关库、不销毁线程池：worker 线程 detach 后进程以状态 3 退出，`[Pool]` 错误日志给出仍在运行的 worker/queued/active 计数；正常排空后继续停止刷新、探测和记账线程并关闭数据库，打印 `[Shutdown] graceful stop finished in N ms` 并以 0 退出。
 
 后台维护包括:
 
@@ -98,11 +98,11 @@ bash start.sh --debug
 
 ## 线程池:SemaphorePool
 
-`SemaphorePool` 初始 worker 数为 `clamp(2×CPU, 8, 64)`，上限 256，队列硬上限 4096。任务记录 enqueue/start 时间并聚合 queue p95；满载拒绝数进入健康指标，避免无限排队。监听 backlog 为 512。
+`SemaphorePool` 初始 worker 数为 `clamp(2×CPU, 8, 64)`，上限 512（`TB_MAX_WORKERS` 覆盖值同样 clamp 到 512），队列硬上限 4096。任务记录 enqueue/start 时间并聚合 queue p95；满载拒绝数进入健康指标，避免无限排队。监听 backlog 为 512。
 
 ## 路由与认证
 
-`Router` 只读 `shared_ptr<const RoutingSnapshot>`：`client_key → route_set`、`route_set+model → ordered targets`、endpoint/auth/credential 都在一次配置快照内。请求热路径不查询 SQLite，也不复制整份 URL/secret 候选。普通账户在 V1 中同样是一条 `* → upstream` route rule；聚合只是多条 rule，核心不再检查 `is_aggregate`。
+`Router` 只读 `shared_ptr<const RoutingSnapshot>`：`client_key → route_set`、`route_set+model → ordered targets`、endpoint/auth/credential 都在一次配置快照内。请求热路径不查询 SQLite，也不复制整份 URL/secret 候选。普通账户同样是一条 `* → upstream` route rule；聚合只是多条 rule，核心不再检查 `is_aggregate`。
 
 认证同时接受两种头:`Authorization: Bearer <密钥>` 与 `x-api-key: <密钥>`,与客户端用什么格式无关,密钥只用来选账户。
 
@@ -181,7 +181,7 @@ plan 密钥进入配额冷却后,后台线程按两条通道观察恢复,任一�
 
 流式请求另有**终端事件校验**:上游 2xx 流干净结束(chunked 正常收尾或读到 EOF)时,若解析器从未发布终止事件,按截断失败处理——对外状态 502、消息 `Upstream stream truncated before terminal event`,已向客户端提交过的流向其补发终止错误帧,截断的密钥按 5xx 规则获得 30 秒上游故障避让;未提交的截断(空体 200)可换候选重试。终止事件按上游线格式认定:Anthropic `message_delta.stop_reason` 或 `message_stop`,OpenAI chat `choices[].finish_reason` 或 `data: [DONE]`,Responses `response.completed`/`response.incomplete`,Gemini `candidates[].finishReason`;结束前仍驻留在 SSE 帧缓冲里的终止帧先冲净再判定。非 2xx 响应不参与该校验(按 HTTP 状态分类)。环境变量 `PROXY_STRICT_TERMINAL=0` 关闭校验(干净结束即按成功计费),默认开启。已知限制:上游忽略 `stream:true`、以整包 JSON 200(无 `data:` 帧)应答时没有终止事件,按截断处理。
 
-流式请求另有**单消息周期守卫**:部分网关(实测 opencode.ai Zen/Go 的 Anthropic 端点)会在同一个 HTTP 响应里拼接两条完整消息——第一个终止帧之后又出现一个 `message_start`(或 OpenAI 的新 completion id / Responses 的新 `response.created`)。passthrough 转发按帧切分:`fmt::SseCycleGuard`([proxy/src/format/sse_cycle_guard.h](proxy/src/format/sse_cycle_guard.h))只缓冲当前未完成的那一帧,放行首个终止帧(Anthropic `message_stop`、OpenAI `data: [DONE]`、Responses `response.completed|incomplete|failed`)及其之前的全部字节,之后的字节丢弃并计数;上游省略终止帧时,第二个周期起点即切点。被丢弃的字节不再喂给 metrics 解析器,记账与请求日志保留第一段的 usage。守卫真正放行终止帧后,剩余读取即使被看门狗判成超时也按成功收尾(客户端写失败仍走 499);切点落在"第二个周期起点"时第一段本身没有终止,仍按截断失败处理,客户端会收到已提交内容加一个错误帧。转换路径不建守卫,由三个 stream parser 的周期抑制处理。`PROXY_STREAM_CYCLE_GUARD=0` 关闭 passthrough 守卫。
+流式请求另有**单消息周期守卫**:部分网关(实测 opencode.ai Zen/Go 的 Anthropic 端点)会在同一个 HTTP 响应里拼接两条完整消息——第一个终止帧之后又出现一个 `message_start`(或 OpenAI 的新 completion id / Responses 的新 `response.created`)。passthrough 转发按帧切分:`fmt::SseCycleGuard`([proxy/src/format/sse_cycle_guard.h](proxy/src/format/sse_cycle_guard.h))只缓冲当前未完成的那一帧,放行首个终止帧(Anthropic `message_stop`、OpenAI `data: [DONE]`、Responses `response.completed|incomplete|failed`)及其之前的全部字节,之后的字节丢弃并计数;上游省略终止帧时,第二个周期起点即切点。被丢弃的字节不再喂给 metrics 解析器,记账与请求日志保留第一段的 usage。守卫真正放行终止帧后,剩余读取即使被看门狗判成超时也按成功收尾(客户端写失败仍走 499);切点落在"第二个周期起点"时第一段本身没有终止,仍按截断失败处理,客户端会收到已提交内容加一个错误帧。转换路径不建守卫,由四个 stream parser 的周期抑制处理。`PROXY_STREAM_CYCLE_GUARD=0` 关闭 passthrough 守卫。
 
 客户端断连的检测用 `spawn_client_monitor`:一个线程每 250ms poll 客户端 socket,发现 `POLLHUP / POLLERR / POLLRDHUP` 就 `shutdown()` 上游 socket,把阻塞中的上游读立刻打断,释放线程池线程,而不是干等满超时。注意 TCP 对端 FIN 只表现为 `POLLIN + POLLRDHUP`,所以 poll 必须显式请求 `POLLRDHUP`。非流式路径也有等价的 `client_disconnected` 检查,确认客户端已走就把这次请求记为 499(零 token)结束。
 

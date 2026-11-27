@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ..common import batch, config_value, iter_jsonl, make_event, source, timestamp, walk_files
 from ..ir import ParseBatch, UsageSource
+from .record_identity import assign_ordinals
 
 KIND = "openclaw"
 LABEL = "OpenClaw"
@@ -50,8 +51,10 @@ def _number(usage: dict, *keys) -> int:
 
 
 def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
-    events = []
     project = str(item.context.get("project") or item.path.parent.parent.name or "unknown")
+    # Session logs can be rewritten or compacted, so the physical line number
+    # is not the record's identity; the record's own fields are.
+    payloads = []
     count = 0
     for line_no, obj in iter_jsonl(item.path):
         count = line_no
@@ -63,8 +66,8 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         usage = message.get("usage")
         if not isinstance(usage, dict):
             continue
-        event = make_event(
-            kind=KIND, source_key=item.state_key, ordinal=line_no,
+        payloads.append(dict(
+            kind=KIND, source_key=item.state_key,
             model=message.get("model") or obj.get("model") or "unknown",
             requested_at=timestamp(obj.get("timestamp") or message.get("timestamp")),
             input_tokens=_number(usage, "input", "inputTokens", "input_tokens", "promptTokens", "prompt_tokens")
@@ -72,7 +75,12 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             output_tokens=_number(usage, "output", "outputTokens", "output_tokens", "completionTokens", "completion_tokens"),
             cached_input_tokens=_number(usage, "cacheRead", "cache_read", "cache_read_input_tokens"),
             project=project, session_id=item.path.stem,
-        )
+        ))
+    events = []
+    for payload, ordinal in zip(payloads, assign_ordinals(payloads)):
+        if ordinal is None:
+            continue
+        event = make_event(**payload, ordinal=ordinal)
         if event:
             events.append(event)
     return batch(events, count)

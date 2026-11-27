@@ -21,6 +21,12 @@ class AdapterSpec:
     parse: Callable
     always_scan: bool = False
     replay_skips: Callable | None = None
+    # Declared by the adapter module when ``parse`` is a pure function of the
+    # one source file (plus its SQLite/journal sidecars).  Only then may the
+    # importer replay a cached batch for an unchanged source (see
+    # ``parse_cache``).  Default False: a source whose content also lives
+    # elsewhere must be re-read every pass.
+    parse_cache: bool = False
 
     @classmethod
     def from_module(cls, module) -> "AdapterSpec":
@@ -30,6 +36,7 @@ class AdapterSpec:
             parse=module.parse,
             always_scan=bool(getattr(module, "ALWAYS_SCAN", False)),
             replay_skips=getattr(module, "replay_skips", None),
+            parse_cache=bool(getattr(module, "PARSE_CACHE", False)),
         )
 
 

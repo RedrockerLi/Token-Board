@@ -103,7 +103,8 @@ private:
 /// RAII lease for a pooled client.  The client leaves the pool while leased,
 /// gets its per-request configuration re-applied, and returns on scope exit.
 /// Call discard() when the connection is suspect (timeout / cancel / connect
-/// failure) instead of returning it.
+/// failure) instead of returning it; after discard() the lease is empty, so
+/// client()/address() report nothing and must not be dereferenced by callers.
 class PooledLease {
 public:
     explicit PooledLease(std::optional<PooledClient> value)
@@ -111,6 +112,9 @@ public:
     ~PooledLease() { release(); }
     PooledLease(PooledLease &&other) noexcept : value_(std::move(other.value_)) {}
     PooledLease &operator=(PooledLease &&other) noexcept {
+        // A self-move must not release the client: release() would hand it
+        // back to the pool and empty this lease under the caller.
+        if (this == &other) return *this;
         release();
         value_ = std::move(other.value_);
         return *this;
@@ -121,7 +125,12 @@ public:
     httplib::Client *client() const {
         return value_ ? value_->client.get() : nullptr;
     }
-    const std::string &address() const { return value_->address; }
+    /// Empty when the lease holds no pooled client (default-constructed or
+    /// discarded); never dereferences an empty optional.
+    const std::string &address() const {
+        static const std::string kEmpty;
+        return value_ ? value_->address : kEmpty;
+    }
     bool valid() const { return value_ && value_->client; }
 
     void discard() { value_.reset(); }

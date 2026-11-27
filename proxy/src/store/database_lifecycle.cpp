@@ -3,10 +3,13 @@
 namespace {
 
 // Keep this reviewed with the newest proxy V2 SQL file; the current tip is
-// V2.10 (2-10_pricing_slot_and_fx.sql).  The C++ runtime serves one exact
+// V2.12 (2-11_request_time_pricing_clock.sql rebuilds price_usage_event so the
+// pricing clock is the row's requested_at, and
+// 2-12_reprice_repaired_usage_rows.sql adds reprice_usage_event so a repaired
+// row is repriced on that same clock).  The C++ runtime serves one exact
 // schema contract; Python owns all SQL migrations.
 constexpr int kRequiredRuntimeSchemaMajor = 2;
-constexpr int kRequiredRuntimeSchemaMinor = 10;
+constexpr int kRequiredRuntimeSchemaMinor = 12;
 
 bool validate_v2_schema(sqlite3 *db, const std::string &path,
                         int &major, int &minor) {

@@ -10,6 +10,10 @@ from ..ir import ParseBatch, UsageSource
 KIND = "mimocode"
 LABEL = "MiMoCode"
 ALWAYS_SCAN = True
+# ``parse`` reads nothing but this source file (and its SQLite
+# sidecars), so an unchanged fingerprint reproduces the batch exactly:
+# the importer may replay it instead of re-reading the store.
+PARSE_CACHE = True
 DEFAULT_PATH = Path.home() / ".local" / "share" / "mimocode" / "mimocode.db"
 
 

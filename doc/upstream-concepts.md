@@ -143,12 +143,12 @@
 | `upstream_key_id` | **实际服务的上游 Key** 槽位 id（多密钥归属，无 FK：Key 可删） |
 | `model` | 转发后的上游模型名 |
 | `prompt/completion/cache_read/total_tokens` | 从上游 usage 解析 |
-| `api_cost` | 写时固化的 api 等价价（api=真实账单，plan=虚拟消费），USD 定价按当日汇率换算为 CNY；智能体导入另有独立订阅成本 |
+| `api_cost` | 写时固化的 api 等价价（api=真实账单，plan=虚拟消费），USD 定价按该行 `requested_at` 当天汇率换算为 CNY；智能体导入另有独立订阅成本 |
 | `status_code` / `duration_ms` | 结局 |
 | `ttft_ms` / `generation_ms` / `output_tps` | 性能观测 |
 | `event_id` / `pricing_status` | 智能体导入幂等标识 / 当前写入计价状态 |
 
-写时计价的固化：代理与智能体导入都走 SQLite `price_usage_event` 触发器，按写入时的当前定价计算；改价不回溯。
+计价固化的时点：代理与智能体导入都走 SQLite `price_usage_event` 触发器，按该行 `requested_at` 当天的当前定价与汇率计算并固化；改价、改汇率不回溯历史行；收据修复改写 token 的那一行由 V2.12 的 `reprice_usage_event` 按同一口径重算。
 
 ### request_attempts（每候选一次尝试一行）
 
@@ -210,12 +210,12 @@
 
 | 属性 | 取值 | 它决定什么 | 现在谁在消费 |
 |------|------|-----------|-------------|
-| `billing` | `usage` / `subscription` | `api_cost` 是真实账单还是虚拟消费；真实成本统计是否包含它 | proxy_db 的计费/导出查询、`_plan_key_billing_meta` |
+| `billing` | `usage` / `subscription` | `api_cost` 是真实账单还是虚拟消费；真实成本统计是否包含它 | proxy_db 的计费/导出查询、`BillingUnitResolver.proxy_units`（按 `billing_contracts.charge_type` 取订阅单元） |
 | `routable` | true / false | 本地密钥能否绑它、代理能否转发给它 | `_assert_routable_account`、C++ 路由快照 SQL、前端 `routableAccounts`/并发测试 |
 | `holds_keys` | true / false | 建不建上游密钥；编辑弹窗显不显示密钥区 | `create_account`/`update_account` 的 key 分支、前端字段隐藏 |
 | `deletion` | `immediate` / `configurable` | 删除是永远立即（api）还是跟随设置页「删除默认操作」 | `_cancellation_end`、`delete_account`、前端删除流 |
 | `cooldown` | `subscription_5h` / None | 配额耗尽的 429 是否让该密钥冷却 5 小时 | 建账户时写入合同 `cooldown_policy_json`，C++ 经路由快照读出 `extended_usage_limit_cooldown` |
-| `subscription_unit` | `per_key` / `per_account` | 订阅按每把密钥算一个生命周期（plan），还是每账户一条 | `_plan_key_billing_meta` 合成生命周期 |
+| `subscription_unit` | `per_key` / `per_account` | 订阅按每把密钥算一个生命周期（plan），还是每账户一条 | `BillingUnitResolver.proxy_units` 按 `billing_contracts.billing_scope`（`credential` / `account`）合成生命周期 |
 
 ### 上游子分类（subtypes）
 

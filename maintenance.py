@@ -36,6 +36,12 @@ from app.services.runtime_tasks import (
 
 log = logging.getLogger(__name__)
 
+# AF_UNIX sun_path is 108 bytes and must hold the terminating NUL, so a socket
+# path longer than 107 bytes cannot be bound.  bind() then fails with an
+# OSError that never mentions the limit, which makes a deep data directory look
+# like a code defect; check the length first so the failure names the path.
+AF_UNIX_PATH_MAX_BYTES = 107
+
 
 class MaintenanceService:
     """Own four periodic workers and the local wake socket."""
@@ -87,6 +93,13 @@ class MaintenanceService:
                 log.exception("failed to write maintenance health")
 
     def _prepare_socket(self) -> None:
+        encoded_path = os.fsencode(str(self.socket_path))
+        if len(encoded_path) > AF_UNIX_PATH_MAX_BYTES:
+            raise RuntimeError(
+                f"maintenance socket path is {len(encoded_path)} bytes, "
+                f"over the AF_UNIX limit of {AF_UNIX_PATH_MAX_BYTES}: "
+                f"{self.socket_path}; move the data directory (or TMPDIR) to a "
+                "shorter path")
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             if not self.socket_path.is_socket():

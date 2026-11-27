@@ -14,9 +14,14 @@ frankfurter from 1999-01-04 on).
 
 The table lives in token-board.db (fx_rates) and is excluded from cloud sync.
 Every function is best-effort and never raises into the request path. Generic
-readers retain the historical 1.0 result when a pair has never been stored;
-the billing materializer treats that ``source_date is None`` state as
-unresolved and does not finalize a financial charge with it.
+readers keep a degraded result for compatibility: the nearest-earlier stored
+rate, the earliest one when the requested date precedes every stored rate, and
+1.0 when the pair has never been stored at all. The billing materializer accepts
+none of those as a financial fact — it finalizes a charge only with the exact
+period-start rate (``FxResolution.locked``); a provisional resolution leaves
+the charge pending, logs a warning, surfaces in the overview's
+``billing_incomplete_count``, and is retried by later materializations once the
+exact rate has been fetched.
 """
 
 from dataclasses import dataclass
@@ -47,8 +52,10 @@ class FxRateResolver:
 
     ``resolve`` never fetches or writes. ``ensure`` is the opt-in boundary for
     historical fetches and returns the same immutable result type. ``locked``
-    still identifies an exact period-start rate; billing may explicitly freeze
-    a non-exact fallback when the configured policy allows it.
+    marks the exact period-start rate. ``finalize`` refuses every provisional
+    resolution (a nearest-earlier or earliest stored rate, or the 1.0
+    placeholder), so a caller that needs a financial fact must ``ensure`` the
+    exact rate rather than freeze a fallback.
     """
 
     @staticmethod

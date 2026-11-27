@@ -164,8 +164,18 @@ int main() {
     json block = fmt::anthropic_block_from_responses_reasoning(reasoning);
     assert(block["type"] == "thinking");
     assert(block["thinking"] == "visible");
-    assert(!block.contains("signature"));
-    assert(block.dump().find("token-board") == std::string::npos);
+    // 01-P-17 ③: the ciphertext travels in this service's own envelope, so the
+    // block always carries a signature (base64url, no padding) ...
+    const std::string openai_prefix = "token-board-openai-reasoning-v1:";
+    assert(block.contains("signature"));
+    assert(block["signature"].get<std::string>().rfind(openai_prefix, 0) == 0);
+    json decoded;
+    assert(fmt::decode_reasoning_envelope(block["signature"].get<std::string>(),
+                                          openai_prefix.c_str(), decoded));
+    assert(decoded["encrypted_content"] == "cipher");
+    // ... and only the whitelisted fields enter it (`status` must not).
+    assert(!decoded.contains("status"));
+    assert(decoded["summary"].size() == 1);
 
     // Responses -> Anthropic -> Responses degrades instead of fabricating:
     // the visible summary survives, the unverifiable metadata does not.
@@ -173,15 +183,50 @@ int main() {
     assert(restored["type"] == "reasoning");
     assert(restored["summary"].size() == 1);
     assert(restored["summary"][0]["text"] == "visible");
-    assert(!restored.contains("encrypted_content"));
-    assert(restored.dump().find("token-board") == std::string::npos);
+    // 01-P-17 ③/④: our own envelope decodes back to the item it carried, so a
+    // Responses -> Anthropic -> Responses hop is lossless for this service.
+    assert(restored["type"] == "reasoning");
+    assert(restored["encrypted_content"] == "cipher");
+    assert(restored.dump().find("redacted_thinking") == std::string::npos);
+
+    // 01-P-17 ④: a *vendor*-signed thinking block is re-wrapped into our own
+    // Anthropic envelope instead of losing the signature.
+    const std::string anthropic_prefix = "token-board-anthropic-thinking-v1:";
+    json vendor_block{{"type", "thinking"}, {"thinking", "visible"},
+                      {"signature", "visible-sig"}};
+    json vendor_item = fmt::responses_reasoning_from_anthropic_block(vendor_block);
+    assert(vendor_item["type"] == "reasoning");
+    const std::string vendor_env = vendor_item["encrypted_content"].get<std::string>();
+    assert(vendor_env.rfind(anthropic_prefix, 0) == 0);
+    json vendor_decoded;
+    assert(fmt::decode_reasoning_envelope(vendor_env, anthropic_prefix.c_str(),
+                                          vendor_decoded));
+    assert(vendor_decoded["signature"] == "visible-sig");
+    // An unsigned thinking block stays unsigned: no envelope is invented.
+    json unsigned_block{{"type", "thinking"}, {"thinking", "visible"}};
+    assert(!fmt::responses_reasoning_from_anthropic_block(unsigned_block)
+                .contains("encrypted_content"));
+    // A carrier redacted_thinking block is carried the same way.
+    json redacted_block{{"type", "redacted_thinking"}, {"data", "cipher-data"}};
+    json redacted_item = fmt::responses_reasoning_from_anthropic_block(redacted_block);
+    assert(std::string(redacted_item["encrypted_content"])
+               .rfind(anthropic_prefix, 0) == 0);
 
     // A reasoning item that only has encrypted_content has no text carrier:
     // it cannot be represented on the Anthropic wire, so the bridge signals
     // "drop" instead of re-labelling it as redacted_thinking with magic data.
     json encrypted_only{{"type", "reasoning"}, {"id", "rs-enc"},
                         {"encrypted_content", "cipher"}};
-    assert(fmt::anthropic_block_from_responses_reasoning(encrypted_only).is_null());
+    // 01-P-17 ③: an item with only encrypted_content is carried by an empty
+    // thinking block, never by redacted_thinking.
+    json enc_block = fmt::anthropic_block_from_responses_reasoning(encrypted_only);
+    assert(enc_block["type"] == "thinking");
+    assert(enc_block["thinking"] == "");
+    assert(enc_block["signature"].get<std::string>().rfind(openai_prefix, 0) == 0);
+    assert(enc_block.dump().find("redacted_thinking") == std::string::npos);
+    // nothing to carry at all → still dropped.
+    json empty_item{{"type", "reasoning"}, {"id", "rs-empty"}};
+    assert(fmt::anthropic_block_from_responses_reasoning(empty_item).is_null());
 
     // Envelopes written by earlier releases stay decodable (read-only
     // compatibility for conversations produced before this contract).
@@ -189,7 +234,12 @@ int main() {
                       {"signature", fmt::encode_reasoning_envelope(
                            reasoning, "token-board-openai-reasoning-v1:")}};
     json legacy_restored = fmt::responses_reasoning_from_anthropic_block(legacy_block);
-    assert(legacy_restored == reasoning);
+    assert(legacy_restored["type"] == "reasoning");
+    assert(legacy_restored["id"] == "rs");
+    assert(legacy_restored["encrypted_content"] == "cipher");
+    assert(legacy_restored["summary"].size() == 1);
+    // The whitelist is permanent: a field outside it never comes back.
+    assert(!legacy_restored.contains("status"));
 
     // End-to-end: the Anthropic request built from a Responses reasoning item
     // must not carry a signature for that block nor any token-board envelope.
@@ -209,12 +259,17 @@ int main() {
             if (part.value("type", "") == "thinking") {
                 ++thinking_blocks;
                 assert(part.value("thinking", "") == "visible");
-                assert(!part.contains("signature"));
+                // No verification context here, so the carrier is kept for
+                // cross-vendor replay (01-P-17 ⑤ strips it only for
+                // signature-verifying Anthropic targets).
+                assert(part.contains("signature"));
+                assert(part["signature"].get<std::string>().rfind(
+                           openai_prefix, 0) == 0);
             }
         }
     }
     assert(thinking_blocks == 1);
-    assert(p17_anthropic.dump().find("token-board") == std::string::npos);
+    assert(p17_anthropic.dump().find(openai_prefix) != std::string::npos);
 
     // A thinking block that came off an Anthropic response keeps the
     // signature that vendor issued: only the Responses-origin item is adapted,
@@ -248,8 +303,10 @@ int main() {
     assert(responses->parse_request(encrypted_only_request, encrypted_only_ir, error));
     json encrypted_only_anthropic =
         anthropic_reasoning->serialize_request(encrypted_only_ir);
-    assert(encrypted_only_anthropic.dump().find("redacted_thinking") == std::string::npos);
-    assert(encrypted_only_anthropic.dump().find("token-board") == std::string::npos);
+    assert(encrypted_only_anthropic.dump().find("redacted_thinking") ==
+           std::string::npos);
+    assert(encrypted_only_anthropic.dump().find(openai_prefix) !=
+           std::string::npos);
     for (const auto &message : encrypted_only_anthropic["messages"]) {
         assert(!message["content"].empty());
         for (const auto &part : message["content"]) assert(!part.empty());

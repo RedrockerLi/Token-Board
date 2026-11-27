@@ -338,6 +338,10 @@ if $START_ALL; then
     BUILD_JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
     cmake --build "$SCRIPT_DIR/proxy/build" -j"$BUILD_JOBS" >/dev/null 2>&1
     [ -x "$PROXY_BIN" ] || { echo "[ERROR] proxy binary not found: $PROXY_BIN" >&2; exit 1; }
+    # --all is the deployment path that writes the ExecStart unit, so it checks
+    # the artifact too: a production binary must not carry the test crash
+    # marker. The check lives in scripts/start-proxy.sh so both entries share it.
+    bash "$SCRIPT_DIR/scripts/start-proxy.sh" --verify-binary "$PROXY_BIN" || exit 1
     echo -e "${GREEN}✓ 编译完成${NC}"
 
     if databases_are_current; then

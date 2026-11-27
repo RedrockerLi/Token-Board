@@ -113,7 +113,7 @@ class ProxyRoutingMixin:
                                 duration_ms: int = 0, output_tps: float = 0.0) -> bool:
         """Insert one imported software usage row on the caller's connection.
 
-        A pending V1 event lets SQLite select the current write-time price and FX.  A
+        A pending V1 event lets SQLite select the request-time price and FX.  A
         permanent receipt makes INSERT OR IGNORE idempotent even after the
         request_log retention window; `requested_at` must be a SQLite UTC timestamp
         "YYYY-MM-DD HH:MM:SS".
@@ -131,6 +131,23 @@ class ProxyRoutingMixin:
                 conn.execute("UPDATE request_log SET duration_ms=?,output_tps=? "
                              "WHERE event_id=? AND duration_ms=0",
                              (int(duration_ms), float(output_tps), event_id))
+            # token 是计价数量:重扫若看到原次扫描看不到的 token,旧金额就是
+            # 错的。收据拦住了整行写入,所以这里只把确有差异的那一行改回
+            # 'pending' 并清除金额,由同一触发器权威(V2.12 的 AFTER UPDATE)
+            # 按 requested_at 重新计价——不在 Python 里另写一份价格逻辑。
+            # event_id 唯一,单行 UPDATE;金额已一致时不写。
+            conn.execute(
+                "UPDATE request_log SET prompt_tokens=?,completion_tokens=?,"
+                "cache_read_tokens=?,total_tokens=?,pricing_status='pending',"
+                "equivalent_cost=0,billed_usage_cost=0 "
+                "WHERE event_id=? AND (prompt_tokens IS NOT ? "
+                "OR completion_tokens IS NOT ? OR cache_read_tokens IS NOT ? "
+                "OR total_tokens IS NOT ?)",
+                (int(prompt_tokens), int(completion_tokens),
+                 int(cache_read_tokens), int(total_tokens), event_id,
+                 int(prompt_tokens), int(completion_tokens),
+                 int(cache_read_tokens), int(total_tokens)),
+            )
             return False
         cur = conn.execute(
             "INSERT OR IGNORE INTO request_log"

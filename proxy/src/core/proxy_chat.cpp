@@ -391,6 +391,13 @@ void ProxyServer::handle_chat_request(const httplib::Request &req,
                 ir::to_string(upstream), c.upstream_model(), [&] {
                     auto request_context = request_conversion;
                     request_context.target = upstream;
+                    // A Responses reasoning item reaches Anthropic inside an
+                    // envelope this service owns; Anthropic's own API verifies
+                    // that field and would reject it (audit 01-P-17 ⑤).
+                    request_context.target_verifies_thinking_signature =
+                        upstream == ir::ApiFormat::Anthropic &&
+                        upstream_verifies_anthropic_signatures(
+                            c.account().base_url);
                     return upstream_codec->serialize_request(
                         cReq, &request_context).dump();
                 });

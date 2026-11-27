@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.db.proxy.billing import materialize_period_charges
-from app.db.proxy_db import ProxyDatabase
 from app.services.agent_usage.importer import import_once
 from app.services.sync.dashboard_sync import sync_dashboard
 from app.services.sync.dashboard_user_delete import delete_dashboard_users

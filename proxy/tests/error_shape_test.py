@@ -305,8 +305,13 @@ def main() -> None:
             assert retry_after is not None and 20 <= int(retry_after) <= 30, \
                 headers
             assert body["error"]["type"] == "service_unavailable", body
-            assert body["error"]["message"] == \
-                "All upstream keys are temporarily unavailable", body
+            # 04-C-19: code/type stay contractual; the message keeps its
+            # synthesized prefix and must now quote the last upstream response
+            # so an operator can see what actually failed.
+            message = body["error"]["message"]
+            assert message.startswith(
+                "All upstream keys are temporarily unavailable"), body
+            assert "Last upstream" in message, body
             print("3b OK: proxy timeout -> provider-fault avoid with the real "
                   f"Retry-After ({retry_after}s), not a 1s re-hammer")
 
@@ -365,9 +370,16 @@ def main() -> None:
                 "tb-anthbusy", {"model": "anthbusy-model",
                                 "messages": chat["messages"]})
             assert status == 429, f"anth busy status {status}"
-            assert body == {"type": "error", "error": {
-                "message": "All upstream keys are in provider quota cooldown",
-                "type": "rate_limit_error", "code": 429}}, body
+            # 04-C-19: the envelope shape, code and type stay contractual; the
+            # message must carry the last upstream response instead of being a
+            # bare synthetic line.
+            assert body["type"] == "error", body
+            assert body["error"]["code"] == 429, body
+            assert body["error"]["type"] == "rate_limit_error", body
+            message = body["error"]["message"]
+            assert message.startswith(
+                "All upstream keys are in provider quota cooldown"), body
+            assert "Last upstream" in message, body
             print(f"5 OK: Anthropic chat busy-429 envelope -> {body}")
 
             # ── 6. Embeddings used-failure 500 → structured, no "Upstream error:" ──
@@ -387,9 +399,12 @@ def main() -> None:
             status, body, _ = send(proxy_port, "POST", "/v1/embeddings",
                 "tb-embbusy", {"model": "embbusy-model", "input": "hi"})
             assert status == 429, f"emb busy status {status}"
-            assert body == {"error": {"message":
-                "All upstream keys are in provider quota cooldown",
-                "type": "rate_limit_error", "code": 429}}, body
+            assert body["error"]["code"] == 429, body
+            assert body["error"]["type"] == "rate_limit_error", body
+            message = body["error"]["message"]
+            assert message.startswith(
+                "All upstream keys are in provider quota cooldown"), body
+            assert "Last upstream" in message, body
             print(f"7 OK: embeddings busy-429 -> {body}")
 
             # ── 8. Models is a local catalog read: the stored catalog is

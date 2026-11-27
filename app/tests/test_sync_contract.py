@@ -5,11 +5,10 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from app.db.migrations import SchemaVersion, apply_sql_migrations, migrate
+from app.db.migrations import SchemaVersion, apply_sql_migrations
 from app.db.proxy_db import ProxyDatabase
 from app.db.schema_upgrade import ensure_local_databases
 from app.db.schema_upgrade.coordinator import inspect_version
@@ -21,7 +20,6 @@ from app.services.sync.webdav import (
     WebDAVConflict,
     WebDAVError,
     WebDAVClient,
-    publish_versioned_artifact,
 )
 from app.services.sync.config_merge import merge_config_tables
 from app.services.sync.config_sync import sync_config_pull, sync_config_upload

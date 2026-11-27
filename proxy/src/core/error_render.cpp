@@ -1,9 +1,47 @@
 #include "proxy_server_internal.h"
 
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <mutex>
 #include <stdexcept>
 
 namespace {
+
+// Wall-clock ISO-8601 stamp (UTC, milliseconds) for a recorded observation.
+std::string iso8601_utc_ms(std::int64_t wall_ms) {
+    const std::time_t seconds = static_cast<std::time_t>(wall_ms / 1000);
+    std::tm utc{};
+    gmtime_r(&seconds, &utc);
+    char stamp[40];
+    std::snprintf(stamp, sizeof stamp, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                  utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+                  utc.tm_hour, utc.tm_min, utc.tm_sec,
+                  static_cast<int>(wall_ms % 1000));
+    return stamp;
+}
+
+// What the upstream actually said: its response body when it sent one, the
+// transport/classification text otherwise.
+std::string upstream_payload(const UpstreamClient::ForwardResult &fwd) {
+    return fwd.body.empty() ? fwd.error : fwd.body;
+}
+
+// Last observed upstream error, process-wide.  One proxy serves one database,
+// so a single slot is the honest scope; only the most recent failure is kept
+// (this is an explanation for the next all-candidates-skipped response, not an
+// event log — the attempt journal keeps the history).
+struct UpstreamErrorLog {
+    std::mutex mutex;
+    UpstreamErrorSnapshot last;
+    bool seen = false;
+};
+
+UpstreamErrorLog &upstream_error_log() {
+    static UpstreamErrorLog log;
+    return log;
+}
 
 struct ErrorEnvelopeMapping {
     ir::ApiFormat format;
@@ -105,9 +143,95 @@ json normalize_upstream_error(const FormatCodec *upstream_codec,
             return upstream_codec->parse_error_body(json::parse(fwd.body));
         } catch (...) {}
     }
-    return json{{"message", fwd.error.empty() ? "upstream error" : fwd.error},
+    // No codec could normalize the body (opaque text, an unknown envelope, a
+    // non-JSON page): the classification text alone would hide the only
+    // actionable part, so the escaped excerpt rides along (04-C-19).
+    std::string message = fwd.error.empty() ? "upstream error" : fwd.error;
+    if (!fwd.body.empty()) {
+        const std::string excerpt = upstream_text_excerpt(fwd.body);
+        if (!excerpt.empty()) message += ": " + excerpt;
+    }
+    return json{{"message", message},
                 {"type", "upstream_error"},
                 {"code", default_status}};
+}
+
+std::string upstream_text_excerpt(const std::string &raw, std::size_t limit) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(limit == 0 ? raw.size() : limit + 24);
+    std::size_t consumed = 0;
+    for (const unsigned char ch : raw) {
+        std::string piece;
+        switch (ch) {
+            case '\\': piece = "\\\\"; break;
+            case '"': piece = "\\\""; break;
+            case '\r': piece = "\\r"; break;
+            case '\n': piece = "\\n"; break;
+            case '\t': piece = "\\t"; break;
+            default:
+                if (ch < 0x20 || ch == 0x7f) {
+                    piece = "\\x";
+                    piece.push_back(hex[ch >> 4]);
+                    piece.push_back(hex[ch & 0x0f]);
+                } else {
+                    piece.push_back(static_cast<char>(ch));
+                }
+        }
+        if (limit > 0 && out.size() + piece.size() > limit) break;
+        out += piece;
+        ++consumed;
+    }
+    if (consumed < raw.size()) {
+        out += "...(+";
+        out += std::to_string(raw.size() - consumed);
+        out += " bytes)";
+    }
+    return out;
+}
+
+void record_upstream_error(int status_code, const std::string &raw) {
+    if (raw.empty()) return;
+    UpstreamErrorSnapshot snapshot;
+    snapshot.status_code = status_code;
+    snapshot.excerpt = upstream_text_excerpt(raw);
+    snapshot.wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    auto &log = upstream_error_log();
+    std::lock_guard<std::mutex> lock(log.mutex);
+    log.last = std::move(snapshot);
+    log.seen = true;
+}
+
+bool last_upstream_error(UpstreamErrorSnapshot *out) {
+    auto &log = upstream_error_log();
+    std::lock_guard<std::mutex> lock(log.mutex);
+    if (!log.seen) return false;
+    if (out != nullptr) *out = log.last;
+    return true;
+}
+
+std::string with_upstream_context(
+    const std::string &message,
+    const std::vector<Database::AttemptInfo> &attempts,
+    const UpstreamClient::ForwardResult &fwd) {
+    if (!attempts.empty()) {
+        // This request reached the upstream: quote its own last error.
+        const std::string excerpt =
+            upstream_text_excerpt(upstream_payload(fwd));
+        if (excerpt.empty()) return message;
+        return message + ". Last upstream error: " + excerpt;
+    }
+    // Every candidate was skipped locally: quote the last upstream answer the
+    // proxy did see, with the time it arrived, so "all keys rate limited" can
+    // be told apart from an exhausted quota or a disabled model.
+    UpstreamErrorSnapshot last;
+    if (!last_upstream_error(&last))
+        return message + ". No upstream response has been recorded yet";
+    return message + ". Last upstream response (" +
+           std::to_string(last.status_code) + ") at " +
+           iso8601_utc_ms(last.wall_ms) + ": " + last.excerpt;
 }
 
 TerminalError render_terminal_error(
@@ -151,10 +275,31 @@ TerminalError render_terminal_error(
             : opts.no_candidate_retry_after;
         const char *message =
             no_candidate_message(opts.no_candidate_reason, opts.busy_message);
+        // A skipped candidate is still an upstream fact: quote what the
+        // upstream last said so the client can tell a transient rate limit
+        // from an exhausted quota or a disabled model (04-C-19).  Local
+        // capacity is a proxy-resource condition with no upstream answer to
+        // quote, so it keeps the plain message.
+        const bool upstream_conditioned =
+            provider_cooldown || rate_limited ||
+            opts.no_candidate_reason == NoCandidateReason::kKeyUnavailable ||
+            opts.no_candidate_reason == NoCandidateReason::kSubscriptionLapsed;
+        const std::string annotated = upstream_conditioned
+            ? with_upstream_context(message, attempts, fwd)
+            : std::string(message);
         normalized = from_body(out.status, json{
-            {"message", message},
+            {"message", annotated},
             {"type", throttled ? "rate_limit_error" : "service_unavailable"},
             {"code", out.status}});
+    } else if (!opts.used) {
+        // Attempts were made but no candidate owns this failure (the retry
+        // budget ended mid-chain): keep the normalized upstream message and
+        // append this request's raw upstream error.
+        NormalizedError base = from_body(
+            out.status,
+            normalize_upstream_error(upstream_codec, fwd, out.status));
+        base.message = with_upstream_context(base.message, attempts, fwd);
+        normalized = std::move(base);
     } else if (opts.used && opts.passthrough && !fwd.body.empty()) {
         // Same-format upstream error: preserve its structured body verbatim.
         out.body = fwd.body;
@@ -226,8 +371,17 @@ NormalizedError render_stream_error(
         const bool throttled = provider_cooldown || rate_limited;
         const char *message =
             no_candidate_message(no_candidate_reason, busy_message);
+        // Same rule as the terminal renderer: an upstream-conditioned skip
+        // quotes the last upstream answer (04-C-19), local capacity does not.
+        const bool upstream_conditioned =
+            provider_cooldown || rate_limited ||
+            no_candidate_reason == NoCandidateReason::kKeyUnavailable ||
+            no_candidate_reason == NoCandidateReason::kSubscriptionLapsed;
+        const std::string annotated = upstream_conditioned
+            ? with_upstream_context(message, attempts, fwd)
+            : std::string(message);
         out = from_body(throttled ? 429 : 503,
-                        json{{"message", message},
+                        json{{"message", annotated},
                              {"type", throttled
                                           ? "rate_limit_error"
                                           : "service_unavailable"},

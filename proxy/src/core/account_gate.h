@@ -24,7 +24,9 @@
 ///   - subscription quota cooldown: an explicit quota-exhaustion 429 on a
 ///     plan key holds it until the trusted window reset (5h fallback when no
 ///     reset is known); only evidence (a fresh usage observation, or the
-///     probe channel for keys without usage data) lifts it early.
+///     probe channel for keys without usage data) lifts it early, and only
+///     when that evidence postdates the cooldown it lifts (see
+///     clear_cooldown_if_current).
 ///   - rate limit: an ordinary 429 holds the key for the upstream's
 ///     Retry-After (60s default); a later success clears it.
 ///   - auth error: 401/403 holds the key for 15 minutes; a later success
@@ -53,6 +55,19 @@ public:
         /// subscription.  Produced by AttemptExecutor, not by the gate; the
         /// key is excluded from this request without touching its state.
         kSubscriptionLapsed,
+    };
+
+    /// Outcome of a recovery-driven cooldown clear.  Only kCleared means the
+    /// cooldown the recovery evidence observed was lifted; the other results
+    /// let the caller log a dropped clear instead of losing it silently.
+    enum class CooldownClearResult {
+        kCleared,
+        /// The slot is no longer cooling (expired, or already cleared).
+        kNotCooling,
+        /// A newer cooldown replaced the observed one between the recovery
+        /// observation and this call: the evidence does not cover it, so it
+        /// stays in force.
+        kSuperseded,
     };
 
     static constexpr auto PLAN_COOLDOWN = std::chrono::hours(5);
@@ -209,14 +224,27 @@ public:
         return true;
     }
 
-    /// Clear the quota cooldown for a slot (the recovery evidence confirmed
-    /// the window reset, or the probe found the upstream serving again).
-    /// No-op when the slot is not cooling.
-    void clear_cooldown(int key_slot_id) {
+    /// Clear the quota cooldown the recovery evidence observed.
+    ///
+    /// `observation_wall` is the wall epoch at which the recovery evidence was
+    /// gathered (`CooldownEvidence::marked_wall` of the observed cooldown, the
+    /// usage snapshot's `observed_at`, or a probe's start time).  A cooldown
+    /// marked after that instant was created by a failure the evidence never
+    /// saw, so lifting it would let the key hit the same 429 again for free:
+    /// the call reports kSuperseded and leaves it in force.
+    CooldownClearResult clear_cooldown_if_current(int key_slot_id,
+                                                  std::int64_t observation_wall) {
         auto &state = shard(key_slot_id);
         std::lock_guard<std::mutex> lock(state.mutex);
-        state.cooldown_until.erase(key_slot_id);
+        auto cooling = state.cooldown_until.find(key_slot_id);
+        if (cooling == state.cooldown_until.end()) return CooldownClearResult::kNotCooling;
+        auto evidence = state.cooldown_evidence.find(key_slot_id);
+        if (evidence != state.cooldown_evidence.end() &&
+            evidence->second.marked_wall > observation_wall)
+            return CooldownClearResult::kSuperseded;
+        state.cooldown_until.erase(cooling);
         state.cooldown_evidence.erase(key_slot_id);
+        return CooldownClearResult::kCleared;
     }
 
 private:

@@ -147,3 +147,28 @@ class AccountDuplicateTest(AppDatabaseTestCase):
         rejected = self._duplicate(aggregate.get_json()["id"])
         self.assertEqual(rejected.status_code, 404,
                          rejected.get_data(as_text=True))
+
+    def test_duplicate_keeps_best_effort_catalog_failure_observable(self) -> None:
+        """03-F-17: 模型目录复制失败仍是 best-effort，但必须留下 warning。"""
+        source_id = self._create()
+        self.db.update_account_models(source_id, ["m-a", "m-b"])
+        # Only the model-catalog copy fails: the table is gone, exactly like a
+        # partially migrated installation.  Patching the routing helper would
+        # also break account serialization, which is a different failure.
+        with sqlite_connection(self.proxy_path) as connection:
+            connection.execute("DROP TABLE upstream_model_catalog")
+        with self.assertLogs("app.db.proxy.accounts_write",
+                             level="WARNING") as captured:
+            response = self._duplicate(source_id)
+        created_id = response.get_json()["id"]
+        self.assertEqual(response.status_code, 201,
+                         response.get_data(as_text=True))
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(any("model catalog copy failed" in message
+                            and str(created_id) in message
+                            for message in messages),
+                        messages)
+        created = response.get_json()
+        # The best-effort copy still succeeds and keeps its declared shape.
+        self.assertEqual(set(created), {"id", "name", "keys_copied"})
+        self.assertEqual(created["name"], "copy-source 副本")

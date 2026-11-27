@@ -127,6 +127,12 @@ struct ConversionContext {
     ApiFormat target = ApiFormat::OpenAI;
     ToolContext tools;
     std::string generated_response_id;
+    // True when the upstream verifies the Anthropic thinking-block `signature`
+    // it issued.  The reasoning bridge puts an envelope this service owns in
+    // that slot, which such an upstream rejects, so the request serializer
+    // strips it first (audit 01-P-17 ⑤).  Callers set it from
+    // `upstream_verifies_anthropic_signatures(base_url)`.
+    bool target_verifies_thinking_signature = false;
 };
 
 struct ReasoningConfig {
@@ -184,18 +190,6 @@ enum class StreamEventType {
     MessageFinish,         // stop_reason (+ stop_sequence in extra)
     UsageEvent,            // usage snapshot (last wins)
     ErrorEvent,            // in-stream upstream error; envelope in `extra`
-    // Typed Item/Event vocabulary used by Responses adapters.  Aliases keep
-    // existing Chat/Anthropic parsers source-compatible while exposing the
-    // lifecycle names to new codecs and tests.
-    ResponseStart = MessageStart,
-    ItemStart = ToolCallStart,
-    TextDelta = ContentTextDelta,
-    ReasoningDelta = ContentThinkingDelta,
-    ToolPayloadDelta = ToolCallArgumentDelta,
-    ItemDone = ToolCallDone,
-    ResponseFinish = MessageFinish,
-    Usage = UsageEvent,
-    Error = ErrorEvent,
 };
 
 struct StreamEvent {

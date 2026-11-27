@@ -23,10 +23,14 @@ bool build_tool_context(const std::vector<ir::Tool> &source,
 
 // Streaming wire/state limits.  They are deliberately larger than normal LLM
 // deltas while still preventing one unterminated SSE frame or tool call from
-// retaining an unbounded amount of memory.
+// retaining an unbounded amount of memory.  Emitter state is bounded the same
+// way: one entry per open item (parsers refuse to open more than
+// kMaxStreamItems), plus the text of the answer being re-emitted in the
+// terminal event, which is as large as the answer the client asked for.  No
+// separate byte cap applies to that buffered text — a fixed cap would fail
+// legitimate long answers rather than stop a leak (audit 03-F-07).
 inline constexpr size_t kMaxSseFrameBytes = 4 * 1024 * 1024;
 inline constexpr size_t kMaxToolArgumentsBytes = 8 * 1024 * 1024;
-inline constexpr size_t kMaxEmitterStateBytes = 16 * 1024 * 1024;
 inline constexpr size_t kMaxStreamItems = 256;
 
 /// Parse an OpenAI-style `{type:"image_url", image_url:{url}}` part into an
@@ -46,9 +50,19 @@ std::string build_data_uri(const std::string &media_type,
 const char *stop_reason_to_openai(ir::StopReason r);   // finish_reason
 const char *stop_reason_to_anthropic(ir::StopReason r); // stop_reason
 const char *stop_reason_to_responses(ir::StopReason r); // status: completed/incomplete
+/// `incomplete_details.reason` for a stop reason that maps to the `incomplete`
+/// status: "max_output_tokens" (Length) or "content_filter" (ContentFilter).
+/// nullptr when the reason's status is `completed`.  Anthropic's `refusal` is
+/// the carrier of ContentFilter, so this is what keeps that value reversible
+/// between the two protocols (audit 01-P-12).
+const char *responses_incomplete_reason(ir::StopReason r);
 ir::StopReason openai_finish_reason_to_stop(const std::string &fr);
 ir::StopReason anthropic_stop_reason_to_stop(const std::string &sr);
-ir::StopReason responses_status_to_stop(const std::string &st);
+/// `incomplete_details` (the whole object, or null) refines `incomplete`:
+/// `reason == "content_filter"` reads back as ContentFilter instead of Length
+/// (audit 01-P-12).
+ir::StopReason responses_status_to_stop(const std::string &st,
+                                        const json &incomplete_details = json());
 
 /// Normalize an IR tool_choice (raw, may be either format's shape) into the
 /// OpenAI chat-completions tool_choice shape:

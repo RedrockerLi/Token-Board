@@ -18,6 +18,7 @@ from ..common import (
     timestamp,
 )
 from ..ir import ParseBatch, UsageSource
+from .record_identity import assign_ordinals
 
 KIND = "cline"
 LABEL = "Cline"
@@ -67,13 +68,18 @@ def _roots(software: dict) -> list[Path]:
         base = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
-    return _unique([
+    roots = _unique([
         home / ".cline",
         Path(os.environ.get("CLINE_DIR", home / ".cline")).expanduser(),
         Path(os.environ.get("CLINE_DATA_DIR", home / ".cline" / "data")).expanduser(),
         *[base / host / "User" / "globalStorage" / "saoudrizwan.claude-dev"
           for host in HOSTS],
     ])
+    # Both a Cline home and its ``data`` directory are stores: the reference
+    # resolver expands every root with its ``data`` sibling, so a relocated
+    # ``CLINE_DIR`` that keeps the tasks under ``<dir>/data`` is found too.
+    return _unique([candidate for root in roots
+                    for candidate in (root, root / "data")])
 
 
 def _sdk_session_dirs(software: dict | None = None) -> list[Path]:
@@ -84,9 +90,9 @@ def _sdk_session_dirs(software: dict | None = None) -> list[Path]:
         candidates = [root / "sessions" for root in roots]
         candidates.extend(root / "data" / "sessions" for root in roots)
     else:
+        # ``_roots`` already carries each store's ``data`` sibling, so one
+        # ``sessions`` probe per root matches the reference resolution.
         candidates = [root / "sessions" for root in _roots(software or {})]
-        candidates.extend(root / "data" / "sessions"
-                          for root in _roots(software or {}))
         explicit = os.environ.get("CLINE_SESSION_DATA_DIR", "").strip()
         if explicit:
             candidates.append(Path(explicit).expanduser())
@@ -156,8 +162,10 @@ def _parse_legacy(item: UsageSource) -> ParseBatch:
                            or task.get("shadowGitConfigWorkTree")
                            or task.get("cwd"))
     fallback_model = str(task.get("modelId") or "cline-unknown")
-    events = []
-    for index, message in enumerate(messages):
+    # A task's ui_messages array can be rewritten (resume, truncate), so the
+    # array index is not the record's identity; its own fields are.
+    payloads = []
+    for message in messages:
         if not isinstance(message, dict):
             continue
         ts = timestamp(message.get("ts"))
@@ -169,10 +177,9 @@ def _parse_legacy(item: UsageSource) -> ParseBatch:
             continue
         if not isinstance(info, dict):
             continue
-        event = make_event(
+        payloads.append(dict(
             kind=KIND,
             source_key=f"task:{item.context.get('task_identity') or item.context.get('task_id')}",
-            ordinal=index,
             model=info.get("model") or fallback_model,
             requested_at=ts,
             input_tokens=info.get("tokensIn", 0) + info.get("cacheWrites", 0),
@@ -180,7 +187,12 @@ def _parse_legacy(item: UsageSource) -> ParseBatch:
             cached_input_tokens=info.get("cacheReads", 0),
             project=project,
             session_id=item.context.get("task_id"),
-        )
+        ))
+    events = []
+    for payload, ordinal in zip(payloads, assign_ordinals(payloads)):
+        if ordinal is None:
+            continue
+        event = make_event(**payload, ordinal=ordinal)
         if event:
             events.append(event)
     return batch(events, len(messages))

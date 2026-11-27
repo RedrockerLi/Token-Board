@@ -49,7 +49,9 @@ bool ResponsesCodec::parse_response(const json &in, ir::ChatResponse &out,
     if (in.contains("model") && in["model"].is_string())
         out.model = in["model"].get<std::string>();
     if (in.contains("status") && in["status"].is_string())
-        out.stop_reason = fmt::responses_status_to_stop(in["status"].get<std::string>());
+        out.stop_reason = fmt::responses_status_to_stop(
+            in["status"].get<std::string>(),
+            in.contains("incomplete_details") ? in["incomplete_details"] : json());
 
     if (in.contains("output") && in["output"].is_array()) {
         for (const auto &item : in["output"]) {
@@ -235,6 +237,12 @@ json ResponsesCodec::serialize_response(const ir::ChatResponse &in,
     out["created_at"] = in.extras.contains("created_at") ? in.extras["created_at"]
                                                          : json(nullptr);
     out["status"] = fmt::stop_reason_to_responses(in.stop_reason);
+    // The status alone cannot carry a filtered answer: `incomplete` needs the
+    // detail object, otherwise the reason degrades to Length on the way back
+    // (audit 01-P-12).
+    if (const char *incomplete_reason =
+            fmt::responses_incomplete_reason(in.stop_reason))
+        out["incomplete_details"] = json{{"reason", incomplete_reason}};
     out["model"] = in.model;
     if (preserve_native_metadata && in.extras.contains("context_management"))
         out["context_management"] = in.extras["context_management"];

@@ -1,10 +1,15 @@
 """ProxyDatabase methods for ProxyAccountWriteMixin."""
 
+import logging
+
 from app.core.time import utc_now
 from app.db.proxy.common import (
     ACCOUNT_TYPES, ConflictError, _parse_iso_date, _subscription_date,
     is_subscription, json, spec, sqlite3, uuid,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 def _validated_subtype(value: object, type_spec) -> str | None:
@@ -304,6 +309,7 @@ class ProxyAccountWriteMixin:
 
         # 已缓存的模型目录属于账户当前可用的模型集合，随配置一起复制；best-effort：
         # 账户已经建好，目录复制失败不该把成功的复制报成失败（首次「更新」可补）。
+        # 但不得静默：失败留 warning（含账号与完整异常），排障与健康检查可见。
         try:
             conn = self._connect()
             try:
@@ -318,8 +324,9 @@ class ProxyAccountWriteMixin:
                     conn.commit()
             finally:
                 conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("model catalog copy failed for duplicated account %s: %s",
+                        new_id, exc, exc_info=True)
 
         return {"id": new_id, "name": new_name, "keys_copied": len(keys)}
 

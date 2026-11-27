@@ -108,5 +108,50 @@ int main() {
                           "https://host/v1beta", "", "gemini-2.5-pro", false,
                           path, path_is_full);
     assert(path == "/models/gemini-2.5-pro:generateContent");
+
+    // ── 01-P-18: the OpenAI family gains /v1 when the base URL has no version
+    // segment, exactly like the Anthropic and Gemini targets. ──────────────
+    resolve_upstream_path(endpoint_policy(EndpointKind::Chat), "openai",
+                          "https://api.example.com", "", "", false, path,
+                          path_is_full);
+    assert(path == "/v1/chat/completions");
+    assert(!path_is_full);
+    resolve_upstream_path(endpoint_policy(EndpointKind::Responses),
+                          "openai_responses", "https://api.example.com", "", "",
+                          false, path, path_is_full);
+    assert(path == "/v1/responses");
+    assert(!path_is_full);
+    resolve_upstream_path(compact, "openai_responses", "https://api.example.com",
+                          "", "", false, path, path_is_full);
+    assert(path == "/v1/responses/compact");
+    assert(!path_is_full);
+    // A base URL that already names a version must not be doubled.
+    resolve_upstream_path(endpoint_policy(EndpointKind::Chat), "openai",
+                          "https://api.example.com/v1", "", "", false, path,
+                          path_is_full);
+    assert(path == "/chat/completions");
+    resolve_upstream_path(endpoint_policy(EndpointKind::Responses),
+                          "openai_responses", "https://api.example.com/v1", "",
+                          "", false, path, path_is_full);
+    assert(path == "/responses");
+    resolve_upstream_path(endpoint_policy(EndpointKind::Chat), "openai",
+                          "https://api.example.com/v1beta", "", "", false, path,
+                          path_is_full);
+    assert(path == "/chat/completions");
+    assert(!path_is_full);
+
+    // ── 01-P-17 ⑤: only Anthropic's own endpoints verify thinking
+    // signatures, so only those need this service's carrier stripped. ─────
+    assert(upstream_verifies_anthropic_signatures("https://api.anthropic.com"));
+    assert(upstream_verifies_anthropic_signatures(
+        "https://api.anthropic.com/v1"));
+    assert(upstream_verifies_anthropic_signatures("https://anthropic.com"));
+    assert(upstream_verifies_anthropic_signatures("api.anthropic.com"));
+    assert(!upstream_verifies_anthropic_signatures("https://api.deepseek.com"));
+    assert(!upstream_verifies_anthropic_signatures(
+        "https://anthropic-compatible.example.com"));
+    assert(!upstream_verifies_anthropic_signatures("https://notanthropic.com"));
+    assert(!upstream_verifies_anthropic_signatures(""));
+
     return 0;
 }

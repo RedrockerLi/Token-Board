@@ -30,6 +30,7 @@ from ..common import (
     timestamp,
 )
 from ..ir import ParseBatch, UsageSource
+from .record_identity import assign_ordinals
 
 log = logging.getLogger(__name__)
 
@@ -245,19 +246,29 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
             ),
         )
 
-    events = []
+    # The export is a fresh full snapshot on every sync, so its row order is
+    # not a contract: a positional event id re-imports rows that merely moved.
+    # The identity is the row's own content instead.
+    payloads = []
     rows = list(csv_rows(text))
-    for index, row in enumerate(rows):
+    for row in rows:
         model = row.get("Model", "").strip()
         ts = timestamp(row.get("Date"))
         if not model or not ts:
             continue
-        event = make_event(
-            kind=KIND, source_key=item.state_key, ordinal=f"{index}:{row.get('Date')}:{model}", model=model,
-            requested_at=ts, input_tokens=_csv_int(row.get("Input (w/ Cache Write)")) + _csv_int(row.get("Input (w/o Cache Write)")),
-            output_tokens=_csv_int(row.get("Output Tokens")), cached_input_tokens=_csv_int(row.get("Cache Read")),
+        payloads.append(dict(
+            kind=KIND, source_key=item.state_key, model=model, requested_at=ts,
+            input_tokens=(_csv_int(row.get("Input (w/ Cache Write)"))
+                          + _csv_int(row.get("Input (w/o Cache Write)"))),
+            output_tokens=_csv_int(row.get("Output Tokens")),
+            cached_input_tokens=_csv_int(row.get("Cache Read")),
             project="unknown", input_includes_cache=False,
-        )
+        ))
+    events = []
+    for payload, ordinal in zip(payloads, assign_ordinals(payloads)):
+        if ordinal is None:
+            continue
+        event = make_event(**payload, ordinal=ordinal)
         if event:
             events.append(event)
     return batch(events, len(rows))

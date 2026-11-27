@@ -14,7 +14,6 @@ void ProxyServer::handle_streaming(
     const std::string &upstream_session,
     const std::string &anthropic_beta, const httplib::Request &req,
     httplib::Response &res, std::chrono::steady_clock::time_point t0) {
-    const FormatCodec &harness_codec = codecs_.get(harness);
     const auto &request_policy = endpoint_policy(endpoint_kind);
     auto log_context = make_proxy_log_context(request_id, req.method, req.path, ir::to_string(harness));
     set_proxy_log_client_fields(log_context, req.remote_addr,
@@ -194,6 +193,13 @@ void ProxyServer::handle_streaming(
                             : std::make_shared<ir::ConversionContext>();
                         request_context->source = harness;
                         request_context->target = upstream;
+                        // See the non-streaming path: an envelope this service
+                        // wrote must not reach an upstream that verifies the
+                        // signature field (audit 01-P-17 ⑤).
+                        request_context->target_verifies_thinking_signature =
+                            upstream == ir::ApiFormat::Anthropic &&
+                            upstream_verifies_anthropic_signatures(
+                                candidate.account().base_url);
                         found = converted_bodies.emplace(
                             cache_key,
                             codecs_.get(upstream).serialize_request(

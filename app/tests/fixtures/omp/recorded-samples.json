@@ -1,0 +1,69 @@
+{
+  "provenance": "Sanitized local captures, 2026-11-05; OMP 18.16.0. Container shape modeled on ref/vibe-usage/test/fixtures/magpie/recorded-samples.json (provenance + files map); records are kept verbatim, including fields Token-Board does not read, so the golden case also proves unknown fields cannot change the parsed result.",
+  "files": {
+    "omp--2026-11-05T08-47-42-468Z_01a1aae4-7984-739b-8fda-527cc87e9f41.jsonl": [
+      {
+        "type": "session",
+        "version": 3,
+        "id": "01a1aae4-7984-739b-8fda-527cc87e9f41",
+        "timestamp": "2026-11-05T08:47:42.468Z",
+        "cwd": "/Users/example/work/proj-alpha",
+        "recorderExtension": {"unknown": "captured field that parsing must ignore"}
+      },
+      {
+        "type": "message",
+        "id": "8f0a3f70-3d4f-4a4d-9a5a-53d6cb2a1b21",
+        "timestamp": "2026-11-05T08:47:43.120Z",
+        "message": {
+          "role": "user",
+          "content": "summarize the captured session"
+        },
+        "telemetry": {"elapsedMs": 12}
+      },
+      {
+        "type": "message",
+        "id": "5b6c7c2e-8f3a-4f31-a9f5-1a2c3d4e5f60",
+        "timestamp": "2026-11-05T08:47:44.905Z",
+        "message": {
+          "role": "assistant",
+          "model": "deepseek/deepseek-v4.1-flash",
+          "usage": {
+            "input": 120,
+            "output": 40,
+            "cacheRead": 30,
+            "cacheWrite": 6,
+            "reasoning": 8,
+            "serviceTier": "standard",
+            "unknownUsageField": 99
+          },
+          "providerMetadata": {"provider": "deepseek", "requestId": "req-001"}
+        },
+        "recorderExtension": {"transport": "http"}
+      },
+      {
+        "type": "message",
+        "id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+        "timestamp": "2026-11-05T08:47:46.210Z",
+        "message": {
+          "role": "assistant",
+          "modelId": "deepseek-v4.1",
+          "usage": {
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "cacheReadInputTokens": 2
+          }
+        }
+      },
+      {
+        "type": "message",
+        "id": "9f8e7d6c-5b4a-4321-9876-543210fedcba",
+        "timestamp": "2026-11-05T08:47:47.010Z",
+        "message": {
+          "role": "assistant",
+          "model": "deepseek/deepseek-v4.1-flash",
+          "content": "no usage captured for this turn"
+        }
+      }
+    ]
+  }
+}

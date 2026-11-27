@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest.mock import patch

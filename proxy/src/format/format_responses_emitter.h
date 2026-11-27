@@ -19,6 +19,10 @@ private:
     // finished", so a usage event that precedes the terminal must not emit
     // response.completed early (or with a guessed status).
     std::string deferred_status_;
+    // The status string cannot distinguish Length from ContentFilter; keep the
+    // IR reason so the terminal event can write `incomplete_details.reason`
+    // (audit 01-P-12).
+    ir::StopReason deferred_stop_reason_ = ir::StopReason::Unknown;
     ir::Usage last_usage_;
     json terminal_extras_ = json::object();
     std::map<int, std::string> text_, reasoning_text_, item_ids_;

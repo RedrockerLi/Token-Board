@@ -6,6 +6,7 @@
 #include "routing_snapshot.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -107,18 +108,25 @@ inline bool candidate_usage_exhausted(const UpstreamCandidate &candidate,
 }
 
 /// Earliest trusted reset among the windows that veto the credential; 0 when
-/// none is known (those sort last among exhausted candidates).
+/// none is known (those sort last among exhausted candidates).  "Trusted"
+/// means the reset stamp is still ahead of `now`: a present reset is used
+/// whether or not the surrounding snapshot is fresh, because the deadline
+/// itself is what makes the credential recover.
 inline std::int64_t candidate_exhausted_reset(
     const UpstreamCandidate &candidate, std::int64_t now) {
     const auto *usage = candidate.usage();
     if (usage == nullptr) return 0;
-    const bool fresh = usage_snapshot_fresh(usage, now);
     std::int64_t earliest = 0;
     for (const auto &window : usage->windows) {
         if (window.percent < kExhaustedPercent) continue;
-        const bool vetos = window.resets_at > now ||
-            (window.resets_at == 0 && fresh);
-        if (!vetos || window.resets_at == 0) continue;
+        // Only a reset still ahead of `now` puts the credential on a recovery
+        // schedule.  resets_at == 0 means "unknown" and is not a deadline
+        // either, and `now` is wall-clock epoch seconds (so 0 <= now holds):
+        // the earlier two-branch test (reset ahead of now, or an unknown
+        // reset on a fresh snapshot) plus the unconditional unknown-reset
+        // skip reduce to exactly this single deadline test.  Snapshot
+        // freshness cannot change the outcome for any input.
+        if (window.resets_at <= now) continue;
         if (earliest == 0 || window.resets_at < earliest)
             earliest = window.resets_at;
     }
@@ -151,12 +159,22 @@ inline bool candidate_subscription_lapsed(const UpstreamCandidate &candidate,
 
 enum class UsageWindowKind { kMonthly, kWeekly, kRolling };
 
+/// Wire name of a usage window.  The switch enumerates every UsageWindowKind
+/// value (so -Wswitch keeps flagging a newly added kind here); a non-void
+/// function must still return on the fall-through path after the switch.
 inline const char *usage_window_name(UsageWindowKind kind) {
     switch (kind) {
         case UsageWindowKind::kMonthly: return "month";
         case UsageWindowKind::kWeekly: return "week";
         case UsageWindowKind::kRolling: return "5h";
     }
+    // Unreachable through the type: only the three enumerators above exist,
+    // and every call site passes one of them by name (candidate_in_kill_line's
+    // kMonthly, candidate_order's fixed monthly/weekly/rolling list).  It
+    // stays — rather than a `default:` label, which would silence the
+    // exhaustiveness warning — because a value produced by an explicit cast
+    // can still arrive here; "" then names no window, so the caller declines
+    // to judge pressure instead of inventing a signal.
     return "";
 }
 
@@ -186,7 +204,13 @@ inline bool window_pressure(const UpstreamCandidate &candidate,
     if (window->resets_at <= now) return false;
     out->remaining = 100 - window->percent;
     out->seconds = window->resets_at - now;
-    return out->remaining > 0;
+    // The invariant lives here, not in the return value: the guard above
+    // rejects percent >= kExhaustedPercent (100), so remaining = 100 - percent
+    // is at least 1 for every input that reaches this line — a negative
+    // percent only makes it larger.  The bool answers "this window supplies a
+    // pressure signal"; callers may read `out` once it is true.
+    assert(out->remaining > 0);
+    return true;
 }
 
 /// True when the credential's month window resets in strictly less than
@@ -308,6 +332,15 @@ inline std::vector<size_t> candidate_order(
         const int in_flight = gate ? gate->in_flight(candidate.key_slot_id) : 0;
         return ledger->effective_cost(candidate.key_slot_id, in_flight);
     };
+    // Snapshot each candidate's ordering cost once.  cost_of() takes the gate's
+    // shard lock and the ledger's shared lock, and the comparator below runs
+    // O(N log N) times — reading the cost inside it amplified one per-request
+    // O(1) lock into 2·2·N·log₂N acquisitions (~344 for 20 candidates).  The
+    // snapshot also keeps the comparator a strict weak ordering while another
+    // thread allocates or releases slots mid-sort.
+    std::vector<double> costs(candidates.size());
+    for (size_t index = 0; index < candidates.size(); ++index)
+        costs[index] = cost_of(candidates[index]);
     const auto before = [&](size_t lhs, size_t rhs) {
         const auto &a = candidates[lhs];
         const auto &b = candidates[rhs];
@@ -324,8 +357,8 @@ inline std::vector<size_t> candidate_order(
                 if (b_reset == 0) return true;
                 return a_reset < b_reset;
             }
-            const double a_cost = cost_of(a);
-            const double b_cost = cost_of(b);
+            const double a_cost = costs[lhs];
+            const double b_cost = costs[rhs];
             if (a_cost != b_cost) return a_cost < b_cost;
             return false;
         }
@@ -357,8 +390,8 @@ inline std::vector<size_t> candidate_order(
                 if (lhs != rhs) return lhs > rhs;
             }
         }
-        const double a_cost = cost_of(a);
-        const double b_cost = cost_of(b);
+        const double a_cost = costs[lhs];
+        const double b_cost = costs[rhs];
         if (a_cost != b_cost) return a_cost < b_cost;
         return false;
     };

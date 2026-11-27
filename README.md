@@ -8,7 +8,7 @@
 - 多账户路由:一个本地密钥绑定一个上游账户;聚合账户把多个上游合并成一个模型列表,同一模型可配置多个账户自动回退
 - 峰谷定价:按时段给模型定价配倍率,成本在请求写入时按当时价格固化,改价不回溯
 - 用量仪表盘:模型趋势、Token 类型分布、按用户分摊费用;存档只存用量与总价,改价不回溯
-- 智能体管理:独立维护订阅与软件来源,通过统一 IR 导入 34 种本地 agent 用量,一个订阅同一时点只绑定一个 Agent,绑定关系可解绑或改绑,实现参考[vibe-usage](https://github.com/vibe-cafe/vibe-usage)
+- 智能体管理:独立维护订阅与软件来源,通过统一 IR 导入 36 种本地 agent 用量,一个订阅同一时点只绑定一个 Agent,绑定关系可解绑或改绑,实现参考[vibe-usage](https://github.com/vibe-cafe/vibe-usage)
 - 性能监控:成功率、延迟分布(P50/P95/P99)、输出速度分布、吞吐、实时并发
 - WebDAV 同步:配置与聚合用量跨机器同步,明细数据不上传
 
@@ -233,7 +233,7 @@ bash scripts/status.sh
 | [doc/database-migrations.md](doc/database-migrations.md) | schema 迁移机制与升级步骤 |
 | [doc/billing-pricing.md](doc/billing-pricing.md) | 定价、峰谷档位、写时计价固化、plan 虚拟消费 |
 | [doc/upstream-concepts.md](doc/upstream-concepts.md) | 上游账户模型：api/plan 类型、单上游多密钥、聚合上游，及智能体管理的边界 |
-| [doc/format-conversion.md](doc/format-conversion.md) | 三格式转换、IR 与 codec、流式处理、think 抽取 |
+| [doc/format-conversion.md](doc/format-conversion.md) | 四格式转换、IR 与 codec、流式处理、think 抽取 |
 | [doc/proxy-internals.md](doc/proxy-internals.md) | 路由、并发闸门、超时、回退、性能监控 |
 | [doc/sync.md](doc/sync.md) | WebDAV 同步协议、云端权威事务、高水位检查点、追加模式 |
 | [doc/api-reference.md](doc/api-reference.md) | 全部 API 端点与命令行参数 |

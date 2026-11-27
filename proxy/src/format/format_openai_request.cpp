@@ -1,5 +1,9 @@
 #include "format_openai_internal.h"
 
+#include <atomic>
+#include <cctype>
+#include <cstdint>
+
 using namespace ir;
 
 bool OpenAICodec::parse_request(const json &in, ir::ChatRequest &out,
@@ -263,11 +267,25 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in,
             in.tool_choice, context, ApiFormat::OpenAI);
     if (in.reasoning.enabled && !in.reasoning.effort.empty())
         body["reasoning_effort"] = in.reasoning.effort;
+    else if (in.reasoning.enabled && in.reasoning.budget_tokens.has_value())
+        // Anthropic clients express strength as `thinking.budget_tokens` and
+        // never set `effort`; Chat Completions has no budget field, so map the
+        // budget back onto the effort tier it stands for instead of dropping
+        // the strength entirely (audit 01-P-02).
+        body["reasoning_effort"] =
+            openai_effort_from_budget(*in.reasoning.budget_tokens);
     else if (in.reasoning.enabled && !in.reasoning.extra.empty() &&
              in.reasoning.extra.is_object() && in.reasoning.extra.contains("effort"))
         body["reasoning"] = in.reasoning.extra;
-    if (in.max_tokens.has_value())
-        body["max_completion_tokens"] = *in.max_tokens;
+    if (in.max_tokens.has_value()) {
+        // `max_completion_tokens` is only understood by OpenAI's own o-series /
+        // GPT-5 models; most OpenAI-compatible upstreams accept `max_tokens`
+        // only and reject (or ignore) the other spelling.  Pick by the upstream
+        // model this body is addressed to (audit 01-P-08).
+        body[openai_uses_max_completion_tokens(in.model) ? "max_completion_tokens"
+                                                        : "max_tokens"] =
+            *in.max_tokens;
+    }
     if (in.temperature.has_value())
         body["temperature"] = *in.temperature;
     if (!in.stop_sequences.empty()) {
@@ -311,9 +329,21 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in,
                     {"required", json::array({"input"})}};
                 arr.push_back(std::move(j));
             } else if (type != "function") {
-                // namespace / web_search / tool_search are not representable
-                // in OpenAI chat completions; drop them (cc-switch drops
-                // web_search; namespace children are not preserved by the IR).
+                // namespace / web_search / tool_search have no Chat Completions
+                // representation, so the tool cannot be forwarded.  The loss
+                // itself is unavoidable here, but it must not be silent: the
+                // model is about to answer without a tool the request declared
+                // (audit 01-P-06).  Counted and logged like the other
+                // informational conditions in this module.
+                static std::atomic<std::uint64_t> dropped_tools{0};
+                const std::uint64_t occurrence =
+                    dropped_tools.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (occurrence == 1 || occurrence % 1000 == 0)
+                    TB_LOG_WARN(
+                        "[OpenAI] dropped tool \"%s\" of type \"%s\": Chat "
+                        "Completions cannot represent it (occurrence %llu)\n",
+                        t.name.c_str(), type.c_str(),
+                        static_cast<unsigned long long>(occurrence));
                 continue;
             } else {
                 json j;
@@ -333,8 +363,18 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in,
 
     if (!in.system.empty()) {
         std::string sys_text;
-        for (const auto &b : in.system)
-            if (b.kind == ContentKind::Text) sys_text += b.text;
+        // Audit 01-P-01: several system blocks folded into one string must stay
+        // separated, otherwise the last sentence of one is glued to the first
+        // of the next ("...end." + "You must" -> "...end.You must").  Blocks
+        // are joined by a blank line; the separator is skipped when nothing has
+        // been written yet or the text already ends in whitespace.
+        for (const auto &b : in.system) {
+            if (b.kind != ContentKind::Text) continue;
+            if (!sys_text.empty() &&
+                !std::isspace(static_cast<unsigned char>(sys_text.back())))
+                sys_text += "\n\n";
+            sys_text += b.text;
+        }
         if (!in.system.empty()) {
             json sys = json::object();
             sys["role"] = "system";
@@ -397,7 +437,12 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in,
             json parts = json::array();
             bool has_tools = false;
             json tool_calls = json::array();
-            json tool_media = json::array();
+            // Media parts of a tool result cannot ride on the role:"tool"
+            // message, so they travel in a user message.  Keep them grouped per
+            // tool_call_id instead of merging every call's media into one
+            // unattributed message: upstream otherwise cannot tell which call
+            // produced which image (audit 01-P-07).
+            std::vector<std::pair<std::string, json>> media_by_id;
             std::string reasoning_text;
             std::vector<std::pair<std::string, std::string>> tr_by_id;
             for (const auto &b : m.content) {
@@ -413,7 +458,20 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in,
                         }
                         if (!found) tr_by_id.emplace_back(b.tool_use_id, fmt::tool_result_text(b));
                         json media = fmt::serialize_openai_tool_media_parts(b);
-                        for (const auto &part : media) tool_media.push_back(part);
+                        if (!media.empty()) {
+                            bool media_found = false;
+                            for (auto &kv : media_by_id) {
+                                if (kv.first == b.tool_use_id) {
+                                    for (const auto &part : media)
+                                        kv.second.push_back(part);
+                                    media_found = true;
+                                    break;
+                                }
+                            }
+                            if (!media_found)
+                                media_by_id.emplace_back(b.tool_use_id,
+                                                         std::move(media));
+                        }
                     } else {
                         // No id → cannot be a tool message; keep as text part.
                         json p;
@@ -436,8 +494,19 @@ json OpenAICodec::serialize_request(const ir::ChatRequest &in,
                 jt["content"] = kv.second;
                 msgs.push_back(std::move(jt));
             }
-            if (!tool_media.empty())
-                msgs.push_back(json{{"role", "user"}, {"content", tool_media}});
+            // One user message per tool_call_id, opening with a text part that
+            // names the id: that is the only place a Chat request can carry the
+            // attribution the tool-result message lost (audit 01-P-07).
+            for (const auto &kv : media_by_id) {
+                json content = json::array();
+                content.push_back(
+                    json{{"type", "text"},
+                         {"text", "Tool output media for tool_call_id \"" +
+                                      kv.first + "\":"}});
+                for (const auto &part : kv.second) content.push_back(part);
+                msgs.push_back(
+                    json{{"role", "user"}, {"content", std::move(content)}});
+            }
             // Non-tool parts become a normal user message after the tool results.
             if (parts.size() == 1 && parts[0].value("type", "") == "text")
                 jm["content"] = parts[0]["text"];

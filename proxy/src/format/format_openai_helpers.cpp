@@ -1,6 +1,7 @@
 #include "format_openai_internal.h"
 
 #include <array>
+#include <cctype>
 
 void append_openai_content_part(json &parts, json &tool_calls, bool &has_tools,
                                 std::string &reasoning_text,
@@ -44,6 +45,34 @@ void append_openai_content_part(json &parts, json &tool_calls, bool &has_tools,
     }
 }
 
+/// Read an Anthropic `thinking.budget_tokens` back as a Chat Completions
+/// `reasoning_effort` tier.  Chat has no budget field, so without this the
+/// strength the client asked for is silently dropped and the upstream reasons
+/// at its own default (audit 01-P-02).  Thresholds are the ones audit 01-P-02
+/// prescribes: >=8192 -> high, >=2048 -> medium, otherwise low.
+std::string openai_effort_from_budget(int budget_tokens) {
+    if (budget_tokens >= 8192) return "high";
+    if (budget_tokens >= 2048) return "medium";
+    return "low";
+}
+
+/// True when the upstream model only accepts `max_completion_tokens` for the
+/// output ceiling.  OpenAI's own o-series and GPT-5 models reject `max_tokens`,
+/// while almost every OpenAI-compatible upstream (DeepSeek/MiniMax/…) accepts
+/// only `max_tokens` (audit 01-P-08).  A leading vendor prefix (`openai/o1`) is
+/// ignored so routes that carry one still match.
+bool openai_uses_max_completion_tokens(const std::string &model) {
+    std::string name = model;
+    const size_t slash = name.rfind('/');
+    if (slash != std::string::npos) name.erase(0, slash + 1);
+    for (char &c : name)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    static const char *kHints[] = {"o1", "o3", "o4", "gpt-5"};
+    for (const char *hint : kHints)
+        if (name.rfind(hint, 0) == 0) return true;
+    return false;
+}
+
 bool openai_request_key_consumed(const std::string &key) {
     static constexpr std::array<const char *, 14> consumed{{
         "model", "messages", "system", "tools", "tool_choice", "stream",
@@ -75,6 +104,14 @@ void parse_openai_namespace_children(const json &value, ir::Tool &tool) {
     }
 }
 
+// MiniMax requires `role=system` only in the first slot; DeepSeek/other strict
+// OpenAI layers reject mid-conversation system messages.  Codex emits a system
+// message from `instructions` plus one `developer` message per turn (mapped to
+// `system` above), so merge them all into a single leading `system` message.
+// Semantically lossless for lenient upstreams too — mirroring cc-switch's
+// `collapse_system_messages_to_head`.  (Moved here from the deleted stale copy
+// in format_openai.cpp so the reason survives next to the live implementation —
+// audit 03-F-06.)
 void collapse_openai_system_messages(json &messages) {
     if (!messages.is_array()) return;
     std::vector<std::string> system;

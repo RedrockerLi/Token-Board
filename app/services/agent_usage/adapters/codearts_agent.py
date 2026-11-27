@@ -21,6 +21,10 @@ KIND = "codearts-agent"
 LABEL = "CodeArts Agent"
 DESCRIPTION = "CodeArts Agent 本地用量"
 ALWAYS_SCAN = True
+# ``parse`` reads nothing but this source file (and its SQLite
+# sidecars), so an unchanged fingerprint reproduces the batch exactly:
+# the importer may replay it instead of re-reading the store.
+PARSE_CACHE = True
 DEFAULT_PATH = Path.home() / ".codeartsdoer" / "codearts-data" / "opencode.db"
 
 USAGE_SQL = """
@@ -134,8 +138,12 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         return batch([], 0, skipped=True, warnings=(f"codearts-agent: cannot read {item.path}: {err}",))
 
     records: dict[str, dict] = {}
+    # An interrupted scan is incomplete: mark it skipped so the caller neither
+    # advances the cursor nor caches the partial batch.
+    stopped = False
     for index, row in enumerate(rows):
         if stop_event is not None and stop_event.is_set():
+            stopped = True
             break
 
         ts = _resolve_ts(row["dataCreated"], row["columnCreated"])
@@ -191,4 +199,4 @@ def parse(item: UsageSource, stop_event=None, **_) -> ParseBatch:
         if event:
             events.append(event)
 
-    return batch(events, len(rows))
+    return batch(events, len(rows), skipped=stopped)

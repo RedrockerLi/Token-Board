@@ -1,4 +1,11 @@
-"""Small normalized V2 fixtures shared by proxy integration tests."""
+"""Small normalized V2 fixtures shared by proxy integration tests.
+
+The filename keeps its V1-era name while every fixture here builds the V2
+schema and its V2 database pair (`ensure_v2_database`, `add_upstream`,
+`add_plain_route`).  Twenty test scripts import this module by that name, so
+renaming it is a mechanical sweep of test imports with no behavioural effect,
+kept out of unrelated fixes (05-TB05-F11).
+"""
 
 from __future__ import annotations
 

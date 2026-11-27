@@ -188,11 +188,22 @@ void ProxyServer::run_usage_watch_cycle() {
             static_cast<long long>(evidence.resets_at),
             static_cast<long long>(usage->observed_at), clear ? 1 : 0);
         if (clear) {
-            gate_.clear_cooldown(key_slot_id);
-            TB_LOG_DEBUG(
-                    "[Proxy] cooldown: key %d reset observed in the usage "
-                    "snapshot, cooldown cleared\n",
-                    key_slot_id);
+            // The clear must be conditional: the observation the decision is
+            // based on predates any cooldown a request marked while this cycle
+            // was running.
+            const auto outcome = gate_.clear_cooldown_if_current(
+                key_slot_id, usage->observed_at);
+            if (outcome == AccountGate::CooldownClearResult::kCleared) {
+                TB_LOG_DEBUG(
+                        "[Proxy] cooldown: key %d reset observed in the usage "
+                        "snapshot, cooldown cleared\n",
+                        key_slot_id);
+            } else if (outcome == AccountGate::CooldownClearResult::kSuperseded) {
+                TB_LOG_WARN(
+                        "[Proxy] cooldown watch: key %d saw a reset at %lld but "
+                        "a newer cooldown was marked meanwhile; keeping it\n",
+                        key_slot_id, static_cast<long long>(usage->observed_at));
+            }
         }
     }
 }
@@ -211,16 +222,22 @@ void ProxyServer::run_ledger_refresh_cycle() {
 }
 
 void ProxyServer::run_cooldown_probe_cycle() {
+    // Probe a few cooling keys at once.  One unresponsive key can cost 15s (a
+    // 5s lease wait plus the 10s probe timeout), so a serial sweep of K keys
+    // can outlast the probe period itself; overlapping the sweep changes no
+    // per-key rule and leaves the cadence alone (C-13).
+    constexpr std::size_t kProbeConcurrency = 4;
     const auto now = std::chrono::steady_clock::now();
     const auto cooling = gate_.cooling_keys(now);
     if (cooling.empty()) return;
-    for (const int key_slot_id : cooling) {
+
+    const auto probe_key = [this](int key_slot_id) {
         const auto target = db_.lookup_probe_target(key_slot_id);
-        if (!target) continue;  // key/account deleted meanwhile — cooldown is
-                                // in-memory and will expire on its own.
+        if (!target) return;  // key/account deleted meanwhile — cooldown is
+                              // in-memory and will expire on its own.
         if (target->profile->cooldown_recovery !=
             CooldownRecoveryChannel::kHttpProbe)
-            continue;  // the usage-watch cycle handles this key
+            return;  // the usage-watch cycle handles this key
         ForwardOptions opts;
         opts.non_streaming_timeout = 10;
         opts.non_streaming_total_timeout = 10;
@@ -246,6 +263,10 @@ void ProxyServer::run_cooldown_probe_cycle() {
             method = "POST";
         }
         UpstreamClient::ForwardResult fwd;
+        // Wall stamp of this probe's observation.  A cooldown marked after it
+        // was created by a failure this probe never saw, so the probe's 2xx
+        // must not lift it.
+        const std::int64_t probe_started_wall = wall_now_epoch();
         try {
             fwd = upstream_.forward(method, target->base_url,
                                     target->key_value, probe_path, probe_body,
@@ -253,21 +274,52 @@ void ProxyServer::run_cooldown_probe_cycle() {
         } catch (const std::exception &e) {
             TB_LOG_WARN("[Proxy] cooldown probe error (key=%d): %s\n",
                     key_slot_id, e.what());
-            continue;  // keep cooling; retry next cycle
+            return;  // keep cooling; retry next cycle
         }
         if (fwd.status_code >= 200 && fwd.status_code < 300) {
             // A successful probe is explicit evidence that the provider's
-            // quota cooldown can be cleared.
-            gate_.clear_cooldown(key_slot_id);
-            TB_LOG_DEBUG(
-                    "[Proxy] cooldown probe: key %d profile=%s healthy, "
-                    "cooldown cleared early (status %d)\n",
-                    key_slot_id, target->profile->name, fwd.status_code);
+            // quota cooldown can be cleared — for the state it observed.
+            const auto outcome =
+                gate_.clear_cooldown_if_current(key_slot_id, probe_started_wall);
+            if (outcome == AccountGate::CooldownClearResult::kCleared) {
+                TB_LOG_DEBUG(
+                        "[Proxy] cooldown probe: key %d profile=%s healthy, "
+                        "cooldown cleared early (status %d)\n",
+                        key_slot_id, target->profile->name, fwd.status_code);
+            } else if (outcome == AccountGate::CooldownClearResult::kSuperseded) {
+                TB_LOG_WARN(
+                        "[Proxy] cooldown probe: key %d profile=%s healthy "
+                        "(status %d) but a newer cooldown was marked after the "
+                        "probe started; keeping it\n",
+                        key_slot_id, target->profile->name, fwd.status_code);
+            }
         } else {
             TB_LOG_DEBUG(
                     "[Proxy] cooldown probe: key %d profile=%s still cooling "
                     "(status %d)\n",
                     key_slot_id, target->profile->name, fwd.status_code);
         }
+    };
+
+    const std::size_t workers = std::min(kProbeConcurrency, cooling.size());
+    if (workers <= 1) {
+        probe_key(cooling.front());
+        return;
     }
+    // The cycle thread joins every worker before it returns, so the next
+    // cycle cannot overlap this one.
+    std::atomic<std::size_t> next{0};
+    std::vector<std::thread> probes;
+    probes.reserve(workers);
+    for (std::size_t i = 0; i < workers; ++i) {
+        probes.emplace_back([&] {
+            for (;;) {
+                const std::size_t index =
+                    next.fetch_add(1, std::memory_order_relaxed);
+                if (index >= cooling.size()) return;
+                probe_key(cooling[index]);
+            }
+        });
+    }
+    for (auto &probe : probes) probe.join();
 }

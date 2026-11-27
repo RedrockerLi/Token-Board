@@ -2,6 +2,7 @@
 #include "reasoning_bridge.h"
 
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 
 using namespace ir;
@@ -60,6 +61,27 @@ bool AnthropicCodec::parse_request(const json &in, ir::ChatRequest &out,
             if (block.kind == ContentKind::ToolUse && !block.tool_input.is_object()) {
                 err = "tool_use input must be an object";
                 return false;
+            }
+        }
+    }
+
+    // Anthropic accepts only the user/assistant roles inside `messages`, and a
+    // tool_result block answers a call from an assistant turn, so it may only
+    // appear in a user message.  Reject the other combinations here with a
+    // clear error instead of letting the serializer quietly relabel the role to
+    // `user` and move the message's own blocks with it (audit 01-P-05).
+    for (const auto &message : out.messages) {
+        if (message.role != "user" && message.role != "assistant") {
+            err = "Anthropic message role must be user or assistant, got \"" +
+                  message.role + "\"";
+            return false;
+        }
+        if (message.role == "assistant") {
+            for (const auto &block : message.content) {
+                if (block.kind == ContentKind::ToolResult) {
+                    err = "tool_result blocks are only valid in user messages";
+                    return false;
+                }
             }
         }
     }
@@ -244,6 +266,17 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in,
             th["budget_tokens"] = *in.reasoning.budget_tokens;
         else if (!in.reasoning.effort.empty())
             th["budget_tokens"] = anthropic_effort_budget(in.reasoning.effort);
+        else {
+            // Anthropic requires `budget_tokens` whenever thinking is enabled,
+            // so forwarding `enabled` without one is a guaranteed 400.  Fill in
+            // the medium budget — the same default an unknown effort gets — and
+            // say so (audit 01-P-13).
+            const int fallback = anthropic_effort_budget("medium");
+            th["budget_tokens"] = fallback;
+            TB_LOG_DEBUG("[Anthropic] thinking enabled without budget_tokens, "
+                         "using the medium budget (%d)\n",
+                         fallback);
+        }
         body["thinking"] = std::move(th);
     } else if (in.reasoning.extra.contains("type")) {
         body["thinking"] = in.reasoning.extra;
@@ -261,27 +294,17 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in,
             json j;
             j["name"] = t.name;
             j["description"] = t.description;
-            j["input_schema"] = t.input_schema.is_object() ? t.input_schema
-                                                           : json::object();
+            // A tool that came from Chat/Responses may carry `parameters: null`
+            // or a schema without `type:"object"`; Anthropic validates
+            // `input_schema` strictly, so apply the same normalization the Chat
+            // target applies instead of forwarding an empty schema (audit
+            // 01-P-09).
+            j["input_schema"] = fmt::normalize_function_parameters(t.input_schema);
             if (t.extra.contains("cache_control"))
                 j["cache_control"] = t.extra["cache_control"];
             arr.push_back(std::move(j));
         }
         body["tools"] = std::move(arr);
-    }
-
-    // System: top-level string or block array.
-    if (!in.system.empty()) {
-        bool all_text = true;
-        std::string joined;
-        for (const auto &b : in.system) {
-            if (b.kind != ContentKind::Text) { all_text = false; break; }
-            joined += b.text;
-        }
-        if (all_text)
-            body["system"] = joined;
-        else
-            body["system"] = serialize_anthropic_blocks(in.system);
     }
 
     json msgs = json::array();
@@ -308,13 +331,50 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in,
             auto &merged = normalized_items.back();
             merged.content.insert(merged.content.end(), item.content.begin(),
                                   item.content.end());
-            merged.item_kind = ItemKind::Message;
-            merged.extra = json::object();
+            // Only `content` merges.  Resetting the accumulator's
+            // `item_kind`/`extra` here would also wipe the *first* item's own
+            // Message-level fields (the audit's 01-P-11), and the Chat target
+            // keeps them; the merge has no reason to differ.
         } else {
             normalized_items.push_back(std::move(item));
         }
     }
+
+    // System: top-level string or block array.  Anthropic has no `developer`
+    // role and no `system` role inside `messages`, so both carry instruction
+    // text that belongs to this field — mirroring the Chat target, which maps
+    // `developer` to `system`.  A Responses client sends Codex `developer` turns
+    // and `role:"system"` message items; leaving them in `messages` put an
+    // unknown role on the wire (audit 01-P-04).
+    std::vector<ContentBlock> system_blocks = in.system;
+    for (const auto &source : source_items) {
+        if (source.role != "developer" && source.role != "system") continue;
+        system_blocks.insert(system_blocks.end(), source.content.begin(),
+                             source.content.end());
+    }
+    if (!system_blocks.empty()) {
+        bool all_text = true;
+        std::string folded;
+        for (const auto &b : system_blocks) {
+            if (b.kind != ContentKind::Text) { all_text = false; break; }
+            // Audit 01-P-01: folded blocks stay separated by a blank line
+            // instead of being glued together ("...end." + "You must" ->
+            // "...end.You must").  The separator is skipped while nothing has
+            // been written yet or the text already ends in whitespace.
+            if (!folded.empty() &&
+                !std::isspace(static_cast<unsigned char>(folded.back())))
+                folded += "\n\n";
+            folded += b.text;
+        }
+        if (all_text)
+            body["system"] = folded;
+        else
+            body["system"] = serialize_anthropic_blocks(system_blocks);
+    }
+
     for (const auto &m : normalized_items) {
+        // Folded into the top-level `system` field above.
+        if (m.role == "developer" || m.role == "system") continue;
         json jm;
         bool has_tool_result = false;
         for (const auto &b : m.content)
@@ -328,5 +388,10 @@ json AnthropicCodec::serialize_request(const ir::ChatRequest &in,
         msgs.push_back(std::move(jm));
     }
     body["messages"] = std::move(msgs);
+    // A carrier this service wrote into `signature`/`data` is only meaningful
+    // between the client and this proxy; an upstream that verifies signatures
+    // would reject it, so strip it before forwarding (audit 01-P-17 ⑤).
+    if (context && context->target_verifies_thinking_signature)
+        fmt::strip_reasoning_envelopes(body);
     return body;
 }

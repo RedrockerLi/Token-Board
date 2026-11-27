@@ -146,6 +146,13 @@ public:
         // exhaustion from ordinary upstream failures; only the former may
         // enter the retained provider-quota cooldown.
         bool usage_limit = false;
+        // Set when the 4xx body identified a *terminal* billing/quota
+        // exhaustion (Google's monthly spending cap, quota exceeded,
+        // insufficient_quota, "exceeded your current quota").  Unlike the
+        // usage-limit envelope above, this text is terminal for every account
+        // kind: the key must take a long quota cooldown instead of the
+        // ordinary short rate-limit avoid (04-C-18).
+        bool usage_limit_terminal = false;
         // The window the usage-limit envelope named ("5h" / "week" / "month";
         // empty when absent): the cooldown prefers that window's trusted reset
         // over the PLAN_COOLDOWN fallback.

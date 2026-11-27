@@ -3,7 +3,8 @@
 // The runtime no longer contains a second C++ pricing algorithm.  This test
 // therefore seeds the current V1 pricing tables and verifies that a pending
 // UsageEvent is rated by SQLite's V1 trigger, including model matching,
-// cache/slot pricing and write-time FX selection.  Keeping this test at the
+// cache/slot pricing and FX selection at the usage instant (requested_at).
+// Keeping this test at the
 // C++ boundary ensures Database::open() and the production schema agree while
 // leaving one authoritative implementation of the billing formula.
 //
@@ -57,6 +58,9 @@ const Case CASES[] = {
     {"usd-fx-sameday",     "usd-model",   1000,    0,       0,       kAug6_08},
     {"usd-fx-older",       "usd-model",   1000,    0,       0,       kAug5_08},
     {"usd-no-fx",          "usd-model",   1000,    0,       0,       kAug1_08},
+    // Only a later GBP rate exists: an event does not borrow a rate stamped
+    // after its own usage instant, so it stays unrated.
+    {"fx-after-requested", "gbp-model",   1000,    0,       0,       kAug1_08},
     {"cny-fx-ignored",     "slot-model",  100,     0,       100,     kAug6_1230},
     {"zero-tokens",        "gpt-4o",      0,       0,       0,       kAug6_10_30},
     {"million-scale",      "high-token",  1234567, 987654,  12345678, kAug6_10_30},
@@ -95,18 +99,29 @@ int main(int argc, char **argv) {
                        "(2,'gpt-*',10,1,0.5,2,'CNY'),"
                        "(3,'usd-model',0,3,0,6,'USD'),"
                        "(4,'slot-model',0,5,0,5,'CNY'),"
-                       "(5,'high-token',0,0.001,0,0.002,'CNY')") &&
+                       "(5,'high-token',0,0.001,0,0.002,'CNY'),"
+                       "(6,'gbp-model',0,3,0,6,'GBP')") &&
         exec_sql(seed, "INSERT INTO pricing_slots "
                        "(id, pricing_rule_id, start_minute, end_minute, multiplier) VALUES "
                        "(1,4,0,1440,2.0)") &&
         exec_sql(seed, "INSERT INTO fx_rates "
                        "(base_currency,quote_currency,date,rate) VALUES "
+                       // usd-no-fx asks whether a usable rate exists for its
+                       // usage instant (2026-08-01); this older stamp keeps the
+                       // case asking about 2026-08-01 instead of about the two
+                       // later stamps.
+                       "('USD','CNY','2026-07-30',7.0),"
                        "('USD','CNY','2026-08-05',7.1),"
-                       "('USD','CNY','2026-08-06',7.2)");
+                       "('USD','CNY','2026-08-06',7.2),"
+                       // The only GBP rate lands after fx-after-requested's
+                       // usage instant, so no rate is available to that event.
+                       "('GBP','CNY','2026-08-10',9.0)");
     assert(ok);
 
-    // Fire the V1 pending-event trigger. The supplied event time is historical
-    // on purpose; price selection must use the INSERT execution time.
+    // Fire the V1 pending-event trigger.  The supplied event time is historical
+    // on purpose: price selection (slot window and FX availability alike) reads
+    // requested_at, so every case stays pinned to the instant it names rather
+    // than to the moment the fixture happens to insert the row.
     auto rated = [&](const Case &c, int id) -> std::tuple<double, int> {
         char sql[768];
         snprintf(sql, sizeof(sql),
@@ -146,13 +161,21 @@ int main(int argc, char **argv) {
     for (const auto &c : CASES) {
         const auto [cost, status] = rated(c, n + 1);
         assert(!isnan(cost));
-        const bool unrated = std::string(c.label) == "no-match";
+        const std::string label(c.label);
+        // Two distinct reasons to stay unrated: no pricing rule matches the
+        // model, or no rate is stamped on/before the usage instant.
+        const bool unrated = label == "no-match" ||
+                             label == "fx-after-requested";
+        // Report the case before judging it: stdout is block-buffered, so the
+        // abort that follows a failing assert would otherwise swallow the whole
+        // table and the failure would not name the case that broke.
+        printf("  %-22s equivalent_cost=%.12g status=%s\n",
+               label.c_str(), cost, status == 1 ? "rated" : "unrated");
+        fflush(stdout);
         assert(status == (unrated ? 0 : 1));
         if (unrated) {
             assert(cost == 0.0);
         }
-        printf("  %-22s equivalent_cost=%.12g status=%s\n",
-               c.label, cost, status == 1 ? "rated" : "unrated");
         ++n;
     }
 

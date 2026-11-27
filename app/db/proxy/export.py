@@ -3,9 +3,6 @@
 import hashlib
 import json
 
-from app.core.time import format_utc, parse_runtime_timestamp, utc_now
-from app.db.proxy.common import _billing_period_month, _period_start
-
 
 def _billing_event_payload_hash(event) -> str:
     payload = {
@@ -61,6 +58,11 @@ class ProxyExportMixin:
             # A) usage + actual cost: keyed by stable user_id.  The identity
             # name is carried in the same batch so usage and users are committed
             # together by the Dashboard writer.
+            #
+            # Plan/agent equivalent amounts are part of this stream, not a
+            # separate virtual ledger: api_equivalent_cost_micro_cny below
+            # already carries them, so the two-table Dashboard has no
+            # plan-summary rows of its own.
             cost_columns = (
                 "COALESCE(SUM(r.equivalent_cost),0) AS cost, "
                 "COALESCE(SUM(r.billed_usage_cost),0) AS billed_usage_cost,"
@@ -131,54 +133,6 @@ class ProxyExportMixin:
                 event_dict = dict(event)
                 frozen_charge_count += dash_db.record_billing_export_event(
                     event_dict, _billing_event_payload_hash(event_dict))
-
-            # C) Request-log plan/agent equivalent amounts are already in the
-            # daily model rows above. Keep this traversal for compatibility,
-            # but the two-table Dashboard has no separate virtual ledger.
-            now = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
-            metas = self._plan_key_billing_meta(conn)
-            by_key_id = {meta["key_id"]: meta for meta in metas if meta["key_id"] is not None}
-            by_account = {}
-            for meta in metas:
-                by_account.setdefault(meta["account_id"], meta)
-
-            virtual_buckets: dict[tuple[str, int, str], float] = {}
-            plan_logs = conn.execute(
-                "SELECT COALESCE(r.account_identity_id,r.account_id) account_id,"
-                "r.billing_unit_id,r.billing_anchor_day,r.upstream_key_id,r.requested_at,"
-                "r.equivalent_cost api_cost FROM request_log r "
-                "LEFT JOIN billing_contracts bc ON bc.account_id=r.account_id "
-                "LEFT JOIN account_identities ai ON ai.id=COALESCE(r.account_identity_id,r.account_id) "
-                "WHERE r.id>? AND r.id<=? AND r.status_code BETWEEN 200 AND 299 "
-                "AND ai.account_kind='proxy' AND "
-                "(r.billing_unit_id IS NOT NULL OR (bc.charge_type='recurring' "
-                "AND bc.valid_from<=r.requested_at AND "
-                "(bc.ends_at IS NULL OR bc.ends_at>r.requested_at)))",
-                (mark, max_id),
-            ).fetchall()
-            for log in plan_logs:
-                meta = by_key_id.get(log["upstream_key_id"]) or by_account.get(log["account_id"])
-                if log["billing_unit_id"]:
-                    meta = dict(meta or {})
-                    meta["billing_unit_id"] = log["billing_unit_id"]
-                    meta["account_id"] = log["account_id"]
-                if meta is None or not meta.get("billing_unit_id"):
-                    continue
-                requested = parse_runtime_timestamp(log["requested_at"])
-                anchor_day = (log["billing_anchor_day"] or
-                              (meta.get("anchor").day if meta.get("anchor") else 1))
-                month = _billing_period_month(requested, int(anchor_day))
-                period_start = format_utc(_period_start(month, int(anchor_day)))
-                bucket = (period_start, meta["account_id"],
-                          meta["billing_unit_id"])
-                virtual_buckets[bucket] = virtual_buckets.get(bucket, 0.0) + float(log["api_cost"] or 0)
-            for (period_start, account_id, billing_unit_id), virtual_cost in virtual_buckets.items():
-                dash_db.accumulate_plan_summary(
-                    period_start=period_start, account_id=account_id,
-                    billing_unit_id=billing_unit_id,
-                    subscription_cost=0.0, virtual_cost=virtual_cost,
-                    refresh_subscription=False,
-                )
 
             return {
                 "record_count": len(rows),

@@ -290,7 +290,10 @@ private:
                 return;
             }
             const auto &r = j["response"]; StreamEvent fin; fin.type = StreamEventType::MessageFinish;
-            fin.stop_reason = fmt::responses_status_to_stop(r.value("status", type));
+            fin.stop_reason = fmt::responses_status_to_stop(
+                r.value("status", type),
+                r.contains("incomplete_details") ? r["incomplete_details"]
+                                                 : json());
             if (r.contains("object")) fin.extra["object"] = r["object"];
             if (r.contains("context_management"))
                 fin.extra["context_management"] = r["context_management"];
